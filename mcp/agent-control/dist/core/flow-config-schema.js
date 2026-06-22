@@ -1,0 +1,221 @@
+export const flowConfigJsonSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    $id: "https://agent-control.local/schemas/flow-config.schema.json",
+    title: "Agent Control Flow Config",
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "initial_step", "steps"],
+    properties: {
+        id: { type: "string", minLength: 1 },
+        version: { type: "string", minLength: 1 },
+        description: { type: "string", minLength: 1 },
+        initial_step: { type: "string", minLength: 1 },
+        prompts: {
+            type: "object",
+            additionalProperties: { $ref: "#/$defs/promptSource" }
+        },
+        artifacts: {
+            type: "object",
+            additionalProperties: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    path: { type: "string", minLength: 1 },
+                    description: { type: "string", minLength: 1 }
+                }
+            }
+        },
+        roles: {
+            type: "object",
+            additionalProperties: { $ref: "#/$defs/promptOwner" }
+        },
+        steps: {
+            type: "object",
+            minProperties: 1,
+            additionalProperties: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    role: { type: "string", minLength: 1 },
+                    agent_id: { type: "string", minLength: 1 },
+                    prompt: { type: "string", minLength: 1 },
+                    prompt_ref: { type: "string", minLength: 1 },
+                    prompt_path: { type: "string", minLength: 1 },
+                    description: { type: "string", minLength: 1 },
+                    inputs: {
+                        type: "object",
+                        additionalProperties: { $ref: "#/$defs/artifactReference" }
+                    },
+                    outputs: {
+                        type: "object",
+                        additionalProperties: { $ref: "#/$defs/artifactReference" }
+                    },
+                    report: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            tool: { type: "string", minLength: 1 },
+                            schema: { $ref: "#/$defs/resultSchema" }
+                        }
+                    },
+                    on: {
+                        type: "object",
+                        additionalProperties: { $ref: "#/$defs/action" }
+                    }
+                }
+            }
+        }
+    },
+    $defs: {
+        promptSource: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+                path: { type: "string", minLength: 1 },
+                text: { type: "string", minLength: 1 },
+                description: { type: "string", minLength: 1 }
+            },
+            oneOf: [{ required: ["path"] }, { required: ["text"] }]
+        },
+        promptOwner: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+                backend: { type: "string", minLength: 1 },
+                model: { type: "string", minLength: 1 },
+                description: { type: "string", minLength: 1 },
+                prompt: { type: "string", minLength: 1 },
+                prompt_ref: { type: "string", minLength: 1 },
+                prompt_path: { type: "string", minLength: 1 }
+            }
+        },
+        artifactReference: {
+            type: "object",
+            additionalProperties: false,
+            required: ["artifact"],
+            properties: {
+                artifact: { type: "string", minLength: 1 },
+                required: { type: "boolean" }
+            }
+        },
+        resultSchema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+                type: { const: "object" },
+                required: {
+                    type: "array",
+                    items: { type: "string", minLength: 1 }
+                },
+                properties: {
+                    type: "object",
+                    additionalProperties: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                            enum: {
+                                type: "array",
+                                items: {
+                                    anyOf: [
+                                        { type: "string" },
+                                        { type: "number" },
+                                        { type: "boolean" },
+                                        { type: "null" }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        condition: {
+            anyOf: [
+                {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["equals"],
+                    properties: {
+                        equals: {
+                            type: "object",
+                            additionalProperties: false,
+                            required: ["var", "value"],
+                            properties: {
+                                var: { type: "string", minLength: 1 },
+                                value: {}
+                            }
+                        }
+                    }
+                },
+                {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["exists"],
+                    properties: {
+                        exists: {
+                            type: "object",
+                            additionalProperties: false,
+                            required: ["var"],
+                            properties: {
+                                var: { type: "string", minLength: 1 }
+                            }
+                        }
+                    }
+                },
+                {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["all"],
+                    properties: {
+                        all: {
+                            type: "array",
+                            minItems: 1,
+                            items: { $ref: "#/$defs/condition" }
+                        }
+                    }
+                },
+                {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["any"],
+                    properties: {
+                        any: {
+                            type: "array",
+                            minItems: 1,
+                            items: { $ref: "#/$defs/condition" }
+                        }
+                    }
+                }
+            ]
+        },
+        action: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+                notify: { type: "string", minLength: 1 },
+                to: { type: "string", minLength: 1 },
+                finish: { type: "boolean" },
+                transitions: {
+                    type: "array",
+                    items: { $ref: "#/$defs/transition" }
+                }
+            }
+        },
+        transition: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id"],
+            properties: {
+                id: { type: "string", minLength: 1 },
+                when: { $ref: "#/$defs/condition" },
+                notify: { type: "string", minLength: 1 },
+                to: { type: "string", minLength: 1 },
+                finish: { type: "boolean" },
+                transitions: {
+                    type: "array",
+                    items: { $ref: "#/$defs/transition" }
+                }
+            }
+        }
+    }
+};

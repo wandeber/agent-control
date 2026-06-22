@@ -1,0 +1,582 @@
+export const AGENT_STATUSES = [
+  "planned",
+  "queued",
+  "starting",
+  "running",
+  "waiting_for_input",
+  "completed",
+  "failed",
+  "blocked",
+  "stopping",
+  "stopped",
+  "unknown"
+] as const;
+
+export type AgentStatus = (typeof AGENT_STATUSES)[number];
+
+export const FAILURE_REASONS = [
+  "backend_unavailable",
+  "auth_required",
+  "permission_required",
+  "timeout",
+  "idle_timeout",
+  "missing_artifact",
+  "stale_artifact",
+  "tool_error",
+  "worker_reported_blocker",
+  "unsupported_operation",
+  "unknown"
+] as const;
+
+export type FailureReason = (typeof FAILURE_REASONS)[number];
+
+export const EVENT_TYPES = [
+  "agent.started",
+  "agent.status_changed",
+  "agent.message",
+  "agent.completed",
+  "agent.failed",
+  "agent.blocked",
+  "agent.stopped",
+  "agent.unregistered",
+  "agent.delivery_failed",
+  "artifact.created",
+  "artifact.updated",
+  "goal.confirmation_requested",
+  "goal.confirmation_deferred",
+  "goal.completed",
+  "goal.continued",
+  "goal.blocked",
+  "flow.started",
+  "flow.step_started",
+  "flow.step_reported",
+  "flow.step_blocked",
+  "flow.transition_selected",
+  "flow.notification",
+  "flow.completed",
+  "heartbeat.timeout",
+  "timer.elapsed"
+] as const;
+
+export type EventType = (typeof EVENT_TYPES)[number];
+
+export type GoalStatus = "active" | "complete" | "continue" | "blocked" | "cancelled";
+
+export const AGENT_LINK_TYPES = [
+  "parent_child",
+  "waits_for",
+  "subscribed_to",
+  "blocks",
+  "handoff"
+] as const;
+
+export type AgentLinkType = (typeof AGENT_LINK_TYPES)[number];
+
+export const FLOW_INSTANCE_STATUSES = [
+  "active",
+  "waiting_for_orchestrator",
+  "blocked",
+  "completed",
+  "cancelled"
+] as const;
+
+export type FlowInstanceStatus = (typeof FLOW_INSTANCE_STATUSES)[number];
+
+export const FLOW_STEP_INSTANCE_STATUSES = [
+  "active",
+  "completed",
+  "blocked",
+  "failed",
+  "cancelled"
+] as const;
+
+export type FlowStepInstanceStatus = (typeof FLOW_STEP_INSTANCE_STATUSES)[number];
+
+export interface RunRecord {
+  run_id: string;
+  title: string;
+  repo_dir: string | null;
+  parent_run_id: string | null;
+  created_by_agent_id: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentRecord {
+  agent_id: string;
+  run_id: string;
+  backend: string;
+  title: string;
+  role: string | null;
+  objective: string | null;
+  repo_dir: string | null;
+  model: string | null;
+  backend_handle: Record<string, unknown> | null;
+  status: AgentStatus;
+  failure_reason: FailureReason | null;
+  unregistered_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EventRecord {
+  event_id: string;
+  run_id: string | null;
+  agent_id: string | null;
+  type: EventType;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface SubscriptionRecord {
+  subscription_id: string;
+  run_id: string | null;
+  source_agent_id: string | null;
+  subscriber_agent_id: string;
+  event_type: EventType;
+  enabled: boolean;
+  last_delivered_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HeartbeatRecord {
+  heartbeat_id: string;
+  agent_id: string;
+  idle_timeout_ms: number;
+  reminder_interval_ms: number | null;
+  last_event_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GoalRecord {
+  goal_id: string;
+  agent_id: string;
+  objective: string;
+  status: GoalStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GoalConfirmationResult {
+  goal: GoalRecord;
+  message: string;
+  delivered: boolean;
+  deferred: boolean;
+  elapsed_ms: number;
+  active_descendants: AgentRecord[];
+}
+
+export interface ArtifactRecord {
+  artifact_id: string;
+  run_id: string | null;
+  agent_id: string | null;
+  label: string;
+  path: string;
+  expected: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentLinkRecord {
+  link_id: string;
+  run_id: string;
+  source_agent_id: string;
+  target_agent_id: string;
+  type: AgentLinkType;
+  label: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentTokenRecord {
+  token_id: string;
+  agent_id: string;
+  token_hash: string;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+export type AgentWithToken = AgentRecord & {
+  agent_token: string;
+};
+
+export interface OrchestratorLoginResult {
+  run: RunRecord;
+  agent: AgentRecord;
+  agent_token: string;
+}
+
+export interface UsageSnapshotRecord {
+  usage_id: string;
+  run_id: string;
+  agent_id: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  context_used: number | null;
+  context_limit: number | null;
+  source: string | null;
+  model: string | null;
+  captured_at: string;
+}
+
+export interface FlowRecord {
+  flow_record_id: string;
+  flow_id: string;
+  version: string | null;
+  description: string | null;
+  config: FlowConfig;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlowInstanceRecord {
+  flow_instance_id: string;
+  flow_record_id: string;
+  run_id: string;
+  status: FlowInstanceStatus;
+  current_step_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlowStepInstanceRecord {
+  step_instance_id: string;
+  flow_instance_id: string;
+  step_id: string;
+  agent_id: string | null;
+  status: FlowStepInstanceStatus;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  result_json: Record<string, unknown>;
+  transition_id: string | null;
+  summary: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface FlowStepReportRecord {
+  report_id: string;
+  step_instance_id: string;
+  status: FlowStepInstanceStatus;
+  result_json: Record<string, unknown>;
+  artifacts_json: Record<string, unknown>;
+  summary: string | null;
+  created_at: string;
+}
+
+export interface FlowTransitionRecord {
+  flow_transition_id: string;
+  flow_instance_id: string;
+  from_step_instance_id: string;
+  transition_id: string;
+  target_step_id: string | null;
+  action_json: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface FlowArtifactBindingRecord {
+  binding_id: string;
+  flow_instance_id: string;
+  artifact_key: string;
+  artifact_id: string | null;
+  path: string;
+  produced_by_step_instance_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlowConfig {
+  id: string;
+  version?: string;
+  description?: string;
+  initial_step: string;
+  prompts?: Record<string, FlowPromptConfig>;
+  artifacts?: Record<string, FlowArtifactConfig>;
+  roles?: Record<string, FlowRoleConfig>;
+  steps: Record<string, FlowStepConfig>;
+}
+
+export interface FlowPromptConfig {
+  path?: string;
+  text?: string;
+  description?: string;
+}
+
+export interface FlowPromptReferenceConfig {
+  prompt?: string;
+  prompt_ref?: string;
+  prompt_path?: string;
+}
+
+export interface FlowRoleConfig {
+  backend?: string;
+  model?: string;
+  description?: string;
+  prompt?: string;
+  prompt_ref?: string;
+  prompt_path?: string;
+}
+
+export interface FlowArtifactConfig {
+  path?: string;
+  description?: string;
+}
+
+export interface FlowStepConfig {
+  role?: string;
+  agent_id?: string;
+  prompt?: string;
+  prompt_ref?: string;
+  prompt_path?: string;
+  description?: string;
+  inputs?: Record<string, FlowArtifactReferenceConfig>;
+  outputs?: Record<string, FlowArtifactReferenceConfig>;
+  report?: FlowReportConfig;
+  on?: Record<string, FlowStepActionConfig>;
+}
+
+export interface FlowArtifactReferenceConfig {
+  artifact: string;
+  required?: boolean;
+}
+
+export interface FlowReportConfig {
+  tool?: string;
+  schema?: FlowResultSchemaConfig;
+}
+
+export interface FlowResultSchemaConfig {
+  type?: "object";
+  required?: string[];
+  properties?: Record<string, FlowResultPropertyConfig>;
+}
+
+export interface FlowResultPropertyConfig {
+  enum?: Array<string | number | boolean | null>;
+}
+
+export interface FlowStepActionConfig {
+  notify?: string;
+  to?: string;
+  finish?: boolean;
+  transitions?: FlowTransitionConfig[];
+}
+
+export interface FlowTransitionConfig extends FlowStepActionConfig {
+  id: string;
+  when?: FlowConditionConfig;
+}
+
+export type FlowConditionConfig =
+  | { equals: { var: string; value?: unknown } }
+  | { exists: { var: string } }
+  | { all: FlowConditionConfig[] }
+  | { any: FlowConditionConfig[] };
+
+export interface FlowStartResult {
+  flow: FlowRecord;
+  instance: FlowInstanceRecord;
+  active_step: FlowStepInstanceRecord | null;
+  reused?: boolean;
+  blocked_reason?: string;
+}
+
+export interface FlowSnapshot {
+  flow: FlowRecord;
+  instance: FlowInstanceRecord;
+  steps: FlowStepInstanceRecord[];
+  reports: FlowStepReportRecord[];
+  transitions: FlowTransitionRecord[];
+  artifact_bindings: FlowArtifactBindingRecord[];
+}
+
+export interface FlowStepReportResult extends FlowSnapshot {
+  reported_step: FlowStepInstanceRecord;
+  selected_transition: FlowTransitionRecord | null;
+  active_step: FlowStepInstanceRecord | null;
+  notification: string | null;
+}
+
+export interface FlowStepStartResult extends FlowSnapshot {
+  selected_transition: FlowTransitionRecord | null;
+  active_step: FlowStepInstanceRecord | null;
+  notification: string | null;
+}
+
+export interface FlowDispatchActiveResult {
+  flow_instance_id: string;
+  step: Record<string, unknown>;
+  agent: Record<string, unknown>;
+  subscriptions: Array<Record<string, unknown>>;
+  expected_artifacts: string[];
+  prompt_size: number;
+}
+
+export type FlowContinueAction =
+  | "dispatched"
+  | "waiting_for_report"
+  | "waiting_for_orchestrator"
+  | "blocked"
+  | "completed"
+  | "cancelled"
+  | "no_active_step";
+
+export interface FlowContinueResult {
+  flow_instance_id: string;
+  action: FlowContinueAction;
+  instance: FlowInstanceRecord;
+  active_step: FlowStepInstanceRecord | null;
+  dispatch: FlowDispatchActiveResult | null;
+  agent: AgentRecord | null;
+  notification: string | null;
+  blocked_reason: string | null;
+}
+
+export interface FlowStepReportAndContinueResult {
+  report: FlowStepReportResult;
+  continuation: FlowContinueResult | null;
+}
+
+export interface AgentComputedState {
+  agent_id: string;
+  elapsed_ms: number;
+  status_age_ms: number;
+  is_terminal: boolean;
+  latest_usage: UsageSnapshotRecord | null;
+}
+
+export interface DashboardSnapshot {
+  generated_at: string;
+  selected_run_id: string | null;
+  runs: RunRecord[];
+  agents: AgentRecord[];
+  agent_links: AgentLinkRecord[];
+  flows: FlowRecord[];
+  flow_instances: FlowInstanceRecord[];
+  flow_steps: FlowStepInstanceRecord[];
+  flow_reports: FlowStepReportRecord[];
+  flow_transitions: FlowTransitionRecord[];
+  flow_artifact_bindings: FlowArtifactBindingRecord[];
+  subscriptions: SubscriptionRecord[];
+  heartbeats: HeartbeatRecord[];
+  goals: GoalRecord[];
+  artifacts: ArtifactRecord[];
+  latest_events: EventRecord[];
+  computed_agents: AgentComputedState[];
+  status_counts: Record<AgentStatus, number>;
+  usage_totals: {
+    input_tokens: number | null;
+    output_tokens: number | null;
+    total_tokens: number | null;
+    context_used: number | null;
+    context_limit: number | null;
+  };
+}
+
+export interface PurgeOptions {
+  dryRun: boolean;
+  stopFirst: boolean;
+  force: boolean;
+  deleteRuntimeFiles: boolean;
+}
+
+export interface MaintenancePurgeOptions extends PurgeOptions {
+  olderThanMs: number;
+}
+
+export interface PurgeResult {
+  dry_run: boolean;
+  purged_runs: string[];
+  purged_agents: string[];
+  deleted_rows: Record<string, number>;
+  deleted_runtime_paths: string[];
+  skipped_runtime_paths: string[];
+}
+
+export interface AgentCapabilities {
+  canStart: boolean;
+  canSendMessage: boolean;
+  canReadLatest: boolean;
+  canStopGracefully: boolean;
+  canForceStop: boolean;
+  canStreamMessages: boolean;
+  canInspectStatusCheaply: boolean;
+  canAttachExisting: boolean;
+}
+
+export interface AgentHandle {
+  backend: string;
+  id: string;
+  data: Record<string, unknown>;
+}
+
+export interface StartAgentInput {
+  agent: AgentRecord;
+  agentToken?: string;
+  prompt?: string;
+  server?: string;
+  model?: string;
+  expectedArtifacts?: string[];
+  attachments?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentMessageInput {
+  message: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentMessage {
+  id: string;
+  role: string;
+  text: string;
+  created_at: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentStatusSnapshot {
+  status: AgentStatus;
+  failureReason?: FailureReason;
+  message?: string;
+  updatedAt?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface ReadLatestOptions {
+  limit: number;
+}
+
+export interface StopOptions {
+  mode: "graceful" | "interrupt" | "kill";
+}
+
+export interface StopResult {
+  status: AgentStatus;
+  failureReason?: FailureReason;
+  message?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface UnregisterOptions {
+  archiveRecord: boolean;
+}
+
+export interface AgentAdapter {
+  kind: string;
+  capabilities(): AgentCapabilities;
+  start(input: StartAgentInput): Promise<AgentHandle>;
+  sendMessage(handle: AgentHandle, message: AgentMessageInput): Promise<void>;
+  getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot>;
+  readLatest(handle: AgentHandle, options: ReadLatestOptions): Promise<AgentMessage[]>;
+  stop(handle: AgentHandle, options: StopOptions): Promise<StopResult>;
+  watchStatus?(
+    handle: AgentHandle,
+    onChange: (snapshot: AgentStatusSnapshot) => void | Promise<void>
+  ): () => void;
+  unregister?(handle: AgentHandle, options: UnregisterOptions): Promise<void>;
+}

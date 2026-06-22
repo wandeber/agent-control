@@ -1,0 +1,507 @@
+# Agent Control demo flow. Environment placeholders use ${VAR:-default} and are resolved by agentctl.
+
+id: demo-age-duration
+version: 0.1.0
+description: Overengineered demo flow that answers how long a person has been alive from their birth date.
+initial_step: resolve_current_date
+
+prompts:
+  role_date_resolver:
+    path: roles/date-resolver.md
+    description: Stable behavior for resolving the current date.
+  role_millisecond_calculator:
+    path: roles/millisecond-calculator.md
+    description: Stable behavior for calculating elapsed milliseconds.
+  role_millisecond_checker:
+    path: roles/millisecond-checker.md
+    description: Stable behavior for independently checking elapsed milliseconds.
+  role_duration_formatter:
+    path: roles/duration-formatter.md
+    description: Stable behavior for formatting milliseconds as human duration units.
+  role_format_checker:
+    path: roles/format-checker.md
+    description: Stable behavior for independently checking formatted duration units.
+  role_answer_writer:
+    path: roles/answer-writer.md
+    description: Stable behavior for writing the final user-facing answer.
+  role_final_reviewer:
+    path: roles/final-reviewer.md
+    description: Stable behavior for final fresh review.
+  step_resolve_current_date:
+    path: prompts/resolve-current-date.md
+    description: Resolve the current date and normalize the provided birth date.
+  step_calculate_milliseconds:
+    path: prompts/calculate-milliseconds.md
+    description: Calculate elapsed milliseconds.
+  step_check_milliseconds:
+    path: prompts/check-milliseconds.md
+    description: Validate elapsed milliseconds independently.
+  step_format_duration:
+    path: prompts/format-duration.md
+    description: Convert milliseconds into human-readable units.
+  step_check_format:
+    path: prompts/check-format.md
+    description: Validate the formatted duration independently.
+  step_write_answer:
+    path: prompts/write-answer.md
+    description: Write the final user-facing answer.
+  step_final_review:
+    path: prompts/final-review.md
+    description: Final review before closing the demo flow.
+
+roles:
+  date_resolver:
+    backend: ${DEMO_AGE_DATE_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_DATE_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_date_resolver
+    description: Extracts the birth date from the run objective and records the current date.
+  millisecond_calculator:
+    backend: ${DEMO_AGE_CALCULATOR_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_CALCULATOR_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_millisecond_calculator
+    description: Calculates the elapsed lifetime in milliseconds.
+  millisecond_checker:
+    backend: ${DEMO_AGE_MS_CHECKER_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_MS_CHECKER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_millisecond_checker
+    description: Independently checks the millisecond calculation, optionally with a script.
+  duration_formatter:
+    backend: ${DEMO_AGE_FORMATTER_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_FORMATTER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_duration_formatter
+    description: Converts milliseconds into days, hours, minutes, and seconds.
+  format_checker:
+    backend: ${DEMO_AGE_FORMAT_CHECKER_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_FORMAT_CHECKER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_format_checker
+    description: Independently checks the human-readable duration, optionally with a script.
+  answer_writer:
+    backend: ${DEMO_AGE_WRITER_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_WRITER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_answer_writer
+    description: Turns the verified duration into a compact answer for the user.
+  final_reviewer:
+    backend: ${DEMO_AGE_FINAL_REVIEW_BACKEND:-opencode-server}
+    model: ${DEMO_AGE_FINAL_REVIEW_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_final_reviewer
+    description: Fresh reviewer for the final answer.
+  orchestrator:
+    description: Receives missing birthdate, ambiguous date, blocked, or human-decision states.
+
+artifacts:
+  current_date:
+    path: "{run_dir}/current-date.md"
+    description: Current date/time and normalized birth date.
+  duration_ms:
+    path: "{run_dir}/duration-ms.md"
+    description: Elapsed lifetime in milliseconds.
+  duration_ms_review:
+    path: "{run_dir}/duration-ms-review.md"
+    description: Independent review of elapsed lifetime in milliseconds.
+  duration_human:
+    path: "{run_dir}/duration-human.md"
+    description: Milliseconds converted to days, hours, minutes, and seconds.
+  duration_human_review:
+    path: "{run_dir}/duration-human-review.md"
+    description: Independent review of the formatted duration.
+  answer:
+    path: "{run_dir}/answer.md"
+    description: Final user-facing answer.
+  final_review:
+    path: "{run_dir}/final-review.md"
+    description: Final review of the user-facing answer.
+
+steps:
+  resolve_current_date:
+    role: date_resolver
+    prompt_ref: step_resolve_current_date
+    description: Resolve current date/time and normalize the birth date from the objective.
+    outputs:
+      current_date:
+        artifact: current_date
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - resolved
+              - needs_birthdate
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: date-resolved-to-ms-calculation
+            when:
+              equals:
+                var: result.conclusion
+                value: resolved
+            to: calculate_milliseconds
+          - id: date-needs-birthdate
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_birthdate
+            notify: orchestrator
+          - id: date-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  calculate_milliseconds:
+    role: millisecond_calculator
+    prompt_ref: step_calculate_milliseconds
+    description: Calculate elapsed milliseconds from normalized birth date to current date.
+    inputs:
+      current_date:
+        artifact: current_date
+        required: true
+      duration_ms_review:
+        artifact: duration_ms_review
+        required: false
+      duration_human_review:
+        artifact: duration_human_review
+        required: false
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      duration_ms:
+        artifact: duration_ms
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - calculated
+              - invalid_birthdate
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: ms-calculated-to-ms-check
+            when:
+              equals:
+                var: result.conclusion
+                value: calculated
+            to: check_milliseconds
+          - id: ms-invalid-birthdate
+            when:
+              equals:
+                var: result.conclusion
+                value: invalid_birthdate
+            notify: orchestrator
+          - id: ms-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  check_milliseconds:
+    role: millisecond_checker
+    prompt_ref: step_check_milliseconds
+    description: Independently validate the millisecond calculation.
+    inputs:
+      current_date:
+        artifact: current_date
+        required: true
+      duration_ms:
+        artifact: duration_ms
+        required: true
+    outputs:
+      duration_ms_review:
+        artifact: duration_ms_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - needs_recalculation
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: ms-check-approved-to-format
+            when:
+              equals:
+                var: result.conclusion
+                value: approved
+            to: format_duration
+          - id: ms-check-needs-recalculation
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_recalculation
+            to: calculate_milliseconds
+          - id: ms-check-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  format_duration:
+    role: duration_formatter
+    prompt_ref: step_format_duration
+    description: Format elapsed milliseconds as days, hours, minutes, and seconds.
+    inputs:
+      duration_ms:
+        artifact: duration_ms
+        required: true
+      duration_human_review:
+        artifact: duration_human_review
+        required: false
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      duration_human:
+        artifact: duration_human
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - formatted
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: format-done-to-format-check
+            when:
+              equals:
+                var: result.conclusion
+                value: formatted
+            to: check_format
+          - id: format-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  check_format:
+    role: format_checker
+    prompt_ref: step_check_format
+    description: Independently validate the human-readable duration.
+    inputs:
+      duration_ms:
+        artifact: duration_ms
+        required: true
+      duration_human:
+        artifact: duration_human
+        required: true
+    outputs:
+      duration_human_review:
+        artifact: duration_human_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - needs_reformat
+              - needs_recalculation
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: format-check-approved-to-answer
+            when:
+              equals:
+                var: result.conclusion
+                value: approved
+            to: write_answer
+          - id: format-check-needs-reformat
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_reformat
+            to: format_duration
+          - id: format-check-needs-recalculation
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_recalculation
+            to: calculate_milliseconds
+          - id: format-check-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  write_answer:
+    role: answer_writer
+    prompt_ref: step_write_answer
+    description: Write the final user-facing answer.
+    inputs:
+      current_date:
+        artifact: current_date
+        required: true
+      duration_human:
+        artifact: duration_human
+        required: true
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      answer:
+        artifact: answer
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_format_revision
+              - blocked
+    "on":
+      reported:
+        transitions:
+          - id: answer-ready-to-final-review
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: final_review
+          - id: answer-needs-format-revision
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_format_revision
+            to: format_duration
+          - id: answer-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+
+  final_review:
+    role: final_reviewer
+    prompt_ref: step_final_review
+    description: Fresh final review of the answer and supporting artifacts.
+    inputs:
+      current_date:
+        artifact: current_date
+        required: true
+      duration_ms:
+        artifact: duration_ms
+        required: true
+      duration_human:
+        artifact: duration_human
+        required: true
+      answer:
+        artifact: answer
+        required: true
+    outputs:
+      final_review:
+        artifact: final_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+          - target_phase
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - changes_required
+              - blocked
+          target_phase:
+            enum:
+              - done
+              - calculate_milliseconds
+              - format_duration
+              - write_answer
+              - orchestrator
+    "on":
+      reported:
+        transitions:
+          - id: final-approved
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: approved
+                - equals:
+                    var: result.target_phase
+                    value: done
+            finish: true
+            notify: orchestrator
+          - id: final-to-ms-calculation
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: calculate_milliseconds
+            to: calculate_milliseconds
+          - id: final-to-format
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: format_duration
+            to: format_duration
+          - id: final-to-answer
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: write_answer
+            to: write_answer
+          - id: final-to-orchestrator
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: orchestrator
+            notify: orchestrator
+          - id: final-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator

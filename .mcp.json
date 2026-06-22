@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agent_control": {
+      "command": "sh",
+      "args": [
+        "-lc",
+        "runner=\"${CODEX_AGENT_CONTROL_MCP_RUNNER:-}\"; if [ -z \"$runner\" ]; then for candidate in \"$HOME/.codex/plugins/cache/agent-control/0.1.0/mcp/agent-control/run-agent-control-mcp.sh\" \"$PWD/mcp/agent-control/run-agent-control-mcp.sh\" \"$HOME/.codex/plugins/cache/agent-settings/agent-control/0.1.0/mcp/agent-control/run-agent-control-mcp.sh\" \"$PWD/agent-control/mcp/agent-control/run-agent-control-mcp.sh\"; do if [ -x \"$candidate\" ]; then runner=\"$candidate\"; break; fi; done; fi; if [ -z \"$runner\" ]; then echo \"agent_control runner not found\" >&2; exit 127; fi; exec \"$runner\""
+      ],
+      "env": {},
+      "note": "Local agent controller MCP. State defaults to $HOME/.codex/agent-control/state.sqlite and artifacts/logs stay outside target repositories."
+    }
+  }
+}

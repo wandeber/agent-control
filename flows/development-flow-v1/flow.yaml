@@ -1,0 +1,440 @@
+# Agent Control flow config. Environment placeholders use ${VAR:-default} and are resolved by agentctl.
+
+id: development-flow-v1
+version: 1.0.0
+description: Auto-routed development workflow for intelligent workers. Normal phase handoffs, intent
+  reviews, corrections, and final review rollbacks are handled by Agent Control transitions; the
+  orchestrator is notified only for clarification, blockers, ambiguous routing, or human
+  confirmation.
+initial_step: analysis
+prompts:
+  role_analyst:
+    path: roles/analyst.md
+    description: Stable analyst role behavior for context, analysis, and plan intent review.
+  role_planner:
+    path: roles/planner.md
+    description: Stable planner role behavior for planning and implementation intent review.
+  role_implementer:
+    path: roles/implementer.md
+    description: Stable implementer role behavior for edits, integration, and mechanical checks.
+  role_final_reviewer:
+    path: roles/final-reviewer.md
+    description: Stable final external reviewer role behavior.
+  step_analysis:
+    path: prompts/analysis.md
+    description: Analysis or correction-focused analysis instructions.
+  step_planning:
+    path: prompts/planning.md
+    description: Planning instructions.
+  step_plan_review:
+    path: prompts/plan-review.md
+    description: Analyst review of plan intent preservation.
+  step_implementation:
+    path: prompts/implementation.md
+    description: Implementation and implementation-owned mechanical validation instructions.
+  step_implementation_review:
+    path: prompts/implementation-review.md
+    description: Planner review of implementation intent preservation.
+  step_final_review:
+    path: prompts/final-review.md
+    description: Final fresh external review instructions.
+roles:
+  analyst:
+    backend: ${DEVFLOW_ANALYST_BACKEND:-opencode-server}
+    model: ${DEVFLOW_ANALYST_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_analyst
+    description: Understands the task and repository context, writes analysis, and later checks whether
+      planning preserved analysis intent.
+  planner:
+    backend: ${DEVFLOW_PLANNER_BACKEND:-opencode-server}
+    model: ${DEVFLOW_PLANNER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_planner
+    description: Turns analysis into a worker-ready plan and later checks whether implementation
+      preserved plan intent.
+  implementer:
+    backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-opencode-server}
+    model: ${DEVFLOW_IMPLEMENTER_MODEL:-opencode-go/deepseek-v4-pro}
+    prompt_ref: role_implementer
+    description: Implements the accepted plan, integrates internal work, runs mechanical checks, and
+      reports one coherent result.
+  final_reviewer:
+    backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_FINAL_REVIEWER_MODEL:-gpt-5.5}
+    prompt_ref: role_final_reviewer
+    description: Fresh clean-context reviewer for the final external review gate.
+  orchestrator:
+    description: Receives clarification requests, blockers, ambiguous routing, and final
+      human-confirmation decisions.
+artifacts:
+  analysis:
+    path: "{run_dir}/analysis.md"
+    description: Analysis or correction-focused analysis produced by the analyst.
+  plan:
+    path: "{run_dir}/plan.md"
+    description: Implementation plan produced by the planner.
+  plan_review:
+    path: "{run_dir}/plan-review.md"
+    description: Analyst review of whether the plan preserves analysis intent.
+  implementation_report:
+    path: "{run_dir}/implementation-report.md"
+    description: Implementer report covering changed files, integration shape, checks, fixes, and blockers.
+  implementation_review:
+    path: "{run_dir}/implementation-review.md"
+    description: Planner review of whether implementation preserves plan intent.
+  final_review:
+    path: "{run_dir}/final-review.md"
+    description: Fresh external expert review.
+steps:
+  analysis:
+    role: analyst
+    prompt_ref: step_analysis
+    description: Gather task/repo understanding and produce durable solution intent.
+    inputs:
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      analysis:
+        artifact: analysis
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_clarification
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: analysis-ready-to-planning
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: planning
+          - id: analysis-needs-clarification
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_clarification
+            notify: orchestrator
+          - id: analysis-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+  planning:
+    role: planner
+    prompt_ref: step_planning
+    description: Turn accepted analysis into an implementation-ready plan.
+    inputs:
+      analysis:
+        artifact: analysis
+        required: true
+      plan_review:
+        artifact: plan_review
+        required: false
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      plan:
+        artifact: plan
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_analysis_revision
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: planning-ready-to-plan-review
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: plan_review
+          - id: planning-needs-analysis-revision
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_analysis_revision
+            to: analysis
+          - id: planning-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+  plan_review:
+    role: analyst
+    prompt_ref: step_plan_review
+    description: Analyst checks whether the plan preserved analysis intent.
+    inputs:
+      analysis:
+        artifact: analysis
+        required: true
+      plan:
+        artifact: plan
+        required: true
+    outputs:
+      plan_review:
+        artifact: plan_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - needs_plan_changes
+              - analysis_revision_needed
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: plan-review-approved-to-implementation
+            when:
+              equals:
+                var: result.conclusion
+                value: approved
+            to: implementation
+          - id: plan-review-needs-plan-changes
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_plan_changes
+            to: planning
+          - id: plan-review-analysis-revision-needed
+            when:
+              equals:
+                var: result.conclusion
+                value: analysis_revision_needed
+            to: analysis
+          - id: plan-review-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+  implementation:
+    role: implementer
+    prompt_ref: step_implementation
+    description: Implement the approved plan, integrate internal work, and run mechanical checks.
+    inputs:
+      plan:
+        artifact: plan
+        required: true
+      implementation_review:
+        artifact: implementation_review
+        required: false
+      final_review:
+        artifact: final_review
+        required: false
+    outputs:
+      implementation_report:
+        artifact: implementation_report
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_plan_revision
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: implementation-ready-to-implementation-review
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: implementation_review
+          - id: implementation-needs-plan-revision
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_plan_revision
+            to: planning
+          - id: implementation-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+  implementation_review:
+    role: planner
+    prompt_ref: step_implementation_review
+    description: Planner checks whether implementation preserved plan intent and required checks.
+    inputs:
+      plan:
+        artifact: plan
+        required: true
+      implementation_report:
+        artifact: implementation_report
+        required: true
+    outputs:
+      implementation_review:
+        artifact: implementation_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - implementation_changes_needed
+              - plan_revision_needed
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: implementation-review-approved-to-final-review
+            when:
+              equals:
+                var: result.conclusion
+                value: approved
+            to: final_review
+          - id: implementation-review-needs-implementation-changes
+            when:
+              equals:
+                var: result.conclusion
+                value: implementation_changes_needed
+            to: implementation
+          - id: implementation-review-plan-revision-needed
+            when:
+              equals:
+                var: result.conclusion
+                value: plan_revision_needed
+            to: planning
+          - id: implementation-review-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+  final_review:
+    role: final_reviewer
+    prompt_ref: step_final_review
+    description: Fresh external expert review with authority to close or route corrections upstream.
+    inputs:
+      plan:
+        artifact: plan
+        required: true
+    outputs:
+      final_review:
+        artifact: final_review
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+          - target_phase
+        properties:
+          conclusion:
+            enum:
+              - approved
+              - changes_required
+              - blocked
+          target_phase:
+            enum:
+              - done
+              - analysis
+              - planning
+              - implementation
+              - final_review
+              - orchestrator
+    on:
+      reported:
+        transitions:
+          - id: final-review-approved
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: approved
+                - equals:
+                    var: result.target_phase
+                    value: done
+            finish: true
+          - id: final-review-to-analysis
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: analysis
+            to: analysis
+          - id: final-review-to-planning
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: planning
+            to: planning
+          - id: final-review-to-implementation
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: implementation
+            to: implementation
+          - id: final-review-rerun
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: final_review
+            to: final_review
+          - id: final-review-needs-orchestrator
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: result.target_phase
+                    value: orchestrator
+            notify: orchestrator
+          - id: final-review-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator

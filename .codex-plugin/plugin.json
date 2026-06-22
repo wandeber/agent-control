@@ -1,0 +1,46 @@
+{
+  "name": "agent-control",
+  "version": "0.1.0",
+  "description": "Local agent control plane for registering, supervising, blocking on terminal events, stopping, waking, and inspecting Codex and OpenCode workers through MCP, CLI, and a local API/WebSocket server.",
+  "author": {
+    "name": "wandeber",
+    "url": "https://github.com/wandeber"
+  },
+  "homepage": "https://github.com/wandeber/agent-control",
+  "repository": "https://github.com/wandeber/agent-control.git",
+  "license": "UNLICENSED",
+  "keywords": [
+    "agents",
+    "codex",
+    "opencode",
+    "mcp",
+    "coordination",
+    "workers",
+    "orchestration"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Agent Control",
+    "shortDescription": "MCP, CLI, API/socket server, and web console for local agent workers",
+    "longDescription": "A deterministic local control plane and premium local web console for registering Codex and OpenCode workers, starting work, sending compact messages, blocking on terminal events, polling cheap status, stopping or unregistering agents, recording goals and heartbeats, validating declarative flow state, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering subscription events without asking an orchestrator model to wait and poll.",
+    "developerName": "wandeber",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/wandeber/agent-control",
+    "defaultPrompt": [
+      "Use the Agent Control MCP to register a run, start workers, subscribe to completion events, and avoid polling worker transcripts from the orchestrator.",
+      "Use agentctl agent wait or agentctl sub wait to block in deterministic code until a worker reaches a terminal event.",
+      "Use flow_catalog_list and flow_catalog_get, or agentctl flow catalog commands, to discover repository flows before launching a named flow.",
+      "Use flow_validate_config, flow_start, flow_get, flow_step_start, flow_step_report, or agentctl flow commands when a workflow is backed by a declarative flow config.",
+      "Use agentctl to inspect, stop, or unregister local Codex and OpenCode worker agents.",
+      "Start the bundled static Agent Control web console with agentctl web start --port 3766 --api-port 3767 to inspect runs, graphs, goals, heartbeats, chats, events, and artifacts in realtime.",
+      "Start the Agent Control API/WebSocket server with agentctl server start --port 3766 when another local UI or tool needs live controller state.",
+      "Create a controller run for this multi-agent workflow and subscribe the orchestrator to worker completion and failure events."
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

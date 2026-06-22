@@ -1,0 +1,783 @@
+@import "@xyflow/react/dist/style.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: #f6f7f9;
+  --foreground: #15191d;
+  --muted: #66717d;
+  --line: rgba(21, 25, 29, 0.1);
+  --panel: rgba(255, 255, 255, 0.86);
+  --panel-solid: #ffffff;
+  --canvas-dot: rgba(21, 25, 29, 0.13);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+.console-shell,
+.console-sidebar,
+.console-top,
+.console-graph,
+.console-bottom,
+.console-inspector,
+.console-workspace {
+  min-width: 0;
+}
+
+.truncate-start {
+  overflow: hidden;
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.console-shell {
+  isolation: isolate;
+  --runs-panel-width: clamp(280px, 24vw, 380px);
+  --thread-panel-width: clamp(360px, 38vw, 560px);
+  --bottom-panel-height: min(360px, 42dvh);
+  --left-panel-offset: 0px;
+  --right-panel-offset: 0px;
+  --bottom-panel-offset: 0px;
+}
+
+.console-shell[data-runs-open="true"] {
+  --left-panel-offset: var(--runs-panel-width);
+}
+
+.console-shell[data-thread-open="true"] {
+  --right-panel-offset: var(--thread-panel-width);
+}
+
+.console-shell[data-bottom-panel="agent"],
+.console-shell[data-bottom-panel="run"],
+.console-shell[data-bottom-panel="timeline"] {
+  --bottom-panel-offset: var(--bottom-panel-height);
+}
+
+.console-shell[data-resizing="bottom"] .console-top,
+.console-shell[data-resizing="bottom"] .console-graph,
+.console-shell[data-resizing="bottom"] .console-bottom-panel,
+.console-shell[data-resizing="runs"] .console-top,
+.console-shell[data-resizing="runs"] .console-graph,
+.console-shell[data-resizing="runs"] .console-bottom-panel,
+.console-shell[data-resizing="thread"] .console-top,
+.console-shell[data-resizing="thread"] .console-graph,
+.console-shell[data-resizing="thread"] .console-bottom-panel {
+  transition: none;
+}
+
+.console-top {
+  position: absolute;
+  top: 12px;
+  right: calc(var(--right-panel-offset) + 12px);
+  left: calc(var(--left-panel-offset) + 12px);
+  z-index: 30;
+  transition:
+    left 180ms ease,
+    right 180ms ease;
+}
+
+.console-top header {
+  container-type: inline-size;
+  height: 56px;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 18px 48px rgba(21, 25, 29, 0.12);
+}
+
+.console-graph {
+  position: absolute;
+  top: 0;
+  right: var(--right-panel-offset);
+  bottom: var(--bottom-panel-offset);
+  left: var(--left-panel-offset);
+  overflow: hidden;
+  padding: 0;
+  transition:
+    bottom 180ms ease,
+    left 180ms ease,
+    right 180ms ease;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: linear-gradient(180deg, #ffffff 0%, var(--background) 42%, #eef2f5 100%);
+  color: var(--foreground);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  letter-spacing: 0;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(20, 184, 166, 0.22);
+}
+
+.agent-scroll {
+  scrollbar-color: rgba(21, 25, 29, 0.26) transparent;
+  scrollbar-width: thin;
+}
+
+.agent-scroll::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+
+.agent-scroll::-webkit-scrollbar-thumb {
+  background: rgba(21, 25, 29, 0.22);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+.react-flow {
+  --xy-background-pattern-color-default: var(--canvas-dot);
+  --xy-node-boxshadow-hover-default: 0 18px 44px rgba(22, 27, 34, 0.18);
+  --xy-node-border-default: transparent;
+  --xy-edge-stroke-width-default: 1.75;
+}
+
+.react-flow__viewport-portal {
+  pointer-events: none;
+  z-index: 1;
+}
+
+.agent-relation-layer {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.react-flow__nodes {
+  position: relative;
+  z-index: 2;
+}
+
+.react-flow__controls {
+  overflow: hidden;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(22, 27, 34, 0.1);
+}
+
+.react-flow__controls-button {
+  border-bottom: 1px solid rgba(21, 25, 29, 0.08);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 14px 34px rgba(22, 27, 34, 0.1);
+}
+
+.chat-prose code {
+  border-radius: 4px;
+  background: rgba(21, 25, 29, 0.06);
+  padding: 0.08rem 0.24rem;
+  font-size: 0.9em;
+}
+
+.chat-prose pre {
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(21, 25, 29, 0.09);
+  background: #11161b;
+  color: #ecf4f1;
+  padding: 0.8rem;
+}
+
+.thread-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18rem;
+}
+
+.console-side-panel,
+.console-bottom-panel {
+  position: absolute;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: none;
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 150ms ease,
+    transform 190ms ease;
+  will-change: opacity, transform;
+}
+
+.console-side-panel[data-open="true"],
+.console-bottom-panel[data-open="true"] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.console-side-panel {
+  top: 0;
+  bottom: 0;
+  z-index: 45;
+  border-radius: 0;
+}
+
+.console-runs-panel {
+  left: 0;
+  width: var(--runs-panel-width);
+  border-width: 0 1px 0 0;
+  transform: translateX(calc(-100% - 16px));
+}
+
+.console-runs-panel[data-open="true"] {
+  transform: translateX(0);
+}
+
+.console-thread-panel {
+  right: 0;
+  width: var(--thread-panel-width);
+  border-width: 0 0 0 1px;
+  transform: translateX(calc(100% + 16px));
+}
+
+.console-thread-panel[data-open="true"] {
+  transform: translateX(0);
+}
+
+.console-thread-panel .thread-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.console-thread-panel .thread-sidecar {
+  display: none;
+}
+
+.console-bottom-panel {
+  right: var(--right-panel-offset);
+  bottom: 0;
+  left: var(--left-panel-offset);
+  z-index: 46;
+  height: var(--bottom-panel-height);
+  border-width: 1px 0 0;
+  border-radius: 0;
+  transform: translateY(calc(100% + 16px));
+  transition:
+    left 180ms ease,
+    opacity 150ms ease,
+    right 180ms ease,
+    transform 190ms ease;
+}
+
+.console-bottom-panel[data-open="true"] {
+  transform: translateY(0);
+}
+
+.console-resize-handle {
+  position: absolute;
+  z-index: 70;
+  flex: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  touch-action: none;
+}
+
+.console-resize-handle::after {
+  position: absolute;
+  border-radius: 0;
+  background: transparent;
+  content: "";
+  transition:
+    background 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.console-resize-handle:hover::after,
+.console-resize-handle:focus-visible::after,
+.console-shell[data-resizing="runs"] .console-runs-panel .console-resize-handle::after,
+.console-shell[data-resizing="thread"] .console-thread-panel .console-resize-handle::after,
+.console-shell[data-resizing="bottom"] .console-bottom-panel .console-resize-handle::after {
+  background: rgba(20, 184, 166, 0.7);
+  box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.12);
+}
+
+.console-runs-panel .console-resize-handle,
+.console-thread-panel .console-resize-handle {
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  cursor: col-resize;
+}
+
+.console-runs-panel .console-resize-handle {
+  right: -6px;
+}
+
+.console-thread-panel .console-resize-handle {
+  left: -6px;
+}
+
+.console-runs-panel .console-resize-handle::after,
+.console-thread-panel .console-resize-handle::after {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.console-runs-panel .console-resize-handle::after {
+  left: 5px;
+}
+
+.console-thread-panel .console-resize-handle::after {
+  left: 6px;
+}
+
+.console-bottom-panel .console-resize-handle {
+  top: -6px;
+  right: 0;
+  left: 0;
+  height: 12px;
+  cursor: row-resize;
+}
+
+.console-bottom-panel .console-resize-handle::after {
+  top: 6px;
+  right: 0;
+  left: 0;
+  height: 1px;
+}
+
+.console-panel-header,
+.console-bottom-panel-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid rgba(21, 25, 29, 0.08);
+  background: rgba(248, 250, 252, 0.72);
+  padding: 10px 14px;
+  container-type: inline-size;
+}
+
+.console-panel-close {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #66717d;
+  transition:
+    background 160ms ease,
+    color 160ms ease;
+}
+
+.console-panel-close:hover {
+  background: rgba(21, 25, 29, 0.06);
+  color: #15191d;
+}
+
+.top-bar-button-group {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.74);
+}
+
+.top-bar-group-button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #64748b;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.top-bar-group-button + .top-bar-group-button {
+  border-left: 1px solid rgba(21, 25, 29, 0.08);
+}
+
+.top-bar-group-button:hover,
+.top-bar-group-button:focus-visible {
+  background: rgba(21, 25, 29, 0.06);
+  color: #15191d;
+}
+
+.top-bar-group-button[data-active="true"] {
+  background: rgba(20, 184, 166, 0.12);
+  color: #0f766e;
+}
+
+.console-panel-body {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.console-panel-body > aside,
+.console-panel-body > section,
+.console-panel-body > div {
+  height: 100%;
+  border-right: 0;
+  border-radius: 0;
+}
+
+.console-bottom-tabs {
+  display: inline-flex;
+  min-width: 0;
+  align-self: stretch;
+  gap: 16px;
+  overflow: hidden;
+}
+
+.console-bottom-tab {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  border-radius: 0;
+  padding: 0 1px;
+  color: #56616d;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0;
+  white-space: nowrap;
+  transition:
+    color 160ms ease,
+    opacity 160ms ease;
+}
+
+.console-bottom-tab::after {
+  position: absolute;
+  right: 0;
+  bottom: -11px;
+  left: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: transparent;
+  content: "";
+  transition: background 160ms ease;
+}
+
+.console-bottom-tab[aria-selected="true"] {
+  color: #15191d;
+}
+
+.console-bottom-tab[aria-selected="true"]::after {
+  background: #14b8a6;
+}
+
+.console-bottom-tab:hover {
+  color: #15191d;
+}
+
+.workspace-panel {
+  container-type: inline-size;
+}
+
+.workspace-tab-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@container (max-width: 430px) {
+  .workspace-tabs {
+    gap: 4px;
+  }
+
+  .workspace-tab-button {
+    width: 32px;
+    justify-content: center;
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  .workspace-tab-label {
+    display: none;
+  }
+}
+
+@container (max-width: 260px) {
+  .console-bottom-tabs {
+    gap: 12px;
+  }
+
+  .console-bottom-tab {
+    width: 28px;
+    justify-content: center;
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  .console-bottom-tab-label {
+    display: none;
+  }
+}
+
+.agent-graph-toolbar {
+  top: 84px;
+  left: 16px;
+  max-width: calc(100% - 152px) !important;
+}
+
+.agent-graph-actions {
+  top: 84px;
+  right: 16px;
+}
+
+.agent-graph-action-group {
+  display: flex;
+  align-items: center;
+  border: 1px solid rgba(21, 25, 29, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.86);
+  overflow: hidden;
+  backdrop-filter: blur(16px);
+}
+
+.agent-graph-action-button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #64748b;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.agent-graph-action-button + .agent-graph-action-button {
+  border-left: 1px solid rgba(21, 25, 29, 0.08);
+}
+
+.agent-graph-action-button:hover,
+.agent-graph-action-button:focus-visible {
+  background: rgba(21, 25, 29, 0.06);
+  color: #15191d;
+}
+
+.agent-graph-action-button[data-active="true"] {
+  background: rgba(20, 184, 166, 0.12);
+  color: #0f766e;
+}
+
+.agent-graph-mode-button {
+  display: inline-flex;
+  height: 32px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0 10px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 650;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.agent-graph-mode-button + .agent-graph-mode-button {
+  border-left: 1px solid rgba(21, 25, 29, 0.08);
+}
+
+.agent-graph-mode-button:hover,
+.agent-graph-mode-button:focus-visible {
+  background: rgba(21, 25, 29, 0.06);
+  color: #15191d;
+}
+
+.agent-graph-mode-button[data-active="true"] {
+  background: rgba(20, 184, 166, 0.12);
+  color: #0f766e;
+}
+
+.agent-graph-mode-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 980px) {
+  .thread-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .thread-sidecar {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .console-shell {
+    --runs-panel-width: min(360px, calc(100vw - 16px));
+    --thread-panel-width: min(420px, calc(100vw - 16px));
+  }
+
+  .console-top {
+    top: 8px;
+    right: 8px;
+    left: 8px;
+  }
+
+  .console-top header {
+    height: 56px;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .console-graph {
+    right: 0;
+    bottom: 0;
+    left: 0;
+    padding: 0;
+  }
+
+  .console-side-panel {
+    top: 76px;
+    bottom: 8px;
+    z-index: 60;
+    border-width: 1px;
+    border-radius: 8px;
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.16);
+  }
+
+  .console-runs-panel {
+    right: auto;
+    left: 8px;
+    width: var(--runs-panel-width);
+    border-width: 1px;
+    transform: translateX(calc(-100% - 16px));
+  }
+
+  .console-thread-panel {
+    right: 8px;
+    left: auto;
+    width: var(--thread-panel-width);
+    border-width: 1px;
+    transform: translateX(calc(100% + 16px));
+  }
+
+  .console-runs-panel[data-open="true"],
+  .console-thread-panel[data-open="true"] {
+    transform: translateX(0);
+  }
+
+  .graph-stack {
+    grid-template-rows: minmax(0, 1fr) !important;
+  }
+
+  .agent-graph-actions {
+    top: 76px;
+    right: 8px;
+  }
+
+  .agent-graph-toolbar {
+    top: 76px;
+    right: 8px;
+    left: 8px;
+    max-width: none;
+  }
+
+  .console-bottom-panel {
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    z-index: 60;
+    height: min(var(--bottom-panel-height), calc(100dvh - 96px));
+    border-width: 1px;
+    border-radius: 8px;
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.16);
+    transform: translateY(calc(100% + 16px));
+    transition:
+      opacity 150ms ease,
+      transform 190ms ease;
+  }
+
+  .console-bottom-panel[data-open="true"] {
+    transform: translateY(0);
+  }
+
+  .console-resize-handle {
+    display: block;
+  }
+
+  .console-side-panel[data-open="true"] .console-resize-handle::after,
+  .console-bottom-panel[data-open="true"] .console-resize-handle::after {
+    background: rgba(20, 184, 166, 0.36);
+  }
+
+  .console-side-panel[data-open="true"] .console-resize-handle:hover::after,
+  .console-side-panel[data-open="true"] .console-resize-handle:focus-visible::after,
+  .console-bottom-panel[data-open="true"] .console-resize-handle:hover::after,
+  .console-bottom-panel[data-open="true"] .console-resize-handle:focus-visible::after {
+    background: rgba(20, 184, 166, 0.7);
+  }
+
+  .console-bottom-panel-header,
+  .console-panel-header {
+    padding: 8px 10px;
+  }
+
+  .console-bottom-tabs {
+    overflow-x: auto;
+    max-width: calc(100vw - 72px);
+  }
+
+  .console-bottom-tab::after {
+    bottom: -9px;
+  }
+}

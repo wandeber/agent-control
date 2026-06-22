@@ -1,0 +1,74 @@
+export const AGENT_STATUSES = [
+    "planned",
+    "queued",
+    "starting",
+    "running",
+    "waiting_for_input",
+    "completed",
+    "failed",
+    "blocked",
+    "stopping",
+    "stopped",
+    "unknown"
+];
+export const FAILURE_REASONS = [
+    "backend_unavailable",
+    "auth_required",
+    "permission_required",
+    "timeout",
+    "idle_timeout",
+    "missing_artifact",
+    "stale_artifact",
+    "tool_error",
+    "worker_reported_blocker",
+    "unsupported_operation",
+    "unknown"
+];
+export const EVENT_TYPES = [
+    "agent.started",
+    "agent.status_changed",
+    "agent.message",
+    "agent.completed",
+    "agent.failed",
+    "agent.blocked",
+    "agent.stopped",
+    "agent.unregistered",
+    "agent.delivery_failed",
+    "artifact.created",
+    "artifact.updated",
+    "goal.confirmation_requested",
+    "goal.confirmation_deferred",
+    "goal.completed",
+    "goal.continued",
+    "goal.blocked",
+    "flow.started",
+    "flow.step_started",
+    "flow.step_reported",
+    "flow.step_blocked",
+    "flow.transition_selected",
+    "flow.notification",
+    "flow.completed",
+    "heartbeat.timeout",
+    "timer.elapsed"
+];
+export const AGENT_LINK_TYPES = [
+    "parent_child",
+    "waits_for",
+    "subscribed_to",
+    "blocks",
+    "handoff"
+];
+export const FLOW_INSTANCE_STATUSES = [
+    "active",
+    "waiting_for_orchestrator",
+    "blocked",
+    "completed",
+    "cancelled"
+];
+export const FLOW_STEP_INSTANCE_STATUSES = [
+    "active",
+    "completed",
+    "blocked",
+    "failed",
+    "cancelled"
+];
