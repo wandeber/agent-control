@@ -18,7 +18,7 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "flow_catalog_list",
-        description: "List flow configs from Agent Control's default flow catalog. The default catalog is the repository-level ../flows directory relative to Agent Control.",
+        description: "List flow configs from Agent Control's bundled and user flow catalogs. Bundled flows come from the repository flows directory; user flows default to ~/.agent-control/flows.",
         inputSchema: objectSchema({
             query: stringProperty("Optional case-insensitive filter over flow id, directory, description, version, or path.")
         }),

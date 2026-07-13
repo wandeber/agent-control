@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flow Runner"
+  short_description: "Run and resume Agent Control flows"
+  default_prompt: "Use $flow-runner to execute this Agent Control flow."

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { registerMarketplaceCommands } from "./cli/marketplace.js";
 import { registerSmokeCommands } from "./cli/smoke.js";
 import {
   collect,
@@ -51,6 +52,7 @@ const cliDeps = { controller, output, authOptions };
 registerWorkerCommands(program, cliDeps);
 registerWatchCommands(program, cliDeps);
 registerSmokeCommands(program, cliDeps);
+registerMarketplaceCommands(program, output);
 
 const auth = program.command("auth").description("Authenticate Agent Control orchestrators.");
 

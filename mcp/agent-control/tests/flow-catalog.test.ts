@@ -7,6 +7,7 @@ import {
   getFlowFromCatalog,
   listFlowCatalog,
   resolveDefaultFlowCatalogRoot,
+  resolveUserFlowCatalogRoot,
   type FlowCatalogDescriptor
 } from "../src/core/flow-catalog.js";
 
@@ -102,6 +103,23 @@ describe("flow catalog", () => {
         env: { AGENT_CONTROL_FLOW_CATALOG_DIR: explicit }
       })
     ).toBe(explicit);
+  });
+
+  it("uses a configurable user flow catalog under the Agent Control home", () => {
+    expect(resolveUserFlowCatalogRoot({ env: { HOME: "/tmp/example-home" } })).toBe(
+      "/tmp/example-home/.agent-control/flows"
+    );
+    expect(resolveUserFlowCatalogRoot({ env: { AGENT_CONTROL_HOME: "/tmp/agent-home" } })).toBe(
+      "/tmp/agent-home/flows"
+    );
+    expect(
+      resolveUserFlowCatalogRoot({
+        env: {
+          AGENT_CONTROL_HOME: "/tmp/agent-home",
+          AGENT_CONTROL_USER_FLOW_CATALOG_DIR: "/tmp/custom-flows"
+        }
+      })
+    ).toBe("/tmp/custom-flows");
   });
 
   it("finds marketplace-root flows when running from a plugin cache path", () => {

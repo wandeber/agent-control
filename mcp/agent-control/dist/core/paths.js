@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 export function defaultControlHome() {
-    return process.env.AGENT_CONTROL_HOME || join(homedir(), ".codex", "agent-control");
+    return process.env.AGENT_CONTROL_HOME || process.env.AGENT_CONTROL_USER_DIR || join(homedir(), ".agent-control");
 }
 export function defaultStatePath() {
     return process.env.AGENT_CONTROL_DB || join(defaultControlHome(), "state.sqlite");

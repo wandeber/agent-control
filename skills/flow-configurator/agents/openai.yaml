@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flow Configurator"
+  short_description: "Configure flow backend/model overrides"
+  default_prompt: "Use $flow-configurator to configure backend and model overrides for development-flow-v1."

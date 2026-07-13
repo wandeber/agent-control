@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export function defaultControlHome(): string {
-  return process.env.AGENT_CONTROL_HOME || join(homedir(), ".codex", "agent-control");
+  return process.env.AGENT_CONTROL_HOME || process.env.AGENT_CONTROL_USER_DIR || join(homedir(), ".agent-control");
 }
 
 export function defaultStatePath(): string {

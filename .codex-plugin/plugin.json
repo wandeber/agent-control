@@ -19,6 +19,7 @@
     "orchestration"
   ],
   "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
   "interface": {
     "displayName": "Agent Control",
     "shortDescription": "MCP, CLI, API/socket server, and web console for local agent workers",
@@ -31,11 +32,15 @@
     ],
     "websiteURL": "https://github.com/wandeber/agent-control",
     "defaultPrompt": [
+      "Use $flow-author to design or refine declarative Agent Control flow configs.",
+      "Use $flow-configurator to inspect or set project-local .agents.env backend/model overrides for a named Agent Control flow.",
+      "Use $flow-runner to discover, execute, resume, inspect, or debug a declarative Agent Control flow config.",
       "Use the Agent Control MCP to register a run, start workers, subscribe to completion events, and avoid polling worker transcripts from the orchestrator.",
       "Use agentctl agent wait or agentctl sub wait to block in deterministic code until a worker reaches a terminal event.",
       "Use flow_catalog_list and flow_catalog_get, or agentctl flow catalog commands, to discover repository flows before launching a named flow.",
       "Use flow_validate_config, flow_start, flow_get, flow_step_start, flow_step_report, or agentctl flow commands when a workflow is backed by a declarative flow config.",
       "Use agentctl to inspect, stop, or unregister local Codex and OpenCode worker agents.",
+      "Open the native Agent Control console with open_agent_control_console to inspect runs, graphs, goals, heartbeats, chats, events, and logs in a Codex side panel.",
       "Start the bundled static Agent Control web console with agentctl web start --port 3766 --api-port 3767 to inspect runs, graphs, goals, heartbeats, chats, events, and artifacts in realtime.",
       "Start the Agent Control API/WebSocket server with agentctl server start --port 3766 when another local UI or tool needs live controller state.",
       "Create a controller run for this multi-agent workflow and subscribe the orchestrator to worker completion and failure events."

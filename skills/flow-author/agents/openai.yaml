@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flow Author"
+  short_description: "Design declarative Agent Control flows"
+  default_prompt: "Use $flow-author to design a declarative Agent Control flow for this workflow."

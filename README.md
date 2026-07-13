@@ -4,9 +4,61 @@ Agent Control is a local deterministic control plane for agent workers. It is
 packaged as a Codex plugin with an MCP server and an `agentctl` CLI that share
 the same TypeScript core.
 
+The plugin also ships Agent Control skills:
+
+- `flow-author` for designing declarative flow packages
+- `flow-configurator` for setting backend/model environment overrides
+- `flow-runner` for launching, resuming, and inspecting flows
+
 The controller does not plan, review, or decide semantic quality. It registers
 agents, starts work, sends messages, reads compact status, stops agents,
 records goals and heartbeats, and delivers subscription events.
+
+## Codex Marketplace
+
+This repository is a Codex plugin marketplace. The marketplace manifest is
+`.agents/plugins/marketplace.json`, and it exposes the root `agent-control`
+plugin with its MCP server, CLI, web console runtime, bundled flows, and flow
+skills.
+
+Install from this local checkout while developing:
+
+```bash
+agentctl marketplace install
+```
+
+That command is equivalent to:
+
+```bash
+codex plugin marketplace add "$(pwd)"
+```
+
+Install from Git once the repository is published:
+
+```bash
+agentctl marketplace install wandeber/agent-control
+```
+
+or directly:
+
+```bash
+codex plugin marketplace add wandeber/agent-control --ref main
+```
+
+Refresh an existing Git marketplace installation after changes are pushed:
+
+```bash
+agentctl marketplace update
+```
+
+or directly:
+
+```bash
+codex plugin marketplace upgrade agent-control
+```
+
+Local path marketplaces read from the checkout directly, so they usually do not
+need an upgrade command after file edits.
 
 ## Identity
 
@@ -18,7 +70,7 @@ time.
 
 The admin key is resolved from `AGENT_CONTROL_ADMIN_KEY`. If that variable is
 unset, Agent Control generates a local random key under
-`~/.codex/agent-control` with `0600` permissions so local controller processes
+`~/.agent-control` with `0600` permissions so local controller processes
 can share it. Startup wrappers should set `AGENT_CONTROL_ADMIN_KEY` explicitly
 when they need unattended root login.
 
@@ -45,16 +97,26 @@ creates the `parent_child` relationship. When a caller creates a run with its
 token, the new run records `parent_run_id` and `created_by_agent_id` so the web
 console can show the run tree.
 
-## Web Console, Local API, And WebSocket
+## Codex Console, Local API, And WebSocket
 
-Agent Control includes a local web console plus an API/WebSocket server for
-tools that need live controller state without going through MCP. The console
-source is a Next.js app, but normal plugin installs run the prebuilt static
-runtime from `web-runtime`; they do not start Next.js dev
-or require a `.next` directory. The console shows runs, agent relationship
-graphs, draggable nodes, pan/zoom/follow graph controls, goals, heartbeats,
+Agent Control includes a native Codex MCP App console, a local web console, and
+an API/WebSocket server for tools that need live controller state without going
+through MCP. The console source is a Next.js app, but normal plugin installs run
+the prebuilt static runtime from `web-runtime`; they do not start Next.js dev or
+require a `.next` directory. The console shows runs, agent relationship graphs,
+draggable nodes, pan/zoom/follow graph controls, goals, heartbeats,
 usage/context metrics, artifacts, events, logs, and read-only agent chat/message
 views.
+
+Inside Codex, open the native side-panel console with the MCP tool:
+
+```text
+open_agent_control_console
+```
+
+The native panel reads compact snapshots, agent messages, and log tails through
+app-only MCP tools. It falls back to the local API/WebSocket server when opened
+as a normal browser page.
 
 Start the full console with:
 
@@ -184,14 +246,17 @@ the process environment only; it does not source `.env` files.
 When validation receives `--config-file`, prompt file references are checked
 relative to the flow config file.
 
-Agent Control also exposes a tiny flow catalog for discovery. In v0 there is one
-default catalog, `repo-flows`, pointing at this repository's top-level
-`flows/` directory or the installed marketplace root.
+Agent Control also exposes flow catalogs for discovery. The bundled catalog,
+`repo-flows`, points at this repository's top-level `flows/` directory or the
+installed marketplace root. User-added flows belong outside the repository in
+`user-flows`, which defaults to `$HOME/.agent-control/flows`.
 Use `flow_catalog_list` / `agentctl flow catalog list` to discover available
 flow ids, and `flow_catalog_get` / `agentctl flow catalog get --flow <flow-id>`
 to resolve a flow id or directory name to its config path and loaded config.
 Set `AGENT_CONTROL_FLOW_CATALOG_DIR` only when a local runtime needs to override
-that default root.
+the bundled catalog root. Set `AGENT_CONTROL_USER_FLOW_CATALOG_DIR` to override
+the user flow catalog directly, or set `AGENT_CONTROL_HOME` /
+`AGENT_CONTROL_USER_DIR` to move the whole user Agent Control home.
 
 Flow artifacts are named resources. Steps consume artifact paths through
 `inputs` and produce artifact paths through `outputs`; agents do not wait on
@@ -283,8 +348,8 @@ required artifact, or terminates without reporting, the flow instance moves to
 - Web console: `agentctl web start --port 3766 --api-port 3767`
 - Static web build: `agentctl web build`
 - API/WebSocket server: `agentctl server start --port 3766`
-- State: `$HOME/.codex/agent-control/state.sqlite`
-- Runtime files: `$HOME/.codex/agent-control/runs/<run-id>/`
+- State: `$HOME/.agent-control/state.sqlite`
+- Runtime files: `$HOME/.agent-control/runs/<run-id>/`
 
 CLI commands print JSON on success. Runtime, controller, and validation errors
 also print structured JSON to stderr before exiting non-zero:
@@ -315,7 +380,7 @@ error text.
 
 Purge commands are intentionally separate because they are destructive. They
 never delete arbitrary artifact paths in target repositories; runtime deletion
-is limited to `$HOME/.codex/agent-control/runs/...`.
+is limited to `$HOME/.agent-control/runs/...`.
 
 When a run should be cancelled completely, prefer `run purge --stop-first
 --force`. The controller attempts to stop active workers before deleting rows,

@@ -1,4 +1,5 @@
 import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadFlowConfigFile } from "./flow-config-loader.js";
@@ -38,12 +39,19 @@ export function getFlowFromCatalog(input) {
 }
 export function defaultFlowCatalogs() {
     const rootPath = resolveDefaultFlowCatalogRoot();
+    const userRootPath = resolveUserFlowCatalogRoot();
     return [
         {
             catalog_id: "repo-flows",
-            name: "Repository flows",
+            name: "Bundled flows",
             root_path: rootPath,
             exists: existsSync(rootPath)
+        },
+        {
+            catalog_id: "user-flows",
+            name: "User flows",
+            root_path: userRootPath,
+            exists: existsSync(userRootPath)
         }
     ];
 }
@@ -59,6 +67,18 @@ export function resolveDefaultFlowCatalogRoot(options = {}) {
         ...ancestorFlowCatalogCandidates(basePath)
     ].filter((candidate) => Boolean(candidate)));
     return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0] ?? resolve(basePath, "flows");
+}
+export function resolveUserFlowCatalogRoot(options = {}) {
+    const env = options.env ?? process.env;
+    const explicitUserFlowRoot = env.AGENT_CONTROL_USER_FLOW_CATALOG_DIR;
+    if (explicitUserFlowRoot) {
+        return resolve(explicitUserFlowRoot);
+    }
+    const userHome = env.AGENT_CONTROL_USER_DIR ?? env.AGENT_CONTROL_HOME ?? join(resolveHomeDirectory(env), ".agent-control");
+    return resolve(userHome, "flows");
+}
+function resolveHomeDirectory(env) {
+    return env.HOME ?? env.USERPROFILE ?? homedir();
 }
 function defaultCatalogBasePath() {
     const here = dirname(fileURLToPath(import.meta.url));

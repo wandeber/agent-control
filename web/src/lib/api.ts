@@ -2,6 +2,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { getMcpAppClient, shouldTryMcpApp } from "./mcp-app";
 import type { AgentLogTail, AgentMessage, DashboardSnapshot, SocketPayload } from "./types";
 
 export type ConnectionState = "connecting" | "live" | "offline";
@@ -79,6 +80,14 @@ function normalizeBase(value: string | null): string | null {
 }
 
 export async function fetchSnapshot(runId?: string | null): Promise<DashboardSnapshot> {
+  const client = await getMcpAppClient();
+  if (client) {
+    const result = await client.callTool<{ snapshot: DashboardSnapshot }>("agent_control_console_snapshot", {
+      ...(runId ? { run_id: runId } : {})
+    });
+    return result.snapshot;
+  }
+
   const url = new URL(`${controlApiBase()}/api/control/snapshot`);
   if (runId) {
     url.searchParams.set("run_id", runId);
@@ -91,6 +100,15 @@ export async function fetchSnapshot(runId?: string | null): Promise<DashboardSna
 }
 
 export async function fetchAgentMessages(agentId: string, limit = 12): Promise<AgentMessage[]> {
+  const client = await getMcpAppClient();
+  if (client) {
+    const result = await client.callTool<{ messages: AgentMessage[] }>("agent_control_console_agent_messages", {
+      agent_id: agentId,
+      limit
+    });
+    return result.messages;
+  }
+
   const url = new URL(`${controlApiBase()}/api/control/agents/${encodeURIComponent(agentId)}/messages`);
   url.searchParams.set("limit", String(limit));
   const response = await fetch(url);
@@ -101,6 +119,15 @@ export async function fetchAgentMessages(agentId: string, limit = 12): Promise<A
 }
 
 export async function fetchAgentLog(agentId: string, maxChars = 16000): Promise<AgentLogTail> {
+  const client = await getMcpAppClient();
+  if (client) {
+    const result = await client.callTool<{ log: AgentLogTail }>("agent_control_console_agent_log", {
+      agent_id: agentId,
+      max_chars: maxChars
+    });
+    return result.log;
+  }
+
   const url = new URL(`${controlApiBase()}/api/control/agents/${encodeURIComponent(agentId)}/log`);
   url.searchParams.set("max_chars", String(maxChars));
   const response = await fetch(url);
@@ -111,6 +138,9 @@ export async function fetchAgentLog(agentId: string, maxChars = 16000): Promise<
 }
 
 export function artifactImageUrl(artifactId: string): string {
+  if (shouldTryMcpApp()) {
+    return "";
+  }
   return `${controlApiBase()}/api/control/artifacts/${encodeURIComponent(artifactId)}/file`;
 }
 
@@ -135,6 +165,49 @@ export function useSnapshotStream(selectedRunId: string | null, selectedAgentId:
   }, [query.data]);
 
   useEffect(() => {
+    if (shouldTryMcpApp()) {
+      let cancelled = false;
+      let timer: ReturnType<typeof setInterval> | null = null;
+      setConnection("connecting");
+
+      const tick = async () => {
+        try {
+          const nextSnapshot = await fetchSnapshot(requestedRunId);
+          if (cancelled) {
+            return;
+          }
+          setConnection("live");
+          setSnapshot(nextSnapshot);
+          for (const item of nextSnapshot.latest_events) {
+            lastEventIds.current.add(item.event_id);
+          }
+          if (selectedAgentId && nextSnapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
+            const messages = await fetchAgentMessages(selectedAgentId, 96);
+            if (!cancelled) {
+              queryClient.setQueriesData<AgentMessage[]>({ queryKey: ["messages", selectedAgentId] }, messages);
+            }
+            const log = await fetchAgentLog(selectedAgentId, 8000);
+            if (!cancelled) {
+              setAgentLog(log);
+            }
+          }
+        } catch {
+          if (!cancelled) {
+            setConnection("offline");
+          }
+        }
+      };
+
+      void tick();
+      timer = setInterval(() => void tick(), 1400);
+      return () => {
+        cancelled = true;
+        if (timer) {
+          clearInterval(timer);
+        }
+      };
+    }
+
     let closed = false;
     let reconnect: ReturnType<typeof setTimeout> | null = null;
     let socket: WebSocket | null = null;
