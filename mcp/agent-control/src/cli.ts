@@ -26,10 +26,13 @@ import type {
   FlowStartResult,
   FlowStepInstanceStatus,
   FlowStepReportAndContinueResult,
-  GoalStatus
+  GoalStatus,
+  OrchestratorActionClaimedEnvelope,
+  PublicActionClaimRef,
+  PublicBridgeGrantRef
 } from "./core/types.js";
 
-const { controller, store } = createController();
+const { controller, store, credentialStore } = createController();
 const program = new Command();
 
 program
@@ -144,7 +147,7 @@ run
 run
   .command("shutdown")
   .requiredOption("--run <runId>", "Run id.")
-  .action((options: { run: string }) => output(controller.shutdownRun(options.run)));
+  .action(async (options: { run: string }) => output(await controller.shutdownRun(options.run)));
 
 run
   .command("purge")
@@ -160,15 +163,15 @@ run
       stopFirst?: boolean;
       force?: boolean;
       keepRuntimeFiles?: boolean;
-    }) =>
-      output(
-        await controller.runPurge(options.run, {
+    }) => {
+      const result = await controller.runPurge(options.run, {
           dryRun: Boolean(options.dryRun),
           stopFirst: Boolean(options.stopFirst),
           force: Boolean(options.force),
           deleteRuntimeFiles: !options.keepRuntimeFiles
-        })
-      )
+        });
+      output(result);
+    }
   );
 
 const flow = program.command("flow").description("Manage declarative flow instances.");
@@ -213,6 +216,8 @@ flow
   .option("--run <runId>", "Existing run id. If omitted, a new run is created.")
   .option("--run-title <title>", "Title for a newly created run.")
   .option("--repo-dir <dir>", "Repository directory for a newly created run.")
+  .option("--owner-task-identity <id>", "Optional root CODEX_THREAD_ID binding for a native bridge grant.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
   .option("--compact", "Print only ids and active step summary.")
   .action(
     async (options: {
@@ -222,6 +227,8 @@ flow
       run?: string;
       runTitle?: string;
       repoDir?: string;
+      ownerTaskIdentity?: string;
+      ownerTaskPath?: string;
       configYaml?: string;
       compact?: boolean;
     }) => {
@@ -229,15 +236,24 @@ flow
       if (!auth.adminKey && !auth.agentToken) {
         throw new Error("flow start requires --admin-key, --token, AGENT_CONTROL_ADMIN_KEY, or AGENT_CONTROL_TOKEN.");
       }
+      credentialStore.assertReady();
       const result = controller.startFlow({
         config: await readConfigOption(options),
         runId: options.run,
         runTitle: options.runTitle,
         repoDir: options.repoDir,
         adminKey: auth.adminKey,
-        agentToken: auth.agentToken
+        agentToken: auth.agentToken,
+        ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),
+        ownerTaskPath: options.ownerTaskPath,
+        bridgeCredentialDelivery: "local"
       });
-      output(options.compact ? compactFlowStartResult(result) : result);
+      const bridgeGrant = result.bridge_grant ?? null;
+      output(
+        options.compact
+          ? compactFlowStartResult(result, bridgeGrant)
+          : publicFlowStartResult(result, bridgeGrant)
+      );
     }
   );
 
@@ -246,11 +262,14 @@ flow
   .description("Authenticate a local orchestrator, start or resume a flow, dispatch the active step, and return.")
   .requiredOption("--config-file <path>", "Read flow config JSON/YAML from this file.")
   .requiredOption("--title <title>", "Run title/objective. This is passed to workers through the runtime contract.")
+  .option("--run <runId>", "Existing run id to resume.")
   .option("--repo-dir <dir>", "Repository directory for the run.", process.cwd())
   .option("--orchestrator-title <title>", "Registered orchestrator title.")
   .option("--orchestrator-backend <backend>", "Registered orchestrator backend.", "codex-thread")
   .option("--orchestrator-thread-id <threadId>", "Codex thread id for attaching the visible coordinator.")
   .option("--orchestrator-backend-handle-json <json>", "Explicit orchestrator backend handle JSON.")
+  .option("--owner-task-identity <id>", "Optional root CODEX_THREAD_ID binding for the native bridge.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
   .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
   .option("--ui-host <host>", "Web console host for the returned ui_url.", "localhost")
   .option("--ui-port <port>", "Web console port for the returned ui_url.", parseIntOption, 3766)
@@ -259,11 +278,14 @@ flow
     async (options: {
       configFile: string;
       title: string;
+      run?: string;
       repoDir?: string;
       orchestratorTitle?: string;
       orchestratorBackend?: string;
       orchestratorThreadId?: string;
       orchestratorBackendHandleJson?: string;
+      ownerTaskIdentity?: string;
+      ownerTaskPath?: string;
       server?: string;
       uiHost: string;
       uiPort: number;
@@ -273,12 +295,14 @@ flow
       if (!adminKey) {
         throw new Error("flow launch requires --admin-key, AGENT_CONTROL_ADMIN_KEY, or a local stored admin key.");
       }
+      credentialStore.assertReady();
       const repoDir = options.repoDir ?? process.cwd();
       const backendHandle = resolveLaunchOrchestratorBackendHandle({ ...options, repoDir });
       const login = controller.orchestratorLogin({
         adminKey,
         title: options.orchestratorTitle ?? `${options.title} orchestrator`,
         runTitle: options.title,
+        runId: options.run,
         repoDir,
         backend: options.orchestratorBackend,
         objective: options.title,
@@ -287,13 +311,28 @@ flow
       const start = controller.startFlow({
         config: await readConfigOption({ configFile: options.configFile }),
         runId: login.run.run_id,
-        agentToken: login.agent_token
+        agentToken: login.agent_token,
+        ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),
+        ownerTaskPath: options.ownerTaskPath,
+        bridgeCredentialDelivery: "local"
       });
+      const bridgeGrant = start.bridge_grant ?? null;
+      const bridgeToken =
+        bridgeGrant
+          ? credentialStore.resolveBridgeToken({
+              bridgeGrantId: bridgeGrant.bridge_grant_id,
+              runId: login.run.run_id,
+              orchestratorAgentId: login.agent.agent_id,
+              ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),
+              ownerTaskPath: options.ownerTaskPath ?? "/root"
+            })
+          : null;
       const continuation = start.active_step
         ? await controller.continueFlow({
             flowInstanceId: start.instance.flow_instance_id,
             server: options.server,
-            agentToken: login.agent_token
+            agentToken: bridgeToken ? undefined : login.agent_token,
+            bridgeToken: bridgeToken ?? undefined
           })
         : null;
       output(
@@ -303,6 +342,7 @@ flow
           orchestratorAgentId: login.agent.agent_id,
           start,
           continuation,
+          bridgeGrant,
           uiHost: options.uiHost,
           uiPort: options.uiPort,
           uiApiPort: options.uiApiPort
@@ -323,18 +363,32 @@ flow
   .requiredOption("--flow <flowInstanceId>", "Flow instance id.")
   .option("--subscriber-agent <agentId>", "Agent to notify on worker terminal events.")
   .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
+  .option("--bridge-grant <grantId>", "Local scoped bridge grant id returned by flow start/launch.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
   .action(
-    async (options: { flow: string; subscriberAgent?: string; server?: string }) => {
+    async (options: {
+      flow: string;
+      subscriberAgent?: string;
+      server?: string;
+      bridgeGrant?: string;
+      ownerTaskPath?: string;
+    }) => {
       const auth = authOptions();
-      if (!auth.agentToken && !options.subscriberAgent) {
-        throw new Error("flow dispatch-active requires --token, AGENT_CONTROL_TOKEN, or --subscriber-agent.");
+      const bridgeToken = resolveBridgeTokenForFlow(
+        options.flow,
+        options.bridgeGrant,
+        options.ownerTaskPath ?? "/root"
+      );
+      if (!auth.agentToken && !bridgeToken && !options.subscriberAgent) {
+        throw new Error("flow dispatch-active requires --token, --bridge-grant, or --subscriber-agent.");
       }
       output(
         await controller.dispatchActiveFlowStep({
           flowInstanceId: options.flow,
           subscriberAgentId: options.subscriberAgent,
           server: options.server,
-          agentToken: auth.agentToken ?? undefined
+          agentToken: auth.agentToken ?? undefined,
+          bridgeToken
         })
       );
     }
@@ -346,15 +400,29 @@ flow
   .requiredOption("--flow <flowInstanceId>", "Flow instance id.")
   .option("--subscriber-agent <agentId>", "Optional agent to notify on dispatched worker terminal events.")
   .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
+  .option("--bridge-grant <grantId>", "Local scoped bridge grant id returned by flow start/launch.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
   .action(
-    async (options: { flow: string; subscriberAgent?: string; server?: string }) => {
+    async (options: {
+      flow: string;
+      subscriberAgent?: string;
+      server?: string;
+      bridgeGrant?: string;
+      ownerTaskPath?: string;
+    }) => {
       const auth = authOptions();
+      const bridgeToken = resolveBridgeTokenForFlow(
+        options.flow,
+        options.bridgeGrant,
+        options.ownerTaskPath ?? "/root"
+      );
       output(
         await controller.continueFlow({
           flowInstanceId: options.flow,
           subscriberAgentId: options.subscriberAgent,
           server: options.server,
-          agentToken: auth.agentToken ?? undefined
+          agentToken: auth.agentToken ?? undefined,
+          bridgeToken
         })
       );
     }
@@ -367,9 +435,9 @@ flow
   .requiredOption("--step-id <stepId>", "Configured step id to activate.")
   .option("--from-step <stepInstanceId>", "Previous step instance that led to this manual transition.")
   .option("--transition-id <transitionId>", "Transition id to record.")
-  .option("--reason <reason>", "Compact reason for the manual transition.")
+  .option("--reason <reason>", "Coordinator context and reason delivered to the manually activated step.")
   .action(
-    (options: {
+    async (options: {
       flow: string;
       stepId: string;
       fromStep?: string;
@@ -377,7 +445,7 @@ flow
       reason?: string;
     }) =>
       output(
-        controller.startFlowStep({
+        await controller.startFlowStep({
           flowInstanceId: options.flow,
           stepId: options.stepId,
           fromStepInstanceId: options.fromStep,
@@ -420,6 +488,74 @@ flow
           })
         )
       )
+  );
+
+const action = program.command("action").description("Execute scoped root-bridge actions.");
+
+action
+  .command("claim")
+  .requiredOption("--action <actionId>", "Orchestrator action id.")
+  .option("--bridge-grant <grantId>", "Explicit local scoped bridge grant id.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
+  .action((options: { action: string; bridgeGrant?: string; ownerTaskPath?: string }) => {
+    const actionRef = controller.getOrchestratorActionRef(options.action);
+    const result = controller.claimOrchestratorAction({
+      actionId: options.action,
+      bridgeToken: credentialStore.resolveBridgeToken({
+        bridgeGrantId: options.bridgeGrant,
+        runId: actionRef.run_id,
+        orchestratorAgentId: actionRef.orchestrator_agent_id,
+        ownerTaskIdentity: resolveOwnerTaskIdentity(),
+        ownerTaskPath: options.ownerTaskPath ?? "/root"
+      })
+    });
+    if (!("action_token" in result)) {
+      output(result);
+      return;
+    }
+    const actionRecord = store.getOrchestratorAction(result.action_id);
+    if (!actionRecord) {
+      throw new Error("Claimed orchestrator action disappeared before local persistence.");
+    }
+    const actionClaim = credentialStore.persistActionClaim(result, actionRecord);
+    output(publicActionClaimResult(result, actionClaim));
+  });
+
+action
+  .command("ack")
+  .requiredOption("--action <actionId>", "Claimed orchestrator action id.")
+  .option("--action-token <token>", "Explicit action token; normally resolved from the local action-claim ref.")
+  .requiredOption("--status <status>", "succeeded or failed.")
+  .option("--result-json <json>", "Structured non-secret native result JSON.")
+  .option("--error-json <json>", "Structured native failure JSON.")
+  .action(
+    (options: {
+      action: string;
+      actionToken?: string;
+      status: "succeeded" | "failed";
+      resultJson?: string;
+      errorJson?: string;
+    }) => {
+      if (options.status !== "succeeded" && options.status !== "failed") {
+        throw new Error("action ack --status must be succeeded or failed.");
+      }
+      const actionRef = controller.getOrchestratorActionRef(options.action);
+      output(
+        controller.acknowledgeOrchestratorAction({
+          actionId: options.action,
+          actionToken:
+            options.actionToken ??
+            credentialStore.resolveActionToken({
+              actionId: options.action,
+              runId: actionRef.run_id,
+              orchestratorAgentId: actionRef.orchestrator_agent_id
+            }),
+          status: options.status,
+          result: options.resultJson ? parseJsonObjectOption(options.resultJson) : undefined,
+          error: options.errorJson ? parseJsonObjectOption(options.errorJson) : undefined
+        })
+      );
+    }
   );
 
 const agent = program.command("agent").description("Manage agents.");
@@ -565,6 +701,61 @@ agent
   );
 
 agent
+  .command("external-sync")
+  .description("Synchronize one codex-subagent card from root-owned subagent v2 state.")
+  .requiredOption("--agent <agentId>", "Agent Control agent id.")
+  .option("--bridge-grant <grantId>", "Explicit local scoped bridge grant id.")
+  .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
+  .requiredOption("--native-status <status>", "pending_init, running, completed, interrupted, shutdown, errored, or missing.")
+  .option("--native-agent-id <id>", "Native Codex subagent id.")
+  .option("--native-task-name <name>", "Native task name.")
+  .option("--native-task-path <path>", "Canonical native task path.")
+  .option("--latest-message <message>", "Private latest message, limited to 4 KiB.")
+  .option("--observed-at <timestamp>", "Observation timestamp.")
+  .option("--confirmed-absent", "Confirm exact absence after the recovery delay.")
+  .action(
+    (options: {
+      agent: string;
+      bridgeGrant?: string;
+      ownerTaskPath?: string;
+      nativeStatus:
+        | "pending_init"
+        | "running"
+        | "completed"
+        | "interrupted"
+        | "shutdown"
+        | "errored"
+        | "missing";
+      nativeAgentId?: string;
+      nativeTaskName?: string;
+      nativeTaskPath?: string;
+      latestMessage?: string;
+      observedAt?: string;
+      confirmedAbsent?: boolean;
+    }) =>
+      {
+        const scope = controller.getCodexSubagentBridgeScope(options.agent);
+        output(controller.syncCodexSubagent({
+          agentId: options.agent,
+          bridgeToken: credentialStore.resolveBridgeToken({
+            bridgeGrantId: options.bridgeGrant,
+            runId: scope.run_id,
+            orchestratorAgentId: scope.orchestrator_agent_id,
+            ownerTaskIdentity: resolveOwnerTaskIdentity(),
+            ownerTaskPath: options.ownerTaskPath ?? "/root"
+          }),
+          nativeAgentId: options.nativeAgentId,
+          nativeTaskName: options.nativeTaskName,
+          nativeTaskPath: options.nativeTaskPath,
+          nativeStatus: options.nativeStatus,
+          latestMessage: options.latestMessage,
+          observedAt: options.observedAt,
+          confirmedAbsent: options.confirmedAbsent
+        }));
+      }
+  );
+
+agent
   .command("read-latest")
   .requiredOption("--agent <agentId>", "Agent id.")
   .option("--limit <n>", "Maximum messages.", parseIntOption)
@@ -583,7 +774,7 @@ agent
       output(await controller.stopAgent(options.agent, options.mode));
       return;
     }
-    output(controller.stopAgents({ runId: options.run, mode: options.mode }));
+    output(await controller.stopAgents({ runId: options.run, mode: options.mode }));
   });
 
 agent
@@ -958,16 +1149,16 @@ maintenance
       stopFirst?: boolean;
       force?: boolean;
       keepRuntimeFiles?: boolean;
-    }) =>
-      output(
-        await controller.maintenancePurgeOld({
+    }) => {
+      const result = await controller.maintenancePurgeOld({
           olderThanMs: parseDurationMs(options.olderThan),
           dryRun: Boolean(options.dryRun),
           stopFirst: Boolean(options.stopFirst),
           force: Boolean(options.force),
           deleteRuntimeFiles: !options.keepRuntimeFiles
-        })
-      )
+        });
+      output(result);
+    }
   );
 
 program.hook("postAction", async () => {
@@ -996,11 +1187,19 @@ function authOptions(optionsOverride: { allowStoredAdminKey?: boolean } = {}): {
   };
 }
 
+function resolveOwnerTaskIdentity(explicitIdentity?: string): string | null {
+  const normalized = (explicitIdentity ?? process.env.CODEX_THREAD_ID)?.trim();
+  return normalized ? normalized : null;
+}
+
 function output(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
-function compactFlowStartResult(result: FlowStartResult): Record<string, unknown> {
+function compactFlowStartResult(
+  result: FlowStartResult,
+  bridgeGrant: PublicBridgeGrantRef | null
+): Record<string, unknown> {
   return {
     flow_record_id: result.flow.flow_record_id,
     flow_id: result.flow.flow_id,
@@ -1015,8 +1214,49 @@ function compactFlowStartResult(result: FlowStartResult): Record<string, unknown
           status: result.active_step.status
         }
       : null,
-    blocked_reason: result.blocked_reason
+    blocked_reason: result.blocked_reason,
+    bridge_grant: bridgeGrant
   };
+}
+
+function publicFlowStartResult(
+  result: FlowStartResult,
+  bridgeGrant: PublicBridgeGrantRef | null
+): Record<string, unknown> {
+  const { bridge_credential: _privateCredential, ...publicResult } = result;
+  return { ...publicResult, bridge_grant: bridgeGrant };
+}
+
+function publicActionClaimResult(
+  result: OrchestratorActionClaimedEnvelope,
+  actionClaim: PublicActionClaimRef
+): Record<string, unknown> {
+  const { action_token: _privateActionToken, ...publicResult } = result;
+  return { ...publicResult, action_claim: actionClaim };
+}
+
+function resolveBridgeTokenForFlow(
+  flowInstanceId: string,
+  bridgeGrantId: string | undefined,
+  ownerTaskPath: string
+): string | null {
+  const snapshot = controller.getFlowSnapshot(flowInstanceId);
+  const orchestratorAgentId = snapshot.instance.orchestrator_agent_id;
+  if (!orchestratorAgentId) {
+    if (bridgeGrantId) {
+      throw new Error("Flow instance has no orchestrator binding for the requested bridge grant.");
+    }
+    return null;
+  }
+  const binding = {
+    runId: snapshot.instance.run_id,
+    orchestratorAgentId,
+    ownerTaskIdentity: resolveOwnerTaskIdentity(),
+    ownerTaskPath
+  };
+  return bridgeGrantId
+    ? credentialStore.resolveBridgeToken({ ...binding, bridgeGrantId })
+    : credentialStore.findBridgeToken(binding);
 }
 
 function compactFlowLaunchResult(input: {
@@ -1025,6 +1265,7 @@ function compactFlowLaunchResult(input: {
   orchestratorAgentId: string;
   start: FlowStartResult;
   continuation: FlowContinueResult | null;
+  bridgeGrant: PublicBridgeGrantRef | null;
   uiHost: string;
   uiPort: number;
   uiApiPort: number;
@@ -1044,6 +1285,8 @@ function compactFlowLaunchResult(input: {
     flow_status: input.continuation?.instance.status ?? input.start.instance.status,
     flow_reused: Boolean(input.start.reused),
     continuation_action: input.continuation?.action ?? null,
+    bridge_grant: input.bridgeGrant,
+    orchestrator_action: input.continuation?.orchestrator_action ?? null,
     active_step: activeStep
       ? {
           step_instance_id: activeStep.step_instance_id,
@@ -1084,8 +1327,14 @@ function flowLaunchNext(start: FlowStartResult, continuation: FlowContinueResult
   switch (continuation.action) {
     case "dispatched":
       return "worker_dispatched_end_turn_until_agent_control_wakeup";
+    case "orchestrator_action_required":
+      return "native_subagent_action_required";
     case "waiting_for_report":
       return "worker_already_running_end_turn_until_agent_control_wakeup";
+    case "start_in_progress":
+      return "worker_start_in_progress_end_turn_until_agent_control_wakeup";
+    case "start_superseded":
+      return "flow_route_advanced_during_worker_start";
     case "waiting_for_orchestrator":
       return "orchestrator_action_required";
     case "blocked":
@@ -1107,7 +1356,13 @@ function flowLaunchReason(next: string, continuation: FlowContinueResult | null)
     worker_dispatched_end_turn_until_agent_control_wakeup: "A worker was dispatched; end the current turn until Agent Control wakes the coordinator.",
     worker_already_running_end_turn_until_agent_control_wakeup:
       "The active step already has a running worker; end the current turn until its report is available.",
+    worker_start_in_progress_end_turn_until_agent_control_wakeup:
+      "Another controller owns the durable backend-start lease; end the current turn until it completes.",
+    flow_route_advanced_during_worker_start:
+      "The flow advanced while an older backend start was unresolved; Agent Control retained the newer route and cleaned up the late worker.",
     orchestrator_action_required: "The flow reached a configured orchestrator decision point.",
+    native_subagent_action_required:
+      "A scoped native subagent action must be claimed, executed with the root collaboration tool, and acknowledged.",
     flow_blocked: "The flow is blocked and needs intervention.",
     flow_completed: "The flow completed.",
     flow_cancelled: "The flow was cancelled.",
@@ -1171,7 +1426,8 @@ function compactFlowReportResult(result: FlowStepReportAndContinueResult): Recor
               }
             : null,
           blocked_reason: result.continuation.blocked_reason,
-          notification: result.continuation.notification
+          notification: result.continuation.notification,
+          orchestrator_action: result.continuation.orchestrator_action
         }
       : null
   };

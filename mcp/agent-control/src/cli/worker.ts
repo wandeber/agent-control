@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import type { Command } from "commander";
 import { parseDurationMs } from "../core/duration.js";
 import { defaultControlHome } from "../core/paths.js";
-import type { AgentLinkType, AgentRecord, AgentWithToken, EventType } from "../core/types.js";
+import type { AgentLinkType, AgentRecord, AgentStartResult, EventType } from "../core/types.js";
 import {
   collect,
   type CliDeps,
@@ -46,6 +46,7 @@ export type WorkerLaunchOptions = {
   heartbeat?: boolean;
   heartbeatTimeoutMs?: number;
   startTimeoutMs: number;
+  inputHandoffsJson?: string;
   inputArtifact: string[];
   constraint: string[];
   expectArtifact: string[];
@@ -98,6 +99,17 @@ type WatchRunOptions = {
   intervalMs: number;
 };
 
+type WorkerInputHandoff = {
+  label: string;
+  kind: string;
+  payload: Record<string, unknown>;
+};
+
+const WORKER_HANDOFF_TOKEN_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
+const MAX_WORKER_INPUT_HANDOFFS = 16;
+const MAX_WORKER_INPUT_HANDOFF_PAYLOAD_BYTES = 16 * 1024;
+const MAX_WORKER_INPUT_HANDOFF_COLLECTION_BYTES = 64 * 1024;
+
 export function registerWorkerCommands(program: Command, deps: CliDeps): void {
   const worker = program.command("worker").description("Launch standalone workers through Agent Control.");
 
@@ -128,6 +140,11 @@ export function registerWorkerCommands(program: Command, deps: CliDeps): void {
     .option("--heartbeat", "Create an idle heartbeat for the worker.")
     .option("--heartbeat-timeout-ms <ms>", "Idle heartbeat timeout.", parseIntOption)
     .option("--start-timeout-ms <ms>", "Worker start timeout.", parseIntOption, DEFAULT_WORKER_START_TIMEOUT_MS)
+    .option(
+      "--input-handoffs-json <json>",
+      "Compact workflow handoffs as one validated JSON array.",
+      parseSingleInputHandoffsJsonOption
+    )
     .option("--input-artifact <label=path>", "Input artifact path by label.", collect, [] as string[])
     .option("--constraint <text>", "Runtime constraint to include in the worker dispatch.", collect, [] as string[])
     .option("--expect-artifact <path>", "Additional expected artifact path.", collect, [] as string[])
@@ -177,6 +194,9 @@ export function registerWatchCommands(program: Command, deps: CliDeps): void {
 }
 
 export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps): Promise<Record<string, unknown>> {
+  // Validate the complete handoff envelope before authentication can lead to
+  // run/agent registration. Invalid workflow state must never reach a backend.
+  const normalizedInputHandoffsJson = parseWorkerInputHandoffs(options.inputHandoffsJson);
   const auth = deps.authOptions();
   const agentToken = options.agentToken ?? auth.agentToken;
   const caller = agentToken ? deps.controller.requireAgentToken(agentToken) : null;
@@ -308,13 +328,14 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
     repoDir,
     outputArtifact,
     inputArtifacts,
+    inputHandoffsJson: normalizedInputHandoffsJson,
     constraints: options.constraint,
     attachments,
     promptFile,
     canonicalPrompt: readFileSync(promptFile, "utf8")
   });
 
-  let started: AgentWithToken;
+  let started: AgentStartResult;
   try {
     started = await withTimeout(
       deps.controller.startAgent({
@@ -548,6 +569,130 @@ function parseWorkerInputArtifacts(values: string[]): Array<{ label: string; pat
   });
 }
 
+function parseSingleInputHandoffsJsonOption(value: string, previous: string | undefined): string | undefined {
+  if (previous !== undefined) {
+    throw new Error("--input-handoffs-json may be provided at most once.");
+  }
+  return value;
+}
+
+function parseWorkerInputHandoffs(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch (error) {
+    throw new Error(`--input-handoffs-json must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("--input-handoffs-json must be a JSON array.");
+  }
+  if (parsed.length > MAX_WORKER_INPUT_HANDOFFS) {
+    throw new Error(`--input-handoffs-json accepts at most ${MAX_WORKER_INPUT_HANDOFFS} handoffs.`);
+  }
+  if (parsed.length === 0) {
+    return undefined;
+  }
+
+  const labels = new Set<string>();
+  const handoffs = parsed.map((entry, index): WorkerInputHandoff => {
+    if (!isJsonObject(entry)) {
+      throw new Error(`input_handoffs[${index}] must be a JSON object.`);
+    }
+
+    const keys = Object.keys(entry);
+    if (keys.length !== 3 || !keys.includes("label") || !keys.includes("kind") || !keys.includes("payload")) {
+      throw new Error(`input_handoffs[${index}] must contain exactly label, kind, and payload.`);
+    }
+
+    const label = entry.label;
+    const kind = entry.kind;
+    if (typeof label !== "string" || !WORKER_HANDOFF_TOKEN_PATTERN.test(label)) {
+      throw new Error(`input_handoffs[${index}].label must match ${WORKER_HANDOFF_TOKEN_PATTERN.source}.`);
+    }
+    if (typeof kind !== "string" || !WORKER_HANDOFF_TOKEN_PATTERN.test(kind)) {
+      throw new Error(`input_handoffs[${index}].kind must match ${WORKER_HANDOFF_TOKEN_PATTERN.source}.`);
+    }
+    if (labels.has(label)) {
+      throw new Error(`input_handoffs contains duplicate label: ${label}.`);
+    }
+    labels.add(label);
+
+    if (!isJsonObject(entry.payload)) {
+      throw new Error(`input_handoffs[${index}].payload must be a JSON object.`);
+    }
+
+    // The payload remains opaque to Agent Control. Validate only that rendering
+    // preserves its JSON values, then enforce the per-payload byte bound.
+    assertLosslessJsonRendering(entry.payload, `input_handoffs[${index}].payload`);
+    const payloadJson = serializeJson(entry.payload, `input_handoffs[${index}].payload`);
+    const payloadBytes = Buffer.byteLength(payloadJson, "utf8");
+    if (payloadBytes > MAX_WORKER_INPUT_HANDOFF_PAYLOAD_BYTES) {
+      throw new Error(
+        `input_handoffs[${index}].payload is ${payloadBytes} bytes; maximum is ${MAX_WORKER_INPUT_HANDOFF_PAYLOAD_BYTES}.`
+      );
+    }
+    return { label, kind, payload: entry.payload };
+  });
+
+  const compactJson = serializeJson(handoffs, "input_handoffs");
+  const collectionBytes = Buffer.byteLength(compactJson, "utf8");
+  if (collectionBytes > MAX_WORKER_INPUT_HANDOFF_COLLECTION_BYTES) {
+    throw new Error(
+      `input_handoffs is ${collectionBytes} bytes; maximum is ${MAX_WORKER_INPUT_HANDOFF_COLLECTION_BYTES}.`
+    );
+  }
+  return compactJson;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function serializeJson(value: unknown, path: string): string {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+      throw new Error("value serialized to undefined");
+    }
+    return serialized;
+  } catch (error) {
+    throw new Error(`${path} cannot be serialized as bounded JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Traverse parsed JSON iteratively so values that JSON.stringify would silently
+ * coerce (notably overflowed numbers) fail before the prompt is rendered.
+ * Payload keys and string values are deliberately opaque caller-owned data.
+ */
+function assertLosslessJsonRendering(value: unknown, rootPath: string): void {
+  const pending: Array<{ value: unknown; path: string }> = [{ value, path: rootPath }];
+
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (typeof current.value === "number" && !Number.isFinite(current.value)) {
+      throw new Error(`${current.path} must contain only finite JSON numbers.`);
+    }
+    if (current.value === null || typeof current.value !== "object") {
+      continue;
+    }
+    if (Array.isArray(current.value)) {
+      current.value.forEach((item, index) =>
+        pending.push({ value: item, path: `${current.path}[${index}]` })
+      );
+      continue;
+    }
+
+    for (const [key, nestedValue] of Object.entries(current.value)) {
+      pending.push({ value: nestedValue, path: `${current.path}.${key}` });
+    }
+  }
+}
 function assertReadableFiles(paths: string[]): void {
   for (const path of paths) {
     if (!existsSync(path) || !statSync(path).isFile()) {
@@ -562,6 +707,7 @@ function buildWorkerDispatchPrompt(input: {
   repoDir: string;
   outputArtifact: string;
   inputArtifacts: Array<{ label: string; path: string }>;
+  inputHandoffsJson?: string;
   constraints: string[];
   attachments: string[];
   promptFile: string;
@@ -579,6 +725,9 @@ function buildWorkerDispatchPrompt(input: {
     ...(input.inputArtifacts.length > 0
       ? input.inputArtifacts.map((artifact) => `- ${artifact.label}: ${artifact.path}`)
       : ["- none"]),
+    ...(input.inputHandoffsJson
+      ? ["", "Input handoffs:", "```json", input.inputHandoffsJson, "```"]
+      : []),
     "",
     "Constraints:",
     ...(input.constraints.length > 0 ? input.constraints.map((constraint) => `- ${constraint}`) : ["- none"]),

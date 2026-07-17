@@ -82,7 +82,28 @@ export const flowConfigJsonSchema = {
       additionalProperties: false,
       properties: {
         backend: { type: "string", minLength: 1 },
-        model: { type: "string", minLength: 1 },
+        model: { type: ["string", "null"] },
+        agent_lifecycle: {
+          type: "string",
+          enum: ["reuse", "fresh_per_step"],
+          default: "reuse"
+        },
+        backend_options: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            codex_subagent: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                fork_turns: {
+                  type: "string",
+                  pattern: "^(none|all|[1-9][0-9]*)$"
+                }
+              }
+            }
+          }
+        },
         description: { type: "string", minLength: 1 },
         prompt: { type: "string", minLength: 1 },
         prompt_ref: { type: "string", minLength: 1 },

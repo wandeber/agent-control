@@ -12,6 +12,14 @@ export function generateAgentToken(): string {
   return `act_${randomBytes(32).toString("base64url")}`;
 }
 
+export function generateBridgeToken(): string {
+  return `acb_${randomBytes(32).toString("base64url")}`;
+}
+
+export function generateActionToken(): string {
+  return `aca_${randomBytes(32).toString("base64url")}`;
+}
+
 export function generateAdminKey(): string {
   return `ack_${randomBytes(32).toString("base64url")}`;
 }

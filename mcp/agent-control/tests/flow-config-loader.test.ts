@@ -1,12 +1,14 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   expandEnvironmentReferences,
   loadFlowConfigFile,
   parseFlowConfigText
 } from "../src/core/flow-config-loader.js";
+import { parseFlowConfig, resolveFlowAgentLifecycle } from "../src/core/flow.js";
+import { flowConfigJsonSchema } from "../src/core/flow-config-schema.js";
 
 describe("flow config loader", () => {
   let tmp: string;
@@ -101,5 +103,88 @@ steps:
 
   it("throws when an env reference has no value or default", () => {
     expect(() => expandEnvironmentReferences("${MISSING}", {})).toThrow(/MISSING/);
+  });
+
+  it("parses fresh role lifecycle declarations while omitted roles keep reuse semantics", () => {
+    const config = parseFlowConfigText(
+      `
+id: lifecycle-flow
+initial_step: analysis
+roles:
+  analyst:
+    backend: fake
+  final_reviewer:
+    backend: codex-thread
+    agent_lifecycle: fresh_per_step
+steps:
+  analysis:
+    role: analyst
+`,
+      { format: "yaml" }
+    );
+
+    expect(config.roles?.final_reviewer?.agent_lifecycle).toBe("fresh_per_step");
+    expect(resolveFlowAgentLifecycle(config.roles?.analyst?.agent_lifecycle)).toBe("reuse");
+    expect(flowConfigJsonSchema.$defs.promptOwner.properties.agent_lifecycle).toEqual({
+      type: "string",
+      enum: ["reuse", "fresh_per_step"],
+      default: "reuse"
+    });
+  });
+
+  it("keeps one bundled independent reviewer across correction iterations", () => {
+    const flowPaths = [
+      "../../flows/development-flow-v0/flow.yaml",
+      "../../flows/development-flow-v1/flow.yaml",
+      "../../flows/demo-age-duration/flow.yaml"
+    ];
+
+    for (const flowPath of flowPaths) {
+      const config = loadFlowConfigFile(resolve(process.cwd(), flowPath));
+      expect(config.roles?.final_reviewer?.agent_lifecycle).toBe("reuse");
+    }
+  });
+
+  it("rejects unsupported role lifecycle values", () => {
+    expect(() =>
+      parseFlowConfig(
+        parseFlowConfigText(
+          `
+id: invalid-lifecycle
+initial_step: review
+roles:
+  reviewer:
+    backend: fake
+    agent_lifecycle: sometimes_fresh
+steps:
+  review:
+    role: reviewer
+`,
+          { format: "yaml" }
+        )
+      )
+    ).toThrow(/Invalid flow config/);
+  });
+
+  it("rejects persistent agent ids on fresh-per-step roles", () => {
+    expect(() =>
+      parseFlowConfig(
+        parseFlowConfigText(
+          `
+id: contradictory-lifecycle
+initial_step: review
+roles:
+  reviewer:
+    backend: fake
+    agent_lifecycle: fresh_per_step
+steps:
+  review:
+    role: reviewer
+    agent_id: agent_persistent
+`,
+          { format: "yaml" }
+        )
+      )
+    ).toThrow(/fresh_per_step role cannot use a persistent step agent_id/);
   });
 });

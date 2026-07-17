@@ -4,8 +4,9 @@
       "command": "sh",
       "args": [
         "-lc",
-        "runner=\"${CODEX_AGENT_CONTROL_MCP_RUNNER:-}\"; if [ -z \"$runner\" ]; then for candidate in \"$HOME/.codex/plugins/cache/agent-control/0.1.0/mcp/agent-control/run-agent-control-mcp.sh\" \"$PWD/mcp/agent-control/run-agent-control-mcp.sh\"; do if [ -x \"$candidate\" ]; then runner=\"$candidate\"; break; fi; done; fi; if [ -z \"$runner\" ]; then echo \"agent_control runner not found\" >&2; exit 127; fi; exec \"$runner\""
+        "runner=\"${CODEX_AGENT_CONTROL_MCP_RUNNER:-./mcp/agent-control/run-agent-control-mcp.sh}\"; if [ ! -x \"$runner\" ]; then echo \"agent_control runner not found: $runner\" >&2; exit 127; fi; exec \"$runner\""
       ],
+      "cwd": ".",
       "env": {},
       "note": "Local agent controller MCP. State defaults to $HOME/.agent-control/state.sqlite and artifacts/logs stay outside target repositories."
     }

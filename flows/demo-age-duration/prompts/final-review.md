@@ -2,6 +2,10 @@
 
 Review the final answer against the supporting duration artifacts.
 
+Use the same independent reviewer for every iteration. On the first iteration,
+start from clean context; on later iterations, verify the corrected answer
+against that reviewer's own prior findings.
+
 ## Must
 
 - verify the final answer uses the approved formatted duration

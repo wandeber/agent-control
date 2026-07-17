@@ -1,4 +1,5 @@
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
+import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import {
   agentLinkCreateSchema,
   agentLinkDeleteSchema,
@@ -12,6 +13,7 @@ import {
   agentStartSchema,
   agentStopSchema,
   agentWaitSchema,
+  agentExternalSyncSchema,
   artifactReadHeaderSchema,
   artifactRegisterSchema,
   emptySchema,
@@ -34,6 +36,8 @@ import {
   heartbeatListSchema,
   maintenancePurgeOldSchema,
   orchestratorLoginSchema,
+  orchestratorActionAckSchema,
+  orchestratorActionClaimSchema,
   runCreateSchema,
   runIdSchema,
   runListSchema,
@@ -90,7 +94,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "flow_start",
     description:
-      "Create a flow instance, bind it to a run, and activate the initial step. This does not start backend workers by itself.",
+      "Create a flow instance, bind it to a run, and activate the initial step. Native codex-subagent flows return one scoped bridge credential at creation time.",
     inputSchema: objectSchema(
       {
         config: { type: "object", description: "Flow config object." },
@@ -98,7 +102,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         run_title: stringProperty("Title for a newly created run."),
         repo_dir: stringProperty("Repository directory for a newly created run."),
         admin_key: stringProperty("Admin key for creating a root run."),
-        agent_token: stringProperty("Agent identity token. Creates a child run when run_id is omitted.")
+        agent_token: stringProperty("Agent identity token. Creates a child run when run_id is omitted."),
+        owner_task_identity: stringProperty("Optional CODEX_THREAD_ID binding for the root task."),
+        owner_task_path: stringProperty("Canonical root task path. Defaults to /root.")
       },
       ["config"]
     ),
@@ -119,7 +125,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         flow_instance_id: stringProperty("Flow instance id."),
         subscriber_agent_id: stringProperty("Agent to notify on worker terminal events."),
         server: stringProperty("Backend server URL for server-backed adapters."),
-        agent_token: stringProperty("Optional agent identity token for the coordinator.")
+        agent_token: stringProperty("Optional agent identity token for the coordinator."),
+        bridge_token: stringProperty("Scoped native bridge token returned once by flow_start.")
       },
       ["flow_instance_id"]
     ),
@@ -134,11 +141,70 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         flow_instance_id: stringProperty("Flow instance id."),
         subscriber_agent_id: stringProperty("Optional agent to notify on the dispatched worker's terminal events."),
         server: stringProperty("Backend server URL for server-backed adapters."),
-        agent_token: stringProperty("Optional agent identity token for access checks.")
+        agent_token: stringProperty("Optional agent identity token for access checks."),
+        bridge_token: stringProperty("Scoped native bridge token returned once by flow_start.")
       },
       ["flow_instance_id"]
     ),
     schema: flowContinueSchema
+  },
+  {
+    name: "orchestrator_action_claim",
+    description:
+      "Claim one scoped native subagent action for 60 seconds. A successful claim returns the private request and one-time action token; claims during the lease return already_claimed without either secret.",
+    inputSchema: objectSchema(
+      {
+        action_id: {
+          ...stringProperty("Orchestrator action id from a public action reference."),
+          pattern: ORCHESTRATOR_ACTION_ID_RE.source
+        },
+        bridge_token: stringProperty("Scoped bridge token for the action's run and orchestrator.")
+      },
+      ["action_id", "bridge_token"]
+    ),
+    schema: orchestratorActionClaimSchema
+  },
+  {
+    name: "orchestrator_action_ack",
+    description:
+      "Acknowledge a claimed native action with its rotated action token. Identical acknowledgements are idempotent; conflicting acknowledgements are rejected.",
+    inputSchema: objectSchema(
+      {
+        action_id: {
+          ...stringProperty("Claimed orchestrator action id."),
+          pattern: ORCHESTRATOR_ACTION_ID_RE.source
+        },
+        action_token: stringProperty("One-time token returned by the successful claim."),
+        status: enumProperty(["succeeded", "failed"], "Native tool execution result."),
+        result: { type: "object", description: "Structured non-secret native result." },
+        error: { type: "object", description: "Structured failure details." }
+      },
+      ["action_id", "action_token", "status"]
+    ),
+    schema: orchestratorActionAckSchema
+  },
+  {
+    name: "agent_external_sync",
+    description:
+      "Synchronize one codex-subagent card from root-owned subagent v2 state without semantically completing its flow step.",
+    inputSchema: objectSchema(
+      {
+        agent_id: stringProperty("Agent Control agent id."),
+        bridge_token: stringProperty("Scoped bridge token for this agent's run."),
+        native_agent_id: stringProperty("Native Codex subagent id when known."),
+        native_task_name: stringProperty("Native task name when known."),
+        native_task_path: stringProperty("Canonical native task path when known."),
+        native_status: enumProperty(
+          ["pending_init", "running", "completed", "interrupted", "shutdown", "errored", "missing"],
+          "Observed subagent v2 status."
+        ),
+        latest_message: stringProperty("Private latest message, limited to 4 KiB and excluded from dashboards/events."),
+        observed_at: stringProperty("Observation timestamp. Defaults to now."),
+        confirmed_absent: booleanProperty("Confirm exact absence after the recovery delay.")
+      },
+      ["agent_id", "bridge_token", "native_status"]
+    ),
+    schema: agentExternalSyncSchema
   },
   {
     name: "flow_step_report",
@@ -168,7 +234,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         step_id: stringProperty("Configured step id to activate."),
         from_step_instance_id: stringProperty("Optional previous step instance that led to this manual transition."),
         transition_id: stringProperty("Optional transition id to record."),
-        reason: stringProperty("Optional compact reason for the manual transition.")
+        reason: stringProperty(
+          "Optional coordinator context and transition reason delivered to the manually activated step."
+        )
       },
       ["flow_instance_id", "step_id"]
     ),
@@ -227,7 +295,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "run_shutdown",
-    description: "Stop active agents in a run and mark the run stopped.",
+    description:
+      "Stop active agents in a run. Returns stopped agents plus scoped native actions; the run remains stopping until every native worker is terminal.",
     inputSchema: objectSchema({ run_id: stringProperty("Run id.") }, ["run_id"]),
     schema: runIdSchema
   },
@@ -332,7 +401,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "agent_stop",
-    description: "Stop one agent, all agents in a run, or all registered agents.",
+    description:
+      "Stop one agent, all agents in a run, or all registered agents. Bulk calls await every stop result and retain scoped native actions.",
     inputSchema: objectSchema({
       agent_id: stringProperty("Agent id."),
       run_id: stringProperty("Run id."),

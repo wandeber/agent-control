@@ -3,7 +3,7 @@
 id: development-flow
 version: 0.1.0
 description: Orchestrator-driven development workflow with stable phase owners, artifact handoffs,
-  implementation-owned mechanical checks, and final fresh expert review.
+  implementation-owned mechanical checks, and one persistent independent expert-review loop at the end.
 initial_step: analysis
 prompts:
   role_analyst:
@@ -32,7 +32,7 @@ prompts:
     description: Implementation phase instructions.
   step_final_review:
     path: prompts/final-review.md
-    description: Final fresh external review instructions.
+    description: Final independent review-loop instructions.
 roles:
   analyst:
     prompt_ref: role_analyst
@@ -47,8 +47,9 @@ roles:
     description: Implements the plan, performs mechanical checks, fixes failures, and writes one
       coherent report.
   final_reviewer:
+    agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
-    description: Fresh clean-context reviewer for the final external review gate.
+    description: Clean-context reviewer created on first entry and reused for every final-review iteration.
   orchestrator:
     description: Coordinates routing, user confirmation, retries, rollbacks, and final synthesis.
 artifacts:
@@ -69,7 +70,7 @@ artifacts:
     description: Planner intent-preservation review of implementation against plan.
   final_review:
     path: "{run_dir}/final-review.md"
-    description: Fresh external expert review.
+    description: Independent external expert review updated by the same reviewer across iterations.
 steps:
   analysis:
     role: analyst

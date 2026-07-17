@@ -20,28 +20,35 @@ import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { artifactImageUrl, fetchAgentLog, fetchAgentMessages } from "@/lib/api";
 import { compactId, formatDateTime, safeJson } from "@/lib/format";
 import { agentFlowSteps, artifactReferencesFlowStep, eventReferencesFlowStep, flowStepOrdinal } from "@/lib/flow-steps";
+import { shouldTryMcpApp } from "@/lib/mcp-app";
 import type { AgentLogTail, AgentMessage, ArtifactRecord, DashboardSnapshot, EventRecord, FlowStepInstanceRecord } from "@/lib/types";
+import {
+  MAX_AGENT_MESSAGE_LIMIT,
+  agentLogQueryKey,
+  agentMessagesQueryKey,
+  workspaceRefreshPolicy
+} from "@/lib/workspace-refresh-policy";
 import { EmptyState } from "./ui";
 
 type Tab = "chat" | "events" | "artifacts" | "logs";
-const INITIAL_MESSAGE_LIMIT = 48;
-const MESSAGE_LOAD_STEP = 48;
 const MAX_VISIBLE_MESSAGES = 42;
-const MAX_REQUESTED_MESSAGES = 1000;
 
 export function WorkspacePanel({
   snapshot,
   selectedAgentId,
   selectedStepInstanceId,
-  liveLog
+  liveLog,
+  messageLimit,
+  onRequestOlderMessages
 }: {
   snapshot: DashboardSnapshot;
   selectedAgentId: string | null;
   selectedStepInstanceId: string | null;
   liveLog: AgentLogTail | null;
+  messageLimit: number;
+  onRequestOlderMessages: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("chat");
-  const [messageLimit, setMessageLimit] = useState(INITIAL_MESSAGE_LIMIT);
   const agent = snapshot.agents.find((candidate) => candidate.agent_id === selectedAgentId) ?? snapshot.agents[0] ?? null;
   const agentId = agent?.agent_id ?? null;
   const flowSteps = agentFlowSteps(snapshot, agentId);
@@ -56,21 +63,23 @@ export function WorkspacePanel({
     [agentId, selectedStep?.step_instance_id, snapshot]
   );
 
-  useEffect(() => {
-    setMessageLimit(INITIAL_MESSAGE_LIMIT);
-  }, [agentId, selectedStep?.step_instance_id]);
+  const refreshPolicy = workspaceRefreshPolicy({
+    mcpMode: shouldTryMcpApp(),
+    hasAgent: Boolean(agentId),
+    hasLiveLog: liveLog?.agent_id === agentId
+  });
 
   const messages = useQuery({
-    enabled: Boolean(agentId),
-    queryKey: ["messages", agentId, messageLimit],
+    enabled: refreshPolicy.messagesEnabled,
+    queryKey: agentMessagesQueryKey(agentId, messageLimit),
     queryFn: () => fetchAgentMessages(agentId!, messageLimit),
-    refetchInterval: 6000
+    refetchInterval: refreshPolicy.messagesRefetchInterval
   });
   const log = useQuery({
-    enabled: Boolean(agentId),
-    queryKey: ["log", agentId],
+    enabled: refreshPolicy.logEnabled,
+    queryKey: agentLogQueryKey(agentId),
     queryFn: () => fetchAgentLog(agentId!, 24000),
-    refetchInterval: liveLog?.agent_id === agentId ? false : 4500
+    refetchInterval: refreshPolicy.logRefetchInterval
   });
   const activeLog = liveLog?.agent_id === agentId ? liveLog : log.data ?? null;
 
@@ -106,7 +115,7 @@ export function WorkspacePanel({
             log={activeLog}
             selectedStep={selectedStep}
             messages={messages.data ?? []}
-            onRequestOlder={() => setMessageLimit((value) => Math.min(MAX_REQUESTED_MESSAGES, value + MESSAGE_LOAD_STEP))}
+            onRequestOlder={onRequestOlderMessages}
             requestedLimit={messageLimit}
           />
         ) : tab === "events" ? (
@@ -232,7 +241,7 @@ function ChatView({
   const agentArtifacts = artifacts;
   const agentEvents = events.slice(0, 6);
   const maxWindowStart = Math.max(0, blocks.length - MAX_VISIBLE_MESSAGES);
-  const hasMoreServerHistory = messages.length >= requestedLimit && requestedLimit < MAX_REQUESTED_MESSAGES;
+  const hasMoreServerHistory = messages.length >= requestedLimit && requestedLimit < MAX_AGENT_MESSAGE_LIMIT;
   const visibleStart = Math.min(windowStart, maxWindowStart);
   const visibleBlocks = blocks.slice(visibleStart, visibleStart + MAX_VISIBLE_MESSAGES);
   const hiddenBefore = visibleStart;

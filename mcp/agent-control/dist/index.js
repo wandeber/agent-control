@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createController } from "./core/factory.js";
 import { errorToPayload } from "./core/errors.js";
+import { loadConsoleSnapshot } from "./console-tools.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 const { controller, store } = createController();
@@ -70,7 +71,7 @@ const APP_TOOL_DEFINITIONS = [
 ];
 const OPEN_CONSOLE_TOOL = {
     name: "open_agent_control_console",
-    description: "Open the native Agent Control console as a Codex MCP App panel.",
+    description: "Open the native Agent Control console as a Codex MCP App panel, pinning run_id when supplied or following the latest run otherwise.",
     inputSchema: {
         type: "object",
         properties: {
@@ -181,7 +182,7 @@ function jsonResult(value, isError = false) {
 async function handleConsoleTool(name, input) {
     if (name === "open_agent_control_console") {
         const runId = stringField(input, "run_id");
-        const snapshot = controller.getDashboardSnapshot(runId);
+        const structuredContent = await loadConsoleSnapshot(controller, runId);
         return {
             content: [
                 {
@@ -189,7 +190,7 @@ async function handleConsoleTool(name, input) {
                     text: "Opened Agent Control console."
                 }
             ],
-            structuredContent: { snapshot },
+            structuredContent,
             _meta: { "openai/outputTemplate": CONSOLE_RESOURCE_URI }
         };
     }
@@ -197,7 +198,7 @@ async function handleConsoleTool(name, input) {
         const runId = stringField(input, "run_id");
         return {
             content: [{ type: "text", text: "Loaded Agent Control dashboard snapshot." }],
-            structuredContent: { snapshot: controller.getDashboardSnapshot(runId) }
+            structuredContent: await loadConsoleSnapshot(controller, runId)
         };
     }
     if (name === "agent_control_console_agent_messages") {

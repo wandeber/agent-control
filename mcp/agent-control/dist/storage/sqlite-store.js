@@ -1,8 +1,9 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { newId, nowIso } from "../core/ids.js";
+import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "../core/ids.js";
 import { defaultStatePath } from "../core/paths.js";
+const NATIVE_ORIGIN_GRANT_MIGRATION_ID = "2026-07-16-native-origin-grant-fk-v5";
 function parseJsonObject(value) {
     if (typeof value !== "string" || value.length === 0) {
         return null;
@@ -15,17 +16,90 @@ function parseJsonObject(value) {
 function booleanFromSqlite(value) {
     return value === 1 || value === true;
 }
+function acceptedWorkLeaseIsLive(row, observedAt) {
+    if (typeof row.claim_owner_id !== "string" || row.claim_owner_id.length === 0) {
+        return false;
+    }
+    if (typeof row.lease_expires_at !== "string") {
+        return false;
+    }
+    const leaseExpiresAt = Date.parse(row.lease_expires_at);
+    const observedAtMs = Date.parse(observedAt);
+    return Number.isFinite(leaseExpiresAt) &&
+        Number.isFinite(observedAtMs) &&
+        leaseExpiresAt > observedAtMs;
+}
 export class SqliteStore {
     db;
+    afterCommitCallbacks = [];
     constructor(path = defaultStatePath()) {
         mkdirSync(dirname(path), { recursive: true });
         this.db = new Database(path);
         this.db.pragma("journal_mode = WAL");
         this.db.pragma("foreign_keys = ON");
-        this.migrate();
+        try {
+            this.migrate();
+        }
+        catch (error) {
+            // A failed transactional migration has already rolled its data changes
+            // back. Close this constructor-owned connection as well so a caller can
+            // repair/reopen the database without a leaked WAL reader or file handle.
+            this.db.close();
+            throw error;
+        }
     }
     close() {
         this.db.close();
+    }
+    /** Run a synchronous controller initialization as one SQLite transaction. */
+    transaction(operation) {
+        return this.runTransaction(operation, false);
+    }
+    /**
+     * Acquire SQLite's write reservation before the first read in a state
+     * transition. This is required when a read decides whether new work exists:
+     * a concurrent writer must commit entirely before this operation inspects
+     * it, or wait until this operation has recorded its blocking state.
+     */
+    immediateTransaction(operation) {
+        return this.runTransaction(operation, true);
+    }
+    /**
+     * Defer a side effect until the outer managed transaction commits. Event
+     * rows may be inserted transactionally, but subscriber delivery must never
+     * observe a row or state transition that is still able to roll back.
+     */
+    afterCommit(callback) {
+        if (this.db.inTransaction) {
+            this.afterCommitCallbacks.push(callback);
+            return;
+        }
+        callback();
+    }
+    runTransaction(operation, immediate) {
+        const callbackStart = this.afterCommitCallbacks.length;
+        if (this.db.inTransaction) {
+            try {
+                return operation();
+            }
+            catch (error) {
+                this.afterCommitCallbacks.splice(callbackStart);
+                throw error;
+            }
+        }
+        try {
+            const transaction = this.db.transaction(operation);
+            const result = immediate ? transaction.immediate() : transaction();
+            const committedCallbacks = this.afterCommitCallbacks.splice(callbackStart);
+            for (const callback of committedCallbacks) {
+                callback();
+            }
+            return result;
+        }
+        catch (error) {
+            this.afterCommitCallbacks.splice(callbackStart);
+            throw error;
+        }
     }
     createRun(input) {
         const now = nowIso();
@@ -56,6 +130,12 @@ export class SqliteStore {
             .all(limit);
         return rows.map((row) => this.runFromRow(row));
     }
+    listRunsByStatus(status) {
+        const rows = this.db
+            .prepare("select * from runs where status = ? order by created_at asc")
+            .all(status);
+        return rows.map((row) => this.runFromRow(row));
+    }
     listStoppedRunsOlderThan(cutoffIso) {
         const rows = this.db
             .prepare("select * from runs where status = 'stopped' and updated_at < ? order by updated_at asc")
@@ -84,6 +164,8 @@ export class SqliteStore {
             repo_dir: input.repoDir ?? null,
             model: input.model ?? null,
             backend_handle: input.backendHandle ?? null,
+            work_generation: 0,
+            work_revision: 0,
             status: input.status ?? "queued",
             failure_reason: null,
             unregistered_at: null,
@@ -93,9 +175,10 @@ export class SqliteStore {
         this.db
             .prepare(`insert into agents (
           agent_id, run_id, backend, title, role, objective, repo_dir, model,
-          backend_handle_json, status, failure_reason, unregistered_at, created_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-            .run(agent.agent_id, agent.run_id, agent.backend, agent.title, agent.role, agent.objective, agent.repo_dir, agent.model, agent.backend_handle ? JSON.stringify(agent.backend_handle) : null, agent.status, agent.failure_reason, agent.unregistered_at, agent.created_at, agent.updated_at);
+          backend_handle_json, work_generation, work_revision, status, failure_reason,
+          unregistered_at, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(agent.agent_id, agent.run_id, agent.backend, agent.title, agent.role, agent.objective, agent.repo_dir, agent.model, agent.backend_handle ? JSON.stringify(agent.backend_handle) : null, agent.work_generation, agent.work_revision, agent.status, agent.failure_reason, agent.unregistered_at, agent.created_at, agent.updated_at);
         return agent;
     }
     getAgent(agentId) {
@@ -152,6 +235,638 @@ export class SqliteStore {
         }
         return agent;
     }
+    updateAgentForNewWork(agentId, patch, options = {}) {
+        const assignments = ["status = ?", "failure_reason = ?", "updated_at = ?"];
+        const values = [patch.status, patch.failureReason, nowIso()];
+        if (options.advanceWorkGeneration) {
+            // The same conditional write that accepts new work advances the refresh
+            // fence. A stop that wins the predicate race prevents both changes.
+            assignments.push("work_generation = work_generation + 1");
+        }
+        if ("backendHandle" in patch) {
+            assignments.unshift("backend_handle_json = ?");
+            values.unshift(patch.backendHandle ? JSON.stringify(patch.backendHandle) : null);
+        }
+        values.push(agentId);
+        const workGenerationPredicate = options.expectedWorkGeneration === undefined
+            ? ""
+            : " and work_generation = ?";
+        if (options.expectedWorkGeneration !== undefined) {
+            values.push(options.expectedWorkGeneration);
+        }
+        const workRevisionPredicate = options.expectedWorkRevision === undefined
+            ? ""
+            : " and work_revision = ?";
+        if (options.expectedWorkRevision !== undefined) {
+            values.push(options.expectedWorkRevision);
+        }
+        // The predicate prevents another process from projecting new work over a
+        // stop that committed after its controller-side re-read.
+        const update = this.db
+            .prepare(`update agents
+         set ${assignments.join(", ")}
+           where agent_id = ?
+             ${workGenerationPredicate}
+             ${workRevisionPredicate}
+             and status not in ('stopping', 'stopped')
+           and exists (
+             select 1 from runs
+             where runs.run_id = agents.run_id
+               and runs.status not in ('stopping', 'stopped')
+           )`)
+            .run(...values);
+        const agent = this.getAgent(agentId);
+        if (!agent) {
+            throw new Error(`Agent not found after conditional new-work update: ${agentId}`);
+        }
+        return { agent, changed: update.changes === 1 };
+    }
+    /**
+     * Advance the status-observation fence for work that has crossed an external
+     * invocation boundary, optionally making that attempt inspectable in the
+     * same transaction. The durable acceptance key makes re-processing one
+     * physical attempt idempotent; every independent attempt receives a new key
+     * and therefore a new monotonic generation.
+     */
+    advanceAgentWorkGenerationForAcceptedWork(agentId, acceptanceKey, options) {
+        return this.immediateTransaction(() => {
+            const existing = this.db
+                .prepare(`select agent_id, work_generation
+           from agent_work_acceptances
+           where acceptance_key = ?`)
+                .get(acceptanceKey);
+            if (existing) {
+                if (String(existing.agent_id) !== agentId) {
+                    throw new Error(`Accepted-work key belongs to another agent: ${acceptanceKey}`);
+                }
+            }
+            const current = this.getAgent(agentId);
+            if (!current) {
+                throw new Error(`Agent not found while accepting work: ${agentId}`);
+            }
+            const run = this.getRun(current.run_id);
+            if (!run) {
+                throw new Error(`Run not found while accepting work: ${current.run_id}`);
+            }
+            if (current.status === "stopping" ||
+                current.status === "stopped" ||
+                run.status === "stopping" ||
+                run.status === "stopped") {
+                // This check runs after BEGIN IMMEDIATE has acquired SQLite's write
+                // reservation. Therefore a stop that committed first is authoritative
+                // and no acceptance row is created, while a stop that arrives later
+                // waits behind the durable invocation boundary recorded below.
+                return { type: "stop_intent", agent: current, advanced: false };
+            }
+            if (existing) {
+                return { type: "already_accepted", agent: current, advanced: false };
+            }
+            const acceptedAt = nowIso();
+            const workGeneration = current.work_generation + 1;
+            const workRevision = current.work_revision + 1;
+            this.db
+                .prepare(`insert into agent_work_acceptances (
+             acceptance_key, agent_id, work_generation, attempt_revision,
+             phase, completion_revision, claim_owner_id, lease_expires_at,
+             delivery_event_id, delivery_claim_attempt,
+             created_at, updated_at, completed_at
+           ) values (?, ?, ?, ?, 'invoking', null, ?, ?, ?, ?, ?, ?, null)`)
+                .run(acceptanceKey, agentId, workGeneration, workRevision, options.claimOwnerId, options.leaseExpiresAt, options.deliveryEventId ?? null, options.deliveryClaimAttempt ?? null, acceptedAt, acceptedAt);
+            const advanced = this.db
+                .prepare(`update agents
+           set work_generation = ?, work_revision = ?, updated_at = ?
+           where agent_id = ? and work_generation = ? and work_revision = ?`)
+                .run(workGeneration, workRevision, acceptedAt, agentId, current.work_generation, current.work_revision);
+            if (advanced.changes !== 1) {
+                throw new Error(`Agent work generation changed while accepting work: ${agentId}`);
+            }
+            if (options.projectStatus) {
+                // This second write shares the same BEGIN IMMEDIATE reservation. The
+                // generation always advances for the physical attempt, while a stop
+                // that already won keeps its stopping/stopped projection intact.
+                this.updateAgentForNewWork(agentId, {
+                    status: options.projectStatus,
+                    failureReason: options.failureReason ?? null
+                }, {
+                    expectedWorkGeneration: workGeneration,
+                    expectedWorkRevision: workRevision
+                });
+            }
+            return { type: "accepted", agent: this.getAgent(agentId), advanced: true };
+        });
+    }
+    /**
+     * Close one physical adapter invocation and advance only its observation
+     * revision. This invalidates a refresh that began after the generation fence
+     * but before the adapter accepted/rejected, without counting another logical
+     * work generation.
+     */
+    completeAgentAcceptedWorkAttempt(input) {
+        return this.immediateTransaction(() => {
+            const row = this.db
+                .prepare(`select agent_id, work_generation, attempt_revision, phase,
+                  completion_revision, claim_owner_id
+           from agent_work_acceptances
+           where acceptance_key = ?`)
+                .get(input.acceptanceKey);
+            if (!row || String(row.agent_id) !== input.agentId) {
+                throw new Error(`Accepted work attempt not found: ${input.acceptanceKey}`);
+            }
+            const current = this.getAgent(input.agentId);
+            if (!current) {
+                throw new Error(`Agent not found while completing accepted work: ${input.agentId}`);
+            }
+            const phase = String(row.phase);
+            if (String(row.claim_owner_id ?? "") !== input.claimOwnerId) {
+                throw new Error(`Accepted work attempt belongs to another controller: ${input.acceptanceKey}`);
+            }
+            if (phase !== "invoking") {
+                if (phase !== input.outcome) {
+                    throw new Error(`Accepted work attempt has conflicting completion: ${input.acceptanceKey}`);
+                }
+                return { agent: current, completed: false, attemptOwnedAgent: false };
+            }
+            const workGeneration = Number(row.work_generation);
+            const attemptRevision = Number(row.attempt_revision);
+            const attemptOwnedAgent = current.work_generation === workGeneration &&
+                current.work_revision === attemptRevision;
+            const completedAt = nowIso();
+            let completionRevision = null;
+            if (attemptOwnedAgent) {
+                completionRevision = attemptRevision + 1;
+                const revision = this.db
+                    .prepare(`update agents
+             set work_revision = ?, updated_at = ?
+             where agent_id = ? and work_generation = ? and work_revision = ?`)
+                    .run(completionRevision, completedAt, input.agentId, workGeneration, attemptRevision);
+                if (revision.changes !== 1) {
+                    throw new Error(`Agent work revision changed while completing accepted work: ${input.agentId}`);
+                }
+                this.updateAgentForNewWork(input.agentId, { status: input.status, failureReason: input.failureReason }, {
+                    expectedWorkGeneration: workGeneration,
+                    expectedWorkRevision: completionRevision
+                });
+            }
+            const completion = this.db
+                .prepare(`update agent_work_acceptances
+           set phase = ?, completion_revision = ?, updated_at = ?, completed_at = ?
+           where acceptance_key = ? and phase = 'invoking'`)
+                .run(input.outcome, completionRevision, completedAt, completedAt, input.acceptanceKey);
+            if (completion.changes !== 1) {
+                throw new Error(`Accepted work completion lost its phase: ${input.acceptanceKey}`);
+            }
+            return {
+                agent: this.getAgent(input.agentId),
+                completed: true,
+                attemptOwnedAgent
+            };
+        });
+    }
+    agentHasAmbiguousAcceptedWork(agentId, workGeneration) {
+        return Boolean(this.db
+            .prepare(`select 1
+           from agent_work_acceptances
+           where agent_id = ? and work_generation = ? and phase = 'ambiguous'
+           limit 1`)
+            .get(agentId, workGeneration));
+    }
+    renewAgentAcceptedWorkLease(input) {
+        return this.db
+            .prepare(`update agent_work_acceptances
+         set lease_expires_at = ?, updated_at = ?
+         where acceptance_key = ? and agent_id = ? and phase = 'invoking'
+           and claim_owner_id = ?`)
+            .run(input.leaseExpiresAt, nowIso(), input.acceptanceKey, input.agentId, input.claimOwnerId).changes === 1;
+    }
+    /**
+     * Resolve the exact acceptance revision observed by a refresh. A live lease
+     * protects in-process adapter I/O from false terminal projection. An expired
+     * or legacy owner is never replayed: it becomes durable ambiguity, advances
+     * the revision fence, and releases any linked delivery into an inspectable
+     * non-retryable state before backend status reconciliation may continue.
+     */
+    resolveInvokingAgentAcceptedWork(agentId, workGeneration, workRevision, observedAt = nowIso()) {
+        return this.immediateTransaction(() => {
+            const agent = this.getAgent(agentId);
+            if (!agent) {
+                throw new Error(`Agent not found while resolving accepted work: ${agentId}`);
+            }
+            const row = this.db
+                .prepare(`select * from agent_work_acceptances
+           where agent_id = ? and work_generation = ?
+             and attempt_revision = ? and phase = 'invoking'
+           limit 1`)
+                .get(agentId, workGeneration, workRevision);
+            if (!row) {
+                return { type: "none", agent };
+            }
+            if (acceptedWorkLeaseIsLive(row, observedAt)) {
+                return { type: "live", agent };
+            }
+            return {
+                type: "recovered_ambiguous",
+                agent: this.recoverAbandonedAgentAcceptedWork(row, observedAt)
+            };
+        });
+    }
+    /** Recover every lease-expired invocation during controller startup. */
+    recoverExpiredAgentAcceptedWork(observedAt = nowIso()) {
+        return this.immediateTransaction(() => {
+            const rows = this.db
+                .prepare("select * from agent_work_acceptances where phase = 'invoking'")
+                .all();
+            const recovered = [];
+            for (const row of rows) {
+                if (!acceptedWorkLeaseIsLive(row, observedAt)) {
+                    recovered.push(this.recoverAbandonedAgentAcceptedWork(row, observedAt));
+                }
+            }
+            return recovered;
+        });
+    }
+    recoverAbandonedAgentAcceptedWork(row, recoveredAt) {
+        const acceptanceKey = String(row.acceptance_key);
+        const agentId = String(row.agent_id);
+        const current = this.getAgent(agentId);
+        if (!current) {
+            throw new Error(`Agent not found for abandoned accepted work: ${agentId}`);
+        }
+        const workGeneration = Number(row.work_generation);
+        const attemptRevision = Number(row.attempt_revision);
+        const attemptOwnsAgent = current.work_generation === workGeneration &&
+            current.work_revision === attemptRevision;
+        let completionRevision = null;
+        if (attemptOwnsAgent) {
+            const run = this.getRun(current.run_id);
+            if (!run) {
+                throw new Error(`Run not found for abandoned accepted work: ${current.run_id}`);
+            }
+            completionRevision = attemptRevision + 1;
+            const stopIntent = current.status === "stopping" ||
+                current.status === "stopped" ||
+                run.status === "stopping" ||
+                run.status === "stopped";
+            const revision = this.db
+                .prepare(`update agents
+           set work_revision = ?, status = ?, failure_reason = ?, updated_at = ?
+           where agent_id = ? and work_generation = ? and work_revision = ?`)
+                .run(completionRevision, stopIntent ? current.status : "unknown", stopIntent ? current.failure_reason : "unknown", recoveredAt, agentId, workGeneration, attemptRevision);
+            if (revision.changes !== 1) {
+                throw new Error(`Agent work revision changed while recovering accepted work: ${agentId}`);
+            }
+        }
+        const recovered = this.db
+            .prepare(`update agent_work_acceptances
+         set phase = 'ambiguous', completion_revision = ?, lease_expires_at = null,
+             updated_at = ?, completed_at = ?
+         where acceptance_key = ? and phase = 'invoking'`)
+            .run(completionRevision, recoveredAt, recoveredAt, acceptanceKey);
+        if (recovered.changes !== 1) {
+            throw new Error(`Accepted work recovery lost its phase: ${acceptanceKey}`);
+        }
+        const deliveryEventId = row.delivery_event_id === null || row.delivery_event_id === undefined
+            ? null
+            : String(row.delivery_event_id);
+        const deliveryClaimAttempt = row.delivery_claim_attempt === null || row.delivery_claim_attempt === undefined
+            ? null
+            : Number(row.delivery_claim_attempt);
+        if (deliveryEventId && deliveryClaimAttempt !== null) {
+            // The original adapter call may have delivered the notification. Release
+            // process ownership but deliberately do not return the row to `pending`:
+            // an automatic retry could duplicate possibly accepted external work.
+            const deliveryRecovery = this.db
+                .prepare(`update subscription_deliveries
+           set status = 'ambiguous', claim_owner_id = null, claimed_at = null,
+               last_error_json = ?, updated_at = ?
+           where event_id = ? and subscriber_agent_id = ? and status = 'invoking'
+             and claim_attempt = ?`)
+                .run(JSON.stringify({
+                reason: "delivery_outcome_ambiguous_after_owner_lease_expired",
+                acceptance_key: acceptanceKey
+            }), recoveredAt, deliveryEventId, agentId, deliveryClaimAttempt);
+            if (deliveryRecovery.changes === 1) {
+                // Recovery is intentionally non-retryable because the original adapter
+                // call may have succeeded. Publish a durable, public diagnostic next to
+                // the delivery row so operators do not need direct SQLite access to
+                // discover why the subscriber stopped progressing. The payload carries
+                // only stable identifiers and the ambiguity reason, never credentials
+                // or the original delivered message.
+                this.createEvent({
+                    runId: current.run_id,
+                    agentId,
+                    type: "agent.delivery_failed",
+                    payload: {
+                        source_event_id: deliveryEventId,
+                        subscriber_agent_id: agentId,
+                        delivery_claim_attempt: deliveryClaimAttempt,
+                        status: "ambiguous",
+                        reason: "delivery_outcome_ambiguous_after_owner_lease_expired"
+                    }
+                });
+            }
+        }
+        return this.getAgent(agentId);
+    }
+    /**
+     * Claim the single start attempt associated with a fresh flow worker. The
+     * BEGIN IMMEDIATE reservation serializes every process that can decide to
+     * invoke the adapter. Only an expired `prepared` attempt is reclaimable;
+     * expiry after `invoking` is conservatively persisted as ambiguity.
+     */
+    claimAgentStartAttempt(input) {
+        return this.immediateTransaction(() => {
+            const observedAt = nowIso();
+            const agent = this.getAgent(input.agentId);
+            const run = agent ? this.getRun(agent.run_id) : null;
+            if (!agent ||
+                !run ||
+                agent.status === "stopping" ||
+                agent.status === "stopped" ||
+                run.status === "stopping" ||
+                run.status === "stopped") {
+                return { type: "stop_intent", attempt: null };
+            }
+            const step = this.getFlowStepInstance(input.stepInstanceId);
+            const instance = this.getFlowInstance(input.flowInstanceId);
+            if (!step ||
+                !instance ||
+                step.agent_id !== input.agentId ||
+                step.flow_instance_id !== input.flowInstanceId ||
+                instance.run_id !== agent.run_id) {
+                throw new Error("Agent start attempt metadata does not match its durable flow assignment.");
+            }
+            const existing = this.getAgentStartAttemptForStep(input.agentId, input.stepInstanceId, input.generation);
+            if (existing) {
+                if (existing.phase === "prepared") {
+                    if (Date.parse(existing.lease_expires_at) > Date.parse(observedAt)) {
+                        return { type: "in_progress", attempt: existing };
+                    }
+                    const claimOwnerId = newId("startclaim");
+                    this.db
+                        .prepare(`update agent_start_attempts
+               set claim_owner_id = ?, lease_expires_at = ?, updated_at = ?
+               where start_attempt_id = ? and phase = 'prepared'
+                 and lease_expires_at <= ?`)
+                        .run(claimOwnerId, input.leaseExpiresAt, observedAt, existing.start_attempt_id, observedAt);
+                    return {
+                        type: "claimed",
+                        attempt: this.requireAgentStartAttempt(existing.start_attempt_id)
+                    };
+                }
+                if (existing.phase === "invoking") {
+                    if (Date.parse(existing.lease_expires_at) > Date.parse(observedAt)) {
+                        return { type: "in_progress", attempt: existing };
+                    }
+                    const error = {
+                        reason: "backend_start_invocation_lease_expired",
+                        message: "The backend start invocation lease expired after the adapter call boundary; automatic retry is disabled."
+                    };
+                    this.db
+                        .prepare(`update agent_start_attempts
+               set phase = 'ambiguous', error_json = ?, updated_at = ?, completed_at = ?
+               where start_attempt_id = ? and phase = 'invoking'
+                 and lease_expires_at <= ?`)
+                        .run(JSON.stringify(error), observedAt, observedAt, existing.start_attempt_id, observedAt);
+                    return {
+                        type: "ambiguous",
+                        attempt: this.requireAgentStartAttempt(existing.start_attempt_id)
+                    };
+                }
+                return {
+                    type: existing.phase === "ambiguous" ? "ambiguous" : "terminal",
+                    attempt: existing
+                };
+            }
+            const attempt = {
+                start_attempt_id: newId("startattempt"),
+                agent_id: input.agentId,
+                flow_instance_id: input.flowInstanceId,
+                step_instance_id: input.stepInstanceId,
+                generation: input.generation,
+                phase: "prepared",
+                claim_owner_id: newId("startclaim"),
+                lease_expires_at: input.leaseExpiresAt,
+                invocation_started_at: null,
+                handle_json: null,
+                error_json: null,
+                created_at: observedAt,
+                updated_at: observedAt,
+                completed_at: null
+            };
+            this.db
+                .prepare(`insert into agent_start_attempts (
+            start_attempt_id, agent_id, flow_instance_id, step_instance_id,
+            generation, phase, claim_owner_id, lease_expires_at,
+            invocation_started_at, handle_json, error_json, created_at,
+            updated_at, completed_at
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                .run(attempt.start_attempt_id, attempt.agent_id, attempt.flow_instance_id, attempt.step_instance_id, attempt.generation, attempt.phase, attempt.claim_owner_id, attempt.lease_expires_at, null, null, null, attempt.created_at, attempt.updated_at, null);
+            return { type: "claimed", attempt };
+        });
+    }
+    /**
+     * Persist the invocation boundary immediately before the adapter call. A
+     * process that loses this CAS must not invoke: its prepared lease was either
+     * reclaimed or cancelled by durable stop intent.
+     */
+    beginAgentStartAttempt(input) {
+        return this.immediateTransaction(() => {
+            const startedAt = nowIso();
+            const update = this.db
+                .prepare(`update agent_start_attempts
+           set phase = 'invoking', invocation_started_at = ?,
+               lease_expires_at = ?, updated_at = ?
+           where start_attempt_id = ? and phase = 'prepared'
+             and claim_owner_id = ? and lease_expires_at > ?
+             and exists (
+               select 1 from agents
+               join runs on runs.run_id = agents.run_id
+               where agents.agent_id = agent_start_attempts.agent_id
+                 and agents.status not in ('stopping', 'stopped')
+                 and runs.status not in ('stopping', 'stopped')
+             )`)
+                .run(startedAt, input.leaseExpiresAt, startedAt, input.startAttemptId, input.claimOwnerId, startedAt);
+            return {
+                began: update.changes === 1,
+                attempt: this.requireAgentStartAttempt(input.startAttemptId)
+            };
+        });
+    }
+    /** Make a proved pre-invocation failure immediately reclaimable. */
+    releasePreparedAgentStartAttempt(input) {
+        const releasedAt = nowIso();
+        this.db
+            .prepare(`update agent_start_attempts
+         set lease_expires_at = ?, error_json = ?, updated_at = ?
+         where start_attempt_id = ? and claim_owner_id = ? and phase = 'prepared'`)
+            .run(releasedAt, JSON.stringify(input.error), releasedAt, input.startAttemptId, input.claimOwnerId);
+        return this.requireAgentStartAttempt(input.startAttemptId);
+    }
+    /** Complete a start while retaining its claimant identity for late-response reconciliation. */
+    completeAgentStartAttemptSuccess(input) {
+        const previous = this.requireAgentStartAttempt(input.startAttemptId);
+        const completedAt = nowIso();
+        const update = this.db
+            .prepare(`update agent_start_attempts
+         set phase = 'succeeded', handle_json = ?, error_json = null,
+             updated_at = ?, completed_at = ?
+         where start_attempt_id = ? and claim_owner_id = ?
+           and phase in ('invoking', 'ambiguous')`)
+            .run(JSON.stringify(input.handle), completedAt, completedAt, input.startAttemptId, input.claimOwnerId);
+        return {
+            completed: update.changes === 1,
+            attempt: this.requireAgentStartAttempt(input.startAttemptId),
+            previousPhase: previous.phase
+        };
+    }
+    markAgentStartAttemptAmbiguous(input) {
+        const completedAt = nowIso();
+        this.db
+            .prepare(`update agent_start_attempts
+         set phase = 'ambiguous', error_json = ?, updated_at = ?, completed_at = ?
+         where start_attempt_id = ? and claim_owner_id = ? and phase = 'invoking'`)
+            .run(JSON.stringify(input.error), completedAt, completedAt, input.startAttemptId, input.claimOwnerId);
+        return this.requireAgentStartAttempt(input.startAttemptId);
+    }
+    /** Persist that a real returned session no longer owns its original route. */
+    markAgentStartAttemptSuperseded(input) {
+        const completedAt = nowIso();
+        const update = this.db
+            .prepare(`update agent_start_attempts
+         set phase = 'superseded', handle_json = ?, error_json = ?,
+             updated_at = ?, completed_at = ?
+         where start_attempt_id = ? and claim_owner_id = ?
+           and phase in ('succeeded', 'cancelled', 'failed')`)
+            .run(JSON.stringify(input.handle), JSON.stringify({ reason: input.reason }), completedAt, completedAt, input.startAttemptId, input.claimOwnerId);
+        return {
+            changed: update.changes === 1,
+            attempt: this.requireAgentStartAttempt(input.startAttemptId)
+        };
+    }
+    cancelPreparedAgentStartAttempts(agentId, error) {
+        const completedAt = nowIso();
+        this.db
+            .prepare(`update agent_start_attempts
+         set phase = 'cancelled', error_json = ?, updated_at = ?, completed_at = ?
+         where agent_id = ? and phase = 'prepared'`)
+            .run(JSON.stringify(error), completedAt, completedAt, agentId);
+        return this.listAgentStartAttempts(agentId);
+    }
+    getAgentStartAttemptForStep(agentId, stepInstanceId, generation = 1) {
+        const row = this.db
+            .prepare(`select * from agent_start_attempts
+         where agent_id = ? and step_instance_id = ? and generation = ?`)
+            .get(agentId, stepInstanceId, generation);
+        return row ? this.agentStartAttemptFromRow(row) : null;
+    }
+    getLatestAgentStartAttempt(agentId) {
+        const row = this.db
+            .prepare(`select * from agent_start_attempts
+         where agent_id = ? order by created_at desc, start_attempt_id desc limit 1`)
+            .get(agentId);
+        return row ? this.agentStartAttemptFromRow(row) : null;
+    }
+    listAgentStartAttempts(agentId) {
+        const rows = this.db
+            .prepare(`select * from agent_start_attempts
+         where agent_id = ? order by created_at asc, start_attempt_id asc`)
+            .all(agentId);
+        return rows.map((row) => this.agentStartAttemptFromRow(row));
+    }
+    getLatestCompletedAgentStartAttemptWithHandle(agentId) {
+        const row = this.db
+            .prepare(`select * from agent_start_attempts
+         where agent_id = ? and phase in ('succeeded', 'superseded')
+           and handle_json is not null
+         order by completed_at desc, created_at desc, start_attempt_id desc
+         limit 1`)
+            .get(agentId);
+        return row ? this.agentStartAttemptFromRow(row) : null;
+    }
+    /** SQLite rowid provides an insertion order even when ISO timestamps tie. */
+    hasFlowStepInstanceAfter(stepInstanceId) {
+        const row = this.db
+            .prepare(`select exists(
+           select 1
+           from flow_step_instances later
+           where later.flow_instance_id = (
+             select current.flow_instance_id
+             from flow_step_instances current
+             where current.step_instance_id = ?
+           )
+             and later.rowid > (
+               select current.rowid
+               from flow_step_instances current
+               where current.step_instance_id = ?
+             )
+         ) as found`)
+            .get(stepInstanceId, stepInstanceId);
+        return booleanFromSqlite(row?.found);
+    }
+    /** Resolve an expired invoking lease without creating or reclaiming an attempt. */
+    resolveAgentStartAttempt(agentId, stepInstanceId, generation = 1) {
+        return this.immediateTransaction(() => {
+            const attempt = this.getAgentStartAttemptForStep(agentId, stepInstanceId, generation);
+            if (attempt?.phase === "invoking" &&
+                Date.parse(attempt.lease_expires_at) <= Date.now()) {
+                const completedAt = nowIso();
+                const error = {
+                    reason: "backend_start_invocation_lease_expired",
+                    message: "The backend start invocation lease expired after the adapter call boundary; automatic retry is disabled."
+                };
+                this.db
+                    .prepare(`update agent_start_attempts
+             set phase = 'ambiguous', error_json = ?, updated_at = ?, completed_at = ?
+             where start_attempt_id = ? and phase = 'invoking'
+               and lease_expires_at <= ?`)
+                    .run(JSON.stringify(error), completedAt, completedAt, attempt.start_attempt_id, completedAt);
+                return this.requireAgentStartAttempt(attempt.start_attempt_id);
+            }
+            return attempt;
+        });
+    }
+    requireAgentStartAttempt(startAttemptId) {
+        const row = this.db
+            .prepare("select * from agent_start_attempts where start_attempt_id = ?")
+            .get(startAttemptId);
+        if (!row) {
+            throw new Error(`Agent start attempt not found: ${startAttemptId}`);
+        }
+        return this.agentStartAttemptFromRow(row);
+    }
+    updateAgentForOpenOrchestratorAction(actionId, agentId, patch) {
+        // This predicate is deliberately repeated at the write boundary even when
+        // the controller already holds BEGIN IMMEDIATE. It makes the transition
+        // safe under same-connection re-entry in tests and future composed store
+        // operations: a terminal ACK can never be followed by a stale projection.
+        const update = this.db
+            .prepare(`update agents
+         set status = ?, failure_reason = ?, updated_at = ?
+         where agent_id = ?
+           and status not in ('stopping', 'stopped')
+           and exists (
+             select 1 from runs
+             where runs.run_id = agents.run_id
+               and runs.status not in ('stopping', 'stopped')
+           )
+           and exists (
+             select 1 from orchestrator_actions
+             where orchestrator_actions.action_id = ?
+               and orchestrator_actions.agent_id = agents.agent_id
+               and orchestrator_actions.run_id = agents.run_id
+               and orchestrator_actions.status in ('pending', 'claimed')
+           )`)
+            .run(patch.status, patch.failureReason, nowIso(), agentId, actionId);
+        const agent = this.getAgent(agentId);
+        if (!agent) {
+            throw new Error(`Agent not found after orchestrator action projection: ${agentId}`);
+        }
+        return {
+            agent,
+            action: this.getOrchestratorAction(actionId),
+            changed: update.changes === 1
+        };
+    }
     createAgentToken(input) {
         const token = {
             token_id: newId("token"),
@@ -178,19 +893,509 @@ export class SqliteStore {
     revokeAgentToken(tokenId) {
         this.db.prepare("update agent_tokens set revoked_at = ? where token_id = ?").run(nowIso(), tokenId);
     }
+    createBridgeGrant(input) {
+        const grant = {
+            bridge_grant_id: newId("bridge"),
+            run_id: input.runId,
+            orchestrator_agent_id: input.orchestratorAgentId,
+            owner_task_identity: input.ownerTaskIdentity ?? null,
+            owner_task_path: input.ownerTaskPath,
+            token_hash: input.tokenHash,
+            created_at: nowIso(),
+            last_used_at: null,
+            expires_at: input.expiresAt ?? null,
+            revoked_at: null
+        };
+        this.db
+            .prepare(`insert into bridge_grants (
+          bridge_grant_id, run_id, orchestrator_agent_id, owner_task_identity,
+          owner_task_path, token_hash, created_at, last_used_at, expires_at, revoked_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(grant.bridge_grant_id, grant.run_id, grant.orchestrator_agent_id, grant.owner_task_identity, grant.owner_task_path, grant.token_hash, grant.created_at, grant.last_used_at, grant.expires_at, grant.revoked_at);
+        return grant;
+    }
+    getBridgeGrantByTokenHash(tokenHash) {
+        const row = this.db
+            .prepare("select * from bridge_grants where token_hash = ? limit 1")
+            .get(tokenHash);
+        return row ? this.bridgeGrantFromRow(row) : null;
+    }
+    getBridgeGrant(bridgeGrantId) {
+        if (!isBridgeGrantId(bridgeGrantId)) {
+            return null;
+        }
+        const row = this.db
+            .prepare("select * from bridge_grants where bridge_grant_id = ?")
+            .get(bridgeGrantId);
+        return row ? this.bridgeGrantFromRow(row) : null;
+    }
+    listBridgeGrants(input = {}) {
+        const conditions = [];
+        const values = [];
+        if (input.runId) {
+            conditions.push("run_id = ?");
+            values.push(input.runId);
+        }
+        if (input.orchestratorAgentId) {
+            conditions.push("orchestrator_agent_id = ?");
+            values.push(input.orchestratorAgentId);
+        }
+        const where = conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+        const rows = this.db
+            .prepare(`select * from bridge_grants ${where} order by created_at asc`)
+            .all(...values);
+        return rows.map((row) => this.bridgeGrantFromRow(row));
+    }
+    revokeBridgeGrant(bridgeGrantId, revokedAt = nowIso()) {
+        if (!isBridgeGrantId(bridgeGrantId)) {
+            return null;
+        }
+        this.db
+            .prepare("update bridge_grants set revoked_at = coalesce(revoked_at, ?) where bridge_grant_id = ?")
+            .run(revokedAt, bridgeGrantId);
+        return this.getBridgeGrant(bridgeGrantId);
+    }
+    getLatestActiveBridgeGrant(runId, orchestratorAgentId) {
+        const now = nowIso();
+        const row = this.db
+            .prepare(`select * from bridge_grants
+         where run_id = ? and orchestrator_agent_id = ? and revoked_at is null
+           and (expires_at is null or expires_at > ?)
+         order by created_at desc
+         limit 1`)
+            .get(runId, orchestratorAgentId, now);
+        return row ? this.bridgeGrantFromRow(row) : null;
+    }
+    touchBridgeGrant(bridgeGrantId, usedAt = nowIso()) {
+        this.db
+            .prepare("update bridge_grants set last_used_at = ? where bridge_grant_id = ?")
+            .run(usedAt, bridgeGrantId);
+    }
+    createOrGetOrchestratorAction(input) {
+        const create = () => {
+            const grant = this.getBridgeGrant(input.originatingBridgeGrantId);
+            const grantExpired = grant?.expires_at
+                ? Date.parse(grant.expires_at) <= Date.now()
+                : false;
+            if (!grant ||
+                grant.revoked_at ||
+                grantExpired ||
+                grant.run_id !== input.runId ||
+                grant.orchestrator_agent_id !== input.orchestratorAgentId) {
+                // Action creation and grant validation share the caller's immediate
+                // transaction. A controller-side lookup may choose a grant, but a
+                // concurrent revocation or ownership change must still fail closed
+                // before an executable action is persisted.
+                return null;
+            }
+            if (input.flowInstanceId) {
+                const flowInstance = this.getFlowInstance(input.flowInstanceId);
+                if (!flowInstance ||
+                    flowInstance.run_id !== input.runId ||
+                    flowInstance.orchestrator_agent_id !== input.orchestratorAgentId ||
+                    flowInstance.originating_bridge_grant_id !== grant.bridge_grant_id) {
+                    // The flow is the causal authority for every native action derived
+                    // from it. Keep this check beside the INSERT under BEGIN IMMEDIATE so
+                    // controller bugs or concurrent legacy repair cannot persist an
+                    // action under a sibling task grant.
+                    return null;
+                }
+            }
+            if (input.operation === "interrupt_agent") {
+                const openInterrupt = this.findOpenOrchestratorAction(input.agentId, ["interrupt_agent"]);
+                if (openInterrupt) {
+                    if (openInterrupt.originating_bridge_grant_id !== grant.bridge_grant_id) {
+                        throw new Error(`Open interrupt action belongs to another bridge grant: ${openInterrupt.action_id}`);
+                    }
+                    return openInterrupt;
+                }
+            }
+            const existing = this.getOrchestratorActionByIdempotencyKey(input.idempotencyKey);
+            if (existing) {
+                if (existing.originating_bridge_grant_id !== grant.bridge_grant_id) {
+                    // Idempotency never transfers execution authority. A rotated owner
+                    // must finish/cancel the old action and create a new generation.
+                    throw new Error(`Orchestrator action idempotency key belongs to another bridge grant: ${existing.action_id}`);
+                }
+                return existing;
+            }
+            const now = nowIso();
+            const action = {
+                action_id: newId("action"),
+                idempotency_key: input.idempotencyKey,
+                run_id: input.runId,
+                orchestrator_agent_id: input.orchestratorAgentId,
+                agent_id: input.agentId,
+                flow_instance_id: input.flowInstanceId ?? null,
+                step_instance_id: input.stepInstanceId ?? null,
+                operation: input.operation,
+                status: "pending",
+                payload_json: input.payloadJson,
+                result_json: null,
+                error_json: null,
+                originating_bridge_grant_id: grant.bridge_grant_id,
+                claimed_by_bridge_grant_id: null,
+                claim_owner_identity: null,
+                claim_attempt: 0,
+                claimed_at: null,
+                claim_lease_expires_at: null,
+                action_token_hash: null,
+                created_at: now,
+                updated_at: now,
+                completed_at: null
+            };
+            try {
+                // BEGIN IMMEDIATE serializes this predicate with shutdown's first
+                // run-status write. Whichever transaction commits first becomes the
+                // durable authority: shutdown either sees and cancels the inserted
+                // action, or this INSERT observes stop intent and inserts nothing.
+                const insert = this.db
+                    .prepare(`insert into orchestrator_actions (
+              action_id, idempotency_key, run_id, orchestrator_agent_id, agent_id,
+              flow_instance_id, step_instance_id, operation, status, payload_json,
+              result_json, error_json, originating_bridge_grant_id,
+              claimed_by_bridge_grant_id, claim_owner_identity,
+              claim_attempt, claimed_at, claim_lease_expires_at, action_token_hash,
+              created_at, updated_at, completed_at
+            )
+            select ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            where ? = 'interrupt_agent'
+               or (
+                 ? in ('spawn_agent', 'send_message', 'followup_task')
+                 and exists (
+                   select 1 from runs
+                   where runs.run_id = ? and runs.status not in ('stopping', 'stopped')
+                 )
+                 and exists (
+                   select 1 from agents
+                   where agents.agent_id = ? and agents.status not in ('stopping', 'stopped')
+                 )
+               )`)
+                    .run(action.action_id, action.idempotency_key, action.run_id, action.orchestrator_agent_id, action.agent_id, action.flow_instance_id, action.step_instance_id, action.operation, action.status, JSON.stringify(action.payload_json), null, null, action.originating_bridge_grant_id, null, null, 0, null, null, null, action.created_at, action.updated_at, null, action.operation, action.operation, action.run_id, action.agent_id);
+                if (insert.changes !== 1) {
+                    return null;
+                }
+            }
+            catch (error) {
+                // A concurrent dispatcher may win the unique idempotency key. Returning
+                // that durable row makes spawn:<step_instance_id> safe across retries.
+                const raced = this.getOrchestratorActionByIdempotencyKey(input.idempotencyKey);
+                if (raced) {
+                    return raced;
+                }
+                throw error;
+            }
+            if (action.operation === "spawn_agent" ||
+                action.operation === "send_message" ||
+                action.operation === "followup_task") {
+                // The action row is the durable acceptance boundary for native work.
+                // Advance the agent fence in this same transaction only for a newly
+                // inserted action; idempotent create-or-get replays return above and
+                // therefore cannot consume another generation.
+                const generation = this.db
+                    .prepare(`update agents
+             set work_generation = work_generation + 1, updated_at = ?
+             where agent_id = ?`)
+                    .run(now, action.agent_id);
+                if (generation.changes !== 1) {
+                    throw new Error(`Agent not found while advancing native work generation: ${action.agent_id}`);
+                }
+            }
+            return action;
+        };
+        // ACK and native-sync reconciliation can create a cleanup interrupt while
+        // already holding a BEGIN IMMEDIATE reservation. Reuse that transaction
+        // directly instead of opening a nested savepoint with ambiguous locking
+        // semantics. Standalone callers still acquire the reservation before the
+        // first read so action creation remains serialized with durable stop.
+        return this.db.inTransaction
+            ? create()
+            : this.db.transaction(create).immediate();
+    }
+    getOrchestratorAction(actionId) {
+        if (!isOrchestratorActionId(actionId)) {
+            return null;
+        }
+        const row = this.db
+            .prepare("select * from orchestrator_actions where action_id = ?")
+            .get(actionId);
+        return row ? this.orchestratorActionFromRow(row) : null;
+    }
+    listOrchestratorActions(input = {}) {
+        const conditions = [];
+        const values = [];
+        if (input.runId) {
+            conditions.push("run_id = ?");
+            values.push(input.runId);
+        }
+        if (input.agentId) {
+            conditions.push("(agent_id = ? or orchestrator_agent_id = ?)");
+            values.push(input.agentId, input.agentId);
+        }
+        if (input.orchestratorAgentId) {
+            conditions.push("orchestrator_agent_id = ?");
+            values.push(input.orchestratorAgentId);
+        }
+        const where = conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+        const rows = this.db
+            .prepare(`select * from orchestrator_actions ${where} order by created_at asc`)
+            .all(...values);
+        return rows.map((row) => this.orchestratorActionFromRow(row));
+    }
+    getOrchestratorActionByIdempotencyKey(idempotencyKey) {
+        const row = this.db
+            .prepare("select * from orchestrator_actions where idempotency_key = ?")
+            .get(idempotencyKey);
+        return row ? this.orchestratorActionFromRow(row) : null;
+    }
+    findOpenOrchestratorAction(agentId, operations) {
+        if (operations.length === 0) {
+            return null;
+        }
+        const placeholders = operations.map(() => "?").join(", ");
+        const row = this.db
+            .prepare(`select * from orchestrator_actions
+         where agent_id = ? and operation in (${placeholders}) and status in ('pending', 'claimed')
+         order by created_at desc
+         limit 1`)
+            .get(agentId, ...operations);
+        return row ? this.orchestratorActionFromRow(row) : null;
+    }
+    claimOrchestratorAction(input) {
+        return this.immediateTransaction(() => {
+            const current = this.getOrchestratorAction(input.actionId);
+            if (!current) {
+                return { type: "unavailable", action: null, reason: "missing" };
+            }
+            const grant = this.getBridgeGrantByTokenHash(input.bridgeTokenHash);
+            if (!grant) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "invalid_grant"
+                };
+            }
+            if (grant.revoked_at) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "revoked_grant"
+                };
+            }
+            if (grant.expires_at && Date.parse(grant.expires_at) <= Date.parse(input.claimedAt)) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "expired_grant"
+                };
+            }
+            if (grant.run_id !== current.run_id ||
+                grant.orchestrator_agent_id !== current.orchestrator_agent_id) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "scope_mismatch"
+                };
+            }
+            if (!current.originating_bridge_grant_id) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "unbound_action"
+                };
+            }
+            if (current.originating_bridge_grant_id !== grant.bridge_grant_id) {
+                return {
+                    type: "authorization_failed",
+                    action: current,
+                    reason: "action_grant_mismatch"
+                };
+            }
+            // Grant authorization, lease ownership, and token rotation share this
+            // BEGIN IMMEDIATE point of linearization. A revocation or scope mutation
+            // that commits first is observed above; one that starts later waits until
+            // this claim has durably recorded its owner and one-time action token.
+            this.touchBridgeGrant(grant.bridge_grant_id, input.claimedAt);
+            if (current.status === "claimed" && current.claim_lease_expires_at) {
+                const remaining = Date.parse(current.claim_lease_expires_at) - Date.parse(input.claimedAt);
+                if (remaining > 0) {
+                    return {
+                        type: "already_claimed",
+                        action: current,
+                        retryAfterMs: remaining
+                    };
+                }
+            }
+            else if (current.status !== "pending") {
+                return {
+                    type: "unavailable",
+                    action: current,
+                    reason: "status"
+                };
+            }
+            // Reclaiming an expired lease rotates the action token in the same write
+            // that increments the attempt. The SQL predicate is the authority for
+            // both lease ownership and durable stop intent: a controller-side check
+            // alone would leave a cross-process window where shutdown and reclaim
+            // could race. Interrupts bypass the stop predicate because they are the
+            // cleanup operation; spawn/message/follow-up actions never do.
+            const update = this.db
+                .prepare(`update orchestrator_actions
+           set status = 'claimed', claimed_by_bridge_grant_id = ?, claim_owner_identity = ?,
+               claim_attempt = claim_attempt + 1, claimed_at = ?, claim_lease_expires_at = ?,
+               action_token_hash = ?, updated_at = ?
+           where action_id = ?
+             and (
+               status = 'pending'
+               or (
+                 status = 'claimed'
+                 and claim_lease_expires_at is not null
+                 and claim_lease_expires_at <= ?
+               )
+             )
+             and (
+               operation = 'interrupt_agent'
+               or (
+                 operation in ('spawn_agent', 'send_message', 'followup_task')
+                 and exists (
+                   select 1 from runs
+                   where runs.run_id = orchestrator_actions.run_id
+                     and runs.status not in ('stopping', 'stopped')
+                 )
+                 and exists (
+                   select 1 from agents
+                   where agents.agent_id = orchestrator_actions.agent_id
+                     and agents.status not in ('stopping', 'stopped')
+                 )
+               )
+             )`)
+                .run(grant.bridge_grant_id, grant.owner_task_identity ?? grant.owner_task_path, input.claimedAt, input.leaseExpiresAt, input.actionTokenHash, input.claimedAt, input.actionId, input.claimedAt);
+            if (update.changes !== 1) {
+                const latest = this.getOrchestratorAction(input.actionId);
+                if (latest?.status === "claimed" && latest.claim_lease_expires_at) {
+                    const remaining = Date.parse(latest.claim_lease_expires_at) - Date.parse(input.claimedAt);
+                    if (remaining > 0) {
+                        return {
+                            type: "already_claimed",
+                            action: latest,
+                            retryAfterMs: remaining
+                        };
+                    }
+                }
+                const latestRun = latest ? this.getRun(latest.run_id) : null;
+                const latestAgent = latest ? this.getAgent(latest.agent_id) : null;
+                const blockedByStopIntent = Boolean(latest &&
+                    (latest.status === "pending" || latest.status === "claimed") &&
+                    latest.operation !== "interrupt_agent" &&
+                    (latestRun?.status === "stopping" ||
+                        latestRun?.status === "stopped" ||
+                        latestAgent?.status === "stopping" ||
+                        latestAgent?.status === "stopped"));
+                return {
+                    type: "unavailable",
+                    action: latest,
+                    reason: blockedByStopIntent ? "stop_intent" : "status"
+                };
+            }
+            return { type: "claimed", action: this.getOrchestratorAction(input.actionId) };
+        });
+    }
+    completeOrchestratorAction(input) {
+        const completedAt = input.completedAt ?? nowIso();
+        // Token validation and the claimed -> terminal transition must be one
+        // atomic write. Otherwise an expired claim could be reclaimed (rotating
+        // its token) between a controller-side read and this update, allowing the
+        // previous owner to acknowledge an action it no longer owns.
+        const update = this.db
+            .prepare(`update orchestrator_actions
+         set status = ?, result_json = ?, error_json = ?, completed_at = ?, updated_at = ?
+         where action_id = ? and status = 'claimed' and action_token_hash = ?`)
+            .run(input.status, input.resultJson ? JSON.stringify(input.resultJson) : null, input.errorJson ? JSON.stringify(input.errorJson) : null, completedAt, completedAt, input.actionId, input.actionTokenHash);
+        const action = this.getOrchestratorAction(input.actionId);
+        if (!action) {
+            throw new Error(`Orchestrator action not found after completion: ${input.actionId}`);
+        }
+        return { action, changed: update.changes === 1 };
+    }
+    cancelUnclaimedOrchestratorAction(input) {
+        const cancelledAt = input.cancelledAt ?? nowIso();
+        // The claim and cancellation predicates compete in SQLite, so a root that
+        // has already claimed (or is claiming) any native action always wins over
+        // a cancellation that can no longer prove the operation did not execute.
+        const update = this.db
+            .prepare(`update orchestrator_actions
+         set status = 'cancelled', error_json = ?, completed_at = ?, updated_at = ?
+         where action_id = ? and status = 'pending' and claim_attempt = 0
+           and claimed_by_bridge_grant_id is null and action_token_hash is null`)
+            .run(JSON.stringify(input.errorJson), cancelledAt, cancelledAt, input.actionId);
+        const action = this.getOrchestratorAction(input.actionId);
+        if (!action) {
+            throw new Error(`Orchestrator action not found after cancellation: ${input.actionId}`);
+        }
+        return { action, changed: update.changes === 1 };
+    }
+    getCodexSubagentExternalState(agentId) {
+        const row = this.db
+            .prepare("select * from codex_subagent_external_states where agent_id = ?")
+            .get(agentId);
+        return row ?? null;
+    }
+    upsertCodexSubagentExternalState(input) {
+        this.db
+            .prepare(`insert into codex_subagent_external_states (
+          agent_id, native_agent_id, native_task_name, native_task_path, native_status,
+          latest_message, observed_at, missing_since, missing_observation_count, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(agent_id) do update set
+          native_agent_id = excluded.native_agent_id,
+          native_task_name = excluded.native_task_name,
+          native_task_path = excluded.native_task_path,
+          native_status = excluded.native_status,
+          latest_message = excluded.latest_message,
+          observed_at = excluded.observed_at,
+          missing_since = excluded.missing_since,
+          missing_observation_count = excluded.missing_observation_count,
+          updated_at = excluded.updated_at`)
+            .run(input.agentId, input.nativeAgentId ?? null, input.nativeTaskName ?? null, input.nativeTaskPath ?? null, input.nativeStatus, input.latestMessage ?? null, input.observedAt, input.missingSince ?? null, input.missingObservationCount, input.observedAt);
+    }
     createEvent(input) {
         const event = {
-            event_id: newId("event"),
+            event_id: input.eventId ?? newId("event"),
             run_id: input.runId ?? null,
             agent_id: input.agentId ?? null,
             type: input.type,
             payload: input.payload ?? {},
             created_at: nowIso()
         };
-        this.db
-            .prepare("insert into events (event_id, run_id, agent_id, type, payload_json, created_at) values (?, ?, ?, ?, ?, ?)")
-            .run(event.event_id, event.run_id, event.agent_id, event.type, JSON.stringify(event.payload), event.created_at);
-        return event;
+        const insert = () => {
+            this.db
+                .prepare("insert into events (event_id, run_id, agent_id, type, payload_json, created_at) values (?, ?, ?, ?, ?, ?)")
+                .run(event.event_id, event.run_id, event.agent_id, event.type, JSON.stringify(event.payload), event.created_at);
+        };
+        try {
+            insert();
+            return event;
+        }
+        catch (error) {
+            if (!input.eventId) {
+                throw error;
+            }
+            const row = this.db
+                .prepare("select * from events where event_id = ?")
+                .get(input.eventId);
+            const existing = row ? this.eventFromRow(row) : null;
+            if (!existing ||
+                existing.run_id !== event.run_id ||
+                existing.agent_id !== event.agent_id ||
+                existing.type !== event.type ||
+                JSON.stringify(existing.payload) !== JSON.stringify(event.payload)) {
+                throw error;
+            }
+            // Deterministic controller events use their primary key as a durable
+            // idempotency boundary. Returning the exact existing row also lets the
+            // subscription delivery claim suppress a concurrent/retried wakeup.
+            return existing;
+        }
     }
     listEvents(input = {}) {
         const clauses = [];
@@ -213,6 +1418,12 @@ export class SqliteStore {
             .prepare(`select * from events ${where} order by created_at desc limit ?`)
             .all(...values);
         return rows.map((row) => this.eventFromRow(row));
+    }
+    getEvent(eventId) {
+        const row = this.db
+            .prepare("select * from events where event_id = ?")
+            .get(eventId);
+        return row ? this.eventFromRow(row) : null;
     }
     createSubscription(input) {
         const now = nowIso();
@@ -250,6 +1461,176 @@ export class SqliteStore {
             .prepare(`select * from subscriptions ${where} order by created_at asc`)
             .all(...values);
         return rows.map((row) => this.subscriptionFromRow(row));
+    }
+    /**
+     * Claim one logical event/subscriber delivery across every matching
+     * subscription row and controller process. The durable attempt ordinal is
+     * also the idempotency identity for the physical adapter invocation. Only a
+     * stale pre-invocation claim is reclaimable; `beginSubscriptionDeliveryAttempt`
+     * changes it to a non-stealable phase before external I/O. Observed adapter
+     * failures explicitly release that phase for a safe retry.
+     */
+    claimSubscriptionDelivery(input) {
+        return this.immediateTransaction(() => {
+            const now = nowIso();
+            this.db
+                .prepare(`insert into subscription_deliveries (
+             event_id, subscriber_agent_id, status, claim_attempt,
+             claim_owner_id, claimed_at, last_error_json, delivered_at,
+             created_at, updated_at
+           ) values (?, ?, 'pending', 0, null, null, null, null, ?, ?)
+           on conflict(event_id, subscriber_agent_id) do nothing`)
+                .run(input.eventId, input.subscriberAgentId, now, now);
+            const stalePreparedClaimBefore = new Date(Date.now() - (input.claimTtlMs ?? 1_000)).toISOString();
+            const claim = this.db
+                .prepare(`update subscription_deliveries
+           set status = 'claimed', claim_attempt = claim_attempt + 1,
+               claim_owner_id = ?, claimed_at = ?, updated_at = ?
+           where event_id = ? and subscriber_agent_id = ?
+             and (
+               status = 'pending'
+               or (
+                 status = 'claimed'
+                 and (claimed_at is null or claimed_at < ?)
+               )
+             )`)
+                .run(input.claimOwnerId, now, now, input.eventId, input.subscriberAgentId, stalePreparedClaimBefore);
+            return {
+                claimed: claim.changes === 1,
+                delivery: this.requireSubscriptionDelivery(input.eventId, input.subscriberAgentId)
+            };
+        });
+    }
+    /**
+     * Atomically cross the adapter-call boundary for a claimed delivery. A
+     * stale prepared claim may be reclaimed, but an `invoking` delivery is never
+     * stolen because its external acceptance outcome is already uncertain.
+     */
+    beginSubscriptionDeliveryAttempt(input) {
+        return this.immediateTransaction(() => {
+            const delivery = this.requireSubscriptionDelivery(input.eventId, input.subscriberAgentId);
+            const agent = this.getAgent(input.subscriberAgentId);
+            if (!agent) {
+                throw new Error(`Subscription subscriber not found: ${input.subscriberAgentId}`);
+            }
+            if (delivery.status !== "claimed" ||
+                delivery.claim_owner_id !== input.claimOwnerId ||
+                delivery.claim_attempt !== input.claimAttempt) {
+                return { type: "claim_lost", began: false, agent };
+            }
+            const accepted = this.advanceAgentWorkGenerationForAcceptedWork(input.subscriberAgentId, input.acceptanceKey, {
+                claimOwnerId: input.claimOwnerId,
+                leaseExpiresAt: input.acceptanceLeaseExpiresAt,
+                deliveryEventId: input.eventId,
+                deliveryClaimAttempt: input.claimAttempt,
+                projectStatus: "running",
+                failureReason: null
+            });
+            if (accepted.type === "stop_intent") {
+                // Stop won before this delivery crossed the durable invocation
+                // boundary. Close the logical claim so another controller cannot
+                // repeatedly reclaim it and attempt physical I/O during cleanup.
+                this.db
+                    .prepare(`update subscription_deliveries
+             set status = 'failed', claim_owner_id = null, claimed_at = null,
+                 last_error_json = ?, updated_at = ?
+             where event_id = ? and subscriber_agent_id = ? and status = 'claimed'
+               and claim_owner_id = ? and claim_attempt = ?`)
+                    .run(JSON.stringify({ reason: "durable_stop_intent" }), nowIso(), input.eventId, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+                return { type: "stop_intent", began: false, agent: accepted.agent };
+            }
+            if (accepted.type === "already_accepted") {
+                // This key may represent I/O performed by a process that died before
+                // updating the delivery row. Close it as ambiguity; reclaiming it as a
+                // fresh attempt would duplicate possibly accepted notification work.
+                this.db
+                    .prepare(`update subscription_deliveries
+             set status = 'ambiguous', claim_owner_id = null, claimed_at = null,
+                 last_error_json = ?, updated_at = ?
+             where event_id = ? and subscriber_agent_id = ? and status = 'claimed'
+               and claim_owner_id = ? and claim_attempt = ?`)
+                    .run(JSON.stringify({
+                    reason: "delivery_acceptance_already_recorded",
+                    acceptance_key: input.acceptanceKey
+                }), nowIso(), input.eventId, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+                return { type: "already_accepted", began: false, agent: accepted.agent };
+            }
+            const invocation = this.db
+                .prepare(`update subscription_deliveries
+           set status = 'invoking', updated_at = ?
+           where event_id = ? and subscriber_agent_id = ? and status = 'claimed'
+             and claim_owner_id = ? and claim_attempt = ?`)
+                .run(nowIso(), input.eventId, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+            if (invocation.changes !== 1) {
+                throw new Error(`Subscription delivery claim changed before invocation: ${input.eventId}:${input.subscriberAgentId}`);
+            }
+            return { type: "began", began: true, agent: accepted.agent };
+        });
+    }
+    releaseSubscriptionDelivery(input) {
+        const releasedAt = nowIso();
+        this.db
+            .prepare(`update subscription_deliveries
+         set status = 'pending', claim_owner_id = null, claimed_at = null,
+             last_error_json = ?, updated_at = ?
+         where event_id = ? and subscriber_agent_id = ?
+           and status in ('claimed', 'invoking')
+           and claim_owner_id = ? and claim_attempt = ?`)
+            .run(JSON.stringify(input.error), releasedAt, input.eventId, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+        return this.requireSubscriptionDelivery(input.eventId, input.subscriberAgentId);
+    }
+    failSubscriptionDelivery(input) {
+        const failedAt = nowIso();
+        this.db
+            .prepare(`update subscription_deliveries
+         set status = 'failed', claim_owner_id = null, claimed_at = null,
+             last_error_json = ?, updated_at = ?
+         where event_id = ? and subscriber_agent_id = ? and status = 'claimed'
+           and claim_owner_id = ? and claim_attempt = ?`)
+            .run(JSON.stringify(input.error), failedAt, input.eventId, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+        return this.requireSubscriptionDelivery(input.eventId, input.subscriberAgentId);
+    }
+    completeSubscriptionDelivery(input) {
+        return this.immediateTransaction(() => {
+            const deliveredAt = nowIso();
+            const completion = this.db
+                .prepare(`update subscription_deliveries
+           set status = 'delivered', claim_owner_id = null, claimed_at = null,
+               last_error_json = null, delivered_at = ?, updated_at = ?
+           where event_id = ? and subscriber_agent_id = ? and status = 'invoking'
+             and claim_owner_id = ? and claim_attempt = ?`)
+                .run(deliveredAt, deliveredAt, input.event.event_id, input.subscriberAgentId, input.claimOwnerId, input.claimAttempt);
+            if (completion.changes === 1) {
+                // Update every row matching the same logical event/subscriber predicate,
+                // including duplicates inserted by another controller during the send.
+                this.db
+                    .prepare(`update subscriptions
+             set last_delivered_event_id = ?, delivery_claim_event_id = null,
+                 delivery_claimed_at = null, updated_at = ?
+             where subscriber_agent_id = ? and event_type = ?
+               and (run_id is null or run_id is ?)
+               and (source_agent_id is null or source_agent_id is ?)`)
+                    .run(input.event.event_id, deliveredAt, input.subscriberAgentId, input.event.type, input.event.run_id, input.event.agent_id);
+            }
+            return {
+                completed: completion.changes === 1,
+                delivery: this.requireSubscriptionDelivery(input.event.event_id, input.subscriberAgentId)
+            };
+        });
+    }
+    getSubscriptionDelivery(eventId, subscriberAgentId) {
+        const row = this.db
+            .prepare(`select * from subscription_deliveries
+         where event_id = ? and subscriber_agent_id = ?`)
+            .get(eventId, subscriberAgentId);
+        return row ? this.subscriptionDeliveryFromRow(row) : null;
+    }
+    requireSubscriptionDelivery(eventId, subscriberAgentId) {
+        const delivery = this.getSubscriptionDelivery(eventId, subscriberAgentId);
+        if (!delivery) {
+            throw new Error(`Subscription delivery not found: ${eventId}:${subscriberAgentId}`);
+        }
+        return delivery;
     }
     updateSubscriptionDelivery(subscriptionId, eventId) {
         this.db
@@ -493,6 +1874,8 @@ export class SqliteStore {
             flow_instance_id: newId("flowinst"),
             flow_record_id: input.flowRecordId,
             run_id: input.runId,
+            orchestrator_agent_id: input.orchestratorAgentId ?? null,
+            originating_bridge_grant_id: input.originatingBridgeGrantId ?? null,
             status: "active",
             current_step_id: input.currentStepId ?? null,
             created_at: now,
@@ -500,9 +1883,10 @@ export class SqliteStore {
         };
         this.db
             .prepare(`insert into flow_instances (
-          flow_instance_id, flow_record_id, run_id, status, current_step_id, created_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?)`)
-            .run(instance.flow_instance_id, instance.flow_record_id, instance.run_id, instance.status, instance.current_step_id, instance.created_at, instance.updated_at);
+          flow_instance_id, flow_record_id, run_id, orchestrator_agent_id,
+          originating_bridge_grant_id, status, current_step_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(instance.flow_instance_id, instance.flow_record_id, instance.run_id, instance.orchestrator_agent_id, instance.originating_bridge_grant_id, instance.status, instance.current_step_id, instance.created_at, instance.updated_at);
         return instance;
     }
     getFlowInstance(flowInstanceId) {
@@ -735,11 +2119,23 @@ export class SqliteStore {
         const flowStepTransitions = inCondition("from_step_instance_id", flowStepIds);
         const flowStepBindings = inCondition("produced_by_step_instance_id", flowStepIds);
         const purge = this.db.transaction(() => {
+            this.db.prepare("delete from agent_work_acceptances where agent_id = ?").run(agentId);
+            this.db
+                .prepare(`delete from subscription_deliveries
+           where subscriber_agent_id = ?
+              or event_id in (select event_id from events where agent_id = ?)`)
+                .run(agentId, agentId);
+            this.db
+                .prepare("delete from orchestrator_actions where agent_id = ? or orchestrator_agent_id = ?")
+                .run(agentId, agentId);
+            this.db.prepare("delete from bridge_grants where orchestrator_agent_id = ?").run(agentId);
+            this.db.prepare("delete from codex_subagent_external_states where agent_id = ?").run(agentId);
             this.db.prepare(`delete from flow_step_reports where ${flowStepReports.sql}`).run(...flowStepReports.values);
             this.db.prepare(`delete from flow_transitions where ${flowStepTransitions.sql}`).run(...flowStepTransitions.values);
             this.db
                 .prepare(`delete from flow_artifact_bindings where ${flowStepBindings.sql}`)
                 .run(...flowStepBindings.values);
+            this.db.prepare("delete from agent_start_attempts where agent_id = ?").run(agentId);
             this.db.prepare("delete from flow_step_instances where agent_id = ?").run(agentId);
             this.db
                 .prepare("delete from subscriptions where source_agent_id = ? or subscriber_agent_id = ?")
@@ -774,6 +2170,7 @@ export class SqliteStore {
         const sourceLinks = inCondition("source_agent_id", agentIds);
         const targetLinks = inCondition("target_agent_id", agentIds);
         const agentScoped = inCondition("agent_id", agentIds);
+        const deliverySubscribers = inCondition("subscriber_agent_id", agentIds);
         const flowInstanceIds = this.flowInstanceIdsForRun(runId);
         const flowRecordIds = this.flowRecordIdsForRun(runId);
         const flowStepIds = this.flowStepInstanceIdsForRun(runId);
@@ -782,12 +2179,33 @@ export class SqliteStore {
         const flowStepReports = inCondition("step_instance_id", flowStepIds);
         const flowStepTransitions = inCondition("from_step_instance_id", flowStepIds);
         const purge = this.db.transaction(() => {
+            this.db
+                .prepare(`delete from agent_work_acceptances where ${agentScoped.sql}`)
+                .run(...agentScoped.values);
+            this.db
+                .prepare(`delete from subscription_deliveries
+           where ${deliverySubscribers.sql}
+              or event_id in (
+                select event_id from events
+                where run_id = ? or ${agentEvents.sql}
+              )`)
+                .run(...deliverySubscribers.values, runId, ...agentEvents.values);
+            this.db.prepare("delete from orchestrator_actions where run_id = ?").run(runId);
+            this.db
+                .prepare(`delete from agent_start_attempts where ${agentScoped.sql}`)
+                .run(...agentScoped.values);
+            this.db
+                .prepare(`delete from codex_subagent_external_states where ${agentScoped.sql}`)
+                .run(...agentScoped.values);
             this.db.prepare(`delete from flow_step_reports where ${flowStepReports.sql}`).run(...flowStepReports.values);
             this.db.prepare(`delete from flow_transitions where ${flowStepTransitions.sql}`).run(...flowStepTransitions.values);
             this.db.prepare(`delete from flow_artifact_bindings where ${flowInstances.sql}`).run(...flowInstances.values);
             this.db.prepare(`delete from flow_step_instances where ${flowInstances.sql}`).run(...flowInstances.values);
             this.db.prepare("delete from flow_instances where run_id = ?").run(runId);
             this.db.prepare(`delete from flows where ${flowRecords.sql}`).run(...flowRecords.values);
+            // Flow instances hold the immutable causal bridge binding, so grants can
+            // only be deleted after their referencing instances are gone.
+            this.db.prepare("delete from bridge_grants where run_id = ?").run(runId);
             this.db
                 .prepare(`delete from subscriptions where run_id = ? or ${sourceSubs.sql} or ${subscriberSubs.sql}`)
                 .run(runId, ...sourceSubs.values, ...subscriberSubs.values);
@@ -814,6 +2232,7 @@ export class SqliteStore {
         return counts;
     }
     migrate() {
+        const acceptedWorkPhaseWasPresent = this.hasColumn("agent_work_acceptances", "phase");
         this.db.exec(`
       create table if not exists runs (
         run_id text primary key,
@@ -836,11 +2255,29 @@ export class SqliteStore {
         repo_dir text,
         model text,
         backend_handle_json text,
+        work_generation integer not null default 0,
+        work_revision integer not null default 0,
         status text not null,
         failure_reason text,
         unregistered_at text,
         created_at text not null,
         updated_at text not null
+      );
+
+      create table if not exists agent_work_acceptances (
+        acceptance_key text primary key,
+        agent_id text not null references agents(agent_id) on delete cascade,
+        work_generation integer not null,
+        attempt_revision integer not null,
+        phase text not null,
+        completion_revision integer,
+        claim_owner_id text,
+        lease_expires_at text,
+        delivery_event_id text,
+        delivery_claim_attempt integer,
+        created_at text not null,
+        updated_at text not null,
+        completed_at text
       );
 
       create table if not exists events (
@@ -864,6 +2301,20 @@ export class SqliteStore {
         delivery_claimed_at text,
         created_at text not null,
         updated_at text not null
+      );
+
+      create table if not exists subscription_deliveries (
+        event_id text not null references events(event_id) on delete cascade,
+        subscriber_agent_id text not null references agents(agent_id) on delete cascade,
+        status text not null,
+        claim_attempt integer not null default 0,
+        claim_owner_id text,
+        claimed_at text,
+        last_error_json text,
+        delivered_at text,
+        created_at text not null,
+        updated_at text not null,
+        primary key(event_id, subscriber_agent_id)
       );
 
       create table if not exists heartbeats (
@@ -950,6 +2401,8 @@ export class SqliteStore {
         flow_instance_id text primary key,
         flow_record_id text not null references flows(flow_record_id) on delete cascade,
         run_id text not null references runs(run_id) on delete cascade,
+        orchestrator_agent_id text,
+        originating_bridge_grant_id text references bridge_grants(bridge_grant_id) on delete set null,
         status text not null,
         current_step_id text,
         created_at text not null,
@@ -982,6 +2435,24 @@ export class SqliteStore {
         created_at text not null
       );
 
+      create table if not exists agent_start_attempts (
+        start_attempt_id text primary key,
+        agent_id text not null references agents(agent_id) on delete cascade,
+        flow_instance_id text not null references flow_instances(flow_instance_id) on delete cascade,
+        step_instance_id text not null references flow_step_instances(step_instance_id) on delete cascade,
+        generation integer not null,
+        phase text not null,
+        claim_owner_id text not null,
+        lease_expires_at text not null,
+        invocation_started_at text,
+        handle_json text,
+        error_json text,
+        created_at text not null,
+        updated_at text not null,
+        completed_at text,
+        unique(agent_id, step_instance_id, generation)
+      );
+
       create table if not exists flow_transitions (
         flow_transition_id text primary key,
         flow_instance_id text not null references flow_instances(flow_instance_id) on delete cascade,
@@ -1003,18 +2474,119 @@ export class SqliteStore {
         updated_at text not null,
         unique(flow_instance_id, artifact_key)
       );
+
+      create table if not exists bridge_grants (
+        bridge_grant_id text primary key,
+        run_id text not null references runs(run_id) on delete cascade,
+        orchestrator_agent_id text not null references agents(agent_id) on delete cascade,
+        owner_task_identity text,
+        owner_task_path text not null,
+        token_hash text not null unique,
+        created_at text not null,
+        last_used_at text,
+        expires_at text,
+        revoked_at text
+      );
+
+      create table if not exists orchestrator_actions (
+        action_id text primary key,
+        idempotency_key text not null unique,
+        run_id text not null references runs(run_id) on delete cascade,
+        orchestrator_agent_id text not null references agents(agent_id) on delete cascade,
+        agent_id text not null references agents(agent_id) on delete cascade,
+        flow_instance_id text references flow_instances(flow_instance_id) on delete cascade,
+        step_instance_id text references flow_step_instances(step_instance_id) on delete cascade,
+        operation text not null,
+        status text not null,
+        payload_json text not null,
+        result_json text,
+        error_json text,
+        originating_bridge_grant_id text references bridge_grants(bridge_grant_id),
+        claimed_by_bridge_grant_id text references bridge_grants(bridge_grant_id) on delete set null,
+        claim_owner_identity text,
+        claim_attempt integer not null default 0,
+        claimed_at text,
+        claim_lease_expires_at text,
+        action_token_hash text,
+        created_at text not null,
+        updated_at text not null,
+        completed_at text
+      );
+
+      create table if not exists codex_subagent_external_states (
+        agent_id text primary key references agents(agent_id) on delete cascade,
+        native_agent_id text,
+        native_task_name text,
+        native_task_path text,
+        native_status text not null,
+        latest_message text,
+        observed_at text not null,
+        missing_since text,
+        missing_observation_count integer not null default 0,
+        updated_at text not null
+      );
+
+      create table if not exists schema_migrations (
+        migration_id text primary key,
+        applied_at text not null
+      );
     `);
         this.ensureColumn("runs", "parent_run_id", "text");
         this.ensureColumn("runs", "created_by_agent_id", "text");
+        this.ensureColumn("agents", "work_generation", "integer not null default 0");
+        this.ensureColumn("agents", "work_revision", "integer not null default 0");
+        this.ensureColumn("agent_work_acceptances", "attempt_revision", "integer not null default 0");
+        this.ensureColumn("agent_work_acceptances", "phase", "text not null default 'invoking'");
+        this.ensureColumn("agent_work_acceptances", "completion_revision", "integer");
+        this.ensureColumn("agent_work_acceptances", "claim_owner_id", "text");
+        this.ensureColumn("agent_work_acceptances", "lease_expires_at", "text");
+        this.ensureColumn("agent_work_acceptances", "delivery_event_id", "text");
+        this.ensureColumn("agent_work_acceptances", "delivery_claim_attempt", "integer");
+        this.ensureColumn("agent_work_acceptances", "updated_at", "text");
+        this.ensureColumn("agent_work_acceptances", "completed_at", "text");
+        if (!acceptedWorkPhaseWasPresent) {
+            // Pre-revision rows already crossed an adapter boundary, but did not
+            // persist its completion phase. Preserve current `unknown` generations
+            // as ambiguous across restart; all other historical rows are closed so
+            // they cannot masquerade as live invocations after migration.
+            this.db.exec(`
+        update agent_work_acceptances
+        set phase = case
+              when exists (
+                select 1 from agents
+                where agents.agent_id = agent_work_acceptances.agent_id
+                  and agents.work_generation = agent_work_acceptances.work_generation
+                  and agents.status = 'unknown'
+              ) then 'ambiguous'
+              else 'succeeded'
+            end,
+            completion_revision = attempt_revision,
+            updated_at = coalesce(updated_at, created_at),
+            completed_at = coalesce(completed_at, created_at);
+      `);
+        }
+        else {
+            this.db.exec(`
+        update agent_work_acceptances
+        set updated_at = coalesce(updated_at, created_at)
+        where updated_at is null;
+      `);
+        }
         this.ensureColumn("subscriptions", "delivery_claim_event_id", "text");
         this.ensureColumn("subscriptions", "delivery_claimed_at", "text");
+        this.ensureColumn("flow_instances", "orchestrator_agent_id", "text");
+        this.migrateNativeOriginGrantBindings();
         this.db.exec(`
       create index if not exists idx_agents_run on agents(run_id);
+      create index if not exists idx_agent_work_acceptances_agent
+        on agent_work_acceptances(agent_id, work_generation);
       create index if not exists idx_runs_parent on runs(parent_run_id);
       create index if not exists idx_runs_created_by_agent on runs(created_by_agent_id);
       create index if not exists idx_events_run_created on events(run_id, created_at);
       create index if not exists idx_events_agent_created on events(agent_id, created_at);
       create index if not exists idx_subscriptions_source on subscriptions(source_agent_id, event_type);
+      create index if not exists idx_subscription_deliveries_subscriber_status
+        on subscription_deliveries(subscriber_agent_id, status, updated_at);
       create index if not exists idx_goals_agent on goals(agent_id);
       create index if not exists idx_heartbeats_agent on heartbeats(agent_id);
       create index if not exists idx_artifacts_run on artifacts(run_id);
@@ -1026,19 +2598,563 @@ export class SqliteStore {
       create index if not exists idx_agent_tokens_agent on agent_tokens(agent_id);
       create index if not exists idx_flows_id on flows(flow_id, version);
       create index if not exists idx_flow_instances_run on flow_instances(run_id);
+      create index if not exists idx_flow_instances_origin_grant on flow_instances(originating_bridge_grant_id);
       create index if not exists idx_flow_step_instances_flow on flow_step_instances(flow_instance_id, created_at);
       create index if not exists idx_flow_step_instances_agent on flow_step_instances(agent_id);
       create index if not exists idx_flow_step_reports_step on flow_step_reports(step_instance_id);
+      create index if not exists idx_agent_start_attempts_agent_phase on agent_start_attempts(agent_id, phase);
+      create index if not exists idx_agent_start_attempts_step on agent_start_attempts(step_instance_id, generation);
       create index if not exists idx_flow_transitions_flow on flow_transitions(flow_instance_id);
       create index if not exists idx_flow_artifact_bindings_flow on flow_artifact_bindings(flow_instance_id);
+      create index if not exists idx_bridge_grants_run_orchestrator on bridge_grants(run_id, orchestrator_agent_id, created_at);
+      create index if not exists idx_orchestrator_actions_run_status on orchestrator_actions(run_id, status, created_at);
+      create index if not exists idx_orchestrator_actions_agent_status on orchestrator_actions(agent_id, status, created_at);
+      create index if not exists idx_orchestrator_actions_step on orchestrator_actions(step_instance_id);
+      create index if not exists idx_orchestrator_actions_origin_grant on orchestrator_actions(originating_bridge_grant_id);
+      create index if not exists idx_codex_subagent_state_native_agent on codex_subagent_external_states(native_agent_id);
+      create index if not exists idx_codex_subagent_state_task_path on codex_subagent_external_states(native_task_path);
+    `);
+    }
+    /**
+     * Upgrade native flow/action grant provenance as one durable schema unit.
+     *
+     * Older databases added the two origin columns with ALTER TABLE. SQLite
+     * accepts a REFERENCES clause in some ADD COLUMN cases, but it cannot retrofit
+     * the complete constraint/on-delete semantics required here. Presence of a
+     * column therefore says nothing about whether the migration finished. This
+     * named migration rebuilds whichever table lacks the exact fresh-schema FK,
+     * performs conservative chronological backfill, verifies referential
+     * integrity, recreates table-owned indexes/triggers, and writes its durable
+     * marker in the same transaction.
+     */
+    migrateNativeOriginGrantBindings() {
+        if (this.hasSchemaMigration(NATIVE_ORIGIN_GRANT_MIGRATION_ID)) {
+            return;
+        }
+        if (this.db.inTransaction) {
+            throw new Error("Native origin grant migration must start outside an existing transaction.");
+        }
+        const foreignKeysWereEnabled = Number(this.db.pragma("foreign_keys", { simple: true })) === 1;
+        // SQLite only permits changing foreign_keys outside a transaction. The
+        // rebuild itself is still atomic; enforcement is disabled solely on this
+        // connection while the old parent tables temporarily do not exist.
+        if (foreignKeysWereEnabled) {
+            this.db.pragma("foreign_keys = OFF");
+        }
+        try {
+            const migrate = this.db.transaction(() => {
+                // A second process may have completed the migration while this
+                // connection waited for BEGIN IMMEDIATE. Recheck under the write lock.
+                if (this.hasSchemaMigration(NATIVE_ORIGIN_GRANT_MIGRATION_ID)) {
+                    return;
+                }
+                const schemaObjectsToRestore = [];
+                const flowNeedsRebuild = !this.hasColumn("flow_instances", "originating_bridge_grant_id") ||
+                    !this.hasExactForeignKey("flow_instances", "originating_bridge_grant_id", "bridge_grants", "bridge_grant_id", "SET NULL", "NO ACTION", true);
+                const actionNeedsRebuild = !this.hasColumn("orchestrator_actions", "originating_bridge_grant_id") ||
+                    !this.hasExactForeignKey("orchestrator_actions", "originating_bridge_grant_id", "bridge_grants", "bridge_grant_id", "NO ACTION", "NO ACTION", true);
+                if (flowNeedsRebuild) {
+                    schemaObjectsToRestore.push(...this.tableOwnedSchemaObjects("flow_instances"));
+                    this.rebuildFlowInstancesForOriginGrant();
+                }
+                if (actionNeedsRebuild) {
+                    schemaObjectsToRestore.push(...this.tableOwnedSchemaObjects("orchestrator_actions"));
+                    this.rebuildOrchestratorActionsForOriginGrant();
+                }
+                this.backfillNativeOriginGrantBindings();
+                // Rebuild drops table-owned indexes and triggers. Recreate their exact
+                // SQL only after backfill so legacy business triggers cannot observe or
+                // interfere with intermediate provenance repair.
+                for (const sql of schemaObjectsToRestore) {
+                    this.db.exec(sql);
+                }
+                if (!this.hasExactForeignKey("flow_instances", "originating_bridge_grant_id", "bridge_grants", "bridge_grant_id", "SET NULL", "NO ACTION", true) ||
+                    !this.hasExactForeignKey("orchestrator_actions", "originating_bridge_grant_id", "bridge_grants", "bridge_grant_id", "NO ACTION", "NO ACTION", true)) {
+                    throw new Error("Native origin grant migration did not install the required foreign keys.");
+                }
+                const violations = [
+                    ...this.db
+                        .prepare("pragma foreign_key_check(flow_instances)")
+                        .all(),
+                    ...this.db
+                        .prepare("pragma foreign_key_check(orchestrator_actions)")
+                        .all()
+                ];
+                if (violations.length > 0) {
+                    throw new Error(`Native origin grant migration left foreign key violations: ${JSON.stringify(violations.slice(0, 5))}`);
+                }
+                this.db
+                    .prepare("insert into schema_migrations (migration_id, applied_at) values (?, ?)")
+                    .run(NATIVE_ORIGIN_GRANT_MIGRATION_ID, nowIso());
+            });
+            migrate.immediate();
+        }
+        finally {
+            if (foreignKeysWereEnabled) {
+                this.db.pragma("foreign_keys = ON");
+                if (Number(this.db.pragma("foreign_keys", { simple: true })) !== 1) {
+                    throw new Error("Failed to restore SQLite foreign key enforcement after migration.");
+                }
+            }
+        }
+    }
+    hasSchemaMigration(migrationId) {
+        return Boolean(this.db
+            .prepare("select migration_id from schema_migrations where migration_id = ?")
+            .get(migrationId));
+    }
+    hasExactForeignKey(table, fromColumn, referencedTable, referencedColumn, onDelete, onUpdate, sourceMustBeNullable) {
+        const foreignKeys = this.db
+            .prepare(`pragma foreign_key_list(${table})`)
+            .all();
+        const sourceColumn = this.db.prepare(`pragma table_info(${table})`).all().find((row) => String(row.name) === fromColumn);
+        if (!sourceColumn ||
+            (sourceMustBeNullable && Number(sourceColumn.notnull) !== 0)) {
+            return false;
+        }
+        const sourceForeignKeys = foreignKeys.filter((row) => String(row.from) === fromColumn);
+        const sourceForeignKey = sourceForeignKeys[0];
+        const foreignKeyGroup = sourceForeignKey
+            ? foreignKeys.filter((row) => String(row.id) === String(sourceForeignKey.id))
+            : [];
+        return (sourceForeignKeys.length === 1 &&
+            // PRAGMA foreign_key_list emits one row per column in an FK. Looking
+            // only at rows whose `from` equals the expected source would accept the
+            // first leg of a composite FK such as (origin, run_id). Require the FK
+            // id itself to contain exactly that one source/target column.
+            foreignKeyGroup.length === 1 &&
+            Number(sourceForeignKey.seq) === 0 &&
+            String(sourceForeignKey.table) === referencedTable &&
+            String(sourceForeignKey.to) === referencedColumn &&
+            String(sourceForeignKey.on_delete).toUpperCase() === onDelete &&
+            String(sourceForeignKey.on_update).toUpperCase() === onUpdate);
+    }
+    /** Capture explicit indexes/triggers; implicit UNIQUE indexes rebuild themselves. */
+    tableOwnedSchemaObjects(table) {
+        return this.db
+            .prepare(`select sql from sqlite_master
+           where tbl_name = ? and type in ('index', 'trigger') and sql is not null
+           order by case type when 'index' then 0 else 1 end, name asc`)
+            .all(table).map((row) => String(row.sql));
+    }
+    rebuildFlowInstancesForOriginGrant() {
+        const originExpression = this.hasColumn("flow_instances", "originating_bridge_grant_id")
+            ? "originating_bridge_grant_id"
+            : "null";
+        this.db.exec(`
+      drop table if exists flow_instances__native_origin_v5;
+      create table flow_instances__native_origin_v5 (
+        flow_instance_id text primary key,
+        flow_record_id text not null references flows(flow_record_id) on delete cascade,
+        run_id text not null references runs(run_id) on delete cascade,
+        orchestrator_agent_id text,
+        originating_bridge_grant_id text references bridge_grants(bridge_grant_id) on delete set null,
+        status text not null,
+        current_step_id text,
+        created_at text not null,
+        updated_at text not null
+      );
+      insert into flow_instances__native_origin_v5 (
+        flow_instance_id, flow_record_id, run_id, orchestrator_agent_id,
+        originating_bridge_grant_id, status, current_step_id, created_at, updated_at
+      )
+      select flow_instance_id, flow_record_id, run_id, orchestrator_agent_id,
+             ${originExpression}, status, current_step_id, created_at, updated_at
+      from flow_instances;
+      drop table flow_instances;
+      alter table flow_instances__native_origin_v5 rename to flow_instances;
+    `);
+    }
+    rebuildOrchestratorActionsForOriginGrant() {
+        const originExpression = this.hasColumn("orchestrator_actions", "originating_bridge_grant_id")
+            ? "originating_bridge_grant_id"
+            : "null";
+        this.db.exec(`
+      drop table if exists orchestrator_actions__native_origin_v5;
+      create table orchestrator_actions__native_origin_v5 (
+        action_id text primary key,
+        idempotency_key text not null unique,
+        run_id text not null references runs(run_id) on delete cascade,
+        orchestrator_agent_id text not null references agents(agent_id) on delete cascade,
+        agent_id text not null references agents(agent_id) on delete cascade,
+        flow_instance_id text references flow_instances(flow_instance_id) on delete cascade,
+        step_instance_id text references flow_step_instances(step_instance_id) on delete cascade,
+        operation text not null,
+        status text not null,
+        payload_json text not null,
+        result_json text,
+        error_json text,
+        originating_bridge_grant_id text references bridge_grants(bridge_grant_id),
+        claimed_by_bridge_grant_id text references bridge_grants(bridge_grant_id) on delete set null,
+        claim_owner_identity text,
+        claim_attempt integer not null default 0,
+        claimed_at text,
+        claim_lease_expires_at text,
+        action_token_hash text,
+        created_at text not null,
+        updated_at text not null,
+        completed_at text
+      );
+      insert into orchestrator_actions__native_origin_v5 (
+        action_id, idempotency_key, run_id, orchestrator_agent_id, agent_id,
+        flow_instance_id, step_instance_id, operation, status, payload_json,
+        result_json, error_json, originating_bridge_grant_id,
+        claimed_by_bridge_grant_id, claim_owner_identity, claim_attempt,
+        claimed_at, claim_lease_expires_at, action_token_hash, created_at,
+        updated_at, completed_at
+      )
+      select action_id, idempotency_key, run_id, orchestrator_agent_id, agent_id,
+             flow_instance_id, step_instance_id, operation, status, payload_json,
+             result_json, error_json, ${originExpression},
+             claimed_by_bridge_grant_id, claim_owner_identity, claim_attempt,
+             claimed_at, claim_lease_expires_at, action_token_hash, created_at,
+             updated_at, completed_at
+      from orchestrator_actions;
+      drop table orchestrator_actions;
+      alter table orchestrator_actions__native_origin_v5 rename to orchestrator_actions;
+    `);
+    }
+    /**
+     * Infer ownership only from evidence that existed no later than the causal
+     * row. A deleted original grant followed by a newer sibling grant therefore
+     * remains unbound instead of silently transferring authority.
+     */
+    backfillNativeOriginGrantBindings() {
+        this.db.exec(`
+      -- Preserve whether a null was present in legacy data or was produced by
+      -- rejecting an explicit provenance claim. Once an explicit claim fails,
+      -- another surviving grant must never acquire that row merely because it
+      -- becomes the only chronological candidate after the clear.
+      drop table if exists native_origin_invalid_actions_v5;
+      create table native_origin_invalid_actions_v5 (
+        action_id text primary key
+      );
+      insert into native_origin_invalid_actions_v5 (action_id)
+      select orchestrator_actions.action_id
+      from orchestrator_actions
+      where orchestrator_actions.originating_bridge_grant_id is not null
+        and not exists (
+          select 1 from bridge_grants
+          where bridge_grants.bridge_grant_id = orchestrator_actions.originating_bridge_grant_id
+            and bridge_grants.run_id = orchestrator_actions.run_id
+            and bridge_grants.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+            and (
+              orchestrator_actions.flow_instance_id is null
+              or exists (
+                select 1 from flow_instances
+                where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+                  and flow_instances.run_id = orchestrator_actions.run_id
+                  and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+                  and orchestrator_actions.created_at >= flow_instances.created_at
+                  and bridge_grants.created_at <= flow_instances.created_at
+              )
+            )
+        );
+
+      -- A claimant is provenance, not merely lease bookkeeping. Record an
+      -- invalid non-null claimant before the later cleanup turns it into an
+      -- indistinguishable null; otherwise the unique surviving grant could be
+      -- inferred as both the action origin and its parent flow origin.
+      insert or ignore into native_origin_invalid_actions_v5 (action_id)
+      select orchestrator_actions.action_id
+      from orchestrator_actions
+      where orchestrator_actions.claimed_by_bridge_grant_id is not null
+        and not exists (
+          select 1 from bridge_grants
+          where bridge_grants.bridge_grant_id = orchestrator_actions.claimed_by_bridge_grant_id
+            and bridge_grants.run_id = orchestrator_actions.run_id
+            and bridge_grants.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+            and (
+              orchestrator_actions.flow_instance_id is null
+              or exists (
+                select 1 from flow_instances
+                where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+                  and flow_instances.run_id = orchestrator_actions.run_id
+                  and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+                  and orchestrator_actions.created_at >= flow_instances.created_at
+                  and bridge_grants.created_at <= flow_instances.created_at
+              )
+            )
+        );
+
+      -- ON DELETE SET NULL may already have erased the claimant id before this
+      -- migration runs. These fields are written atomically by a successful
+      -- claim and are never populated on a fresh pending action. Any one of
+      -- them, or a post-claim status, therefore proves prior execution without
+      -- guessing that every legacy pending/null row was claimed. Cancelled is
+      -- intentionally not status evidence: cancellation is restricted to
+      -- actions whose claim_attempt is zero and whose token/claimant are null.
+      insert or ignore into native_origin_invalid_actions_v5 (action_id)
+      select orchestrator_actions.action_id
+      from orchestrator_actions
+      where orchestrator_actions.claimed_by_bridge_grant_id is null
+        and (
+          orchestrator_actions.claim_attempt > 0
+          or orchestrator_actions.claim_owner_identity is not null
+          or orchestrator_actions.claimed_at is not null
+          or orchestrator_actions.claim_lease_expires_at is not null
+          or orchestrator_actions.action_token_hash is not null
+          or orchestrator_actions.status in ('claimed', 'succeeded', 'failed')
+        );
+
+      -- Two different surviving grants in the explicit origin and claimant
+      -- fields are contradictory provenance. Neither side may win inference.
+      insert or ignore into native_origin_invalid_actions_v5 (action_id)
+      select orchestrator_actions.action_id
+      from orchestrator_actions
+      where orchestrator_actions.originating_bridge_grant_id is not null
+        and orchestrator_actions.claimed_by_bridge_grant_id is not null
+        and orchestrator_actions.originating_bridge_grant_id <>
+            orchestrator_actions.claimed_by_bridge_grant_id;
+
+      drop table if exists native_origin_invalid_flows_v5;
+      create table native_origin_invalid_flows_v5 (
+        flow_instance_id text primary key
+      );
+      insert into native_origin_invalid_flows_v5 (flow_instance_id)
+      select flow_instances.flow_instance_id
+      from flow_instances
+      where flow_instances.originating_bridge_grant_id is not null
+        and not exists (
+          select 1 from bridge_grants
+          where bridge_grants.bridge_grant_id = flow_instances.originating_bridge_grant_id
+            and bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+        );
+
+      -- Child provenance is part of the flow's causal evidence. Once any
+      -- attached action is tainted, a parent that was null (or even carried a
+      -- superficially valid grant) cannot be reconstructed safely from other
+      -- actions or from the remaining grant topology.
+      insert or ignore into native_origin_invalid_flows_v5 (flow_instance_id)
+      select distinct flow_instances.flow_instance_id
+      from flow_instances
+      join orchestrator_actions
+        on orchestrator_actions.flow_instance_id = flow_instances.flow_instance_id
+      join native_origin_invalid_actions_v5
+        on native_origin_invalid_actions_v5.action_id = orchestrator_actions.action_id;
+
+      update orchestrator_actions
+      set originating_bridge_grant_id = null
+      where action_id in (
+        select action_id from native_origin_invalid_actions_v5
+      );
+
+      update orchestrator_actions
+      set claimed_by_bridge_grant_id = null
+      where claimed_by_bridge_grant_id is not null
+        and not exists (
+          select 1 from bridge_grants
+          where bridge_grants.bridge_grant_id = orchestrator_actions.claimed_by_bridge_grant_id
+            and bridge_grants.run_id = orchestrator_actions.run_id
+            and bridge_grants.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+            and (
+              orchestrator_actions.flow_instance_id is null
+              or exists (
+                select 1 from flow_instances
+                where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+                  and flow_instances.run_id = orchestrator_actions.run_id
+                  and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+                  and orchestrator_actions.created_at >= flow_instances.created_at
+                  and bridge_grants.created_at <= flow_instances.created_at
+              )
+            )
+        );
+
+      update orchestrator_actions
+      set originating_bridge_grant_id = claimed_by_bridge_grant_id
+      where originating_bridge_grant_id is null
+        and claimed_by_bridge_grant_id is not null
+        and action_id not in (
+          select action_id from native_origin_invalid_actions_v5
+        );
+
+      update orchestrator_actions
+      set originating_bridge_grant_id = (
+        select min(bridge_grants.bridge_grant_id)
+        from bridge_grants
+        where bridge_grants.run_id = orchestrator_actions.run_id
+          and bridge_grants.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+          and bridge_grants.created_at <= orchestrator_actions.created_at
+          and (
+            orchestrator_actions.flow_instance_id is null
+            or exists (
+              select 1 from flow_instances
+              where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+                and flow_instances.run_id = orchestrator_actions.run_id
+                and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+                and orchestrator_actions.created_at >= flow_instances.created_at
+                and bridge_grants.created_at <= flow_instances.created_at
+            )
+          )
+      )
+      where originating_bridge_grant_id is null
+        and action_id not in (
+          select action_id from native_origin_invalid_actions_v5
+        )
+        and 1 = (
+          select count(*)
+          from bridge_grants
+          where bridge_grants.run_id = orchestrator_actions.run_id
+            and bridge_grants.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+            and (
+              orchestrator_actions.flow_instance_id is null
+              or exists (
+                select 1 from flow_instances
+                where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+                  and flow_instances.run_id = orchestrator_actions.run_id
+                  and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+                  and orchestrator_actions.created_at >= flow_instances.created_at
+                  and bridge_grants.created_at <= flow_instances.created_at
+              )
+            )
+        );
+
+      update flow_instances
+      set originating_bridge_grant_id = null
+      where flow_instance_id in (
+        select flow_instance_id from native_origin_invalid_flows_v5
+      );
+
+      update flow_instances
+      set originating_bridge_grant_id = (
+        select min(orchestrator_actions.originating_bridge_grant_id)
+        from orchestrator_actions
+        join bridge_grants
+          on bridge_grants.bridge_grant_id = orchestrator_actions.originating_bridge_grant_id
+        where orchestrator_actions.flow_instance_id = flow_instances.flow_instance_id
+          and orchestrator_actions.created_at >= flow_instances.created_at
+          and bridge_grants.run_id = flow_instances.run_id
+          and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+          and bridge_grants.created_at <= flow_instances.created_at
+      )
+      where originating_bridge_grant_id is null
+        and flow_instance_id not in (
+          select flow_instance_id from native_origin_invalid_flows_v5
+        )
+        and 1 = (
+          select count(distinct orchestrator_actions.originating_bridge_grant_id)
+          from orchestrator_actions
+          join bridge_grants
+            on bridge_grants.bridge_grant_id = orchestrator_actions.originating_bridge_grant_id
+          where orchestrator_actions.flow_instance_id = flow_instances.flow_instance_id
+            and orchestrator_actions.created_at >= flow_instances.created_at
+            and bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+        );
+
+      update flow_instances
+      set originating_bridge_grant_id = (
+        select min(bridge_grants.bridge_grant_id)
+        from bridge_grants
+        where bridge_grants.run_id = flow_instances.run_id
+          and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+          and bridge_grants.created_at <= flow_instances.created_at
+      )
+      where originating_bridge_grant_id is null
+        and flow_instance_id not in (
+          select flow_instance_id from native_origin_invalid_flows_v5
+        )
+        and 0 = (
+          select count(distinct orchestrator_actions.originating_bridge_grant_id)
+          from orchestrator_actions
+          join bridge_grants
+            on bridge_grants.bridge_grant_id = orchestrator_actions.originating_bridge_grant_id
+          where orchestrator_actions.flow_instance_id = flow_instances.flow_instance_id
+            and orchestrator_actions.created_at >= flow_instances.created_at
+            and bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+        )
+        and 1 = (
+          select count(*)
+          from bridge_grants
+          where bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+        );
+
+      -- A valid flow origin is the authoritative causal boundary for its
+      -- actions. A legacy null can inherit that exact grant even when several
+      -- grants are otherwise eligible, but a null produced by rejecting an
+      -- explicit claim remains fail-closed.
+      update orchestrator_actions
+      set originating_bridge_grant_id = (
+        select flow_instances.originating_bridge_grant_id
+        from flow_instances
+        join bridge_grants
+          on bridge_grants.bridge_grant_id = flow_instances.originating_bridge_grant_id
+        where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+          and flow_instances.run_id = orchestrator_actions.run_id
+          and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+          and orchestrator_actions.created_at >= flow_instances.created_at
+          and bridge_grants.run_id = flow_instances.run_id
+          and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+          and bridge_grants.created_at <= flow_instances.created_at
+          and bridge_grants.created_at <= orchestrator_actions.created_at
+      )
+      where flow_instance_id is not null
+        and originating_bridge_grant_id is null
+        and action_id not in (
+          select action_id from native_origin_invalid_actions_v5
+        )
+        and exists (
+          select 1
+          from flow_instances
+          join bridge_grants
+            on bridge_grants.bridge_grant_id = flow_instances.originating_bridge_grant_id
+          where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+            and flow_instances.run_id = orchestrator_actions.run_id
+            and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and orchestrator_actions.created_at >= flow_instances.created_at
+            and bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+        );
+
+      -- Reconciliation never rewrites a conflicting non-null action from one
+      -- grant to another. It clears the mismatch after the null-binding pass,
+      -- so the same migration cannot reinterpret that conflict as permission
+      -- to adopt the flow's grant.
+      update orchestrator_actions
+      set originating_bridge_grant_id = null
+      where flow_instance_id is not null
+        and originating_bridge_grant_id is not null
+        and not exists (
+          select 1 from flow_instances
+          join bridge_grants
+            on bridge_grants.bridge_grant_id = flow_instances.originating_bridge_grant_id
+          where flow_instances.flow_instance_id = orchestrator_actions.flow_instance_id
+            and flow_instances.run_id = orchestrator_actions.run_id
+            and flow_instances.orchestrator_agent_id = orchestrator_actions.orchestrator_agent_id
+            and flow_instances.originating_bridge_grant_id =
+                orchestrator_actions.originating_bridge_grant_id
+            and orchestrator_actions.created_at >= flow_instances.created_at
+            and bridge_grants.run_id = flow_instances.run_id
+            and bridge_grants.orchestrator_agent_id = flow_instances.orchestrator_agent_id
+            and bridge_grants.created_at <= flow_instances.created_at
+            and bridge_grants.created_at <= orchestrator_actions.created_at
+        );
+
+      drop table native_origin_invalid_actions_v5;
+      drop table native_origin_invalid_flows_v5;
     `);
     }
     ensureColumn(table, column, definition) {
-        const rows = this.db.prepare(`pragma table_info(${table})`).all();
-        const exists = rows.some((row) => row.name === column);
-        if (!exists) {
+        if (!this.hasColumn(table, column)) {
             this.db.exec(`alter table ${table} add column ${column} ${definition}`);
         }
+    }
+    hasColumn(table, column) {
+        const rows = this.db.prepare(`pragma table_info(${table})`).all();
+        return rows.some((row) => row.name === column);
     }
     runFromRow(row) {
         return {
@@ -1063,11 +3179,82 @@ export class SqliteStore {
             repo_dir: row.repo_dir === null ? null : String(row.repo_dir),
             model: row.model === null ? null : String(row.model),
             backend_handle: parseJsonObject(row.backend_handle_json),
+            work_generation: Number(row.work_generation ?? 0),
+            work_revision: Number(row.work_revision ?? 0),
             status: String(row.status),
             failure_reason: row.failure_reason === null ? null : String(row.failure_reason),
             unregistered_at: row.unregistered_at === null ? null : String(row.unregistered_at),
             created_at: String(row.created_at),
             updated_at: String(row.updated_at)
+        };
+    }
+    agentStartAttemptFromRow(row) {
+        return {
+            start_attempt_id: String(row.start_attempt_id),
+            agent_id: String(row.agent_id),
+            flow_instance_id: String(row.flow_instance_id),
+            step_instance_id: String(row.step_instance_id),
+            generation: Number(row.generation),
+            phase: String(row.phase),
+            claim_owner_id: String(row.claim_owner_id),
+            lease_expires_at: String(row.lease_expires_at),
+            invocation_started_at: row.invocation_started_at === null ? null : String(row.invocation_started_at),
+            handle_json: parseJsonObject(row.handle_json),
+            error_json: parseJsonObject(row.error_json),
+            created_at: String(row.created_at),
+            updated_at: String(row.updated_at),
+            completed_at: row.completed_at === null ? null : String(row.completed_at)
+        };
+    }
+    bridgeGrantFromRow(row) {
+        const bridgeGrantId = String(row.bridge_grant_id);
+        if (!isBridgeGrantId(bridgeGrantId)) {
+            throw new Error("SQLite contains an invalid bridge grant id.");
+        }
+        return {
+            bridge_grant_id: bridgeGrantId,
+            run_id: String(row.run_id),
+            orchestrator_agent_id: String(row.orchestrator_agent_id),
+            owner_task_identity: row.owner_task_identity === null ? null : String(row.owner_task_identity),
+            owner_task_path: String(row.owner_task_path),
+            token_hash: String(row.token_hash),
+            created_at: String(row.created_at),
+            last_used_at: row.last_used_at === null ? null : String(row.last_used_at),
+            expires_at: row.expires_at === null ? null : String(row.expires_at),
+            revoked_at: row.revoked_at === null ? null : String(row.revoked_at)
+        };
+    }
+    orchestratorActionFromRow(row) {
+        const actionId = String(row.action_id);
+        if (!isOrchestratorActionId(actionId)) {
+            throw new Error("SQLite contains an invalid orchestrator action id.");
+        }
+        return {
+            action_id: actionId,
+            idempotency_key: String(row.idempotency_key),
+            run_id: String(row.run_id),
+            orchestrator_agent_id: String(row.orchestrator_agent_id),
+            agent_id: String(row.agent_id),
+            flow_instance_id: row.flow_instance_id === null ? null : String(row.flow_instance_id),
+            step_instance_id: row.step_instance_id === null ? null : String(row.step_instance_id),
+            operation: String(row.operation),
+            status: String(row.status),
+            payload_json: parseJsonObject(row.payload_json) ?? {},
+            result_json: parseJsonObject(row.result_json),
+            error_json: parseJsonObject(row.error_json),
+            originating_bridge_grant_id: row.originating_bridge_grant_id === null ||
+                row.originating_bridge_grant_id === undefined
+                ? null
+                : String(row.originating_bridge_grant_id),
+            claimed_by_bridge_grant_id: row.claimed_by_bridge_grant_id === null ? null : String(row.claimed_by_bridge_grant_id),
+            claim_owner_identity: row.claim_owner_identity === null ? null : String(row.claim_owner_identity),
+            claim_attempt: Number(row.claim_attempt),
+            claimed_at: row.claimed_at === null ? null : String(row.claimed_at),
+            claim_lease_expires_at: row.claim_lease_expires_at === null ? null : String(row.claim_lease_expires_at),
+            action_token_hash: row.action_token_hash === null ? null : String(row.action_token_hash),
+            created_at: String(row.created_at),
+            updated_at: String(row.updated_at),
+            completed_at: row.completed_at === null ? null : String(row.completed_at)
         };
     }
     eventFromRow(row) {
@@ -1089,6 +3276,20 @@ export class SqliteStore {
             event_type: String(row.event_type),
             enabled: booleanFromSqlite(row.enabled),
             last_delivered_event_id: row.last_delivered_event_id === null ? null : String(row.last_delivered_event_id),
+            created_at: String(row.created_at),
+            updated_at: String(row.updated_at)
+        };
+    }
+    subscriptionDeliveryFromRow(row) {
+        return {
+            event_id: String(row.event_id),
+            subscriber_agent_id: String(row.subscriber_agent_id),
+            status: String(row.status),
+            claim_attempt: Number(row.claim_attempt),
+            claim_owner_id: row.claim_owner_id === null ? null : String(row.claim_owner_id),
+            claimed_at: row.claimed_at === null ? null : String(row.claimed_at),
+            last_error: parseJsonObject(row.last_error_json),
+            delivered_at: row.delivered_at === null ? null : String(row.delivered_at),
             created_at: String(row.created_at),
             updated_at: String(row.updated_at)
         };
@@ -1173,6 +3374,13 @@ export class SqliteStore {
             flow_instance_id: String(row.flow_instance_id),
             flow_record_id: String(row.flow_record_id),
             run_id: String(row.run_id),
+            orchestrator_agent_id: row.orchestrator_agent_id === null || row.orchestrator_agent_id === undefined
+                ? null
+                : String(row.orchestrator_agent_id),
+            originating_bridge_grant_id: row.originating_bridge_grant_id === null ||
+                row.originating_bridge_grant_id === undefined
+                ? null
+                : String(row.originating_bridge_grant_id),
             status: String(row.status),
             current_step_id: row.current_step_id === null ? null : String(row.current_step_id),
             created_at: String(row.created_at),
@@ -1236,6 +3444,14 @@ export class SqliteStore {
         const flowStepTransitions = inCondition("from_step_instance_id", flowStepIds);
         const flowStepBindings = inCondition("produced_by_step_instance_id", flowStepIds);
         return {
+            agent_work_acceptances: this.count("select count(*) as count from agent_work_acceptances where agent_id = ?", agentId),
+            subscription_deliveries: this.count(`select count(*) as count from subscription_deliveries
+         where subscriber_agent_id = ?
+            or event_id in (select event_id from events where agent_id = ?)`, agentId, agentId),
+            agent_start_attempts: this.count("select count(*) as count from agent_start_attempts where agent_id = ?", agentId),
+            orchestrator_actions: this.count("select count(*) as count from orchestrator_actions where agent_id = ? or orchestrator_agent_id = ?", agentId, agentId),
+            bridge_grants: this.count("select count(*) as count from bridge_grants where orchestrator_agent_id = ?", agentId),
+            codex_subagent_external_states: this.count("select count(*) as count from codex_subagent_external_states where agent_id = ?", agentId),
             flow_step_reports: this.count(`select count(*) as count from flow_step_reports where ${flowStepReports.sql}`, ...flowStepReports.values),
             flow_transitions: this.count(`select count(*) as count from flow_transitions where ${flowStepTransitions.sql}`, ...flowStepTransitions.values),
             flow_artifact_bindings: this.count(`select count(*) as count from flow_artifact_bindings where ${flowStepBindings.sql}`, ...flowStepBindings.values),
@@ -1260,6 +3476,7 @@ export class SqliteStore {
         const sourceLinks = inCondition("source_agent_id", agentIds);
         const targetLinks = inCondition("target_agent_id", agentIds);
         const agentScoped = inCondition("agent_id", agentIds);
+        const deliverySubscribers = inCondition("subscriber_agent_id", agentIds);
         const flowInstanceIds = this.flowInstanceIdsForRun(runId);
         const flowRecordIds = this.flowRecordIdsForRun(runId);
         const flowStepIds = this.flowStepInstanceIdsForRun(runId);
@@ -1268,6 +3485,17 @@ export class SqliteStore {
         const flowStepReports = inCondition("step_instance_id", flowStepIds);
         const flowStepTransitions = inCondition("from_step_instance_id", flowStepIds);
         return {
+            agent_work_acceptances: this.count(`select count(*) as count from agent_work_acceptances where ${agentScoped.sql}`, ...agentScoped.values),
+            subscription_deliveries: this.count(`select count(*) as count from subscription_deliveries
+         where ${deliverySubscribers.sql}
+            or event_id in (
+              select event_id from events
+              where run_id = ? or ${agentEvents.sql}
+            )`, ...deliverySubscribers.values, runId, ...agentEvents.values),
+            agent_start_attempts: this.count(`select count(*) as count from agent_start_attempts where ${agentScoped.sql}`, ...agentScoped.values),
+            orchestrator_actions: this.count("select count(*) as count from orchestrator_actions where run_id = ?", runId),
+            bridge_grants: this.count("select count(*) as count from bridge_grants where run_id = ?", runId),
+            codex_subagent_external_states: this.count(`select count(*) as count from codex_subagent_external_states where ${agentScoped.sql}`, ...agentScoped.values),
             flows: this.count(`select count(*) as count from flows where ${flowRecords.sql}`, ...flowRecords.values),
             flow_instances: this.count("select count(*) as count from flow_instances where run_id = ?", runId),
             flow_step_instances: this.count(`select count(*) as count from flow_step_instances where ${flowInstances.sql}`, ...flowInstances.values),

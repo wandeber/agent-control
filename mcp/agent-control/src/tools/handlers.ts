@@ -27,7 +27,9 @@ export async function handleTool(
         runTitle: maybeString(input.run_title),
         repoDir: maybeString(input.repo_dir),
         adminKey: maybeString(input.admin_key),
-        agentToken: maybeString(input.agent_token)
+        agentToken: maybeString(input.agent_token),
+        ownerTaskIdentity: maybeString(input.owner_task_identity),
+        ownerTaskPath: maybeString(input.owner_task_path)
       });
     case "flow_get":
       return controller.getFlowSnapshot(String(input.flow_instance_id));
@@ -36,17 +38,51 @@ export async function handleTool(
         flowInstanceId: String(input.flow_instance_id),
         subscriberAgentId: maybeString(input.subscriber_agent_id),
         server: maybeString(input.server),
-        agentToken: maybeString(input.agent_token)
+        agentToken: maybeString(input.agent_token),
+        bridgeToken: maybeString(input.bridge_token)
       });
     case "flow_continue":
       return controller.continueFlow({
         flowInstanceId: String(input.flow_instance_id),
         subscriberAgentId: maybeString(input.subscriber_agent_id),
         server: maybeString(input.server),
-        agentToken: maybeString(input.agent_token)
+        agentToken: maybeString(input.agent_token),
+        bridgeToken: maybeString(input.bridge_token)
+      });
+    case "orchestrator_action_claim":
+      return controller.claimOrchestratorAction({
+        actionId: String(input.action_id),
+        bridgeToken: String(input.bridge_token)
+      });
+    case "orchestrator_action_ack":
+      return controller.acknowledgeOrchestratorAction({
+        actionId: String(input.action_id),
+        actionToken: String(input.action_token),
+        status: String(input.status) as "succeeded" | "failed",
+        result: maybeObject(input.result),
+        error: maybeObject(input.error)
+      });
+    case "agent_external_sync":
+      return controller.syncCodexSubagent({
+        agentId: String(input.agent_id),
+        bridgeToken: String(input.bridge_token),
+        nativeAgentId: maybeString(input.native_agent_id),
+        nativeTaskName: maybeString(input.native_task_name),
+        nativeTaskPath: maybeString(input.native_task_path),
+        nativeStatus: String(input.native_status) as
+          | "pending_init"
+          | "running"
+          | "completed"
+          | "interrupted"
+          | "shutdown"
+          | "errored"
+          | "missing",
+        latestMessage: maybeString(input.latest_message),
+        observedAt: maybeString(input.observed_at),
+        confirmedAbsent: maybeBoolean(input.confirmed_absent)
       });
     case "flow_step_start":
-      return controller.startFlowStep({
+      return await controller.startFlowStep({
         flowInstanceId: String(input.flow_instance_id),
         stepId: String(input.step_id),
         fromStepInstanceId: maybeString(input.from_step_instance_id),
@@ -92,7 +128,7 @@ export async function handleTool(
     case "run_get":
       return controller.getRun(String(input.run_id), { agentToken: maybeString(input.agent_token) });
     case "run_shutdown":
-      return controller.shutdownRun(String(input.run_id));
+      return await controller.shutdownRun(String(input.run_id));
     case "agent_register":
       if (!maybeString(input.admin_key) && !maybeString(input.agent_token)) {
         throw new ControllerError("agent_register requires admin_key or agent_token.", "auth_required");
@@ -144,7 +180,7 @@ export async function handleTool(
       if (input.agent_id) {
         return controller.stopAgent(String(input.agent_id), stopMode(input.mode));
       }
-      return controller.stopAgents({
+      return await controller.stopAgents({
         runId: maybeString(input.run_id),
         mode: stopMode(input.mode)
       });

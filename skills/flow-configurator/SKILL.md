@@ -86,3 +86,24 @@ For `development-flow-v1`, the current configurable role keys are:
 
 Prefer flow discovery over hard-coding this list, because future flows can add
 different variables.
+
+## Opting Into Native Codex Subagents
+
+The bundled development/demo roles keep their current backend defaults. To opt
+one configurable role into the native bridge, set its backend to
+`codex-subagent` and set its model variable to an explicit empty value so the
+worker inherits the root model:
+
+```bash
+node "$SKILL_DIR/scripts/flow-env-configurator.mjs" set \
+  --flow development-flow-v1 \
+  --agents-env .agents.env \
+  --set DEVFLOW_ANALYST_BACKEND=codex-subagent \
+  --set DEVFLOW_ANALYST_MODEL=
+```
+
+The bundled role then uses the safe native default `fork_turns: none`.
+`backend_options.codex_subagent.fork_turns` (`none`, `all`, or a positive
+integer string) belongs in a native-only/custom flow role. Do not add dormant
+native options to a role that currently resolves to another backend; Agent
+Control rejects backend-specific options that cannot be applied.

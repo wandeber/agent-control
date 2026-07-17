@@ -1,11 +1,12 @@
-# Agent Control flow config. Environment placeholders use ${VAR:-default} and are resolved by agentctl.
+# Agent Control flow config. Backend placeholders use ${VAR:-default}. Model placeholders intentionally
+# use ${VAR-default}: an explicitly empty model lets the opt-in codex-subagent backend inherit the root model.
 
 id: development-flow-v1
-version: 1.0.0
-description: Auto-routed development workflow for intelligent workers. Normal phase handoffs, intent
-  reviews, corrections, and final review rollbacks are handled by Agent Control transitions; the
-  orchestrator is notified only for clarification, blockers, ambiguous routing, or human
-  confirmation.
+version: 1.1.0
+description: Development workflow with coordinator-owned pre-launch clarification. Normal worker
+  handoffs, downstream intent reviews, corrections, and final review rollbacks are handled by Agent
+  Control transitions; the same visible orchestrator validates analysis intent and handles new
+  clarification, blockers, ambiguous routing, or human confirmation.
 initial_step: analysis
 prompts:
   role_analyst:
@@ -37,34 +38,35 @@ prompts:
     description: Planner review of implementation intent preservation.
   step_final_review:
     path: prompts/final-review.md
-    description: Final fresh external review instructions.
+    description: Final independent review-loop instructions.
 roles:
   analyst:
     backend: ${DEVFLOW_ANALYST_BACKEND:-opencode-server}
-    model: ${DEVFLOW_ANALYST_MODEL:-opencode-go/deepseek-v4-pro}
+    model: ${DEVFLOW_ANALYST_MODEL-opencode-go/deepseek-v4-pro}
     prompt_ref: role_analyst
     description: Understands the task and repository context, writes analysis, and later checks whether
       planning preserved analysis intent.
   planner:
     backend: ${DEVFLOW_PLANNER_BACKEND:-opencode-server}
-    model: ${DEVFLOW_PLANNER_MODEL:-opencode-go/deepseek-v4-pro}
+    model: ${DEVFLOW_PLANNER_MODEL-opencode-go/deepseek-v4-pro}
     prompt_ref: role_planner
     description: Turns analysis into a worker-ready plan and later checks whether implementation
       preserved plan intent.
   implementer:
     backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-opencode-server}
-    model: ${DEVFLOW_IMPLEMENTER_MODEL:-opencode-go/deepseek-v4-pro}
+    model: ${DEVFLOW_IMPLEMENTER_MODEL-opencode-go/deepseek-v4-pro}
     prompt_ref: role_implementer
     description: Implements the accepted plan, integrates internal work, runs mechanical checks, and
       reports one coherent result.
   final_reviewer:
     backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
-    model: ${DEVFLOW_FINAL_REVIEWER_MODEL:-gpt-5.5}
+    model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.5}
+    agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
-    description: Fresh clean-context reviewer for the final external review gate.
+    description: Clean-context reviewer created on first entry and reused for every final-review iteration.
   orchestrator:
-    description: Receives clarification requests, blockers, ambiguous routing, and final
-      human-confirmation decisions.
+    description: Owns pre-launch request clarification, validates analysis against that clarified
+      intent, and handles new clarification, blockers, ambiguous routing, and final human decisions.
 artifacts:
   analysis:
     path: "{run_dir}/analysis.md"
@@ -83,12 +85,13 @@ artifacts:
     description: Planner review of whether implementation preserves plan intent.
   final_review:
     path: "{run_dir}/final-review.md"
-    description: Fresh external expert review.
+    description: Independent external expert review updated by the same reviewer across iterations.
 steps:
   analysis:
     role: analyst
     prompt_ref: step_analysis
-    description: Gather task/repo understanding and produce durable solution intent.
+    description: Analyze the clarified objective and repository context, then produce durable solution
+      intent for validation by the clarification owner.
     inputs:
       final_review:
         artifact: final_review
@@ -111,12 +114,12 @@ steps:
     on:
       reported:
         transitions:
-          - id: analysis-ready-to-planning
+          - id: analysis-ready-for-orchestrator-intent-validation
             when:
               equals:
                 var: result.conclusion
                 value: ready
-            to: planning
+            notify: orchestrator
           - id: analysis-needs-clarification
             when:
               equals:
@@ -340,7 +343,7 @@ steps:
   final_review:
     role: final_reviewer
     prompt_ref: step_final_review
-    description: Fresh external expert review with authority to close or route corrections upstream.
+    description: Persistent independent expert review with authority to close or route corrections upstream.
     inputs:
       plan:
         artifact: plan

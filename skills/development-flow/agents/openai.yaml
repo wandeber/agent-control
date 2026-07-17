@@ -1,0 +1,4 @@
+interface:
+  display_name: "Development Flow"
+  short_description: "Clarify and run the Agent Control development flow"
+  default_prompt: "Use $development-flow to clarify this software task completely, then run development-flow-v1 through Agent Control."

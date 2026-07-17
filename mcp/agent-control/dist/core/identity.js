@@ -8,6 +8,12 @@ const ADMIN_KEY_FILE = "admin-key";
 export function generateAgentToken() {
     return `act_${randomBytes(32).toString("base64url")}`;
 }
+export function generateBridgeToken() {
+    return `acb_${randomBytes(32).toString("base64url")}`;
+}
+export function generateActionToken() {
+    return `aca_${randomBytes(32).toString("base64url")}`;
+}
 export function generateAdminKey() {
     return `ack_${randomBytes(32).toString("base64url")}`;
 }

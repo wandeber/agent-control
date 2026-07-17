@@ -1,10 +1,13 @@
 # Final Review Step Prompt
 
-Use for the final fresh external expert reviewer.
+Use for the final independent expert-review loop. Create the reviewer with clean
+context on first entry, then resume that exact reviewer for every correction
+iteration.
 
 Input is intentionally narrow: use the runtime contract, the current accepted
 plan input artifact, current diff/code access, and this prompt. Do not consume
-unlisted intermediate artifacts or authoring history by default.
+unlisted intermediate artifacts or authoring history by default. On later
+iterations, also use your own prior findings and the focused correction evidence.
 
 ## Must
 
@@ -22,13 +25,14 @@ unlisted intermediate artifacts or authoring history by default.
 - Route to `planning` for correct intent but flawed execution plan.
 - Route to `implementation` when the plan is sound but code, tests, docs, or
   checks are incomplete or wrong.
-- Route to `final_review` only when the review should be rerun cleanly.
+- Route to `final_review` only when you should re-run the review yourself without upstream work.
 - Route to `orchestrator` only for human confirmation, ambiguity, or a true
   coordination blocker.
 
 ## Do Not
 
-- review work you authored or previously reviewed in this chain
+- review work you authored, integrated, or intent-validated
+- implement your own findings or hand a later review iteration to a new reviewer
 - rely on intermediate authoring history by default
 - perform broad speculative redesign
 - approve unverified implementation claims

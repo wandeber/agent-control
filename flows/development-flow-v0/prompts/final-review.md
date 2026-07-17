@@ -1,8 +1,9 @@
 # Final External Expert Review Phase Prompt
 
-Use for the final fresh high-bar reviewer after implementation review and
-implementation-owned mechanical checks. Decide whether the task is safe to
-close.
+Use for the final high-bar independent reviewer after implementation review and
+implementation-owned mechanical checks. Create this reviewer with clean context
+on first entry, then resume the same reviewer for every correction iteration.
+Decide whether the task is safe to close.
 
 Input is intentionally narrow: user objective, current `plan.md`, current
 diff/code access, the assigned `final-review.md` output path, and this prompt.
@@ -17,11 +18,12 @@ Do not consume `analysis.md`, `implementation-report.md`,
 
 ## Rules
 
-- run as a fresh clean-context Codex thread
+- start as a clean-context Codex thread on the first iteration and preserve that exact thread for later iterations
 - review the current code/diff against the user objective and current plan
 - do not use intermediate reports or authoring history by default
 - do not re-perform prior phases unless result is unusable
-- do not review work you authored, integrated, or previously reviewed in this chain
+- do not review work you authored, integrated, or intent-validated
+- do not implement your own findings; route them upstream and re-review the corrected result yourself
 - when rejecting, return to analysis with concrete problems unless the issue is purely missing implementation-owned check evidence
 - hold an uncompromising quality bar; final review is where deeper design, product, maintainability, and edge-case problems can send the flow back upstream
 

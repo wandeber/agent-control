@@ -24,6 +24,24 @@ export const FAILURE_REASONS = [
     "unsupported_operation",
     "unknown"
 ];
+/**
+ * Durable phases for a non-native backend start. `prepared` is the only phase
+ * that may be reclaimed after its lease expires because no adapter call has
+ * crossed the invocation boundary yet. An expired `invoking` attempt becomes
+ * `ambiguous`: the backend may have accepted the request, so automatic retry
+ * would risk creating a duplicate session.
+ * `succeeded` retains a route-owned handle; `superseded` retains a concrete
+ * handle that must be compensated because its original route lost ownership.
+ */
+export const AGENT_START_ATTEMPT_PHASES = [
+    "prepared",
+    "invoking",
+    "succeeded",
+    "superseded",
+    "failed",
+    "ambiguous",
+    "cancelled"
+];
 export const EVENT_TYPES = [
     "agent.started",
     "agent.status_changed",
@@ -69,6 +87,19 @@ export const FLOW_STEP_INSTANCE_STATUSES = [
     "active",
     "completed",
     "blocked",
+    "failed",
+    "cancelled"
+];
+export const ORCHESTRATOR_ACTION_OPERATIONS = [
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "interrupt_agent"
+];
+export const ORCHESTRATOR_ACTION_STATUSES = [
+    "pending",
+    "claimed",
+    "succeeded",
     "failed",
     "cancelled"
 ];

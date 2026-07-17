@@ -2,27 +2,176 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
-import { parseFlowConfig, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
+import { parseFlowConfig, resolveFlowAgentLifecycle, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
 import { getFlowFromCatalog, listFlowCatalog } from "./flow-catalog.js";
-import { generateAgentToken, hashToken, verifyAdminKey } from "./identity.js";
-import { newId, nowIso } from "./ids.js";
+import { generateActionToken, generateAgentToken, generateBridgeToken, hashToken, verifyAdminKey } from "./identity.js";
+import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "./ids.js";
 import { agentRuntimePath, isInsideRunsRuntimeRoot, runRuntimeDir, runRuntimePath } from "./paths.js";
 import { AGENT_STATUSES } from "./types.js";
 const TERMINAL_STATUSES = new Set(["completed", "failed", "blocked", "stopped"]);
 const PURGE_SAFE_STATUSES = new Set(["planned", "completed", "failed", "blocked", "stopped"]);
+const STOP_INTENT_AGENT_STATUSES = new Set(["stopping", "stopped"]);
+const STOP_INTENT_RUN_STATUSES = new Set(["stopping", "stopped"]);
 const DEFAULT_OPENCODE_SERVER = "http://localhost:53910";
 const DEFAULT_OPENCODE_MODEL = "opencode-go/deepseek-v4-pro";
+const CODEX_SUBAGENT_BACKEND = "codex-subagent";
+const ORCHESTRATOR_ACTION_CLAIM_LEASE_MS = 60_000;
+const NON_NATIVE_START_ATTEMPT_LEASE_MS = 60_000;
+const ACCEPTED_WORK_LEASE_MS = 60_000;
+const ACCEPTED_WORK_LEASE_RENEW_INTERVAL_MS = 20_000;
+const EXTERNAL_MISSING_CONFIRMATION_MS = 5_000;
+const MAX_EXTERNAL_LATEST_MESSAGE_BYTES = 4 * 1024;
+const DEFAULT_NATIVE_ACTION_DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000];
+const MAX_NATIVE_ACTION_DELIVERY_RETRIES = 5;
 export class AgentController {
     store;
     adapters;
+    credentialStore;
+    controllerInstanceId = newId("controller");
     statusWatchers = new Map();
     pendingDeliveries = new Set();
     inFlightSubscriberDeliveries = new Set();
+    nativeActionDeliveryRetryTasks = new Map();
     suppressedDeliveryRunIds = new Set();
     suppressedDeliveryAgentIds = new Set();
-    constructor(store, adapters) {
+    nativeActionDeliveryRetryDelaysMs;
+    constructor(store, adapters, credentialStore = null, options = {}) {
         this.store = store;
         this.adapters = adapters;
+        this.credentialStore = credentialStore;
+        const configuredDelays = options.nativeActionDeliveryRetryDelaysMs ??
+            DEFAULT_NATIVE_ACTION_DELIVERY_RETRY_DELAYS_MS;
+        this.nativeActionDeliveryRetryDelaysMs = configuredDelays
+            .slice(0, MAX_NATIVE_ACTION_DELIVERY_RETRIES)
+            .map((delay) => {
+            if (!Number.isFinite(delay) || delay < 0) {
+                throw new Error("Native action delivery retry delays must be finite non-negative numbers.");
+            }
+            return delay;
+        });
+        // A process may die after persisting an adapter invocation boundary but
+        // before recording its response. Expired owners become ambiguity once at
+        // startup; linked deliveries are released from process ownership without
+        // becoming retryable, so recovery never duplicates possibly accepted I/O.
+        const recoveredAcceptedWorkAgents = this.store.recoverExpiredAgentAcceptedWork();
+        const startupCleanupAgentIds = new Set(this.reconcilePersistedStartAttemptHandlesAtStartup());
+        // Manual flow routing and shutdown persist `stopping` before external I/O.
+        // Re-drive every such worker on startup so a crash between the durable
+        // transition and adapter/native cleanup cannot strand an abandoned worker.
+        for (const agent of this.store.listAgents({ includeUnregistered: true })) {
+            if (agent.status === "stopping") {
+                startupCleanupAgentIds.add(agent.agent_id);
+            }
+        }
+        for (const event of this.reconcileTerminalStoppingRunsAtStartup()) {
+            this.scheduleEventDelivery(event);
+        }
+        for (const agentId of startupCleanupAgentIds) {
+            this.scheduleAgentStopCleanup(agentId);
+        }
+        for (const agent of recoveredAcceptedWorkAgents) {
+            if (agent.status !== "unknown" || !agent.backend_handle) {
+                continue;
+            }
+            try {
+                if (this.adapters.get(agent.backend).capabilities().canInspectStatusCheaply) {
+                    this.armStatusWatcher(agent);
+                }
+            }
+            catch {
+                // Missing/temporarily unavailable adapters must not prevent startup.
+                // The durable unknown state remains visible for an explicit refresh.
+            }
+        }
+        this.redrivePendingNativeActionOwnerWakeups();
+    }
+    /**
+     * A completed attempt is durable proof that its backend returned a handle.
+     * Restore that handle before any stop/shutdown logic can mistake a restarted
+     * controller for a safe no-session state. Superseded attempts always require
+     * compensation unless the agent is already terminal; this pass performs no
+     * external I/O and leaves that work to the normal stop path.
+     */
+    reconcilePersistedStartAttemptHandlesAtStartup() {
+        return this.store.immediateTransaction(() => {
+            const cleanupAgentIds = new Set();
+            for (const listedAgent of this.store.listAgents({ includeUnregistered: true })) {
+                const attempt = this.store.getLatestCompletedAgentStartAttemptWithHandle(listedAgent.agent_id);
+                if (!attempt?.handle_json) {
+                    continue;
+                }
+                const agent = listedAgent;
+                const run = this.store.getRun(agent.run_id);
+                if (!run) {
+                    continue;
+                }
+                const stopIntent = agent.status === "stopping" ||
+                    agent.status === "stopped" ||
+                    run.status === "stopping" ||
+                    run.status === "stopped";
+                const supersededRoute = attempt.phase === "superseded";
+                const cleanupIntent = stopIntent || supersededRoute;
+                if (agent.backend_handle) {
+                    if (agent.status === "stopping" ||
+                        (run.status === "stopping" && !TERMINAL_STATUSES.has(agent.status)) ||
+                        (supersededRoute && !TERMINAL_STATUSES.has(agent.status))) {
+                        if (run.status === "stopped") {
+                            this.store.updateRunStatus(run.run_id, "stopping");
+                        }
+                        if (agent.status !== "stopping") {
+                            this.store.updateAgent(agent.agent_id, {
+                                status: "stopping",
+                                failureReason: agent.failure_reason
+                            });
+                        }
+                        cleanupAgentIds.add(agent.agent_id);
+                    }
+                    continue;
+                }
+                if (run.status === "stopped") {
+                    this.store.updateRunStatus(run.run_id, "stopping");
+                }
+                this.store.updateAgent(agent.agent_id, {
+                    backendHandle: attempt.handle_json,
+                    status: cleanupIntent ? "stopping" : agent.status,
+                    failureReason: agent.failure_reason
+                });
+                if (cleanupIntent) {
+                    cleanupAgentIds.add(agent.agent_id);
+                }
+            }
+            return [...cleanupAgentIds];
+        });
+    }
+    /** Track fire-and-reconcile cleanup so tests and orderly shutdown can drain it. */
+    scheduleAgentStopCleanup(agentId) {
+        const cleanup = this.stopAgent(agentId)
+            .then(() => undefined)
+            .catch(() => {
+            // stopAgent durably preserves unresolved cleanup state. Startup and a
+            // manual route must not roll back because external stop I/O failed.
+        })
+            .finally(() => {
+            this.pendingDeliveries.delete(cleanup);
+        });
+        this.pendingDeliveries.add(cleanup);
+    }
+    /**
+     * Repair the legacy crash window where the last agent stop committed but the
+     * run-level projection did not. A write reservation makes the all-terminal
+     * predicate and run update one decision; any live agent keeps the run in
+     * `stopping` for normal cleanup instead of being papered over at startup.
+     */
+    reconcileTerminalStoppingRunsAtStartup() {
+        const pendingEvents = [];
+        this.store.immediateTransaction(() => {
+            for (const run of this.store.listRunsByStatus("stopping")) {
+                this.finalizeStoppingRunIfTerminal(run.run_id, (event) => {
+                    pendingEvents.push(this.store.createEvent(event));
+                });
+            }
+        });
+        return pendingEvents;
     }
     listBackends() {
         return this.adapters.list();
@@ -58,6 +207,14 @@ export class AgentController {
     startFlow(input) {
         const config = parseFlowConfig(input.config);
         const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : null;
+        const requiresNativeBridge = flowUsesCodexSubagents(config);
+        const persistBridgeCredentialLocally = input.bridgeCredentialDelivery === "local";
+        if (requiresNativeBridge && (!caller || caller.role !== "orchestrator")) {
+            throw new ControllerError("A codex-subagent flow must be launched by an authenticated orchestrator agent.", "auth_required", { backend: CODEX_SUBAGENT_BACKEND });
+        }
+        if (requiresNativeBridge && persistBridgeCredentialLocally && !this.credentialStore) {
+            throw new ControllerError("Local bridge credential delivery requires a configured local credential store.", "tool_error", { backend: CODEX_SUBAGENT_BACKEND });
+        }
         const run = input.runId
             ? this.getRun(input.runId, { agentToken: input.agentToken ?? undefined })
             : this.createRun({
@@ -69,6 +226,25 @@ export class AgentController {
         if (input.runId) {
             const reusable = this.findReusableFlowInstance(run.run_id, config);
             if (reusable) {
+                let bridgeGrant;
+                if (requiresNativeBridge && caller) {
+                    if (reusable.instance.orchestrator_agent_id !== caller.agent_id) {
+                        throw new ControllerError("The reusable native flow belongs to a different orchestrator.", "auth_required", { flow_instance_id: reusable.instance.flow_instance_id });
+                    }
+                    const ownerTaskIdentity = normalizeOptionalIdentity(input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null);
+                    const ownerTaskPath = normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root");
+                    const originatingGrant = this.resolveNativeFlowBridgeGrant(reusable.instance);
+                    if (originatingGrant.owner_task_path !== ownerTaskPath ||
+                        (ownerTaskIdentity &&
+                            originatingGrant.owner_task_identity !== ownerTaskIdentity)) {
+                        throw new ControllerError("The reusable native flow requires one active bridge grant for the current task binding.", "auth_required", {
+                            flow_instance_id: reusable.instance.flow_instance_id,
+                            originating_bridge_grant_id: reusable.instance.originating_bridge_grant_id,
+                            requested_owner_task_path: ownerTaskPath
+                        });
+                    }
+                    bridgeGrant = publicBridgeGrantRefFromGrant(originatingGrant);
+                }
                 if (caller) {
                     this.ensureFlowOwnerSubscriptions(run.run_id, caller.agent_id);
                 }
@@ -80,43 +256,91 @@ export class AgentController {
                     instance: reusable.instance,
                     active_step: activeStep,
                     reused: true,
-                    blocked_reason: reusable.instance.status === "blocked" ? "blocked" : undefined
+                    blocked_reason: reusable.instance.status === "blocked" ? "blocked" : undefined,
+                    bridge_grant: bridgeGrant
                 };
             }
         }
-        const flow = this.store.createFlow(config);
-        const instance = this.store.createFlowInstance({
-            flowRecordId: flow.flow_record_id,
-            runId: run.run_id,
-            currentStepId: config.initial_step
-        });
-        this.ensureDeclaredFlowAgents({
-            config,
-            flowId: flow.flow_id,
-            run,
-            caller,
-            agentToken: input.agentToken ?? null
-        });
-        if (caller) {
-            this.ensureFlowOwnerSubscriptions(run.run_id, caller.agent_id);
-        }
-        this.emit({
-            runId: run.run_id,
-            type: "flow.started",
-            payload: {
-                flow_instance_id: instance.flow_instance_id,
-                flow_record_id: flow.flow_record_id,
-                flow_id: flow.flow_id,
-                initial_step: config.initial_step
+        const pendingEvents = [];
+        const initialized = this.store.transaction(() => {
+            const flow = this.store.createFlow(config);
+            let bridgeCredential;
+            let bridgeGrant;
+            let originatingBridgeGrantId = null;
+            if (requiresNativeBridge && caller) {
+                const rawBridgeToken = generateBridgeToken();
+                const grant = this.store.createBridgeGrant({
+                    runId: run.run_id,
+                    orchestratorAgentId: caller.agent_id,
+                    ownerTaskIdentity: normalizeOptionalIdentity(input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null),
+                    ownerTaskPath: normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root"),
+                    tokenHash: hashToken(rawBridgeToken)
+                });
+                originatingBridgeGrantId = grant.bridge_grant_id;
+                bridgeCredential = bridgeCredentialFromGrant(grant, rawBridgeToken);
             }
+            // The flow and its first executable native action share one immutable
+            // causal grant. Persist the binding in the same transaction that creates
+            // the grant and instance, before any step can be dispatched or reused.
+            const instance = this.store.createFlowInstance({
+                flowRecordId: flow.flow_record_id,
+                runId: run.run_id,
+                orchestratorAgentId: caller?.agent_id ?? null,
+                originatingBridgeGrantId,
+                currentStepId: config.initial_step
+            });
+            this.ensureDeclaredFlowAgents({
+                config,
+                flowId: flow.flow_id,
+                run,
+                caller,
+                agentToken: input.agentToken ?? null
+            });
+            if (caller) {
+                this.ensureFlowOwnerSubscriptions(run.run_id, caller.agent_id);
+            }
+            // Event rows participate in the same transaction, but delivery is
+            // deferred until commit. A failed declared backend or activation can
+            // therefore never publish a flow whose instance/grant was rolled back.
+            const queueEvent = (event) => {
+                pendingEvents.push(this.store.createEvent(event));
+            };
+            queueEvent({
+                runId: run.run_id,
+                type: "flow.started",
+                payload: {
+                    flow_instance_id: instance.flow_instance_id,
+                    flow_record_id: flow.flow_record_id,
+                    flow_id: flow.flow_id,
+                    initial_step: config.initial_step
+                }
+            });
+            const activeStep = this.activateFlowStep(flow.config, instance, config.initial_step, {
+                eventSink: queueEvent
+            });
+            // Persist only after every database initialization step has succeeded,
+            // while the bridge grant is still visible on this SQLite connection. A
+            // filesystem failure rolls the whole transaction back, so the next CLI
+            // attempt cannot reuse a flow whose only bridge secret was never stored.
+            if (bridgeCredential && persistBridgeCredentialLocally) {
+                bridgeGrant = this.credentialStore.persistBridgeCredential(bridgeCredential);
+                bridgeCredential = undefined;
+            }
+            return { flow, instance, activeStep, bridgeCredential, bridgeGrant };
         });
-        const activeStep = this.activateFlowStep(flow.config, instance, config.initial_step);
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
         return {
-            flow,
-            instance: this.getFlowInstanceOrThrow(instance.flow_instance_id),
-            active_step: activeStep.status === "active" ? activeStep : null,
+            flow: initialized.flow,
+            instance: this.getFlowInstanceOrThrow(initialized.instance.flow_instance_id),
+            active_step: initialized.activeStep.status === "active" ? initialized.activeStep : null,
             reused: false,
-            blocked_reason: activeStep.status === "blocked" ? String(activeStep.summary ?? "blocked") : undefined
+            blocked_reason: initialized.activeStep.status === "blocked"
+                ? String(initialized.activeStep.summary ?? "blocked")
+                : undefined,
+            bridge_grant: initialized.bridgeGrant,
+            bridge_credential: initialized.bridgeCredential
         };
     }
     getFlowSnapshot(flowInstanceId) {
@@ -131,61 +355,183 @@ export class AgentController {
             artifact_bindings: this.store.listFlowArtifactBindings(flowInstanceId)
         };
     }
-    startFlowStep(input) {
-        const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
-        const flow = this.getFlowOrThrow(instance.flow_record_id);
-        if (!flow.config.steps[input.stepId]) {
-            throw new ControllerError("Cannot start undefined flow step.", "tool_error", {
-                flow_instance_id: input.flowInstanceId,
-                step_id: input.stepId
-            });
-        }
-        let transitionRecord = null;
-        if (input.fromStepInstanceId) {
-            const fromStep = this.getFlowStepInstanceOrThrow(input.fromStepInstanceId);
-            if (fromStep.flow_instance_id !== instance.flow_instance_id) {
-                throw new ControllerError("Manual flow transition source belongs to another flow instance.", "tool_error", {
-                    flow_instance_id: instance.flow_instance_id,
-                    from_step_instance_id: fromStep.step_instance_id
+    async startFlowStep(input) {
+        const pendingEvents = [];
+        const transition = this.store.immediateTransaction(() => {
+            const queueEvent = (event) => {
+                pendingEvents.push(this.store.createEvent(event));
+            };
+            const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+            const flow = this.getFlowOrThrow(instance.flow_record_id);
+            if (flowUsesCodexSubagents(flow.config)) {
+                // Manual routing can cancel workers and enqueue cleanup, so it must
+                // prove the flow's immutable native owner before its first write too.
+                this.resolveNativeFlowBridgeGrant(instance);
+            }
+            if (!flow.config.steps[input.stepId]) {
+                throw new ControllerError("Cannot start undefined flow step.", "tool_error", {
+                    flow_instance_id: input.flowInstanceId,
+                    step_id: input.stepId
                 });
             }
-            const transitionId = input.transitionId ?? `${fromStep.step_id}-manual-to-${input.stepId}`;
-            transitionRecord = this.store.createFlowTransition({
-                flowInstanceId: instance.flow_instance_id,
-                fromStepInstanceId: fromStep.step_instance_id,
-                transitionId,
-                targetStepId: input.stepId,
-                actionJson: {
-                    manual: true,
-                    to: input.stepId,
-                    reason: input.reason ?? null
+            const retainedAgentId = this.manualRouteRetainedAgentId(flow, instance, input.stepId);
+            const cleanupTargets = new Map();
+            let transitionRecord = null;
+            if (input.fromStepInstanceId) {
+                const fromStep = this.getFlowStepInstanceOrThrow(input.fromStepInstanceId);
+                if (fromStep.flow_instance_id !== instance.flow_instance_id) {
+                    throw new ControllerError("Manual flow transition source belongs to another flow instance.", "tool_error", {
+                        flow_instance_id: instance.flow_instance_id,
+                        from_step_instance_id: fromStep.step_instance_id
+                    });
                 }
-            });
-            this.store.updateFlowStepInstance(fromStep.step_instance_id, { transitionId });
-            this.emit({
-                runId: instance.run_id,
-                agentId: fromStep.agent_id,
-                type: "flow.transition_selected",
-                payload: {
-                    flow_instance_id: instance.flow_instance_id,
-                    from_step_instance_id: fromStep.step_instance_id,
-                    transition_id: transitionId,
-                    target_step_id: input.stepId,
-                    manual: true,
-                    reason: input.reason
+                const transitionId = input.transitionId ?? `${fromStep.step_id}-manual-to-${input.stepId}`;
+                transitionRecord = this.store.createFlowTransition({
+                    flowInstanceId: instance.flow_instance_id,
+                    fromStepInstanceId: fromStep.step_instance_id,
+                    transitionId,
+                    targetStepId: input.stepId,
+                    actionJson: {
+                        manual: true,
+                        to: input.stepId,
+                        reason: input.reason ?? null
+                    }
+                });
+                this.store.updateFlowStepInstance(fromStep.step_instance_id, { transitionId });
+                queueEvent({
+                    runId: instance.run_id,
+                    agentId: fromStep.agent_id,
+                    type: "flow.transition_selected",
+                    payload: {
+                        flow_instance_id: instance.flow_instance_id,
+                        from_step_instance_id: fromStep.step_instance_id,
+                        transition_id: transitionId,
+                        target_step_id: input.stepId,
+                        manual: true,
+                        reason: input.reason
+                    }
+                });
+            }
+            // A manual route is authoritative over every prior active generation.
+            // Cancelling each old step and persisting its worker's stop predicate in
+            // this same write transaction closes both directions of the race: neither
+            // a late backend response nor a controller crash can leave the abandoned
+            // worker looking owned by the new route.
+            const abandonedSteps = this.store
+                .listFlowStepInstances(instance.flow_instance_id)
+                .filter((step) => step.status === "active");
+            const abandonedStepIds = new Set(abandonedSteps.map((step) => step.step_instance_id));
+            for (const activeStep of abandonedSteps) {
+                this.store.updateFlowStepInstance(activeStep.step_instance_id, {
+                    status: "cancelled",
+                    summary: `Superseded by manual start of ${input.stepId}.`,
+                    completedAt: nowIso()
+                });
+                if (activeStep.agent_id &&
+                    activeStep.agent_id !== retainedAgentId &&
+                    !this.agentHasOtherActiveFlowOwnership(activeStep.agent_id, instance.run_id, abandonedStepIds) &&
+                    !cleanupTargets.has(activeStep.agent_id)) {
+                    const candidate = this.getAgent(activeStep.agent_id);
+                    if (!TERMINAL_STATUSES.has(candidate.status)) {
+                        cleanupTargets.set(activeStep.agent_id, this.prepareAbandonedFlowWorkerCleanupInTransaction(candidate, queueEvent));
+                    }
                 }
+            }
+            const active = this.activateFlowStep(flow.config, instance, input.stepId, {
+                // A manual route is also the coordinator's handoff boundary. Preserve the
+                // complete decision context so a retried worker receives clarified user
+                // answers or concrete corrections instead of repeating work from the
+                // unchanged run title alone.
+                coordinatorContext: input.reason ?? null,
+                eventSink: queueEvent
             });
+            return {
+                result: {
+                    ...this.getFlowSnapshot(instance.flow_instance_id),
+                    selected_transition: transitionRecord,
+                    active_step: active.status === "active" ? active : null,
+                    notification: active.status === "blocked" ? "blocked" : null
+                },
+                cleanupTargets: [...cleanupTargets.values()]
+            };
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
         }
-        const active = this.activateFlowStep(flow.config, instance, input.stepId);
+        const stoppedWorkers = await Promise.all(transition.cleanupTargets.map((agent) => this.stopAgent(agent.agent_id)));
+        const cleanup = stoppedWorkers.map((stopped) => {
+            const action = stopped.orchestrator_action ?? null;
+            return {
+                agent_id: stopped.agent_id,
+                status: stopped.status,
+                failure_reason: stopped.failure_reason,
+                orchestrator_action: action
+            };
+        });
         return {
-            ...this.getFlowSnapshot(instance.flow_instance_id),
-            selected_transition: transitionRecord,
-            active_step: active.status === "active" ? active : null,
-            notification: active.status === "blocked" ? "blocked" : null
+            ...transition.result,
+            cleanup
         };
+    }
+    /** Resolve the one persistent worker that the manually selected step retains. */
+    manualRouteRetainedAgentId(flow, instance, stepId) {
+        const stepConfig = flow.config.steps[stepId];
+        if (stepConfig.agent_id) {
+            return stepConfig.agent_id;
+        }
+        const roleConfig = stepConfig.role ? flow.config.roles?.[stepConfig.role] : undefined;
+        if (resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) !== "reuse") {
+            return null;
+        }
+        return (this.findDeclaredFlowAgent(instance.run_id, flow.flow_id, stepConfig.role, roleConfig?.backend)?.agent_id ?? null);
+    }
+    /** Do not stop a reusable worker that another concurrently active flow owns. */
+    agentHasOtherActiveFlowOwnership(agentId, runId, abandonedStepIds) {
+        return this.store
+            .listFlowInstances({ runId })
+            .filter((flowInstance) => flowInstance.status === "active")
+            .flatMap((flowInstance) => this.store.listFlowStepInstances(flowInstance.flow_instance_id))
+            .some((step) => step.agent_id === agentId &&
+            step.status === "active" &&
+            !abandonedStepIds.has(step.step_instance_id));
+    }
+    /**
+     * Persist cleanup authority for an abandoned worker while the manual route's
+     * BEGIN IMMEDIATE reservation is still held. External adapter I/O happens only
+     * after commit, but every restart can recover from the durable `stopping`
+     * state (or the atomically terminal handleless/prepared state).
+     */
+    prepareAbandonedFlowWorkerCleanupInTransaction(candidate, eventSink) {
+        let agent = candidate;
+        const adapter = this.adapters.get(agent.backend);
+        if (adapter.capabilities().requiresOrchestratorAction) {
+            agent = this.recoverCodexSubagentSpawnHandle(agent);
+            return this.prepareCodexSubagentStopInTransaction(agent, {
+                scope: "flow_route",
+                recordStopIntent: true
+            }).agent;
+        }
+        if (!agent.backend_handle) {
+            const recoveredHandle = this.recoverBackendHandle(agent);
+            if (recoveredHandle) {
+                agent = this.store.updateAgent(agent.agent_id, {
+                    backendHandle: recoveredHandle
+                });
+            }
+        }
+        if (!agent.backend_handle) {
+            return this.prepareHandlelessNonNativeStartStopInTransaction(agent.agent_id, eventSink).agent;
+        }
+        return this.store.updateAgent(agent.agent_id, {
+            status: "stopping",
+            failureReason: agent.failure_reason
+        });
     }
     async dispatchActiveFlowStep(input) {
         const snapshot = this.getFlowSnapshot(input.flowInstanceId);
+        const nativeFlowBridgeGrant = flowUsesCodexSubagents(snapshot.flow.config)
+            ? this.resolveNativeFlowBridgeGrant(snapshot.instance)
+            : null;
         const activeStep = this.activeFlowStepOrThrow(snapshot, input.flowInstanceId);
         const stepConfig = snapshot.flow.config.steps[activeStep.step_id];
         const roleConfig = stepConfig.role ? snapshot.flow.config.roles?.[stepConfig.role] : undefined;
@@ -214,25 +560,51 @@ export class AgentController {
             }
         }
         const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : subscriber;
-        if (!caller) {
-            throw new ControllerError("flow_dispatch_active requires agent_token or subscriber_agent_id.", "auth_required", {
+        const bridgeGrant = input.bridgeToken
+            ? this.requireBridgeToken(input.bridgeToken, {
+                runId: snapshot.instance.run_id,
+                orchestratorAgentId: snapshot.instance.orchestrator_agent_id,
+                bridgeGrantId: nativeFlowBridgeGrant?.bridge_grant_id ?? null
+            })
+            : null;
+        if (!caller && !bridgeGrant) {
+            throw new ControllerError("flow_dispatch_active requires agent_token, bridge_token, or subscriber_agent_id.", "auth_required", {
                 flow_instance_id: input.flowInstanceId
             });
         }
-        if (!this.canAgentAccessRun(caller, snapshot.instance.run_id)) {
+        if (caller && !this.canAgentAccessRun(caller, snapshot.instance.run_id)) {
             throw new ControllerError(`Run not accessible: ${snapshot.instance.run_id}`, "auth_required", {
                 run_id: snapshot.instance.run_id
             });
         }
-        return this.dispatchActiveFlowStepInternal({
+        // Keep authorization precedence at the public boundary; the internal
+        // dispatcher repeats this policy check immediately before any mutation.
+        this.assertNewWorkAllowed(snapshot.instance.run_id, "flow_dispatch_active");
+        const dispatched = await this.dispatchActiveFlowStepInternal({
             snapshot,
             activeStep,
             subscriberAgentId: input.subscriberAgentId ?? null,
             server: input.server ?? null,
-            agentToken: input.agentToken ?? null
+            agentToken: input.agentToken ?? null,
+            bridgeGrantId: bridgeGrant?.bridge_grant_id ?? null
         });
+        if (bridgeGrant && dispatched.orchestrator_action) {
+            this.assertOrchestratorActionGrant(dispatched.orchestrator_action, bridgeGrant.bridge_grant_id);
+        }
+        return dispatched;
     }
     async continueFlow(input) {
+        const snapshot = this.getFlowSnapshot(input.flowInstanceId);
+        const nativeFlowBridgeGrant = flowUsesCodexSubagents(snapshot.flow.config)
+            ? this.resolveNativeFlowBridgeGrant(snapshot.instance)
+            : null;
+        const bridgeGrant = input.bridgeToken
+            ? this.requireBridgeToken(input.bridgeToken, {
+                runId: snapshot.instance.run_id,
+                orchestratorAgentId: snapshot.instance.orchestrator_agent_id,
+                bridgeGrantId: nativeFlowBridgeGrant?.bridge_grant_id ?? null
+            })
+            : null;
         if (input.agentToken) {
             const caller = this.requireAgentToken(input.agentToken);
             const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
@@ -252,12 +624,25 @@ export class AgentController {
                 });
             }
         }
-        return this.continueFlowInternal({
+        if (flowUsesCodexSubagents(snapshot.flow.config) &&
+            !bridgeGrant &&
+            !input.agentToken &&
+            !input.subscriberAgentId) {
+            throw new ControllerError("A codex-subagent flow continuation requires its scoped bridge token.", "auth_required", {
+                flow_instance_id: input.flowInstanceId
+            });
+        }
+        const continued = await this.continueFlowInternal({
             flowInstanceId: input.flowInstanceId,
             subscriberAgentId: input.subscriberAgentId ?? null,
             server: input.server ?? null,
-            agentToken: input.agentToken ?? null
+            agentToken: input.agentToken ?? null,
+            bridgeGrantId: bridgeGrant?.bridge_grant_id ?? null
         });
+        if (bridgeGrant && continued.orchestrator_action) {
+            this.assertOrchestratorActionGrant(continued.orchestrator_action, bridgeGrant.bridge_grant_id);
+        }
+        return continued;
     }
     async reportFlowStepAndContinue(input) {
         const report = this.reportFlowStep(input);
@@ -268,11 +653,126 @@ export class AgentController {
             flowInstanceId: report.instance.flow_instance_id,
             server: input.server ?? null
         });
+        if (continuation.orchestrator_action) {
+            this.notifyFlowOwnerOfNativeAction(report, continuation);
+        }
         return { report, continuation };
+    }
+    notifyFlowOwnerOfNativeAction(report, continuation) {
+        const action = continuation.orchestrator_action;
+        const ownerAgentId = report.instance.orchestrator_agent_id;
+        if (!action || !ownerAgentId) {
+            return;
+        }
+        if (action.run_id !== report.instance.run_id ||
+            action.flow_instance_id !== report.instance.flow_instance_id) {
+            throw new ControllerError("Automatic continuation returned a native action outside the reported flow.", "tool_error", {
+                action_id: action.action_id,
+                flow_instance_id: report.instance.flow_instance_id
+            });
+        }
+        const eventId = `event_${action.action_id.slice("action_".length)}`;
+        const existing = this.store.getEvent(eventId);
+        if (existing) {
+            const durableAction = this.store.getOrchestratorAction(action.action_id);
+            if (!durableAction || !this.nativeActionWakeMatches(existing, durableAction)) {
+                throw new ControllerError("Native action event id resolved to a conflicting notification.", "tool_error", { action_id: action.action_id, event_id: eventId });
+            }
+            this.scheduleEventDelivery(existing);
+            return;
+        }
+        this.ensureFlowOwnerSubscriptions(report.instance.run_id, ownerAgentId);
+        this.emit({
+            // Action ids and event ids use the same 80-bit random suffix. Mapping the
+            // prefix creates one durable wakeup row per action without persisting an
+            // additional secret or adding a second mutable notification state.
+            eventId,
+            runId: report.instance.run_id,
+            agentId: report.reported_step.agent_id,
+            type: "flow.notification",
+            payload: {
+                flow_instance_id: report.instance.flow_instance_id,
+                step_instance_id: action.step_instance_id,
+                step_id: continuation.active_step?.step_id ?? null,
+                notify: "orchestrator",
+                reason: "native_orchestrator_action_required",
+                status: action.status,
+                message: `Native orchestrator action ${action.action_id} (${action.operation}) is required to continue the flow.`,
+                orchestrator_action: action
+            }
+        });
+    }
+    /**
+     * Wake the flow owner for a native interrupt created while abandoning a
+     * manually superseded step. The deterministic event id makes retries and
+     * controller restarts reuse one safe notification without exposing the
+     * private interrupt target or any bridge/action credential.
+     */
+    notifyFlowOwnerOfNativeCleanupAction(instance, abandonedStep, action) {
+        const ownerAgentId = instance.orchestrator_agent_id;
+        if (!ownerAgentId) {
+            return;
+        }
+        if (action.run_id !== instance.run_id ||
+            action.flow_instance_id !== instance.flow_instance_id ||
+            action.agent_id !== abandonedStep.agent_id) {
+            throw new ControllerError("Manual route cleanup returned a native action outside the abandoned flow step.", "tool_error", {
+                action_id: action.action_id,
+                flow_instance_id: instance.flow_instance_id,
+                step_instance_id: abandonedStep.step_instance_id
+            });
+        }
+        const eventId = `event_${action.action_id.slice("action_".length)}`;
+        const existing = this.store.getEvent(eventId);
+        if (existing) {
+            const durableAction = this.store.getOrchestratorAction(action.action_id);
+            if (!durableAction || !this.nativeActionWakeMatches(existing, durableAction)) {
+                throw new ControllerError("Native cleanup action event id resolved to a conflicting notification.", "tool_error", { action_id: action.action_id, event_id: eventId });
+            }
+            this.scheduleEventDelivery(existing);
+            return;
+        }
+        this.ensureFlowOwnerSubscriptions(instance.run_id, ownerAgentId);
+        this.emit({
+            eventId,
+            runId: instance.run_id,
+            agentId: abandonedStep.agent_id,
+            type: "flow.notification",
+            payload: {
+                flow_instance_id: instance.flow_instance_id,
+                step_instance_id: action.step_instance_id,
+                step_id: abandonedStep.step_id,
+                notify: "orchestrator",
+                reason: "native_orchestrator_action_required",
+                status: action.status,
+                message: `Native orchestrator action ${action.action_id} (${action.operation}) is required to clean a manually superseded flow worker.`,
+                orchestrator_action: action
+            }
+        });
+    }
+    /** Recover flow context for interrupt actions created by stop/restart paths. */
+    notifyFlowOwnerOfNativeCleanupActionRef(action) {
+        if (action.operation !== "interrupt_agent" ||
+            !action.flow_instance_id ||
+            !action.step_instance_id) {
+            return;
+        }
+        const instance = this.store.getFlowInstance(action.flow_instance_id);
+        const step = this.store.getFlowStepInstance(action.step_instance_id);
+        if (!instance ||
+            !step ||
+            !step.summary?.startsWith("Superseded by manual start of ")) {
+            return;
+        }
+        this.notifyFlowOwnerOfNativeCleanupAction(instance, step, action);
     }
     async dispatchActiveFlowStepInternal(input) {
         const snapshot = input.snapshot;
         const activeStep = input.activeStep;
+        const flowBridgeGrant = flowUsesCodexSubagents(snapshot.flow.config)
+            ? this.resolveNativeFlowBridgeGrant(snapshot.instance, input.bridgeGrantId ?? null)
+            : null;
+        this.assertNewWorkAllowed(snapshot.instance.run_id, "flow_dispatch_active");
         const stepConfig = snapshot.flow.config.steps[activeStep.step_id];
         const roleConfig = stepConfig.role ? snapshot.flow.config.roles?.[stepConfig.role] : undefined;
         const backend = roleConfig?.backend;
@@ -286,66 +786,176 @@ export class AgentController {
         this.adapters.get(backend);
         const run = this.getRun(snapshot.instance.run_id);
         const expectedArtifacts = expectedArtifactsFromStep(activeStep);
-        const registered = this.findDeclaredFlowAgent(run.run_id, snapshot.flow.flow_id, stepConfig.role, backend) ??
-            this.registerAgent({
-                runId: run.run_id,
-                backend,
-                title: `${snapshot.flow.flow_id}: ${stepConfig.role ?? activeStep.step_id}`,
-                role: stepConfig.role,
-                objective: run.title,
-                repoDir: run.repo_dir,
-                model: roleConfig?.model,
-                agentToken: input.agentToken
-            });
+        const lifecycle = resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle);
+        const resolved = this.resolveFlowStepDispatchAgent({
+            snapshot,
+            activeStep,
+            run,
+            backend,
+            agentToken: input.agentToken ?? null
+        });
+        const freshStartEvidence = lifecycle === "fresh_per_step"
+            ? this.resolveFreshFlowStepStartEvidence(resolved.agent.agent_id, resolved.step.step_instance_id)
+            : null;
+        const registered = freshStartEvidence?.agent ?? resolved.agent;
+        let effectiveStartAttempt = freshStartEvidence?.startAttempt ?? null;
+        let responseStep = resolved.step;
+        if (freshStartEvidence?.startAttempt?.phase === "ambiguous") {
+            const ambiguity = this.blockFlowStepForAmbiguousStart(resolved.step, registered, freshStartEvidence.startAttempt);
+            responseStep = ambiguity.step;
+            effectiveStartAttempt = ambiguity.attempt;
+        }
+        if (freshStartEvidence?.startAttempt?.phase === "cancelled" ||
+            freshStartEvidence?.startAttempt?.phase === "failed") {
+            const terminal = this.blockFlowStepForTerminalStartAttempt(resolved.step, registered, freshStartEvidence.startAttempt);
+            const terminalState = terminal.blocked
+                ? startStateFromAttemptPhase(terminal.attempt.phase)
+                : "superseded";
+            return {
+                flow_instance_id: snapshot.instance.flow_instance_id,
+                step: {
+                    step_instance_id: terminal.step.step_instance_id,
+                    step_id: terminal.step.step_id,
+                    status: terminal.step.status,
+                    agent_id: terminal.step.agent_id
+                },
+                agent: {
+                    agent_id: terminal.agent.agent_id,
+                    run_id: terminal.agent.run_id,
+                    backend: terminal.agent.backend,
+                    title: terminal.agent.title,
+                    role: terminal.agent.role,
+                    status: terminal.agent.status,
+                    failure_reason: terminal.agent.failure_reason
+                },
+                subscriptions: [],
+                expected_artifacts: expectedArtifacts,
+                prompt_size: 0,
+                orchestrator_action: null,
+                start_state: terminalState
+            };
+        }
+        // Recheck stop authority after resolving the durable assignment and before
+        // creating relationships or starting backend work. The assignment helper
+        // performs the same check while holding the write reservation.
+        this.assertNewWorkAllowed(run.run_id, "flow_dispatch_active", registered);
         const subscriber = input.subscriberAgentId ? this.getAgent(input.subscriberAgentId) : null;
-        if (subscriber && subscriber.agent_id !== registered.agent_id) {
+        // Automatic continuation has no worker token or explicit subscriber. A
+        // fresh step still belongs to the flow owner, so recover that durable
+        // owner from the flow instance instead of dropping its relationships.
+        const owner = subscriber ??
+            (lifecycle === "fresh_per_step" && snapshot.instance.orchestrator_agent_id
+                ? this.getAgent(snapshot.instance.orchestrator_agent_id)
+                : null);
+        if (owner && owner.agent_id !== registered.agent_id) {
             this.createAgentLinkIfMissing({
                 runId: registered.run_id,
-                sourceAgentId: subscriber.agent_id,
+                sourceAgentId: owner.agent_id,
                 targetAgentId: registered.agent_id,
                 type: "parent_child",
                 label: stepConfig.role ?? null
             });
         }
-        const assignedStep = this.store.updateFlowStepInstance(activeStep.step_instance_id, {
-            agentId: registered.agent_id
-        });
+        if (lifecycle === "fresh_per_step") {
+            this.createFreshFlowStepHandoffLinks({
+                snapshot,
+                activeStep: resolved.step,
+                agent: registered,
+                owner
+            });
+        }
         const subscriptions = [];
-        if (subscriber) {
+        if (owner && owner.agent_id !== registered.agent_id) {
             for (const eventType of ["agent.completed", "agent.failed", "agent.blocked", "agent.stopped"]) {
                 subscriptions.push(this.createSubscriptionIfMissing({
                     runId: run.run_id,
                     sourceAgentId: registered.agent_id,
-                    subscriberAgentId: subscriber.agent_id,
+                    subscriberAgentId: owner.agent_id,
                     eventType
                 }));
             }
         }
-        const stepForPrompt = this.store.updateFlowStepInstance(activeStep.step_instance_id, {
-            inputJson: assignFlowStepWorkerAgent(assignedStep.input_json, registered.agent_id)
-        });
-        const prompt = this.buildActiveFlowWorkerPrompt(stepForPrompt);
-        const started = await this.startAgent({
-            agentId: registered.agent_id,
-            prompt,
-            server: input.server ?? DEFAULT_OPENCODE_SERVER,
-            model: roleConfig?.model,
-            expectedArtifacts,
-            metadata: {
-                flow_instance_id: snapshot.instance.flow_instance_id,
-                step_instance_id: activeStep.step_instance_id,
-                step_id: activeStep.step_id
-            },
-            agentToken: input.agentToken
-        });
-        const { agent_token: _agentToken, ...agent } = started;
+        const shouldStart = lifecycle !== "fresh_per_step" || !freshStartEvidence?.hasDurableStartEvidence;
+        // Rebuild the prompt on normal replays to preserve response diagnostics,
+        // but never let a later missing prompt file hide an already-durable action
+        // or session. When work still needs to start, construction remains a hard
+        // gate and a failure leaves the assigned fresh worker eligible for retry.
+        let prompt = null;
+        try {
+            prompt = this.buildActiveFlowWorkerPrompt(resolved.step);
+        }
+        catch (error) {
+            if (shouldStart) {
+                throw error;
+            }
+        }
+        let started;
+        if (!shouldStart) {
+            // An assignment is not start evidence: a process can die after assigning
+            // the fresh worker but before prompt construction or backend dispatch.
+            // Only the evidence resolved above makes a replay idempotent. Surface an
+            // open native action exactly; all other evidence preserves the agent as-is.
+            started = freshStartEvidence?.openAction
+                ? {
+                    ...this.getAgent(registered.agent_id),
+                    orchestrator_action: orchestratorActionRef(freshStartEvidence.openAction)
+                }
+                : this.getAgent(registered.agent_id);
+        }
+        else {
+            started = await this.startAgent({
+                agentId: registered.agent_id,
+                prompt: prompt,
+                server: backend === CODEX_SUBAGENT_BACKEND ? undefined : input.server ?? DEFAULT_OPENCODE_SERVER,
+                model: roleConfig?.model ?? undefined,
+                expectedArtifacts,
+                metadata: {
+                    flow_instance_id: snapshot.instance.flow_instance_id,
+                    step_instance_id: activeStep.step_instance_id,
+                    step_id: activeStep.step_id
+                },
+                agentToken: input.agentToken,
+                bridgeGrantId: flowBridgeGrant?.bridge_grant_id ?? input.bridgeGrantId ?? null,
+                forkTurns: roleConfig?.backend_options?.codex_subagent?.fork_turns
+            });
+        }
+        if (started.start_state === "ambiguous" && lifecycle === "fresh_per_step") {
+            const ambiguousAttempt = this.store.resolveAgentStartAttempt(registered.agent_id, resolved.step.step_instance_id);
+            if (ambiguousAttempt?.phase === "ambiguous") {
+                const ambiguity = this.blockFlowStepForAmbiguousStart(resolved.step, this.getAgent(registered.agent_id), ambiguousAttempt);
+                responseStep = ambiguity.step;
+                effectiveStartAttempt = ambiguity.attempt;
+                if (!ambiguity.blocked && ambiguity.attempt?.phase === "succeeded") {
+                    started = { ...this.getAgent(registered.agent_id), start_state: "started" };
+                }
+            }
+        }
+        if (lifecycle === "fresh_per_step" &&
+            (started.start_state === "cancelled" || started.start_state === "failed")) {
+            const terminalAttempt = this.store.getAgentStartAttemptForStep(registered.agent_id, resolved.step.step_instance_id);
+            if (terminalAttempt?.phase === "cancelled" ||
+                terminalAttempt?.phase === "failed") {
+                const terminal = this.blockFlowStepForTerminalStartAttempt(resolved.step, this.getAgent(registered.agent_id), terminalAttempt);
+                responseStep = terminal.step;
+                effectiveStartAttempt = terminal.attempt;
+                started = {
+                    ...terminal.agent,
+                    start_state: terminal.blocked
+                        ? startStateFromAttemptPhase(terminal.attempt.phase)
+                        : "superseded"
+                };
+            }
+        }
+        const agent = "agent_token" in started
+            ? (({ agent_token: _agentToken, ...safeAgent }) => safeAgent)(started)
+            : started;
         return {
             flow_instance_id: snapshot.instance.flow_instance_id,
             step: {
-                step_instance_id: assignedStep.step_instance_id,
-                step_id: assignedStep.step_id,
-                status: assignedStep.status,
-                agent_id: assignedStep.agent_id
+                step_instance_id: responseStep.step_instance_id,
+                step_id: responseStep.step_id,
+                status: responseStep.status,
+                agent_id: responseStep.agent_id
             },
             agent: {
                 agent_id: agent.agent_id,
@@ -363,18 +973,51 @@ export class AgentController {
                 subscriber_agent_id: subscription.subscriber_agent_id
             })),
             expected_artifacts: expectedArtifacts,
-            prompt_size: prompt.length
+            prompt_size: prompt?.length ?? 0,
+            orchestrator_action: "orchestrator_action" in started ? started.orchestrator_action ?? null : null,
+            start_state: "start_state" in started
+                ? started.start_state ?? null
+                : effectiveStartAttempt
+                    ? startStateFromAttemptPhase(effectiveStartAttempt.phase)
+                    : null
         };
     }
     async continueFlowInternal(input) {
         const snapshot = this.getFlowSnapshot(input.flowInstanceId);
         const instance = snapshot.instance;
+        if (flowUsesCodexSubagents(snapshot.flow.config)) {
+            // Continuation may block a step, refresh lifecycle state, assign a
+            // worker, or create an action. Reject a token from another task binding
+            // before any of those durable effects can happen.
+            this.resolveNativeFlowBridgeGrant(instance, input.bridgeGrantId ?? null);
+        }
         if (instance.status === "waiting_for_orchestrator") {
             return this.flowContinuationResult(snapshot, "waiting_for_orchestrator", {
                 notification: "orchestrator"
             });
         }
         if (instance.status === "blocked") {
+            const blockedStep = snapshot.steps.find((step) => step.status === "blocked" && step.step_id === instance.current_step_id);
+            if (blockedStep?.agent_id) {
+                const attempt = this.store.resolveAgentStartAttempt(blockedStep.agent_id, blockedStep.step_instance_id);
+                if (attempt?.phase === "ambiguous" &&
+                    blockedStep.summary?.startsWith(`Backend start attempt ${attempt.start_attempt_id} `)) {
+                    return this.flowContinuationResult(snapshot, "blocked", {
+                        activeStep: blockedStep,
+                        agent: this.getAgent(blockedStep.agent_id),
+                        blockedReason: "backend_start_ambiguous",
+                        notification: "automatic_backend_start_retry_disabled"
+                    });
+                }
+                if ((attempt?.phase === "cancelled" || attempt?.phase === "failed") &&
+                    blockedStep.summary?.startsWith(`Backend start attempt ${attempt.start_attempt_id} ${attempt.phase} `)) {
+                    return this.flowContinuationResult(snapshot, "blocked", {
+                        activeStep: blockedStep,
+                        agent: this.getAgent(blockedStep.agent_id),
+                        blockedReason: `backend_start_${attempt.phase}`
+                    });
+                }
+            }
             return this.flowContinuationResult(snapshot, "blocked", {
                 blockedReason: "flow_blocked"
             });
@@ -391,7 +1034,118 @@ export class AgentController {
                 blockedReason: "no_active_step"
             });
         }
+        const run = this.getRun(instance.run_id);
+        const activeStepConfig = snapshot.flow.config.steps[activeStep.step_id];
+        const activeStepBackend = activeStepConfig?.role
+            ? snapshot.flow.config.roles?.[activeStepConfig.role]?.backend
+            : null;
+        const activeStepLifecycle = resolveFlowAgentLifecycle(activeStepConfig?.role
+            ? snapshot.flow.config.roles?.[activeStepConfig.role]?.agent_lifecycle
+            : undefined);
+        const freshStartEvidence = activeStep.agent_id && activeStepLifecycle === "fresh_per_step"
+            ? this.resolveFreshFlowStepStartEvidence(activeStep.agent_id, activeStep.step_instance_id)
+            : null;
+        if (freshStartEvidence?.startAttempt?.phase === "ambiguous") {
+            const ambiguity = this.blockFlowStepForAmbiguousStart(activeStep, freshStartEvidence.agent, freshStartEvidence.startAttempt);
+            if (!ambiguity.blocked) {
+                // The original lease owner committed a valid handle between evidence
+                // resolution and the blocking CAS. Re-read instead of publishing a
+                // stale ambiguity or suppressing the now-running worker.
+                return this.continueFlowInternal(input);
+            }
+            return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
+                activeStep: ambiguity.step,
+                agent: freshStartEvidence.agent,
+                blockedReason: "backend_start_ambiguous"
+            });
+        }
+        if (freshStartEvidence?.startAttempt?.phase === "cancelled" ||
+            freshStartEvidence?.startAttempt?.phase === "failed") {
+            const terminal = this.blockFlowStepForTerminalStartAttempt(activeStep, freshStartEvidence.agent, freshStartEvidence.startAttempt);
+            if (!terminal.blocked) {
+                return this.continueFlowInternal(input);
+            }
+            return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
+                activeStep: terminal.step,
+                agent: terminal.agent,
+                blockedReason: `backend_start_${terminal.attempt.phase}`
+            });
+        }
+        const startAttemptInProgress = Boolean(freshStartEvidence?.startAttempt &&
+            (freshStartEvidence.startAttempt.phase === "invoking" ||
+                (freshStartEvidence.startAttempt.phase === "prepared" &&
+                    Date.parse(freshStartEvidence.startAttempt.lease_expires_at) > Date.now())));
+        const shouldRecoverFreshStart = Boolean(activeStep.agent_id &&
+            activeStepLifecycle === "fresh_per_step" &&
+            !freshStartEvidence?.hasDurableStartEvidence);
+        let prospectiveAgent = null;
         if (activeStep.agent_id) {
+            prospectiveAgent = freshStartEvidence?.agent ?? this.getAgent(activeStep.agent_id);
+        }
+        else if (activeStepConfig &&
+            activeStepLifecycle === "reuse") {
+            prospectiveAgent = this.findDeclaredFlowAgent(run.run_id, snapshot.flow.flow_id, activeStepConfig.role, activeStepBackend);
+        }
+        // An assigned worker with durable start evidence is handled below by the
+        // established report/terminal contract. A fresh assignment without that
+        // evidence is about to retry new work, so its own stop intent must block
+        // dispatch just like a reusable declared worker on an unassigned step.
+        const stopBlockReason = this.newWorkStopBlockReason(run, activeStep.agent_id && !shouldRecoverFreshStart ? null : prospectiveAgent);
+        if (stopBlockReason) {
+            if (activeStep.agent_id) {
+                const openActions = this.store
+                    .listOrchestratorActions({ agentId: activeStep.agent_id })
+                    .filter((action) => action.agent_id === activeStep.agent_id &&
+                    action.step_instance_id === activeStep.step_instance_id &&
+                    (action.status === "pending" || action.status === "claimed"));
+                // Stop intent forbids returning pending work-starting actions for
+                // execution. An interrupt remains executable, while an already-claimed
+                // action remains visible only so its original owner can finish the ACK
+                // cleanup protocol with the token it already holds.
+                const cleanupAction = openActions.filter((action) => action.operation === "interrupt_agent").at(-1) ??
+                    openActions
+                        .filter((action) => action.status === "claimed" && action.operation !== "interrupt_agent")
+                        .at(-1) ??
+                    null;
+                if (cleanupAction) {
+                    return this.flowContinuationResult(snapshot, "orchestrator_action_required", {
+                        activeStep,
+                        agent: this.getAgent(activeStep.agent_id),
+                        orchestratorAction: orchestratorActionRef(cleanupAction)
+                    });
+                }
+            }
+            return this.flowContinuationResult(snapshot, "blocked", {
+                activeStep,
+                agent: prospectiveAgent,
+                blockedReason: stopBlockReason
+            });
+        }
+        if (startAttemptInProgress && activeStep.agent_id) {
+            return this.flowContinuationResult(snapshot, "start_in_progress", {
+                activeStep,
+                agent: prospectiveAgent,
+                notification: "backend_start_in_progress"
+            });
+        }
+        if (activeStep.agent_id && !shouldRecoverFreshStart) {
+            // Native stop intent is part of flow continuation state as well as the
+            // action acknowledgement response. This lets a coordinator recover the
+            // exact interrupt after losing an ACK response or restarting, instead of
+            // leaving a real late-spawned worker hidden behind `waiting_for_report`.
+            const pendingNativeAction = this.store.findOpenOrchestratorAction(activeStep.agent_id, [
+                "spawn_agent",
+                "send_message",
+                "followup_task",
+                "interrupt_agent"
+            ]);
+            if (pendingNativeAction && pendingNativeAction.step_instance_id === activeStep.step_instance_id) {
+                return this.flowContinuationResult(snapshot, "orchestrator_action_required", {
+                    activeStep,
+                    agent: this.getAgent(activeStep.agent_id),
+                    orchestratorAction: orchestratorActionRef(pendingNativeAction)
+                });
+            }
             const agent = await this.refreshAgentStatus(activeStep.agent_id);
             if (TERMINAL_STATUSES.has(agent.status)) {
                 const hasReport = this.store
@@ -416,34 +1170,125 @@ export class AgentController {
             activeStep,
             subscriberAgentId: input.subscriberAgentId ?? null,
             server: input.server ?? null,
-            agentToken: input.agentToken ?? null
+            agentToken: input.agentToken ?? null,
+            bridgeGrantId: input.bridgeGrantId ?? null
         });
         const dispatchedAgent = this.getAgent(String(dispatch.agent.agent_id));
+        const durableDispatchAction = dispatch.orchestrator_action
+            ? this.orchestratorActionAfterNewWorkProjection(dispatch.orchestrator_action.action_id, dispatch.orchestrator_action.agent_id).action
+            : null;
+        const durableDispatch = {
+            ...dispatch,
+            orchestrator_action: durableDispatchAction
+        };
+        if (durableDispatch.start_state === "superseded") {
+            const currentSnapshot = this.getFlowSnapshot(input.flowInstanceId);
+            return this.flowContinuationResult(currentSnapshot, "start_superseded", {
+                activeStep: currentSnapshot.steps.find((step) => step.status === "active") ?? null,
+                agent: dispatchedAgent,
+                dispatch: durableDispatch,
+                notification: "flow_route_advanced_during_backend_start"
+            });
+        }
+        if (durableDispatch.start_state === "cancelled" ||
+            durableDispatch.start_state === "failed") {
+            const currentSnapshot = this.getFlowSnapshot(input.flowInstanceId);
+            return this.flowContinuationResult(currentSnapshot, "blocked", {
+                activeStep: currentSnapshot.steps.find((step) => step.step_instance_id === activeStep.step_instance_id) ?? null,
+                agent: dispatchedAgent,
+                dispatch: durableDispatch,
+                blockedReason: `backend_start_${durableDispatch.start_state}`
+            });
+        }
+        if (durableDispatch.start_state === "ambiguous") {
+            return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
+                activeStep: this.getFlowStepInstanceOrThrow(activeStep.step_instance_id),
+                agent: dispatchedAgent,
+                dispatch: durableDispatch,
+                blockedReason: "backend_start_ambiguous"
+            });
+        }
+        if (durableDispatch.start_state === "in_progress") {
+            return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "start_in_progress", {
+                activeStep: this.getFlowStepInstanceOrThrow(activeStep.step_instance_id),
+                agent: dispatchedAgent,
+                dispatch: durableDispatch,
+                notification: "backend_start_in_progress"
+            });
+        }
         if (TERMINAL_STATUSES.has(dispatchedAgent.status) && dispatchedAgent.status !== "completed") {
             const blockedStep = this.blockFlowStepForMissingReport(activeStep, dispatchedAgent);
             return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
                 activeStep: blockedStep,
                 agent: dispatchedAgent,
-                dispatch,
+                dispatch: durableDispatch,
                 blockedReason: `agent_start_${dispatchedAgent.status}`
             });
         }
-        return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "dispatched", {
+        const postDispatchStopReason = this.newWorkStopBlockReason(this.getRun(dispatchedAgent.run_id), dispatchedAgent);
+        if (postDispatchStopReason && !durableDispatchAction) {
+            return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
+                activeStep: this.getFlowStepInstanceOrThrow(activeStep.step_instance_id),
+                agent: dispatchedAgent,
+                dispatch: durableDispatch,
+                blockedReason: postDispatchStopReason
+            });
+        }
+        const orchestratorAction = durableDispatchAction;
+        const continuationAction = orchestratorAction
+            ? "orchestrator_action_required"
+            : dispatchedAgent.backend === CODEX_SUBAGENT_BACKEND
+                ? "waiting_for_report"
+                : "dispatched";
+        return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), continuationAction, {
             activeStep: this.getFlowStepInstanceOrThrow(activeStep.step_instance_id),
             agent: dispatchedAgent,
-            dispatch
+            dispatch: durableDispatch,
+            orchestratorAction
         });
     }
     flowContinuationResult(snapshot, action, options = {}) {
+        const candidateAction = options.orchestratorAction ?? options.dispatch?.orchestrator_action ?? null;
+        const orchestratorAction = candidateAction
+            ? this.orchestratorActionAfterNewWorkProjection(candidateAction.action_id, candidateAction.agent_id).action
+            : null;
+        const durableAgent = candidateAction
+            ? this.getAgent(candidateAction.agent_id)
+            : options.agent ?? null;
+        let resolvedAction = action;
+        let resolvedBlockedReason = options.blockedReason ?? null;
+        if (resolvedAction === "orchestrator_action_required" && !orchestratorAction) {
+            const stopReason = durableAgent
+                ? this.newWorkStopBlockReason(this.getRun(durableAgent.run_id), durableAgent)
+                : null;
+            if (stopReason || (durableAgent && TERMINAL_STATUSES.has(durableAgent.status))) {
+                resolvedAction = "blocked";
+                resolvedBlockedReason =
+                    stopReason ?? `orchestrator_action_unavailable_agent_${durableAgent.status}`;
+            }
+            else {
+                resolvedAction = "waiting_for_report";
+            }
+        }
+        if (resolvedAction === "orchestrator_action_required" && orchestratorAction) {
+            // Automatic handoff notifications are durable, but a process can exit
+            // after the first delivery attempt. Re-encountering the same open action
+            // is therefore a deterministic recovery trigger for its one event row.
+            this.redriveNativeActionOwnerWake(orchestratorAction);
+        }
+        const durableDispatch = options.dispatch
+            ? { ...options.dispatch, orchestrator_action: orchestratorAction }
+            : null;
         return {
             flow_instance_id: snapshot.instance.flow_instance_id,
-            action,
+            action: resolvedAction,
             instance: snapshot.instance,
             active_step: options.activeStep ?? snapshot.steps.find((step) => step.status === "active") ?? null,
-            dispatch: options.dispatch ?? null,
-            agent: options.agent ?? null,
+            dispatch: durableDispatch,
+            agent: durableAgent,
             notification: options.notification ?? null,
-            blocked_reason: options.blockedReason ?? null
+            blocked_reason: resolvedBlockedReason,
+            orchestrator_action: orchestratorAction
         };
     }
     activeFlowStepOrThrow(snapshot, flowInstanceId) {
@@ -454,13 +1299,88 @@ export class AgentController {
             });
         }
         if (activeStep.agent_id) {
-            throw new ControllerError("Active flow step already has an assigned agent.", "tool_error", {
-                flow_instance_id: flowInstanceId,
-                step_instance_id: activeStep.step_instance_id,
-                agent_id: activeStep.agent_id
-            });
+            const stepConfig = snapshot.flow.config.steps[activeStep.step_id];
+            const roleConfig = stepConfig?.role
+                ? snapshot.flow.config.roles?.[stepConfig.role]
+                : undefined;
+            if (resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) !== "fresh_per_step") {
+                throw new ControllerError("Active flow step already has an assigned agent.", "tool_error", {
+                    flow_instance_id: flowInstanceId,
+                    step_instance_id: activeStep.step_instance_id,
+                    agent_id: activeStep.agent_id
+                });
+            }
         }
         return activeStep;
+    }
+    newWorkStopBlockReason(run, agent) {
+        if (STOP_INTENT_RUN_STATUSES.has(run.status)) {
+            return `run_${run.status}_no_new_work`;
+        }
+        if (agent && STOP_INTENT_AGENT_STATUSES.has(agent.status)) {
+            return `agent_${agent.status}_no_new_work`;
+        }
+        return null;
+    }
+    assertNewWorkAllowed(runId, operation, agent) {
+        const run = this.getRun(runId);
+        const blockedReason = this.newWorkStopBlockReason(run, agent);
+        if (!blockedReason) {
+            return;
+        }
+        throw new ControllerError(`Durable stop intent blocks ${operation}; no new work may be started or dispatched.`, "tool_error", {
+            reason: "durable_stop_intent",
+            blocked_reason: blockedReason,
+            operation,
+            run_id: run.run_id,
+            run_status: run.status,
+            agent_id: agent?.agent_id ?? null,
+            agent_status: agent?.status ?? null
+        });
+    }
+    requireCreatedOrchestratorAction(action, agent, operation) {
+        if (action) {
+            return action;
+        }
+        const current = this.getAgent(agent.agent_id);
+        if (operation) {
+            // The SQLite INSERT predicate, rather than this re-read, is the authority.
+            // Re-reading only turns its null result into the same stable public error
+            // used by the controller's fast preflight path.
+            this.assertNewWorkAllowed(current.run_id, operation, current);
+        }
+        throw new ControllerError("SQLite rejected orchestrator action creation because its durable prerequisites changed.", "tool_error", {
+            agent_id: current.agent_id,
+            run_id: current.run_id,
+            orchestrator_action_operation: operation
+        });
+    }
+    orchestratorActionAfterNewWorkProjection(actionId, agentId) {
+        const agent = this.getAgent(agentId);
+        const action = this.store.getOrchestratorAction(actionId);
+        if (!action || (action.status !== "pending" && action.status !== "claimed")) {
+            return { agent, action: null };
+        }
+        if (action.status === "pending" &&
+            action.operation !== "interrupt_agent" &&
+            this.hasDurableStopIntent(agent)) {
+            // A pending work action becomes unclaimable as soon as durable stop wins,
+            // even if another process has not yet projected its cancellation into
+            // this controller's earlier record. Do not surface it as executable.
+            return { agent, action: null };
+        }
+        return { agent, action: orchestratorActionRef(action) };
+    }
+    openOrchestratorActionRef(actionId) {
+        const action = this.store.getOrchestratorAction(actionId);
+        return action && (action.status === "pending" || action.status === "claimed")
+            ? orchestratorActionRef(action)
+            : null;
+    }
+    optionalOpenOrchestratorActionRef(action) {
+        return action
+            ? this.openOrchestratorActionRef(action.action_id) ?? undefined
+            : undefined;
     }
     blockFlowStepForMissingReport(step, agent) {
         const summary = `Worker ${agent.agent_id} reached terminal status ${agent.status} without reporting the flow step result.`;
@@ -486,6 +1406,238 @@ export class AgentController {
             }
         });
         return blocked;
+    }
+    /**
+     * Persist the safety stop for an invocation whose backend outcome is
+     * unknowable. The attempt id in the summary lets a valid late response from
+     * the original lease owner clear only this specific block.
+     */
+    blockFlowStepForAmbiguousStart(step, agent, attempt) {
+        const summary = `Backend start attempt ${attempt.start_attempt_id} crossed the invocation boundary but did not persist a valid handle. Automatic retry is disabled to prevent a duplicate backend session.`;
+        const transition = this.store.immediateTransaction(() => {
+            const currentAttempt = this.store.getAgentStartAttemptForStep(attempt.agent_id, attempt.step_instance_id, attempt.generation);
+            const currentStep = this.getFlowStepInstanceOrThrow(step.step_instance_id);
+            const currentInstance = this.getFlowInstanceOrThrow(step.flow_instance_id);
+            if (currentAttempt?.phase !== "ambiguous") {
+                return {
+                    step: currentStep,
+                    attempt: currentAttempt,
+                    blocked: false,
+                    emitted: false
+                };
+            }
+            if (currentStep.status === "blocked" &&
+                currentStep.summary?.startsWith(`Backend start attempt ${currentAttempt.start_attempt_id} `)) {
+                const stillOwnsFlowBlock = currentInstance.status === "blocked" &&
+                    currentInstance.current_step_id === currentStep.step_id &&
+                    !this.store.hasFlowStepInstanceAfter(currentStep.step_instance_id) &&
+                    !this.store
+                        .listFlowStepInstances(currentStep.flow_instance_id)
+                        .some((candidate) => candidate.status === "active");
+                return {
+                    step: currentStep,
+                    attempt: currentAttempt,
+                    blocked: stillOwnsFlowBlock,
+                    emitted: false
+                };
+            }
+            if (currentStep.status !== "active" ||
+                currentInstance.status !== "active" ||
+                currentInstance.current_step_id !== currentStep.step_id ||
+                this.store.hasFlowStepInstanceAfter(currentStep.step_instance_id) ||
+                this.store
+                    .listFlowStepInstances(currentStep.flow_instance_id)
+                    .some((candidate) => candidate.step_instance_id !== currentStep.step_instance_id &&
+                    candidate.status === "active")) {
+                return {
+                    step: currentStep,
+                    attempt: currentAttempt,
+                    blocked: false,
+                    emitted: false
+                };
+            }
+            const blockedStep = this.store.updateFlowStepInstance(step.step_instance_id, {
+                status: "blocked",
+                summary,
+                completedAt: nowIso()
+            });
+            this.store.updateFlowInstance(step.flow_instance_id, {
+                status: "blocked",
+                currentStepId: step.step_id
+            });
+            return {
+                step: blockedStep,
+                attempt: currentAttempt,
+                blocked: true,
+                emitted: true
+            };
+        });
+        if (!transition.emitted || !transition.attempt) {
+            return transition;
+        }
+        this.emit({
+            runId: agent.run_id,
+            agentId: agent.agent_id,
+            type: "flow.step_blocked",
+            payload: {
+                flow_instance_id: step.flow_instance_id,
+                step_instance_id: step.step_instance_id,
+                step_id: step.step_id,
+                reason: "backend_start_ambiguous",
+                start_attempt_id: transition.attempt.start_attempt_id,
+                attempt_phase: transition.attempt.phase,
+                invocation_started_at: transition.attempt.invocation_started_at,
+                message: transition.attempt.error_json?.message ?? summary
+            }
+        });
+        return transition;
+    }
+    /**
+     * Project a durable terminal start attempt into visible flow state without
+     * invoking the adapter. The active-step ownership predicate and agent
+     * terminal projection share one write reservation, so a concurrent manual
+     * route either wins completely or leaves one precise blocked step.
+     */
+    blockFlowStepForTerminalStartAttempt(step, agent, attempt) {
+        if (attempt.phase !== "cancelled" && attempt.phase !== "failed") {
+            throw new ControllerError("Terminal start blocking requires a cancelled or failed attempt.", "tool_error", { start_attempt_id: attempt.start_attempt_id, phase: attempt.phase });
+        }
+        const reason = `backend_start_${attempt.phase}`;
+        const summary = `Backend start attempt ${attempt.start_attempt_id} ${attempt.phase} before adapter invocation.`;
+        const transition = this.store.immediateTransaction(() => {
+            const currentStep = this.getFlowStepInstanceOrThrow(step.step_instance_id);
+            const currentAttempt = this.store.getAgentStartAttemptForStep(agent.agent_id, step.step_instance_id);
+            const instance = this.getFlowInstanceOrThrow(step.flow_instance_id);
+            const currentAgent = this.getAgent(agent.agent_id);
+            if (currentStep.status !== "active" ||
+                instance.status !== "active" ||
+                instance.current_step_id !== currentStep.step_id ||
+                !currentAttempt ||
+                currentAttempt.start_attempt_id !== attempt.start_attempt_id ||
+                currentAttempt.phase !== attempt.phase) {
+                return {
+                    step: currentStep,
+                    agent: currentAgent,
+                    attempt: currentAttempt ?? attempt,
+                    blocked: false
+                };
+            }
+            const terminalAgent = currentAgent.backend_handle || TERMINAL_STATUSES.has(currentAgent.status)
+                ? currentAgent
+                : this.store.updateAgent(currentAgent.agent_id, {
+                    status: attempt.phase === "cancelled" ? "stopped" : "failed",
+                    failureReason: attempt.phase === "cancelled" ? null : "unknown"
+                });
+            const blockedStep = this.store.updateFlowStepInstance(step.step_instance_id, {
+                status: "blocked",
+                summary,
+                completedAt: nowIso()
+            });
+            this.store.updateFlowInstance(step.flow_instance_id, {
+                status: "blocked",
+                currentStepId: step.step_id
+            });
+            return {
+                step: blockedStep,
+                agent: terminalAgent,
+                attempt: currentAttempt,
+                blocked: true
+            };
+        });
+        if (!transition.blocked) {
+            return transition;
+        }
+        this.emit({
+            runId: transition.agent.run_id,
+            agentId: transition.agent.agent_id,
+            type: "flow.step_blocked",
+            payload: {
+                flow_instance_id: step.flow_instance_id,
+                step_instance_id: step.step_instance_id,
+                step_id: step.step_id,
+                reason,
+                start_attempt_id: transition.attempt.start_attempt_id,
+                attempt_phase: transition.attempt.phase,
+                message: transition.attempt.error_json?.message ?? summary
+            }
+        });
+        return transition;
+    }
+    /**
+     * Decide whether any completed non-native start still belongs to its flow
+     * route. This method runs inside the same BEGIN IMMEDIATE transaction that
+     * persists the returned handle, so a manual route and backend response cannot
+     * each commit from the same stale flow snapshot. Only a response that crosses
+     * the ambiguity boundary may reopen its own exact ambiguity block.
+     */
+    reconcileStartFlowOwnershipInTransaction(attempt, recoverExactAmbiguityBlock) {
+        const marker = `Backend start attempt ${attempt.start_attempt_id} `;
+        const step = this.getFlowStepInstanceOrThrow(attempt.step_instance_id);
+        const instance = this.getFlowInstanceOrThrow(attempt.flow_instance_id);
+        const laterStepExists = this.store.hasFlowStepInstanceAfter(step.step_instance_id);
+        const transitionExists = this.store
+            .listFlowTransitions(instance.flow_instance_id)
+            .some((transition) => transition.from_step_instance_id === step.step_instance_id);
+        const reportExists = this.store
+            .listFlowStepReports(instance.flow_instance_id)
+            .some((report) => report.step_instance_id === step.step_instance_id);
+        const otherActiveStepExists = this.store
+            .listFlowStepInstances(instance.flow_instance_id)
+            .some((candidate) => candidate.step_instance_id !== step.step_instance_id && candidate.status === "active");
+        if (laterStepExists || transitionExists || reportExists || otherActiveStepExists) {
+            return {
+                outcome: "superseded",
+                step,
+                reason: laterStepExists
+                    ? "later_flow_step_exists"
+                    : transitionExists
+                        ? "flow_transition_already_selected"
+                        : reportExists
+                            ? "flow_step_already_reported"
+                            : "another_flow_step_is_active"
+            };
+        }
+        if (instance.status === "active" &&
+            instance.current_step_id === step.step_id &&
+            step.status === "active" &&
+            step.agent_id === attempt.agent_id) {
+            return { outcome: "already_active", step, reason: "original_step_still_active" };
+        }
+        if (!recoverExactAmbiguityBlock ||
+            instance.status !== "blocked" ||
+            instance.current_step_id !== step.step_id ||
+            step.status !== "blocked" ||
+            step.agent_id !== attempt.agent_id ||
+            !step.summary?.startsWith(marker)) {
+            return {
+                outcome: "superseded",
+                step,
+                reason: `flow_${instance.status}_or_block_replaced`
+            };
+        }
+        const recovered = this.store.updateFlowStepInstance(step.step_instance_id, {
+            status: "active",
+            summary: `Late backend start attempt ${attempt.start_attempt_id} reconciled and resumed.`,
+            completedAt: null
+        });
+        this.store.updateFlowInstance(step.flow_instance_id, {
+            status: "active",
+            currentStepId: step.step_id
+        });
+        return { outcome: "recovered", step: recovered, reason: "exact_ambiguity_block_recovered" };
+    }
+    emitLateStartFlowRecovery(attempt, agent) {
+        this.emit({
+            runId: agent.run_id,
+            agentId: agent.agent_id,
+            type: "flow.step_started",
+            payload: {
+                flow_instance_id: attempt.flow_instance_id,
+                step_instance_id: attempt.step_instance_id,
+                start_attempt_id: attempt.start_attempt_id,
+                reason: "late_backend_start_reconciled"
+            }
+        });
     }
     reportFlowStep(input) {
         const existingStep = this.getFlowStepInstanceOrThrow(input.stepInstanceId);
@@ -629,17 +1781,70 @@ export class AgentController {
         const agentToken = this.issueAgentToken(agent.agent_id);
         return { run, agent, agent_token: agentToken };
     }
-    shutdownRun(runId) {
-        const stopped = this.stopAgents({ runId, mode: "graceful" });
-        const run = this.store.updateRunStatus(runId, "stopped");
+    async shutdownRun(runId) {
+        const shutdownAgents = this.store.listAgents({ runId });
+        this.store.transaction(() => {
+            // Persist run-level stop intent in the same write transaction that makes
+            // every unclaimed native message action unclaimable. If a claim won the
+            // race first, the affected worker is marked stopping so its later ACK is
+            // reconciled as uncertain work followed by one deterministic interrupt.
+            this.store.updateRunStatus(runId, "stopping");
+            for (const agent of shutdownAgents.filter((candidate) => candidate.backend === CODEX_SUBAGENT_BACKEND)) {
+                this.prepareCodexSubagentStopInTransaction(agent, {
+                    scope: "run_shutdown",
+                    recordStopIntent: !TERMINAL_STATUSES.has(agent.status)
+                });
+            }
+        });
+        const stopped = await this.stopAgents({ runId, mode: "graceful" });
+        const durableStopped = stopped.map((result) => {
+            const current = this.getAgent(result.agent_id);
+            const action = result.orchestrator_action
+                ? this.openOrchestratorActionRef(result.orchestrator_action.action_id)
+                : null;
+            return action ? { ...current, orchestrator_action: action } : current;
+        });
+        const orchestratorActions = durableStopped.flatMap((agent) => "orchestrator_action" in agent && agent.orchestrator_action
+            ? [agent.orchestrator_action]
+            : []);
+        let pendingAgentIds = this.store
+            .listAgents({ runId })
+            .filter((agent) => !TERMINAL_STATUSES.has(agent.status))
+            .map((agent) => agent.agent_id);
+        let complete = pendingAgentIds.length === 0;
+        let run = this.store.updateRunStatus(runId, complete ? "stopped" : "stopping");
+        if (!complete) {
+            const finalized = this.finalizeStoppingRunIfTerminal(runId);
+            if (finalized) {
+                run = finalized;
+                pendingAgentIds = [];
+                complete = true;
+            }
+        }
         this.emit({
             runId,
             type: "timer.elapsed",
-            payload: { action: "run_shutdown", stoppedAgents: stopped.length }
+            payload: {
+                action: complete ? "run_shutdown" : "run_shutdown_pending",
+                stopped_agents: this.store
+                    .listAgents({ runId })
+                    .filter((agent) => TERMINAL_STATUSES.has(agent.status)).length,
+                pending_agents: pendingAgentIds.length,
+                orchestrator_actions: orchestratorActions.length
+            }
         });
-        return { run, stopped };
+        return {
+            run,
+            stopped: durableStopped,
+            orchestrator_actions: orchestratorActions,
+            pending_agent_ids: pendingAgentIds,
+            complete
+        };
     }
     registerAgent(input) {
+        if (input.backend === CODEX_SUBAGENT_BACKEND && input.model?.trim()) {
+            throw new ControllerError("codex-subagent inherits the root model and does not support model overrides.", "unsupported_operation", { backend: input.backend, option: "model" });
+        }
         const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : null;
         if (!caller && input.adminKey && !verifyAdminKey(input.adminKey)) {
             throw new ControllerError("Invalid Agent Control admin key.", "auth_required");
@@ -693,8 +1898,1547 @@ export class AgentController {
         this.store.createAgentToken({ agentId, tokenHash: hashToken(token) });
         return token;
     }
+    requireBridgeToken(bridgeToken, binding = {}) {
+        const value = bridgeToken?.trim();
+        if (!value) {
+            throw new ControllerError("Bridge token is required.", "auth_required");
+        }
+        const grant = this.store.getBridgeGrantByTokenHash(hashToken(value));
+        const expired = grant?.expires_at ? Date.parse(grant.expires_at) <= Date.now() : false;
+        if (!grant || grant.revoked_at || expired) {
+            throw new ControllerError("Invalid or expired Agent Control bridge token.", "auth_required");
+        }
+        if (binding.runId && grant.run_id !== binding.runId) {
+            throw new ControllerError("Bridge token is scoped to another run.", "auth_required", {
+                run_id: binding.runId
+            });
+        }
+        if (binding.orchestratorAgentId &&
+            grant.orchestrator_agent_id !== binding.orchestratorAgentId) {
+            throw new ControllerError("Bridge token is scoped to another orchestrator.", "auth_required", {
+                orchestrator_agent_id: binding.orchestratorAgentId
+            });
+        }
+        if (binding.bridgeGrantId &&
+            grant.bridge_grant_id !== binding.bridgeGrantId) {
+            throw new ControllerError("Bridge token belongs to a different bridge task binding.", "auth_required", {
+                bridge_grant_id: binding.bridgeGrantId,
+                requested_bridge_grant_id: grant.bridge_grant_id
+            });
+        }
+        this.store.touchBridgeGrant(grant.bridge_grant_id);
+        return grant;
+    }
+    claimOrchestratorAction(input) {
+        const bridgeToken = input.bridgeToken.trim();
+        if (!bridgeToken) {
+            throw new ControllerError("Bridge token is required.", "auth_required");
+        }
+        const rawActionToken = generateActionToken();
+        const claimedAt = nowIso();
+        const leaseExpiresAt = new Date(Date.parse(claimedAt) + ORCHESTRATOR_ACTION_CLAIM_LEASE_MS).toISOString();
+        const claimed = this.store.claimOrchestratorAction({
+            actionId: input.actionId,
+            bridgeTokenHash: hashToken(bridgeToken),
+            actionTokenHash: hashToken(rawActionToken),
+            claimedAt,
+            leaseExpiresAt
+        });
+        if (claimed.type === "authorization_failed") {
+            throw new ControllerError("Invalid, expired, revoked, or incorrectly scoped Agent Control bridge token.", "auth_required", { action_id: input.actionId, reason: claimed.reason });
+        }
+        if (claimed.type === "already_claimed") {
+            return {
+                status: "already_claimed",
+                action_id: claimed.action.action_id,
+                retry_after_ms: Math.max(1, Math.ceil(claimed.retryAfterMs))
+            };
+        }
+        if (claimed.type === "unavailable") {
+            const blockedByStopIntent = claimed.reason === "stop_intent";
+            throw new ControllerError(blockedByStopIntent
+                ? "Durable stop intent blocks this work-starting orchestrator action."
+                : "Orchestrator action is not claimable.", "tool_error", {
+                action_id: input.actionId,
+                status: claimed.action?.status ?? "missing",
+                reason: blockedByStopIntent ? "durable_stop_intent" : claimed.reason
+            });
+        }
+        return {
+            action_id: claimed.action.action_id,
+            action_token: rawActionToken,
+            operation: claimed.action.operation,
+            backend: CODEX_SUBAGENT_BACKEND,
+            run_id: claimed.action.run_id,
+            orchestrator_agent_id: claimed.action.orchestrator_agent_id,
+            agent_id: claimed.action.agent_id,
+            flow_instance_id: claimed.action.flow_instance_id,
+            step_instance_id: claimed.action.step_instance_id,
+            request: claimed.action.payload_json
+        };
+    }
+    getOrchestratorActionRef(actionId) {
+        return orchestratorActionRef(this.getOrchestratorActionOrThrow(actionId));
+    }
+    getCodexSubagentBridgeScope(agentId) {
+        const agent = this.getAgent(agentId);
+        if (agent.backend !== CODEX_SUBAGENT_BACKEND) {
+            throw new ControllerError("Agent does not use the codex-subagent bridge.", "unsupported_operation", {
+                agent_id: agent.agent_id,
+                backend: agent.backend
+            });
+        }
+        const context = this.bridgeContextForAgent(agent);
+        return { run_id: agent.run_id, orchestrator_agent_id: context.orchestratorAgentId };
+    }
+    acknowledgeOrchestratorAction(input) {
+        const actionTokenHash = hashToken(input.actionToken.trim());
+        const result = input.result ?? null;
+        const error = input.error ?? null;
+        const pendingEvents = [];
+        const acknowledged = this.store.immediateTransaction(() => {
+            const queueEvent = (event) => {
+                pendingEvents.push(this.store.createEvent(event));
+            };
+            let action = this.getOrchestratorActionOrThrow(input.actionId);
+            if (!action.action_token_hash || action.action_token_hash !== actionTokenHash) {
+                throw new ControllerError("Invalid or rotated orchestrator action token.", "auth_required", {
+                    action_id: action.action_id
+                });
+            }
+            let newlyCompleted = false;
+            if (action.status === "succeeded" || action.status === "failed") {
+                if (action.status !== input.status ||
+                    !stableJsonEquals(action.result_json, result) ||
+                    !stableJsonEquals(action.error_json, error)) {
+                    throw new ControllerError("Conflicting acknowledgement for completed orchestrator action.", "tool_error", {
+                        action_id: action.action_id,
+                        current_status: action.status,
+                        requested_status: input.status
+                    });
+                }
+            }
+            else {
+                if (action.status !== "claimed") {
+                    throw new ControllerError("Orchestrator action must be claimed before acknowledgement.", "tool_error", { action_id: action.action_id, status: action.status });
+                }
+                if (input.status === "succeeded" && action.operation === "spawn_agent") {
+                    this.validateSpawnAcknowledgement(action, result, this.getAgent(action.agent_id));
+                }
+                const completion = this.store.completeOrchestratorAction({
+                    actionId: action.action_id,
+                    actionTokenHash,
+                    status: input.status,
+                    resultJson: result,
+                    errorJson: error
+                });
+                action = completion.action;
+                newlyCompleted = completion.changed;
+                if (!action.action_token_hash || action.action_token_hash !== actionTokenHash) {
+                    throw new ControllerError("Invalid or rotated orchestrator action token.", "auth_required", { action_id: action.action_id });
+                }
+                if (action.status !== input.status ||
+                    !stableJsonEquals(action.result_json, result) ||
+                    !stableJsonEquals(action.error_json, error)) {
+                    throw new ControllerError("Conflicting acknowledgement for completed orchestrator action.", "tool_error", {
+                        action_id: action.action_id,
+                        current_status: action.status,
+                        requested_status: input.status
+                    });
+                }
+            }
+            // Completion, causal interpretation, agent projection, optional cleanup
+            // creation, and run finalization must commit together. A terminal native
+            // sync can now win before this transaction (and be preserved) or after it
+            // (and supersede it), but never between the ACK's read and write.
+            const applied = newlyCompleted
+                ? this.applyOrchestratorActionAcknowledgement(action, queueEvent)
+                : (() => {
+                    const currentAgent = this.getAgent(action.agent_id);
+                    const replayedAgent = this.followupAcknowledgementStartsNewerTurn(action, currentAgent)
+                        ? this.applySuccessfulCodexSubagentMessageAcknowledgement(action, queueEvent)
+                        : this.mergeTerminalSpawnAcknowledgement(action, currentAgent);
+                    return { agent: replayedAgent };
+                })();
+            const reconciled = this.reconcileAcknowledgedActionStopIntent(action, applied.agent, queueEvent);
+            if (TERMINAL_STATUSES.has(reconciled.agent.status)) {
+                this.finalizeStoppingRunIfTerminal(reconciled.agent.run_id, queueEvent);
+            }
+            return {
+                action,
+                agent: reconciled.agent,
+                orchestratorAction: reconciled.orchestratorAction ?? applied.orchestratorAction
+            };
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        const agent = this.getAgent(acknowledged.agent.agent_id);
+        const cleanupAction = this.optionalOpenOrchestratorActionRef(acknowledged.orchestratorAction);
+        return {
+            action: orchestratorActionRef(acknowledged.action),
+            agent,
+            ...(cleanupAction ? { orchestrator_action: cleanupAction } : {})
+        };
+    }
+    syncCodexSubagent(input) {
+        const agent = this.getAgent(input.agentId);
+        if (agent.backend !== CODEX_SUBAGENT_BACKEND) {
+            throw new ControllerError("External native sync requires a codex-subagent agent.", "unsupported_operation", {
+                agent_id: agent.agent_id,
+                backend: agent.backend
+            });
+        }
+        const context = this.bridgeContextForAgent(agent);
+        const bridgeGrant = this.requireBridgeToken(input.bridgeToken, {
+            runId: agent.run_id,
+            orchestratorAgentId: context.orchestratorAgentId,
+            bridgeGrantId: context.originatingBridgeGrantId
+        });
+        if (bridgeGrant.bridge_grant_id !== context.originatingBridgeGrantId) {
+            throw new ControllerError("Native agent belongs to a different bridge task binding.", "auth_required", {
+                agent_id: agent.agent_id,
+                originating_bridge_grant_id: context.originatingBridgeGrantId,
+                requested_bridge_grant_id: bridgeGrant.bridge_grant_id
+            });
+        }
+        const observedAt = normalizeObservedAt(input.observedAt);
+        if (input.latestMessage !== undefined &&
+            input.latestMessage !== null &&
+            Buffer.byteLength(input.latestMessage, "utf8") > MAX_EXTERNAL_LATEST_MESSAGE_BYTES) {
+            throw new ControllerError("latest_message exceeds the 4 KiB native sync limit.", "tool_error", {
+                agent_id: agent.agent_id,
+                max_bytes: MAX_EXTERNAL_LATEST_MESSAGE_BYTES
+            });
+        }
+        const pendingEvents = [];
+        const synchronized = this.store.immediateTransaction(() => {
+            const queueEvent = (event) => {
+                pendingEvents.push(this.store.createEvent(event));
+            };
+            const current = this.getAgent(agent.agent_id);
+            if (current.backend !== CODEX_SUBAGENT_BACKEND) {
+                throw new ControllerError("External native sync requires a codex-subagent agent.", "unsupported_operation", { agent_id: current.agent_id, backend: current.backend });
+            }
+            const handle = current.backend_handle ?? {};
+            assertMatchingNativeIdentity(handle, input);
+            const existing = this.store.getCodexSubagentExternalState(current.agent_id);
+            const nativeAgentId = input.nativeAgentId ?? recordString(handle, "native_agent_id");
+            const nativeTaskName = input.nativeTaskName ?? recordString(handle, "native_task_name");
+            const nativeTaskPath = input.nativeTaskPath ??
+                recordString(handle, "native_task_path") ??
+                recordString(handle, "expected_task_path");
+            const existingLatestMessage = typeof existing?.latest_message === "string" ? existing.latest_message : null;
+            const latestMessage = input.latestMessage === undefined ? existingLatestMessage : input.latestMessage;
+            const existingObservedAt = nullableRecordString(existing, "observed_at");
+            if (existingObservedAt) {
+                const ordering = Date.parse(observedAt) - Date.parse(existingObservedAt);
+                if (ordering < 0) {
+                    const existingNativeStatus = nullableRecordString(existing, "native_status") ?? input.nativeStatus;
+                    const reconciled = this.reconcileNativeObservationStopIntent(current, existingNativeStatus, existingObservedAt, queueEvent);
+                    return {
+                        agent: reconciled.agent,
+                        nativeStatus: existingNativeStatus,
+                        observedAt: existingObservedAt,
+                        orchestratorAction: reconciled.orchestratorAction
+                    };
+                }
+                if (ordering === 0) {
+                    const sameObservation = nullableRecordString(existing, "native_status") === input.nativeStatus &&
+                        nullableRecordString(existing, "native_agent_id") === (nativeAgentId ?? null) &&
+                        nullableRecordString(existing, "native_task_name") === (nativeTaskName ?? null) &&
+                        nullableRecordString(existing, "native_task_path") === (nativeTaskPath ?? null) &&
+                        existingLatestMessage === (latestMessage ?? null);
+                    if (!sameObservation) {
+                        throw new ControllerError("Conflicting native observations cannot share the same observed_at timestamp.", "tool_error", { agent_id: current.agent_id, observed_at: observedAt });
+                    }
+                    const reconciled = this.reconcileNativeObservationStopIntent(current, input.nativeStatus, observedAt, queueEvent);
+                    return {
+                        agent: reconciled.agent,
+                        nativeStatus: input.nativeStatus,
+                        observedAt: existingObservedAt,
+                        orchestratorAction: reconciled.orchestratorAction
+                    };
+                }
+            }
+            const sameMissingIdentity = input.nativeStatus === "missing" &&
+                existing?.native_status === "missing" &&
+                nullableRecordString(existing, "native_agent_id") === (nativeAgentId ?? null) &&
+                nullableRecordString(existing, "native_task_path") === (nativeTaskPath ?? null);
+            const missingSince = input.nativeStatus === "missing"
+                ? sameMissingIdentity
+                    ? nullableRecordString(existing, "missing_since") ?? observedAt
+                    : observedAt
+                : null;
+            const missingObservationCount = input.nativeStatus === "missing"
+                ? sameMissingIdentity
+                    ? Number(existing?.missing_observation_count ?? 0) + 1
+                    : 1
+                : 0;
+            let mapped = mapCodexSubagentStatus(input.nativeStatus);
+            if (input.nativeStatus === "missing") {
+                const elapsed = Math.max(0, Date.parse(observedAt) - Date.parse(missingSince));
+                const confirmedByRepeatedExactMiss = missingObservationCount >= 2 && elapsed >= EXTERNAL_MISSING_CONFIRMATION_MS;
+                const confirmedByExplicitCheck = Boolean(input.confirmedAbsent) && elapsed >= EXTERNAL_MISSING_CONFIRMATION_MS;
+                mapped = {
+                    status: "unknown",
+                    failureReason: confirmedByRepeatedExactMiss || confirmedByExplicitCheck
+                        ? "backend_unavailable"
+                        : null
+                };
+            }
+            const preserveStopIntent = !TERMINAL_STATUSES.has(mapped.status) && this.hasDurableStopIntent(current);
+            const projectedStatus = preserveStopIntent ? "stopping" : mapped.status;
+            const projectedFailureReason = preserveStopIntent
+                ? mapped.failureReason ?? current.failure_reason
+                : mapped.failureReason;
+            const safeHandle = {
+                ...handle,
+                ...(nativeAgentId ? { native_agent_id: nativeAgentId } : {}),
+                ...(nativeTaskName ? { native_task_name: nativeTaskName } : {}),
+                ...(nativeTaskPath ? { native_task_path: nativeTaskPath } : {})
+            };
+            this.store.upsertCodexSubagentExternalState({
+                agentId: current.agent_id,
+                nativeAgentId,
+                nativeTaskName,
+                nativeTaskPath,
+                nativeStatus: input.nativeStatus,
+                latestMessage,
+                observedAt,
+                missingSince,
+                missingObservationCount
+            });
+            const cancelledInterruptActionIds = TERMINAL_STATUSES.has(projectedStatus)
+                ? this.cancelPendingCodexSubagentInterruptsForTerminalSync(current, input.nativeStatus, observedAt)
+                : [];
+            const changed = current.status !== projectedStatus ||
+                current.failure_reason !== projectedFailureReason;
+            const updated = this.store.updateAgent(current.agent_id, {
+                backendHandle: safeHandle,
+                status: projectedStatus,
+                failureReason: projectedFailureReason
+            });
+            this.store.touchHeartbeat(updated.agent_id, observedAt);
+            if (changed) {
+                queueEvent({
+                    runId: updated.run_id,
+                    agentId: updated.agent_id,
+                    type: this.statusEventType(updated.status),
+                    payload: {
+                        status: updated.status,
+                        failureReason: updated.failure_reason,
+                        native_status: input.nativeStatus,
+                        ...(cancelledInterruptActionIds.length > 0
+                            ? { cancelled_interrupt_action_ids: cancelledInterruptActionIds }
+                            : {})
+                    }
+                });
+            }
+            if (TERMINAL_STATUSES.has(updated.status)) {
+                this.finalizeStoppingRunIfTerminal(updated.run_id, queueEvent);
+            }
+            const reconciled = preserveStopIntent
+                ? this.reconcileNativeObservationStopIntent(updated, input.nativeStatus, observedAt, queueEvent)
+                : { agent: updated };
+            return {
+                agent: reconciled.agent,
+                nativeStatus: input.nativeStatus,
+                observedAt,
+                orchestratorAction: reconciled.orchestratorAction
+            };
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        if (TERMINAL_STATUSES.has(synchronized.agent.status)) {
+            this.disarmStatusWatcher(synchronized.agent.agent_id);
+        }
+        const cleanupAction = this.optionalOpenOrchestratorActionRef(synchronized.orchestratorAction);
+        return {
+            agent: synchronized.agent,
+            native_status: synchronized.nativeStatus,
+            observed_at: synchronized.observedAt,
+            ...(cleanupAction
+                ? { orchestrator_action: cleanupAction }
+                : {})
+        };
+    }
+    cancelPendingCodexSubagentInterruptsForTerminalSync(agent, nativeStatus, observedAt) {
+        // Call only inside the terminal-sync BEGIN IMMEDIATE transaction. A claim
+        // that committed first remains `claimed` and is retained for idempotent
+        // ACK; otherwise this cancellation commits atomically with terminal agent
+        // truth, so no pending cleanup can be returned or re-driven afterward.
+        const cancelledAt = nowIso();
+        return this.store
+            .listOrchestratorActions({ agentId: agent.agent_id })
+            .filter((action) => action.agent_id === agent.agent_id &&
+            action.run_id === agent.run_id &&
+            action.operation === "interrupt_agent" &&
+            action.status === "pending" &&
+            // A cleanup created after the observed terminal instant may protect
+            // newer uncertain work and must survive. With an implicit observedAt,
+            // call ordering guarantees equality still follows action creation.
+            Date.parse(action.created_at) <= Date.parse(observedAt))
+            .flatMap((action) => {
+            const cancellation = this.store.cancelUnclaimedOrchestratorAction({
+                actionId: action.action_id,
+                errorJson: {
+                    reason: "native_terminal_observation_superseded_interrupt",
+                    native_status: nativeStatus,
+                    observed_at: observedAt,
+                    message: "Authoritative native terminal status made this unclaimed cleanup interrupt unnecessary."
+                },
+                cancelledAt
+            });
+            return cancellation.changed ? [cancellation.action.action_id] : [];
+        });
+    }
+    assertSupportedCodexSubagentStart(agent, input) {
+        if (!input.prompt?.trim()) {
+            throw new ControllerError("codex-subagent spawn requires a worker message.", "tool_error", {
+                agent_id: agent.agent_id
+            });
+        }
+        if (input.model?.trim() || agent.model?.trim()) {
+            throw new ControllerError("codex-subagent inherits the root model and does not support model overrides.", "unsupported_operation", { backend: agent.backend, option: "model" });
+        }
+        if (input.server?.trim()) {
+            throw new ControllerError("codex-subagent does not accept a backend server override.", "unsupported_operation", {
+                backend: agent.backend,
+                option: "server"
+            });
+        }
+        if (input.attachments && input.attachments.length > 0) {
+            throw new ControllerError("codex-subagent does not support attachment overrides.", "unsupported_operation", {
+                backend: agent.backend,
+                option: "attachments"
+            });
+        }
+        const allowedMetadata = new Set(["flow_instance_id", "step_instance_id", "step_id"]);
+        const unsupportedMetadata = Object.keys(input.metadata ?? {}).filter((key) => !allowedMetadata.has(key));
+        if (unsupportedMetadata.length > 0) {
+            throw new ControllerError("Unsupported codex-subagent start option.", "unsupported_operation", {
+                backend: agent.backend,
+                options: unsupportedMetadata.sort()
+            });
+        }
+        if (input.forkTurns && !isCodexSubagentForkTurns(input.forkTurns)) {
+            throw new ControllerError("Unsupported codex-subagent fork_turns value.", "unsupported_operation", {
+                backend: agent.backend,
+                fork_turns: input.forkTurns
+            });
+        }
+    }
+    recoverCodexSubagentSpawnHandle(agent) {
+        if (agent.backend_handle) {
+            return agent;
+        }
+        const succeededSpawn = this.store
+            .listOrchestratorActions({ agentId: agent.agent_id })
+            .filter((action) => action.agent_id === agent.agent_id &&
+            action.operation === "spawn_agent" &&
+            action.status === "succeeded")
+            .at(-1);
+        if (!succeededSpawn) {
+            return agent;
+        }
+        // A durable successful spawn ACK already passed identity validation. If a
+        // prior controller process stopped between the action commit and handle
+        // projection, reconstructing that projection prevents a duplicate native
+        // task and lets the next flow step reuse the real worker safely.
+        return this.store.updateAgent(agent.agent_id, {
+            backendHandle: this.spawnBackendHandle(succeededSpawn, agent)
+        });
+    }
+    assertCodexSubagentHasNoPriorSpawnForAnotherStep(agent, metadata) {
+        const stepInstanceId = requiredRecordString(metadata, "step_instance_id");
+        const priorSpawn = this.store
+            .listOrchestratorActions({ agentId: agent.agent_id })
+            .filter((action) => action.agent_id === agent.agent_id &&
+            action.operation === "spawn_agent" &&
+            // Failed and cancelled actions authoritatively prove that no native
+            // worker was created. Pending, claimed, and succeeded actions remain
+            // fail-closed because they may already represent a real native task.
+            (action.status === "pending" ||
+                action.status === "claimed" ||
+                action.status === "succeeded"))
+            .at(-1);
+        if (priorSpawn && priorSpawn.step_instance_id !== stepInstanceId) {
+            throw new ControllerError("Refusing to spawn a second native task because this declared agent already has a spawn action but no recoverable handle.", "tool_error", {
+                agent_id: agent.agent_id,
+                existing_action_id: priorSpawn.action_id,
+                existing_step_instance_id: priorSpawn.step_instance_id,
+                requested_step_instance_id: stepInstanceId
+            });
+        }
+    }
+    enqueueCodexSubagentSpawn(input) {
+        const flowInstanceId = requiredRecordString(input.metadata, "flow_instance_id");
+        const stepInstanceId = requiredRecordString(input.metadata, "step_instance_id");
+        const stepId = requiredRecordString(input.metadata, "step_id");
+        const instance = this.getFlowInstanceOrThrow(flowInstanceId);
+        const step = this.getFlowStepInstanceOrThrow(stepInstanceId);
+        if (instance.run_id !== input.agent.run_id ||
+            step.flow_instance_id !== instance.flow_instance_id ||
+            step.agent_id !== input.agent.agent_id) {
+            throw new ControllerError("codex-subagent spawn metadata does not match its assigned flow step.", "tool_error", {
+                agent_id: input.agent.agent_id,
+                flow_instance_id: flowInstanceId,
+                step_instance_id: stepInstanceId
+            });
+        }
+        if (!instance.orchestrator_agent_id) {
+            throw new ControllerError("Native flow instance has no bound orchestrator.", "auth_required", {
+                flow_instance_id: instance.flow_instance_id
+            });
+        }
+        const idempotencyKey = `spawn:${stepInstanceId}`;
+        const existingAction = this.store.getOrchestratorActionByIdempotencyKey(idempotencyKey);
+        if (existingAction && !existingAction.originating_bridge_grant_id) {
+            throw new ControllerError("Existing native action has no provable originating bridge grant.", "auth_required", { action_id: existingAction.action_id });
+        }
+        const grant = this.resolveNativeFlowBridgeGrant(instance, input.bridgeGrantId ?? null);
+        if (existingAction &&
+            existingAction.originating_bridge_grant_id !== grant.bridge_grant_id) {
+            throw new ControllerError("Existing native action belongs to a different bridge task binding.", "auth_required", { action_id: existingAction.action_id });
+        }
+        const taskName = deterministicCodexSubagentTaskName(input.agent.role ?? stepId, stepInstanceId);
+        const expectedTaskPath = `${grant.owner_task_path}/${taskName}`;
+        const request = {
+            task_name: taskName,
+            expected_task_path: expectedTaskPath,
+            message: input.prompt,
+            fork_turns: input.forkTurns ?? "none"
+        };
+        const action = this.requireCreatedOrchestratorAction(this.store.createOrGetOrchestratorAction({
+            idempotencyKey,
+            runId: instance.run_id,
+            orchestratorAgentId: instance.orchestrator_agent_id,
+            originatingBridgeGrantId: grant.bridge_grant_id,
+            agentId: input.agent.agent_id,
+            flowInstanceId: instance.flow_instance_id,
+            stepInstanceId,
+            operation: "spawn_agent",
+            payloadJson: request
+        }), input.agent, "agent_start");
+        if (!stableJsonEquals(action.payload_json, request)) {
+            throw new ControllerError("Spawn idempotency key resolved to a different native request.", "tool_error", {
+                action_id: action.action_id,
+                step_instance_id: stepInstanceId
+            });
+        }
+        return orchestratorActionRef(action);
+    }
+    enqueueCodexSubagentMessage(agent, message) {
+        const context = this.bridgeContextForAgent(agent);
+        const grant = this.resolveActionBridgeGrant({
+            runId: agent.run_id,
+            orchestratorAgentId: context.orchestratorAgentId,
+            bridgeGrantId: context.originatingBridgeGrantId
+        });
+        const target = codexSubagentTarget(agent);
+        const operation = agent.status === "running" || agent.status === "starting" ? "send_message" : "followup_task";
+        const action = this.requireCreatedOrchestratorAction(this.store.createOrGetOrchestratorAction({
+            idempotencyKey: `${operation}:${agent.agent_id}:${newId("request")}`,
+            runId: agent.run_id,
+            orchestratorAgentId: context.orchestratorAgentId,
+            originatingBridgeGrantId: grant.bridge_grant_id,
+            agentId: agent.agent_id,
+            flowInstanceId: context.flowInstanceId,
+            stepInstanceId: context.stepInstanceId,
+            operation,
+            payloadJson: { target, message }
+        }), agent, "agent_send_message");
+        return { type: "orchestrator_action_required", action: orchestratorActionRef(action) };
+    }
+    enqueueCodexSubagentStepMessage(input) {
+        const flowInstanceId = requiredRecordString(input.metadata, "flow_instance_id");
+        const stepInstanceId = requiredRecordString(input.metadata, "step_instance_id");
+        const stepId = requiredRecordString(input.metadata, "step_id");
+        const instance = this.getFlowInstanceOrThrow(flowInstanceId);
+        const step = this.getFlowStepInstanceOrThrow(stepInstanceId);
+        if (instance.run_id !== input.agent.run_id ||
+            step.flow_instance_id !== instance.flow_instance_id ||
+            step.step_id !== stepId ||
+            step.agent_id !== input.agent.agent_id) {
+            throw new ControllerError("codex-subagent reused-task metadata does not match its assigned flow step.", "tool_error", {
+                agent_id: input.agent.agent_id,
+                flow_instance_id: flowInstanceId,
+                step_instance_id: stepInstanceId
+            });
+        }
+        if (!instance.orchestrator_agent_id) {
+            throw new ControllerError("Native flow instance has no bound orchestrator.", "auth_required", {
+                flow_instance_id: instance.flow_instance_id
+            });
+        }
+        const request = {
+            target: codexSubagentTarget(input.agent),
+            message: input.prompt
+        };
+        const idempotencyKey = `step-message:${stepInstanceId}`;
+        const existing = this.store.getOrchestratorActionByIdempotencyKey(idempotencyKey);
+        if (existing && !existing.originating_bridge_grant_id) {
+            throw new ControllerError("Existing native action has no provable originating bridge grant.", "auth_required", { action_id: existing.action_id });
+        }
+        const grant = this.resolveNativeFlowBridgeGrant(instance, input.bridgeGrantId ?? null);
+        const nativeTaskFlowInstanceId = recordString(input.agent.backend_handle, "flow_instance_id");
+        if (nativeTaskFlowInstanceId !== instance.flow_instance_id) {
+            throw new ControllerError("Existing native task belongs to a different flow task binding.", "auth_required", {
+                agent_id: input.agent.agent_id,
+                native_task_flow_instance_id: nativeTaskFlowInstanceId,
+                requested_flow_instance_id: instance.flow_instance_id
+            });
+        }
+        // A persistent native worker can be reused across steps of its own flow,
+        // but never adopted by a sibling flow/grant merely because both reference
+        // the same logical agent row.
+        this.resolveNativeFlowBridgeGrant(this.getFlowInstanceOrThrow(nativeTaskFlowInstanceId), grant.bridge_grant_id);
+        if (existing &&
+            existing.originating_bridge_grant_id !== grant.bridge_grant_id) {
+            throw new ControllerError("Existing native action belongs to a different bridge task binding.", "auth_required", { action_id: existing.action_id });
+        }
+        if (existing) {
+            if (existing.run_id !== instance.run_id ||
+                existing.orchestrator_agent_id !== instance.orchestrator_agent_id ||
+                existing.originating_bridge_grant_id !== grant.bridge_grant_id ||
+                existing.agent_id !== input.agent.agent_id ||
+                existing.flow_instance_id !== instance.flow_instance_id ||
+                existing.step_instance_id !== step.step_instance_id ||
+                (existing.operation !== "send_message" && existing.operation !== "followup_task") ||
+                !stableJsonEquals(existing.payload_json, request)) {
+                throw new ControllerError("Reused-task idempotency key resolved to a different native request.", "tool_error", { action_id: existing.action_id, step_instance_id: stepInstanceId });
+            }
+            return orchestratorActionRef(existing);
+        }
+        const action = this.requireCreatedOrchestratorAction(this.store.createOrGetOrchestratorAction({
+            idempotencyKey,
+            runId: instance.run_id,
+            orchestratorAgentId: instance.orchestrator_agent_id,
+            originatingBridgeGrantId: grant.bridge_grant_id,
+            agentId: input.agent.agent_id,
+            flowInstanceId: instance.flow_instance_id,
+            stepInstanceId: step.step_instance_id,
+            operation: input.operation,
+            payloadJson: request
+        }), input.agent, "agent_start");
+        if ((action.operation !== "send_message" && action.operation !== "followup_task") ||
+            !stableJsonEquals(action.payload_json, request)) {
+            throw new ControllerError("Reused-task idempotency key resolved to a different native request.", "tool_error", { action_id: action.action_id, step_instance_id: stepInstanceId });
+        }
+        return orchestratorActionRef(action);
+    }
+    enqueueCodexSubagentInterrupt(agent, idempotencyKey = `interrupt:${agent.agent_id}:${newId("request")}`, causalAction) {
+        const context = this.bridgeContextForAgent(agent);
+        if (causalAction && !causalAction.originating_bridge_grant_id) {
+            throw new ControllerError("Causal native action has no provable originating bridge grant.", "auth_required", { agent_id: agent.agent_id, action_id: causalAction.action_id });
+        }
+        const causalBridgeGrantId = causalAction?.originating_bridge_grant_id ??
+            context.originatingBridgeGrantId;
+        const causalFlowInstanceId = causalAction?.flow_instance_id ?? context.flowInstanceId;
+        const causalStepInstanceId = causalAction?.step_instance_id ?? context.stepInstanceId;
+        const causalOrchestratorAgentId = causalAction?.orchestrator_agent_id ?? context.orchestratorAgentId;
+        if (causalAction) {
+            if (!causalAction.flow_instance_id || !causalAction.step_instance_id) {
+                throw new ControllerError("Causal native action has no provable flow task binding.", "auth_required", { action_id: causalAction.action_id });
+            }
+            const causalFlow = this.getFlowInstanceOrThrow(causalAction.flow_instance_id);
+            const causalStep = this.getFlowStepInstanceOrThrow(causalAction.step_instance_id);
+            if (causalAction.agent_id !== agent.agent_id ||
+                causalAction.run_id !== agent.run_id ||
+                causalFlow.orchestrator_agent_id !== causalOrchestratorAgentId ||
+                causalStep.flow_instance_id !== causalFlow.flow_instance_id ||
+                causalStep.agent_id !== agent.agent_id) {
+                throw new ControllerError("Causal native action does not match its flow worker binding.", "auth_required", { action_id: causalAction.action_id });
+            }
+            this.resolveNativeFlowBridgeGrant(causalFlow, causalBridgeGrantId);
+        }
+        const existing = this.store.findOpenOrchestratorAction(agent.agent_id, ["interrupt_agent"]);
+        if (existing) {
+            if (!existing.originating_bridge_grant_id) {
+                throw new ControllerError("Open native cleanup action has no provable bridge task binding.", "auth_required", { action_id: existing.action_id });
+            }
+            if (existing.originating_bridge_grant_id !== causalBridgeGrantId) {
+                throw new ControllerError("Open native cleanup action belongs to a different bridge task binding.", "auth_required", {
+                    action_id: existing.action_id,
+                    originating_bridge_grant_id: existing.originating_bridge_grant_id,
+                    requested_bridge_grant_id: causalBridgeGrantId
+                });
+            }
+            if (existing.flow_instance_id !== causalFlowInstanceId ||
+                existing.step_instance_id !== causalStepInstanceId) {
+                throw new ControllerError("Open native cleanup action belongs to a different flow task binding.", "auth_required", { action_id: existing.action_id });
+            }
+            // Existing cleanup remains owned by its originating task across restart
+            // or grant rotation. Resolving that exact grant also rejects a revoked or
+            // expired owner instead of silently transferring the interrupt.
+            this.resolveActionBridgeGrant({
+                runId: agent.run_id,
+                orchestratorAgentId: causalOrchestratorAgentId,
+                bridgeGrantId: causalBridgeGrantId
+            });
+            return { type: "orchestrator_action_required", action: orchestratorActionRef(existing) };
+        }
+        const grant = this.resolveActionBridgeGrant({
+            runId: agent.run_id,
+            orchestratorAgentId: causalOrchestratorAgentId,
+            bridgeGrantId: causalBridgeGrantId
+        });
+        const target = codexSubagentTarget(agent);
+        let generationKey = idempotencyKey;
+        for (let generation = 0; generation < 64; generation += 1) {
+            const action = this.requireCreatedOrchestratorAction(this.store.createOrGetOrchestratorAction({
+                idempotencyKey: generationKey,
+                runId: agent.run_id,
+                orchestratorAgentId: causalOrchestratorAgentId,
+                originatingBridgeGrantId: grant.bridge_grant_id,
+                agentId: agent.agent_id,
+                flowInstanceId: causalFlowInstanceId,
+                stepInstanceId: causalStepInstanceId,
+                operation: "interrupt_agent",
+                payloadJson: { target }
+            }), agent, null);
+            if (action.status === "pending" || action.status === "claimed") {
+                return { type: "orchestrator_action_required", action: orchestratorActionRef(action) };
+            }
+            // A terminal action can never be returned as executable work. Chaining
+            // the next idempotency key from its durable id produces one stable retry
+            // generation across ACK replay and controller restarts.
+            generationKey = `${idempotencyKey}:after:${action.action_id}`;
+        }
+        throw new ControllerError("Interrupt reconciliation exceeded its deterministic generation limit.", "tool_error", { agent_id: agent.agent_id, idempotency_key: idempotencyKey });
+    }
+    resolveActionBridgeGrant(input) {
+        if (!isBridgeGrantId(input.bridgeGrantId)) {
+            throw new ControllerError("Invalid bridge grant id.", "tool_error", {
+                bridge_grant_id: input.bridgeGrantId
+            });
+        }
+        const grant = this.store.getBridgeGrant(input.bridgeGrantId);
+        const expired = grant?.expires_at ? Date.parse(grant.expires_at) <= Date.now() : false;
+        if (!grant ||
+            grant.revoked_at ||
+            expired ||
+            grant.run_id !== input.runId ||
+            grant.orchestrator_agent_id !== input.orchestratorAgentId) {
+            throw new ControllerError("No active scoped bridge grant is available for this native action.", "auth_required", {
+                run_id: input.runId,
+                orchestrator_agent_id: input.orchestratorAgentId
+            });
+        }
+        return grant;
+    }
+    /**
+     * Resolve the immutable task binding of one native flow. Null legacy rows
+     * remain intentionally unusable: selecting a newer grant by recency would
+     * transfer authority between independent orchestrator tasks.
+     */
+    resolveNativeFlowBridgeGrant(instance, requestedBridgeGrantId = null) {
+        if (!instance.orchestrator_agent_id) {
+            throw new ControllerError("Native flow instance has no bound orchestrator.", "auth_required", { flow_instance_id: instance.flow_instance_id });
+        }
+        if (!instance.originating_bridge_grant_id) {
+            throw new ControllerError("Native flow instance has no provable originating bridge grant.", "auth_required", { flow_instance_id: instance.flow_instance_id });
+        }
+        if (requestedBridgeGrantId &&
+            requestedBridgeGrantId !== instance.originating_bridge_grant_id) {
+            throw new ControllerError("Native flow belongs to a different bridge task binding.", "auth_required", {
+                flow_instance_id: instance.flow_instance_id,
+                originating_bridge_grant_id: instance.originating_bridge_grant_id,
+                requested_bridge_grant_id: requestedBridgeGrantId
+            });
+        }
+        return this.resolveActionBridgeGrant({
+            runId: instance.run_id,
+            orchestratorAgentId: instance.orchestrator_agent_id,
+            bridgeGrantId: instance.originating_bridge_grant_id
+        });
+    }
+    assertOrchestratorActionGrant(actionRef, bridgeGrantId) {
+        const action = this.store.getOrchestratorAction(actionRef.action_id);
+        if (!action || action.originating_bridge_grant_id !== bridgeGrantId) {
+            throw new ControllerError("Native action belongs to a different bridge task binding.", "auth_required", {
+                action_id: actionRef.action_id,
+                originating_bridge_grant_id: action?.originating_bridge_grant_id ?? null,
+                requested_bridge_grant_id: bridgeGrantId
+            });
+        }
+    }
+    bridgeContextForAgent(agent) {
+        const handleFlowInstanceId = recordString(agent.backend_handle, "flow_instance_id");
+        const candidates = this.store
+            .listFlowInstances({ runId: agent.run_id })
+            .filter((instance) => !handleFlowInstanceId || instance.flow_instance_id === handleFlowInstanceId)
+            .reverse();
+        for (const instance of candidates) {
+            if (!instance.orchestrator_agent_id) {
+                continue;
+            }
+            const step = this.store
+                .listFlowStepInstances(instance.flow_instance_id)
+                .filter((entry) => entry.agent_id === agent.agent_id)
+                .at(-1);
+            if (step) {
+                if (!instance.originating_bridge_grant_id) {
+                    throw new ControllerError("Native flow instance has no provable originating bridge grant.", "auth_required", { flow_instance_id: instance.flow_instance_id });
+                }
+                return {
+                    flowInstanceId: instance.flow_instance_id,
+                    stepInstanceId: step.step_instance_id,
+                    orchestratorAgentId: instance.orchestrator_agent_id,
+                    originatingBridgeGrantId: instance.originating_bridge_grant_id
+                };
+            }
+        }
+        throw new ControllerError("codex-subagent agent is not bound to an orchestrated flow step.", "tool_error", {
+            agent_id: agent.agent_id
+        });
+    }
+    getOrchestratorActionOrThrow(actionId) {
+        if (!isOrchestratorActionId(actionId)) {
+            throw new ControllerError("Invalid orchestrator action id.", "tool_error", {
+                action_id: actionId
+            });
+        }
+        const action = this.store.getOrchestratorAction(actionId);
+        if (!action) {
+            throw new ControllerError(`Orchestrator action not found: ${actionId}`, "tool_error", {
+                action_id: actionId
+            });
+        }
+        return action;
+    }
+    validateSpawnAcknowledgement(action, result, agent) {
+        const nativeAgentId = recordString(result, "native_agent_id");
+        const nativeTaskPath = recordString(result, "native_task_path");
+        if (!nativeAgentId && !nativeTaskPath) {
+            throw new ControllerError("Successful spawn acknowledgement requires native_agent_id or native_task_path.", "tool_error", { action_id: action.action_id });
+        }
+        const expectedTaskPath = requiredRecordString(action.payload_json, "expected_task_path");
+        if (nativeTaskPath && nativeTaskPath !== expectedTaskPath) {
+            throw new ControllerError("Spawn acknowledgement returned an unexpected canonical task path.", "tool_error", {
+                action_id: action.action_id,
+                expected_task_path: expectedTaskPath,
+                native_task_path: nativeTaskPath
+            });
+        }
+        const nativeTaskName = recordString(result, "native_task_name");
+        const expectedTaskName = requiredRecordString(action.payload_json, "task_name");
+        if (nativeTaskName && nativeTaskName !== expectedTaskName) {
+            throw new ControllerError("Spawn acknowledgement returned an unexpected native task name.", "tool_error", {
+                action_id: action.action_id,
+                expected_task_name: expectedTaskName,
+                native_task_name: nativeTaskName
+            });
+        }
+        // External sync may legitimately observe the native worker before the
+        // root task ACK reaches Agent Control. Treat that already-stored identity
+        // as authoritative and reject a contradictory ACK before completing the
+        // durable action; otherwise the ACK could silently replace newer native
+        // truth while preserving the logical terminal status.
+        const storedHandle = agent.backend_handle ?? {};
+        const identityComparisons = [
+            ["native_agent_id", recordString(storedHandle, "native_agent_id"), nativeAgentId],
+            ["native_task_name", recordString(storedHandle, "native_task_name"), nativeTaskName],
+            ["native_task_path", recordString(storedHandle, "native_task_path"), nativeTaskPath]
+        ];
+        for (const [field, stored, acknowledged] of identityComparisons) {
+            if (stored && acknowledged && stored !== acknowledged) {
+                throw new ControllerError("Spawn acknowledgement identity conflicts with the stored native agent handle.", "auth_required", {
+                    action_id: action.action_id,
+                    field,
+                    agent_expected: stored,
+                    acknowledged
+                });
+            }
+        }
+        const storedTaskName = recordString(storedHandle, "native_task_name");
+        const storedTaskPath = recordString(storedHandle, "native_task_path");
+        if ((storedTaskName && storedTaskName !== expectedTaskName) ||
+            (storedTaskPath && storedTaskPath !== expectedTaskPath)) {
+            throw new ControllerError("Stored native identity does not match the claimed spawn request.", "auth_required", { action_id: action.action_id });
+        }
+    }
+    applyOrchestratorActionAcknowledgement(action, eventSink) {
+        const agent = this.getAgent(action.agent_id);
+        if (TERMINAL_STATUSES.has(agent.status)) {
+            if (this.followupAcknowledgementStartsNewerTurn(action, agent)) {
+                return {
+                    agent: this.applySuccessfulCodexSubagentMessageAcknowledgement(action, eventSink)
+                };
+            }
+            // External sync is the native lifecycle authority unless durable action
+            // ordering proves that a successful follow-up started a newer turn. A
+            // delayed ACK for every other action, or an observation made after the
+            // follow-up claim, must not rewrite newer lifecycle/failure truth.
+            return { agent: this.mergeTerminalSpawnAcknowledgement(action, agent) };
+        }
+        if ((action.operation === "send_message" || action.operation === "followup_task") &&
+            this.hasDurableStopIntent(agent)) {
+            return {
+                agent: agent.backend_handle ? agent : this.recoverCodexSubagentSpawnHandle(agent)
+            };
+        }
+        if (action.status === "failed") {
+            if (action.operation === "interrupt_agent") {
+                const cleanupPending = this.markCodexSubagentCleanupPending(agent, "native_interrupt_failed", action, eventSink);
+                const stopping = this.store.updateAgent(cleanupPending.agent_id, {
+                    failureReason: "tool_error"
+                });
+                return { agent: stopping };
+            }
+            const failed = this.store.updateAgent(agent.agent_id, {
+                status: "failed",
+                failureReason: "tool_error"
+            });
+            this.recordControllerEvent({
+                runId: failed.run_id,
+                agentId: failed.agent_id,
+                type: "agent.failed",
+                payload: {
+                    reason: "tool_error",
+                    action_id: action.action_id,
+                    operation: action.operation
+                }
+            }, eventSink);
+            return { agent: failed };
+        }
+        if (action.operation === "spawn_agent") {
+            const handle = this.spawnBackendHandle(action, agent);
+            const stopWasRequested = this.hasDurableStopIntent(agent);
+            const projected = stopWasRequested
+                ? {
+                    agent: this.store.updateAgent(agent.agent_id, {
+                        backendHandle: handle,
+                        status: "stopping",
+                        failureReason: null
+                    }),
+                    changed: true
+                }
+                : this.store.updateAgentForNewWork(agent.agent_id, {
+                    backendHandle: handle,
+                    status: "running",
+                    failureReason: null
+                });
+            const updated = projected.changed
+                ? projected.agent
+                : this.store.updateAgent(agent.agent_id, {
+                    backendHandle: handle,
+                    status: "stopping",
+                    failureReason: projected.agent.failure_reason
+                });
+            const cleanupRequired = this.hasDurableStopIntent(updated);
+            this.recordControllerEvent({
+                runId: updated.run_id,
+                agentId: updated.agent_id,
+                type: cleanupRequired ? "agent.status_changed" : "agent.started",
+                payload: cleanupRequired
+                    ? {
+                        status: "stopping",
+                        reason: "native_spawn_acknowledged_after_stop",
+                        action_id: action.action_id
+                    }
+                    : { backend: CODEX_SUBAGENT_BACKEND, action_id: action.action_id }
+            }, eventSink);
+            this.store.touchHeartbeat(updated.agent_id);
+            return { agent: updated };
+        }
+        if (action.operation === "send_message" || action.operation === "followup_task") {
+            return {
+                agent: this.applySuccessfulCodexSubagentMessageAcknowledgement(action, eventSink)
+            };
+        }
+        // An interrupt acknowledgement confirms only that the native tool accepted
+        // the request. The agent remains stopping until external sync observes the
+        // actual interrupted/shutdown state.
+        return {
+            agent: this.markCodexSubagentCleanupPending(agent, "native_interrupt_acknowledged_pending_terminal_sync", action, eventSink)
+        };
+    }
+    followupAcknowledgementStartsNewerTurn(action, agent) {
+        if (action.operation !== "followup_task" ||
+            action.status !== "succeeded" ||
+            !action.claimed_at ||
+            !TERMINAL_STATUSES.has(agent.status)) {
+            return false;
+        }
+        const runStatus = this.store.getRun(agent.run_id)?.status;
+        if (runStatus === "stopping" ||
+            runStatus === "stopped" ||
+            this.store.getOrchestratorActionByIdempotencyKey(`interrupt:stop-message:${action.action_id}`)) {
+            // Run state and the deterministic interrupt key are durable stop
+            // generations. Once either exists, no observation ordering may revive
+            // the acknowledged message action after terminal synchronization.
+            return false;
+        }
+        const externalState = this.store.getCodexSubagentExternalState(agent.agent_id);
+        const nativeStatus = nullableRecordString(externalState, "native_status");
+        const observedAt = nullableRecordString(externalState, "observed_at");
+        if (!nativeStatus || !observedAt) {
+            return false;
+        }
+        const mapped = mapCodexSubagentStatus(nativeStatus);
+        if (mapped.status !== agent.status || mapped.failureReason !== agent.failure_reason) {
+            return false;
+        }
+        const observedAtMs = Date.parse(observedAt);
+        const claimedAtMs = Date.parse(action.claimed_at);
+        return (Number.isFinite(observedAtMs) &&
+            Number.isFinite(claimedAtMs) &&
+            // Millisecond precision cannot order an observation equal to the claim
+            // after execution of the not-yet-issued follow-up. Equality therefore
+            // belongs to the previous turn; only a strictly newer observation wins.
+            observedAtMs <= claimedAtMs);
+    }
+    applySuccessfulCodexSubagentMessageAcknowledgement(action, eventSink) {
+        const projection = this.store.updateAgentForNewWork(action.agent_id, {
+            status: "running",
+            failureReason: null
+        });
+        const running = projection.agent;
+        if (!projection.changed) {
+            return running;
+        }
+        this.recordControllerEvent({
+            runId: running.run_id,
+            agentId: running.agent_id,
+            type: "agent.message",
+            payload: {
+                direction: "outbound",
+                action_id: action.action_id,
+                operation: action.operation
+            }
+        }, eventSink);
+        this.store.touchHeartbeat(running.agent_id);
+        return running;
+    }
+    mergeTerminalSpawnAcknowledgement(action, agent) {
+        if (!TERMINAL_STATUSES.has(agent.status) ||
+            action.operation !== "spawn_agent" ||
+            action.status !== "succeeded") {
+            return agent;
+        }
+        const backendHandle = this.spawnBackendHandle(action, agent);
+        return stableJsonEquals(agent.backend_handle, backendHandle)
+            ? agent
+            : this.store.updateAgent(agent.agent_id, { backendHandle });
+    }
+    spawnBackendHandle(action, agent) {
+        const result = action.result_json ?? {};
+        const existing = agent.backend_handle ?? {};
+        const expectedTaskPath = requiredRecordString(action.payload_json, "expected_task_path");
+        const nativeAgentId = recordString(existing, "native_agent_id") ?? recordString(result, "native_agent_id");
+        return {
+            ...existing,
+            flow_instance_id: action.flow_instance_id,
+            step_instance_id: action.step_instance_id,
+            expected_task_path: expectedTaskPath,
+            native_task_path: recordString(existing, "native_task_path") ??
+                recordString(result, "native_task_path") ??
+                expectedTaskPath,
+            native_task_name: recordString(existing, "native_task_name") ??
+                recordString(result, "native_task_name") ??
+                requiredRecordString(action.payload_json, "task_name"),
+            ...(nativeAgentId ? { native_agent_id: nativeAgentId } : {})
+        };
+    }
+    hasDurableStopIntent(agent) {
+        const runStatus = this.store.getRun(agent.run_id)?.status;
+        return (STOP_INTENT_AGENT_STATUSES.has(agent.status) ||
+            (runStatus !== undefined && STOP_INTENT_RUN_STATUSES.has(runStatus)));
+    }
+    hasCodexSubagentTarget(agent) {
+        return Boolean(recordString(agent.backend_handle, "native_task_path") ??
+            recordString(agent.backend_handle, "native_agent_id") ??
+            recordString(agent.backend_handle, "expected_task_path"));
+    }
+    reconcileNativeObservationStopIntent(agent, nativeStatus, observedAt, eventSink) {
+        const mapped = mapCodexSubagentStatus(nativeStatus);
+        if (TERMINAL_STATUSES.has(mapped.status) || !this.hasDurableStopIntent(agent)) {
+            return { agent };
+        }
+        const orchestratorAction = this.hasCodexSubagentTarget(agent)
+            ? this.enqueueCodexSubagentInterrupt(agent, `interrupt:stop-observation:${agent.agent_id}:${observedAt}`).action
+            : null;
+        const stopping = this.markCodexSubagentCleanupPending(agent, "native_nonterminal_observed_after_stop", undefined, eventSink);
+        if (!orchestratorAction) {
+            // A claimed spawn can still lack an acknowledged target. Its later ACK
+            // re-enters the same stop reconciliation and will create the interrupt
+            // once the canonical native identity is available.
+            return { agent: stopping };
+        }
+        return {
+            agent: stopping,
+            orchestratorAction
+        };
+    }
+    markCodexSubagentCleanupPending(agent, reason, action, eventSink) {
+        const applyProjection = () => {
+            const run = this.getRun(agent.run_id);
+            if (run.status === "stopped") {
+                // A late native observation/ACK can prove that work exists after the
+                // run was provisionally finalized. Reopening only to stopping keeps it
+                // honest until terminal external sync completes cleanup.
+                this.store.updateRunStatus(run.run_id, "stopping");
+            }
+            const current = this.getAgent(agent.agent_id);
+            return {
+                statusChanged: current.status !== "stopping",
+                agent: this.store.updateAgent(current.agent_id, {
+                    status: "stopping",
+                    failureReason: current.failure_reason
+                })
+            };
+        };
+        const projection = this.store.db.inTransaction
+            ? applyProjection()
+            : this.store.transaction(applyProjection);
+        const stopping = projection.agent;
+        if (projection.statusChanged) {
+            this.recordControllerEvent({
+                runId: stopping.run_id,
+                agentId: stopping.agent_id,
+                type: "agent.status_changed",
+                payload: {
+                    status: "stopping",
+                    reason,
+                    ...(action
+                        ? {
+                            action_id: action.action_id,
+                            action_status: action.status,
+                            operation: action.operation
+                        }
+                        : {})
+                }
+            }, eventSink);
+        }
+        return stopping;
+    }
+    reconcileAcknowledgedActionStopIntent(action, agent, eventSink) {
+        const recovered = agent.backend_handle
+            ? agent
+            : this.recoverCodexSubagentSpawnHandle(agent);
+        if (!this.hasDurableStopIntent(recovered)) {
+            return { agent: recovered };
+        }
+        const orchestratorAction = this.stopCleanupActionForAcknowledgedAction(action, recovered);
+        if (!orchestratorAction) {
+            return { agent: recovered };
+        }
+        return {
+            agent: this.markCodexSubagentCleanupPending(recovered, action.operation === "spawn_agent"
+                ? "native_spawn_acknowledged_after_stop"
+                : "native_message_acknowledged_after_stop", action, eventSink),
+            orchestratorAction
+        };
+    }
+    stopCleanupActionForAcknowledgedAction(action, agent) {
+        if (!agent.backend_handle || !this.hasCodexSubagentTarget(agent)) {
+            return null;
+        }
+        if (this.terminalNativeObservationCoversAction(action, agent)) {
+            return null;
+        }
+        if (action.operation === "spawn_agent" && action.status === "succeeded") {
+            return this.lateSpawnStopInterruptForAcknowledgedAction(action, agent);
+        }
+        if ((action.operation === "send_message" || action.operation === "followup_task") &&
+            (action.status === "succeeded" || action.status === "failed")) {
+            return this.messageStopInterruptForAcknowledgedAction(action, agent);
+        }
+        return null;
+    }
+    terminalNativeObservationCoversAction(action, agent) {
+        if (!action.completed_at) {
+            return false;
+        }
+        const externalState = this.store.getCodexSubagentExternalState(agent.agent_id);
+        const nativeStatus = nullableRecordString(externalState, "native_status");
+        const observedAt = nullableRecordString(externalState, "observed_at");
+        if (!nativeStatus || !observedAt || !TERMINAL_STATUSES.has(mapCodexSubagentStatus(nativeStatus).status)) {
+            return false;
+        }
+        const observedAtMs = Date.parse(observedAt);
+        const actionCompletedAtMs = Date.parse(action.completed_at);
+        return (Number.isFinite(observedAtMs) &&
+            Number.isFinite(actionCompletedAtMs) &&
+            // Equality is not enough to prove ordering at millisecond precision.
+            observedAtMs > actionCompletedAtMs);
+    }
+    interruptCompletionCoversAction(interrupt, action) {
+        if (interrupt.operation !== "interrupt_agent" ||
+            interrupt.status !== "succeeded" ||
+            !action.originating_bridge_grant_id ||
+            interrupt.originating_bridge_grant_id !==
+                action.originating_bridge_grant_id ||
+            interrupt.flow_instance_id !== action.flow_instance_id ||
+            interrupt.step_instance_id !== action.step_instance_id ||
+            !interrupt.completed_at ||
+            !action.completed_at) {
+            return false;
+        }
+        const interruptCompletedAtMs = Date.parse(interrupt.completed_at);
+        const actionCompletedAtMs = Date.parse(action.completed_at);
+        return (Number.isFinite(interruptCompletedAtMs) &&
+            Number.isFinite(actionCompletedAtMs) &&
+            // Equality cannot prove which operation completed last at SQLite's
+            // millisecond timestamp precision, so only a strict later ACK covers the
+            // acknowledged work.
+            interruptCompletedAtMs > actionCompletedAtMs);
+    }
+    hasSuccessfulInterruptCoverage(agentId, action) {
+        return this.store
+            .listOrchestratorActions({ agentId })
+            .some((candidate) => candidate.agent_id === agentId &&
+            this.interruptCompletionCoversAction(candidate, action));
+    }
+    lateSpawnStopInterruptForAcknowledgedAction(action, agent) {
+        // The first ACK may have reused an observation-triggered interrupt rather
+        // than the late-spawn base key. Completion ordering, not key provenance,
+        // is the durable proof that any successful interrupt covered this work.
+        if (this.hasSuccessfulInterruptCoverage(agent.agent_id, action)) {
+            return null;
+        }
+        const openInterrupt = this.store.findOpenOrchestratorAction(agent.agent_id, [
+            "interrupt_agent"
+        ]);
+        if (openInterrupt) {
+            this.assertCleanupActionSharesOrigin(openInterrupt, action);
+            return orchestratorActionRef(openInterrupt);
+        }
+        const baseKey = `interrupt:late-spawn:${action.action_id}`;
+        let generationKey = baseKey;
+        for (let generation = 0; generation < 64; generation += 1) {
+            const existing = this.store.getOrchestratorActionByIdempotencyKey(generationKey);
+            if (!existing) {
+                return this.enqueueCodexSubagentInterrupt(agent, generationKey, action).action;
+            }
+            this.assertCleanupActionSharesOrigin(existing, action);
+            if (existing.status === "pending" || existing.status === "claimed") {
+                return orchestratorActionRef(existing);
+            }
+            if (this.interruptCompletionCoversAction(existing, action)) {
+                return null;
+            }
+            // Failed/cancelled interrupts and successful interrupts that completed
+            // no later than the spawn ACK cannot prove cleanup. Deriving the next
+            // key from the terminal action makes the retry exact across ACK replay
+            // and controller restarts without ever returning a terminal action.
+            generationKey = `${baseKey}:after:${existing.action_id}`;
+        }
+        throw new ControllerError("Late-spawn stop reconciliation exceeded its deterministic generation limit.", "tool_error", { action_id: action.action_id, agent_id: agent.agent_id });
+    }
+    messageStopInterruptForAcknowledgedAction(action, agent) {
+        if (this.hasSuccessfulInterruptCoverage(agent.agent_id, action)) {
+            return null;
+        }
+        const openInterrupt = this.store.findOpenOrchestratorAction(agent.agent_id, [
+            "interrupt_agent"
+        ]);
+        if (openInterrupt) {
+            this.assertCleanupActionSharesOrigin(openInterrupt, action);
+            return orchestratorActionRef(openInterrupt);
+        }
+        const baseKey = `interrupt:stop-message:${action.action_id}`;
+        const baseInterrupt = this.store.getOrchestratorActionByIdempotencyKey(baseKey);
+        if (baseInterrupt) {
+            this.assertCleanupActionSharesOrigin(baseInterrupt, action);
+        }
+        if (baseInterrupt && this.interruptCompletionCoversAction(baseInterrupt, action)) {
+            return null;
+        }
+        // This chain can only be created after the message action is durably
+        // completed. A succeeded member therefore proves that its interrupt was
+        // issued after the uncertain work; failed/cancelled members deterministically
+        // advance to one next generation without duplicating on ACK replay.
+        const postAckBaseKey = `${baseKey}:post-ack`;
+        let generationKey = postAckBaseKey;
+        for (let generation = 0; generation < 64; generation += 1) {
+            const existing = this.store.getOrchestratorActionByIdempotencyKey(generationKey);
+            if (!existing) {
+                return this.enqueueCodexSubagentInterrupt(agent, generationKey, action).action;
+            }
+            this.assertCleanupActionSharesOrigin(existing, action);
+            if (existing.status === "pending" || existing.status === "claimed") {
+                return orchestratorActionRef(existing);
+            }
+            if (existing.status === "succeeded") {
+                return null;
+            }
+            generationKey = `${postAckBaseKey}:after:${existing.action_id}`;
+        }
+        throw new ControllerError("Message stop reconciliation exceeded its deterministic generation limit.", "tool_error", { action_id: action.action_id, agent_id: agent.agent_id });
+    }
+    /** Reject cleanup replay that would cross from one task grant to another. */
+    assertCleanupActionSharesOrigin(cleanup, cause) {
+        if (!cause.originating_bridge_grant_id ||
+            cleanup.originating_bridge_grant_id !==
+                cause.originating_bridge_grant_id ||
+            cleanup.flow_instance_id !== cause.flow_instance_id ||
+            cleanup.step_instance_id !== cause.step_instance_id) {
+            throw new ControllerError("Native cleanup action belongs to a different bridge task binding.", "auth_required", {
+                action_id: cleanup.action_id,
+                cause_action_id: cause.action_id,
+                originating_bridge_grant_id: cleanup.originating_bridge_grant_id,
+                cause_bridge_grant_id: cause.originating_bridge_grant_id
+            });
+        }
+    }
     canAgentAccessRun(agent, runId) {
         return this.filterRunsForAgent(this.store.listRuns(5000), agent).some((run) => run.run_id === runId);
+    }
+    /**
+     * Decide whether a fresh step has crossed the backend-start boundary using
+     * durable facts only. The step assignment and transient statuses are written
+     * before backend dispatch, so `queued`, `planned`, or `starting` cannot prove
+     * that a thread/task exists. Conversely, any per-step native action, stored
+     * or recoverable handle, terminal outcome, or `agent.started` event proves a
+     * prior attempt far enough along that replaying start could duplicate work.
+     */
+    resolveFreshFlowStepStartEvidence(agentId, stepInstanceId) {
+        let agent = this.getAgent(agentId);
+        const stepActions = this.store
+            .listOrchestratorActions({ agentId })
+            .filter((action) => action.agent_id === agentId &&
+            action.step_instance_id === stepInstanceId &&
+            (action.operation === "spawn_agent" ||
+                action.operation === "send_message" ||
+                action.operation === "followup_task"));
+        const openAction = stepActions
+            .filter((action) => action.status === "pending" || action.status === "claimed")
+            .at(-1) ?? null;
+        if (!agent.backend_handle && agent.backend === CODEX_SUBAGENT_BACKEND) {
+            agent = this.recoverCodexSubagentSpawnHandle(agent);
+        }
+        const unresolvedStartAttempt = this.store.getAgentStartAttemptForStep(agentId, stepInstanceId);
+        let authoritativeHandleRecovered = false;
+        let authoritativeHandle = agent.backend_handle;
+        if (!agent.backend_handle) {
+            const recoveredHandle = this.recoverBackendHandle(agent);
+            if (recoveredHandle) {
+                authoritativeHandle = recoveredHandle;
+                authoritativeHandleRecovered = true;
+                if (!unresolvedStartAttempt ||
+                    (unresolvedStartAttempt.phase !== "invoking" &&
+                        unresolvedStartAttempt.phase !== "ambiguous")) {
+                    agent = this.store.updateAgent(agent.agent_id, {
+                        backendHandle: recoveredHandle
+                    });
+                }
+            }
+        }
+        const hasStartedEvent = this.store.listEvents({ agentId, type: "agent.started", limit: 1 }).length > 0;
+        let startAttempt = unresolvedStartAttempt;
+        if ((authoritativeHandleRecovered ||
+            (agent.backend === "opencode-server" && Boolean(authoritativeHandle))) &&
+            authoritativeHandle &&
+            startAttempt &&
+            (startAttempt.phase === "invoking" || startAttempt.phase === "ambiguous")) {
+            // OpenCode launch metadata is controller-owned proof that a concrete
+            // backend session exists. Reconcile it before lease expiry can turn the
+            // same invocation into a false ambiguity block.
+            const completion = this.completeNonNativeStartAttemptWithHandle({
+                attempt: startAttempt,
+                handle: authoritativeHandle
+            });
+            startAttempt = completion.attempt;
+            agent = completion.agent;
+            if (completion.flowRecovered) {
+                this.emitLateStartFlowRecovery(completion.attempt, completion.agent);
+            }
+            if (completion.cleanupRequired) {
+                this.scheduleAgentStopCleanup(completion.agent.agent_id);
+            }
+            if (completion.completed && !completion.cleanupRequired) {
+                this.emit({
+                    runId: agent.run_id,
+                    agentId: agent.agent_id,
+                    type: "agent.started",
+                    payload: {
+                        backend: agent.backend,
+                        title: agent.title,
+                        reason: "authoritative_backend_handle_recovered"
+                    }
+                });
+                this.store.touchHeartbeat(agent.agent_id);
+                this.armStatusWatcher(agent);
+            }
+        }
+        else {
+            startAttempt = this.store.resolveAgentStartAttempt(agentId, stepInstanceId);
+        }
+        const attemptCrossedInvocationBoundary = Boolean(startAttempt &&
+            (startAttempt.phase === "invoking" ||
+                startAttempt.phase === "succeeded" ||
+                startAttempt.phase === "superseded" ||
+                startAttempt.phase === "failed" ||
+                startAttempt.phase === "ambiguous"));
+        return {
+            agent,
+            openAction,
+            startAttempt,
+            hasDurableStartEvidence: Boolean(agent.backend_handle) ||
+                stepActions.length > 0 ||
+                attemptCrossedInvocationBoundary ||
+                TERMINAL_STATUSES.has(agent.status) ||
+                hasStartedEvent
+        };
+    }
+    /**
+     * Resolve one durable worker assignment while holding SQLite's write
+     * reservation. `fresh_per_step` never consults the persistent role card:
+     * its deterministic title contains the step-instance id and the new record
+     * starts without a backend handle, which forces codex-thread to call
+     * `thread/start` instead of adding a turn to an earlier review thread.
+     */
+    resolveFlowStepDispatchAgent(input) {
+        return this.store.immediateTransaction(() => {
+            const step = this.getFlowStepInstanceOrThrow(input.activeStep.step_instance_id);
+            if (step.flow_instance_id !== input.snapshot.instance.flow_instance_id ||
+                step.status !== "active") {
+                throw new ControllerError("Flow step is no longer the active dispatch target.", "tool_error", {
+                    flow_instance_id: input.snapshot.instance.flow_instance_id,
+                    step_instance_id: step.step_instance_id,
+                    status: step.status
+                });
+            }
+            if (step.agent_id) {
+                const assigned = this.getAgent(step.agent_id);
+                if (assigned.run_id !== input.run.run_id || assigned.backend !== input.backend) {
+                    throw new ControllerError("Assigned flow worker does not match the active step backend or run.", "tool_error", {
+                        step_instance_id: step.step_instance_id,
+                        agent_id: assigned.agent_id,
+                        expected_backend: input.backend,
+                        actual_backend: assigned.backend
+                    });
+                }
+                return { agent: assigned, step };
+            }
+            this.assertNewWorkAllowed(input.run.run_id, "flow_dispatch_active");
+            const stepConfig = input.snapshot.flow.config.steps[step.step_id];
+            const role = stepConfig.role;
+            const roleConfig = role ? input.snapshot.flow.config.roles?.[role] : undefined;
+            const lifecycle = resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle);
+            let agent = null;
+            if (lifecycle === "fresh_per_step") {
+                const title = freshFlowStepAgentTitle(input.snapshot.flow.flow_id, role ?? step.step_id, step.step_id, step.step_instance_id);
+                // The exact-title lookup is recovery for a partially migrated or
+                // manually repaired database. Under normal execution registration and
+                // assignment are in this same transaction, so no orphan can escape.
+                agent =
+                    this.store
+                        .listAgents({ runId: input.run.run_id })
+                        .find((candidate) => !candidate.unregistered_at &&
+                        candidate.backend === input.backend &&
+                        candidate.role === (role ?? null) &&
+                        candidate.title === title) ?? null;
+                if (!agent) {
+                    const { agent_token: _agentToken, ...created } = this.registerAgent({
+                        runId: input.run.run_id,
+                        backend: input.backend,
+                        title,
+                        role,
+                        objective: input.run.title,
+                        repoDir: input.run.repo_dir,
+                        model: roleConfig?.model,
+                        // Never pass or copy a backend handle here. A fresh lifecycle is
+                        // an Agent Control identity boundary and a backend context boundary.
+                        agentToken: input.agentToken
+                    });
+                    agent = created;
+                }
+            }
+            else {
+                agent =
+                    this.findDeclaredFlowAgent(input.run.run_id, input.snapshot.flow.flow_id, role, input.backend) ??
+                        this.registerAgent({
+                            runId: input.run.run_id,
+                            backend: input.backend,
+                            title: declaredFlowAgentTitle(input.snapshot.flow.flow_id, role ?? step.step_id),
+                            role,
+                            objective: input.run.title,
+                            repoDir: input.run.repo_dir,
+                            model: roleConfig?.model,
+                            agentToken: input.agentToken
+                        });
+            }
+            this.assertNewWorkAllowed(input.run.run_id, "flow_dispatch_active", agent);
+            const assigned = this.store.updateFlowStepInstance(step.step_instance_id, {
+                agentId: agent.agent_id,
+                inputJson: assignFlowStepWorkerAgent(step.input_json, agent.agent_id)
+            });
+            return { agent, step: assigned };
+        });
+    }
+    /**
+     * Persistent role cards can be linked when the flow starts. Fresh cards do
+     * not exist yet, so materialize their real incoming/outgoing handoffs when
+     * the step is dispatched. The latest transition targeting the active step
+     * is its concrete predecessor; rerunning a review therefore links reviewer
+     * N to the distinct reviewer N+1 rather than to a synthetic role node.
+     */
+    createFreshFlowStepHandoffLinks(input) {
+        const runId = input.snapshot.instance.run_id;
+        const incoming = this.store
+            .listFlowTransitions(input.snapshot.instance.flow_instance_id)
+            .filter((transition) => transition.target_step_id === input.activeStep.step_id)
+            .at(-1);
+        if (incoming) {
+            const sourceStep = this.store.getFlowStepInstance(incoming.from_step_instance_id);
+            if (sourceStep?.agent_id && sourceStep.agent_id !== input.agent.agent_id) {
+                this.createAgentLinkIfMissing({
+                    runId,
+                    sourceAgentId: sourceStep.agent_id,
+                    targetAgentId: input.agent.agent_id,
+                    type: "handoff",
+                    label: incoming.transition_id
+                });
+            }
+        }
+        const stepConfig = input.snapshot.flow.config.steps[input.activeStep.step_id];
+        for (const [eventName, action] of Object.entries(stepConfig.on ?? {})) {
+            for (const target of flowActionTargets(action, eventName)) {
+                let targetAgent = null;
+                if (target.kind === "notify") {
+                    if (input.owner &&
+                        (input.owner.role === target.id || target.id === "orchestrator")) {
+                        targetAgent = input.owner;
+                    }
+                    else {
+                        const targetRole = input.snapshot.flow.config.roles?.[target.id];
+                        if (resolveFlowAgentLifecycle(targetRole?.agent_lifecycle) === "reuse") {
+                            targetAgent = this.findDeclaredFlowAgent(runId, input.snapshot.flow.flow_id, target.id, targetRole?.backend);
+                        }
+                    }
+                }
+                else {
+                    const targetStep = input.snapshot.flow.config.steps[target.id];
+                    const targetRole = targetStep?.role
+                        ? input.snapshot.flow.config.roles?.[targetStep.role]
+                        : undefined;
+                    if (targetStep && resolveFlowAgentLifecycle(targetRole?.agent_lifecycle) === "reuse") {
+                        const explicit = targetStep.agent_id
+                            ? this.store.getAgent(targetStep.agent_id)
+                            : null;
+                        targetAgent =
+                            explicit && !explicit.unregistered_at && explicit.run_id === runId
+                                ? explicit
+                                : this.findDeclaredFlowAgent(runId, input.snapshot.flow.flow_id, targetStep.role, targetRole?.backend);
+                    }
+                }
+                if (!targetAgent || targetAgent.agent_id === input.agent.agent_id) {
+                    continue;
+                }
+                this.createAgentLinkIfMissing({
+                    runId,
+                    sourceAgentId: input.agent.agent_id,
+                    targetAgentId: targetAgent.agent_id,
+                    type: "handoff",
+                    label: target.label
+                });
+            }
+        }
     }
     ensureDeclaredFlowAgents(input) {
         const roleAgents = new Map();
@@ -703,6 +3447,12 @@ export class AgentController {
             .filter((role) => Boolean(role)));
         for (const role of [...usedRoles].sort()) {
             const roleConfig = input.config.roles?.[role];
+            // Fresh roles are instantiated only when a concrete step instance is
+            // dispatched. Pre-registering one here would create an unused persistent
+            // card and would make later steps accidentally share its backend handle.
+            if (resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) === "fresh_per_step") {
+                continue;
+            }
             const explicit = this.explicitDeclaredAgentForRole(input.config, input.run.run_id, role);
             if (explicit) {
                 roleAgents.set(role, explicit);
@@ -854,8 +3604,135 @@ export class AgentController {
         }
         return runs.filter((run) => accessible.has(run.run_id) && runById.has(run.run_id));
     }
+    /**
+     * Commit the backend handle and start-attempt outcome as one lifecycle
+     * decision. Stop intent and a superseding flow route both project the agent
+     * directly to `stopping`, making the handle restart-safe before compensation
+     * performs any external I/O.
+     */
+    completeNonNativeStartAttemptWithHandle(input) {
+        return this.store.immediateTransaction(() => {
+            const completion = this.store.completeAgentStartAttemptSuccess({
+                startAttemptId: input.attempt.start_attempt_id,
+                claimOwnerId: input.attempt.claim_owner_id,
+                handle: input.handle
+            });
+            let agent = this.getAgent(input.attempt.agent_id);
+            let attempt = completion.attempt;
+            let flowRecovered = false;
+            /**
+             * Persist the concrete returned handle before compensating it outside the
+             * transaction. Reopening a fully stopped run to `stopping` is intentional:
+             * the adapter response is new proof that a live session may exist.
+             */
+            const requireCleanup = (reason, startState) => {
+                const run = this.getRun(agent.run_id);
+                if (run.status === "stopped") {
+                    this.store.updateRunStatus(run.run_id, "stopping");
+                }
+                agent = this.store.updateAgent(agent.agent_id, {
+                    backendHandle: input.handle,
+                    status: "stopping",
+                    failureReason: agent.failure_reason
+                });
+                return {
+                    completed: completion.completed,
+                    attempt,
+                    agent,
+                    cleanupRequired: true,
+                    cleanupReason: reason,
+                    flowRecovered: false,
+                    startState
+                };
+            };
+            if (completion.completed) {
+                // Route ownership is validated for every successful adapter response,
+                // not only for attempts that had already crossed into ambiguity.
+                const flowDecision = this.reconcileStartFlowOwnershipInTransaction(attempt, completion.previousPhase === "ambiguous");
+                flowRecovered = flowDecision.outcome === "recovered";
+                if (flowDecision.outcome === "superseded") {
+                    attempt = this.store.markAgentStartAttemptSuperseded({
+                        startAttemptId: attempt.start_attempt_id,
+                        claimOwnerId: attempt.claim_owner_id,
+                        handle: input.handle,
+                        reason: flowDecision.reason
+                    }).attempt;
+                    return requireCleanup(`late_backend_start_superseded:${flowDecision.reason}`, "superseded");
+                }
+                if (this.hasDurableStopIntent(agent)) {
+                    return requireCleanup("durable_stop_won_backend_start", startStateFromAttemptPhase(attempt.phase));
+                }
+                const projection = this.store.updateAgentForNewWork(agent.agent_id, {
+                    backendHandle: input.handle,
+                    status: "running",
+                    failureReason: null
+                });
+                if (projection.changed) {
+                    return {
+                        completed: true,
+                        attempt: completion.attempt,
+                        agent: projection.agent,
+                        cleanupRequired: false,
+                        cleanupReason: null,
+                        flowRecovered,
+                        startState: "started"
+                    };
+                }
+                agent = projection.agent;
+                return requireCleanup("durable_stop_won_backend_start_projection", startStateFromAttemptPhase(attempt.phase));
+            }
+            const startState = startStateFromAttemptPhase(attempt.phase);
+            if (attempt.phase === "succeeded") {
+                // Another controller may have completed this exact invocation from
+                // authoritative backend metadata. Preserve that controller's durable
+                // handle and report a coherent success instead of `in_progress`.
+                const flowDecision = this.reconcileStartFlowOwnershipInTransaction(attempt, false);
+                if (flowDecision.outcome === "superseded") {
+                    attempt = this.store.markAgentStartAttemptSuperseded({
+                        startAttemptId: attempt.start_attempt_id,
+                        claimOwnerId: attempt.claim_owner_id,
+                        handle: input.handle,
+                        reason: flowDecision.reason
+                    }).attempt;
+                    return requireCleanup(`late_backend_start_superseded:${flowDecision.reason}`, "superseded");
+                }
+                if (this.hasDurableStopIntent(agent)) {
+                    return requireCleanup("durable_stop_won_backend_start", startState);
+                }
+                const durableHandle = agent.backend_handle ?? attempt.handle_json;
+                if (!durableHandle) {
+                    // A succeeded attempt is required to retain its handle. Treat a
+                    // corrupt/migrated row conservatively as a live response that must be
+                    // stopped instead of fabricating an in-progress state.
+                    return requireCleanup("succeeded_start_missing_durable_handle", startState);
+                }
+                const projection = this.store.updateAgentForNewWork(agent.agent_id, {
+                    backendHandle: durableHandle,
+                    status: "running",
+                    failureReason: null
+                });
+                if (projection.changed) {
+                    return {
+                        completed: false,
+                        attempt,
+                        agent: projection.agent,
+                        cleanupRequired: false,
+                        cleanupReason: null,
+                        flowRecovered: false,
+                        startState
+                    };
+                }
+                agent = projection.agent;
+                return requireCleanup("durable_stop_won_reconciled_start", startState);
+            }
+            // Any other current phase means this response no longer owns a start
+            // completion CAS. It still returned a concrete session, so compensate it
+            // while preserving the exact durable phase in the public start state.
+            return requireCleanup(`backend_start_response_after_${attempt.phase}`, startState);
+        });
+    }
     async startAgent(input) {
-        const agent = this.getAgent(input.agentId);
+        let agent = this.getAgent(input.agentId);
         if (input.agentToken) {
             const caller = this.requireAgentToken(input.agentToken);
             if (!this.canAgentAccessRun(caller, agent.run_id)) {
@@ -864,6 +3741,10 @@ export class AgentController {
                 });
             }
         }
+        // This guard deliberately lives outside the start try/catch. A durable
+        // stop rejection is policy state, not a backend failure, and therefore
+        // must never rewrite a stopping/stopped agent to failed.
+        this.assertNewWorkAllowed(agent.run_id, "agent_start", agent);
         const adapter = this.adapters.get(agent.backend);
         const capabilities = adapter.capabilities();
         if (!capabilities.canStart && !agent.backend_handle) {
@@ -871,15 +3752,125 @@ export class AgentController {
                 backend: agent.backend
             });
         }
-        this.store.updateAgent(agent.agent_id, { status: "starting", failureReason: null });
-        this.emit({
-            runId: agent.run_id,
-            agentId: agent.agent_id,
-            type: "agent.status_changed",
-            payload: { status: "starting" }
-        });
-        const runtimeToken = this.issueAgentToken(agent.agent_id);
+        let runtimeToken = null;
+        let startAttempt = null;
+        let invocationBegan = false;
         try {
+            if (capabilities.requiresOrchestratorAction) {
+                this.assertSupportedCodexSubagentStart(agent, input);
+                agent = this.recoverCodexSubagentSpawnHandle(agent);
+                let nativeStepOperation = null;
+                let nativeActionWasKnown = false;
+                if (agent.backend_handle) {
+                    const stepInstanceId = requiredRecordString(input.metadata, "step_instance_id");
+                    const existingStepAction = this.store.getOrchestratorActionByIdempotencyKey(`step-message:${stepInstanceId}`);
+                    nativeActionWasKnown = Boolean(existingStepAction);
+                    nativeStepOperation =
+                        existingStepAction?.operation === "send_message" ||
+                            existingStepAction?.operation === "followup_task"
+                            ? existingStepAction.operation
+                            : "followup_task";
+                }
+                else {
+                    this.assertCodexSubagentHasNoPriorSpawnForAnotherStep(agent, input.metadata);
+                    const stepInstanceId = requiredRecordString(input.metadata, "step_instance_id");
+                    nativeActionWasKnown = Boolean(this.store.getOrchestratorActionByIdempotencyKey(`spawn:${stepInstanceId}`));
+                }
+                const action = nativeStepOperation
+                    ? this.enqueueCodexSubagentStepMessage({
+                        agent,
+                        prompt: input.prompt,
+                        metadata: input.metadata,
+                        bridgeGrantId: input.bridgeGrantId,
+                        operation: nativeStepOperation
+                    })
+                    : this.enqueueCodexSubagentSpawn({
+                        agent,
+                        prompt: input.prompt,
+                        metadata: input.metadata,
+                        bridgeGrantId: input.bridgeGrantId,
+                        forkTurns: input.forkTurns
+                    });
+                // The action-open check and status projection share one SQLite write
+                // reservation. An ACK that commits first is therefore final and can no
+                // longer be overwritten by this dispatcher's stale pre-ACK snapshot.
+                const projection = this.projectNativeActionForNewWork({
+                    actionId: action.action_id,
+                    agentId: agent.agent_id,
+                    actionWasKnown: nativeActionWasKnown
+                });
+                agent = projection.agent;
+                const surfaced = this.orchestratorActionAfterNewWorkProjection(action.action_id, agent.agent_id);
+                return surfaced.action
+                    ? { ...surfaced.agent, orchestrator_action: surfaced.action }
+                    : surfaced.agent;
+            }
+            const flowInstanceId = nullableRecordString(input.metadata, "flow_instance_id");
+            const stepInstanceId = nullableRecordString(input.metadata, "step_instance_id");
+            if (flowInstanceId && stepInstanceId) {
+                const claim = this.store.claimAgentStartAttempt({
+                    agentId: agent.agent_id,
+                    flowInstanceId,
+                    stepInstanceId,
+                    generation: 1,
+                    leaseExpiresAt: new Date(Date.now() + NON_NATIVE_START_ATTEMPT_LEASE_MS).toISOString()
+                });
+                if (claim.type === "stop_intent") {
+                    this.assertNewWorkAllowed(agent.run_id, "agent_start", this.getAgent(agent.agent_id));
+                    throw new ControllerError("Agent start attempt was rejected by durable stop intent.", "tool_error", { agent_id: agent.agent_id, run_id: agent.run_id });
+                }
+                startAttempt = claim.attempt;
+                if (claim.type === "in_progress") {
+                    return { ...this.getAgent(agent.agent_id), start_state: "in_progress" };
+                }
+                if (claim.type === "ambiguous") {
+                    return { ...this.getAgent(agent.agent_id), start_state: "ambiguous" };
+                }
+                if (claim.type === "terminal") {
+                    return {
+                        ...this.getAgent(agent.agent_id),
+                        start_state: startStateFromAttemptPhase(claim.attempt.phase)
+                    };
+                }
+            }
+            const statusChanged = agent.status !== "starting" || agent.failure_reason !== null;
+            const startingProjection = this.store.updateAgentForNewWork(agent.agent_id, {
+                status: "starting",
+                failureReason: null
+            }, {
+                advanceWorkGeneration: true
+            });
+            agent = startingProjection.agent;
+            if (!startingProjection.changed) {
+                this.assertNewWorkAllowed(agent.run_id, "agent_start", agent);
+                throw new ControllerError("Agent start lost its durable new-work projection race.", "tool_error", { agent_id: agent.agent_id, run_id: agent.run_id });
+            }
+            if (statusChanged) {
+                this.emit({
+                    runId: agent.run_id,
+                    agentId: agent.agent_id,
+                    type: "agent.status_changed",
+                    payload: { status: "starting" }
+                });
+            }
+            runtimeToken = this.issueAgentToken(agent.agent_id);
+            if (startAttempt) {
+                const boundary = this.store.beginAgentStartAttempt({
+                    startAttemptId: startAttempt.start_attempt_id,
+                    claimOwnerId: startAttempt.claim_owner_id,
+                    leaseExpiresAt: new Date(Date.now() + NON_NATIVE_START_ATTEMPT_LEASE_MS).toISOString()
+                });
+                startAttempt = boundary.attempt;
+                if (!boundary.began) {
+                    const current = this.getAgent(agent.agent_id);
+                    return {
+                        ...current,
+                        agent_token: runtimeToken,
+                        start_state: startStateFromAttemptPhase(boundary.attempt.phase)
+                    };
+                }
+                invocationBegan = true;
+            }
             const handle = await adapter.start({
                 agent,
                 agentToken: runtimeToken,
@@ -890,11 +3881,50 @@ export class AgentController {
                 attachments: input.attachments,
                 metadata: input.metadata
             });
-            const updated = this.store.updateAgent(agent.agent_id, {
-                backendHandle: handle.data,
-                status: "running",
-                failureReason: null
-            });
+            let updated;
+            if (startAttempt) {
+                const completion = this.completeNonNativeStartAttemptWithHandle({
+                    attempt: startAttempt,
+                    handle: handle.data
+                });
+                if (!completion.completed) {
+                    if (completion.cleanupRequired) {
+                        return this.reconcileLateNonNativeStartAfterStop(completion.agent, handle, adapter, runtimeToken, completion.cleanupReason ?? "late_backend_start_cleanup_required", completion.startState);
+                    }
+                    return {
+                        ...completion.agent,
+                        agent_token: runtimeToken,
+                        start_state: completion.startState
+                    };
+                }
+                if (completion.cleanupRequired) {
+                    return this.reconcileLateNonNativeStartAfterStop(completion.agent, handle, adapter, runtimeToken, completion.cleanupReason ?? "late_backend_start_cleanup_required", completion.startState);
+                }
+                updated = completion.agent;
+                if (completion.flowRecovered) {
+                    this.emitLateStartFlowRecovery(completion.attempt, updated);
+                }
+                const durableAfterCompletion = this.getAgent(updated.agent_id);
+                if (this.hasDurableStopIntent(durableAfterCompletion)) {
+                    return {
+                        ...durableAfterCompletion,
+                        agent_token: runtimeToken,
+                        start_state: completion.startState
+                    };
+                }
+                updated = durableAfterCompletion;
+            }
+            else {
+                const postStartProjection = this.store.updateAgentForNewWork(agent.agent_id, {
+                    backendHandle: handle.data,
+                    status: "running",
+                    failureReason: null
+                });
+                if (!postStartProjection.changed) {
+                    return this.reconcileLateNonNativeStartAfterStop(postStartProjection.agent, handle, adapter, runtimeToken);
+                }
+                updated = postStartProjection.agent;
+            }
             this.emit({
                 runId: updated.run_id,
                 agentId: updated.agent_id,
@@ -903,10 +3933,55 @@ export class AgentController {
             });
             this.store.touchHeartbeat(updated.agent_id);
             this.armStatusWatcher(updated);
-            return { ...updated, agent_token: runtimeToken };
+            return { ...updated, agent_token: runtimeToken, start_state: "started" };
         }
         catch (error) {
             const payload = errorToPayload(error);
+            if (startAttempt) {
+                if (invocationBegan) {
+                    startAttempt = this.store.markAgentStartAttemptAmbiguous({
+                        startAttemptId: startAttempt.start_attempt_id,
+                        claimOwnerId: startAttempt.claim_owner_id,
+                        error: {
+                            ...payload,
+                            reason: "backend_start_outcome_ambiguous",
+                            invocation_started_at: startAttempt.invocation_started_at
+                        }
+                    });
+                }
+                else {
+                    this.store.releasePreparedAgentStartAttempt({
+                        startAttemptId: startAttempt.start_attempt_id,
+                        claimOwnerId: startAttempt.claim_owner_id,
+                        error: {
+                            ...payload,
+                            reason: "backend_start_failed_before_invocation"
+                        }
+                    });
+                }
+            }
+            const current = this.getAgent(agent.agent_id);
+            if (this.hasDurableStopIntent(current)) {
+                // A stop that wins while start is pending is lifecycle authority. A
+                // backend failure or an atomic action-creation rejection must not
+                // overwrite that durable state with `failed`.
+                if (runtimeToken) {
+                    return {
+                        ...current,
+                        agent_token: runtimeToken,
+                        ...(startAttempt && invocationBegan
+                            ? { start_state: startStateFromAttemptPhase(startAttempt.phase) }
+                            : {})
+                    };
+                }
+                throw error;
+            }
+            if (startAttempt && !invocationBegan) {
+                // The adapter call provably never began. Leave the prepared attempt
+                // immediately reclaimable instead of converting transient local
+                // preparation failure into terminal start evidence.
+                throw error;
+            }
             const reason = payload.reason;
             const failed = this.store.updateAgent(agent.agent_id, {
                 status: "failed",
@@ -918,27 +3993,407 @@ export class AgentController {
                 type: "agent.failed",
                 payload
             });
-            return { ...failed, agent_token: runtimeToken };
+            if (runtimeToken) {
+                return {
+                    ...failed,
+                    agent_token: runtimeToken,
+                    ...(startAttempt && invocationBegan
+                        ? { start_state: startStateFromAttemptPhase(startAttempt.phase) }
+                        : {})
+                };
+            }
+            throw error;
         }
+    }
+    async reconcileLateNonNativeStartAfterStop(agent, handle, adapter, runtimeToken, cleanupReason = "durable_stop_won_backend_start", startState) {
+        const reconciled = await this.reconcileLateNonNativeWorkAfterStop(agent, handle, adapter, "start", cleanupReason);
+        return {
+            ...reconciled,
+            agent_token: runtimeToken,
+            ...(startState ? { start_state: startState } : {})
+        };
+    }
+    async reconcileLateNonNativeWorkAfterStop(agent, handle, adapter, work, cleanupReason = `backend_${work}_completed_after_stop`) {
+        const beforeStatus = agent.status;
+        const stopping = this.store.immediateTransaction(() => {
+            const run = this.getRun(agent.run_id);
+            if (run.status === "stopped") {
+                // Shutdown may have finalized while the backend call was awaiting.
+                // Reopen only to `stopping`; the compensating stop below is now the
+                // cleanup authority for the backend session that just became live.
+                this.store.updateRunStatus(run.run_id, "stopping");
+            }
+            const current = this.getAgent(agent.agent_id);
+            return this.store.updateAgent(current.agent_id, {
+                backendHandle: handle.data,
+                status: "stopping",
+                failureReason: current.failure_reason
+            });
+        });
+        if (beforeStatus !== "stopping") {
+            this.emit({
+                runId: stopping.run_id,
+                agentId: stopping.agent_id,
+                type: "agent.status_changed",
+                payload: {
+                    status: "stopping",
+                    reason: cleanupReason
+                }
+            });
+        }
+        let stopResult;
+        try {
+            stopResult = await adapter.stop(handle, { mode: "graceful" });
+        }
+        catch (error) {
+            const payload = errorToPayload(error);
+            const unresolved = this.store.updateAgent(stopping.agent_id, {
+                backendHandle: handle.data,
+                status: "stopping",
+                failureReason: payload.reason
+            });
+            this.emit({
+                runId: unresolved.run_id,
+                agentId: unresolved.agent_id,
+                type: "agent.status_changed",
+                payload: {
+                    status: "stopping",
+                    reason: `compensating_stop_after_late_${work}_failed`,
+                    cleanup_reason: cleanupReason,
+                    message: payload.error
+                }
+            });
+            return unresolved;
+        }
+        const status = TERMINAL_STATUSES.has(stopResult.status)
+            ? stopResult.status
+            : "stopping";
+        return this.commitAgentStopProjection(stopping.agent_id, {
+            backendHandle: handle.data,
+            status,
+            failureReason: stopResult.failureReason ?? null
+        }, {
+            status,
+            reason: `compensating_stop_after_late_${work}`,
+            cleanup_reason: cleanupReason,
+            message: stopResult.message,
+            data: stopResult.data
+        });
+    }
+    nativeActionMayPrepareAgent(agent, action, actionWasKnown) {
+        if (this.hasDurableStopIntent(agent)) {
+            return false;
+        }
+        if (!TERMINAL_STATUSES.has(agent.status)) {
+            return true;
+        }
+        const externalObservedAt = nullableRecordString(this.store.getCodexSubagentExternalState(agent.agent_id), "observed_at");
+        // A terminal observation from the previous step predates a newly-created
+        // follow-up and is intentionally cleared so the task can resume. A
+        // terminal observation at/after an already-open action is newer lifecycle
+        // truth and must survive dispatch retries just like it survives late ACKs.
+        if (!externalObservedAt) {
+            return true;
+        }
+        const ordering = Date.parse(externalObservedAt) - Date.parse(action.created_at);
+        return ordering < 0 || (ordering === 0 && !actionWasKnown);
+    }
+    /**
+     * Serialize a handleless stop with the non-native start boundary. Prepared
+     * work is provably cancellable; invoking or ambiguous work may already own a
+     * backend session and therefore remains `stopping` until the original call
+     * supplies a handle for compensating stop.
+     */
+    prepareHandlelessNonNativeStartStop(agentId) {
+        const pendingEvents = [];
+        const prepared = this.store.immediateTransaction(() => {
+            return this.prepareHandlelessNonNativeStartStopInTransaction(agentId, (event) => {
+                pendingEvents.push(this.store.createEvent(event));
+            });
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        return prepared;
+    }
+    /**
+     * Cancel every pre-invocation attempt and project the logical worker to its
+     * matching terminal state under the caller's write reservation. Keeping both
+     * writes in one transaction prevents another controller from observing a
+     * cancelled attempt while the agent card still looks queued/startable.
+     */
+    prepareHandlelessNonNativeStartStopInTransaction(agentId, eventSink) {
+        const attempts = this.store.cancelPreparedAgentStartAttempts(agentId, {
+            reason: "agent_stop_before_backend_start_invocation",
+            message: "The prepared backend start was cancelled before its invocation boundary."
+        });
+        const attempt = attempts
+            .filter((candidate) => candidate.phase === "invoking" || candidate.phase === "ambiguous")
+            .at(-1) ??
+            attempts.at(-1) ??
+            null;
+        const current = this.getAgent(agentId);
+        if (attempt && (attempt.phase === "invoking" || attempt.phase === "ambiguous")) {
+            const run = this.getRun(current.run_id);
+            if (run.status === "stopped") {
+                this.store.updateRunStatus(run.run_id, "stopping");
+            }
+            return {
+                outcome: "backend_start_uncertain",
+                agent: this.store.updateAgent(agentId, {
+                    status: "stopping",
+                    failureReason: current.failure_reason
+                }),
+                attempt
+            };
+        }
+        const stopped = TERMINAL_STATUSES.has(current.status)
+            ? current
+            : this.store.updateAgent(agentId, {
+                status: "stopped",
+                failureReason: null
+            });
+        if (stopped.status === "stopped") {
+            this.recordControllerEvent({
+                eventId: agentStoppedEventId(stopped),
+                runId: stopped.run_id,
+                agentId: stopped.agent_id,
+                type: "agent.stopped",
+                payload: {
+                    status: "stopped",
+                    message: "Prepared backend start was cancelled before adapter invocation."
+                }
+            }, eventSink);
+            this.finalizeStoppingRunIfTerminal(stopped.run_id, eventSink);
+        }
+        return {
+            outcome: "safe_without_session",
+            agent: stopped,
+            attempt
+        };
+    }
+    projectNativeActionForNewWork(input) {
+        const pendingEvents = [];
+        const projection = this.store.immediateTransaction(() => {
+            const action = this.store.getOrchestratorAction(input.actionId);
+            const agent = this.getAgent(input.agentId);
+            if (!action ||
+                action.agent_id !== agent.agent_id ||
+                (action.status !== "pending" && action.status !== "claimed") ||
+                !this.nativeActionMayPrepareAgent(agent, action, input.actionWasKnown)) {
+                return { agent, action };
+            }
+            const pendingStatus = action.operation === "send_message" ? "running" : "starting";
+            const statusChanged = agent.status !== pendingStatus || agent.failure_reason !== null;
+            const updated = this.store.updateAgentForOpenOrchestratorAction(action.action_id, agent.agent_id, {
+                status: pendingStatus,
+                failureReason: null
+            });
+            if (updated.changed && statusChanged) {
+                pendingEvents.push(this.store.createEvent({
+                    runId: updated.agent.run_id,
+                    agentId: updated.agent.agent_id,
+                    type: "agent.status_changed",
+                    payload: { status: pendingStatus, operation: action.operation }
+                }));
+            }
+            return { agent: updated.agent, action: updated.action };
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        return projection;
+    }
+    acceptedWorkLeaseExpiresAt() {
+        return new Date(Date.now() + ACCEPTED_WORK_LEASE_MS).toISOString();
+    }
+    /**
+     * Keep ownership alive only while this controller is awaiting adapter I/O.
+     * The timer is unref'd so it never keeps a process alive. A crash stops
+     * renewals; a restarted controller can then convert the stale invocation to
+     * ambiguity without replaying it. Renewal loss deliberately stops this
+     * heartbeat because another durable transition already owns the attempt.
+     */
+    maintainAcceptedWorkLease(agentId, acceptanceKey) {
+        let active = true;
+        const timer = setInterval(() => {
+            if (!active) {
+                return;
+            }
+            try {
+                const renewed = this.store.renewAgentAcceptedWorkLease({
+                    agentId,
+                    acceptanceKey,
+                    claimOwnerId: this.controllerInstanceId,
+                    leaseExpiresAt: this.acceptedWorkLeaseExpiresAt()
+                });
+                if (!renewed) {
+                    active = false;
+                    clearInterval(timer);
+                }
+            }
+            catch {
+                // A transient SQLite writer can delay one renewal. Keep the timer alive
+                // so the next interval can renew unless recovery has already won.
+            }
+        }, ACCEPTED_WORK_LEASE_RENEW_INTERVAL_MS);
+        timer.unref();
+        return () => {
+            if (!active) {
+                return;
+            }
+            active = false;
+            clearInterval(timer);
+        };
     }
     async sendMessage(agentId, message) {
         const agent = this.getAgent(agentId);
+        this.assertNewWorkAllowed(agent.run_id, "agent_send_message", agent);
         const adapter = this.adapters.get(agent.backend);
+        const capabilities = adapter.capabilities();
+        if (!capabilities.canSendMessage) {
+            throw new ControllerError(`Backend cannot deliver messages: ${agent.backend}`, "unsupported_operation", { backend: agent.backend, agent_id: agent.agent_id });
+        }
+        if (capabilities.requiresOrchestratorAction) {
+            const operation = this.enqueueCodexSubagentMessage(agent, message);
+            this.projectNativeActionForNewWork({
+                actionId: operation.action.action_id,
+                agentId,
+                actionWasKnown: false
+            });
+            const surfaced = this.orchestratorActionAfterNewWorkProjection(operation.action.action_id, agentId);
+            return {
+                agent: surfaced.agent,
+                delivered: false,
+                orchestrator_action: surfaced.action
+            };
+        }
         const handle = this.requireHandle(agent);
-        await adapter.sendMessage(handle, { message, metadata: { agentToken: this.issueAgentToken(agentId) } });
-        const updated = this.store.updateAgent(agentId, {
+        const sendAttemptId = newId("sendattempt");
+        const acceptanceKey = `send:${agentId}:${sendAttemptId}`;
+        // Crossing the adapter invocation boundary makes acceptance uncertain even
+        // if the eventual response rejects. Fence older status observations and
+        // make this attempt inspectable before I/O, without overriding a stop that
+        // already won the same SQLite reservation.
+        const acceptedAttempt = this.store.advanceAgentWorkGenerationForAcceptedWork(agentId, acceptanceKey, {
+            claimOwnerId: this.controllerInstanceId,
+            leaseExpiresAt: this.acceptedWorkLeaseExpiresAt(),
+            projectStatus: "running",
+            failureReason: null
+        });
+        if (acceptedAttempt.type === "stop_intent") {
+            throw new ControllerError("Durable stop intent blocks this agent message.", "tool_error", {
+                agent_id: agentId,
+                run_id: acceptedAttempt.agent.run_id,
+                reason: "durable_stop_intent"
+            });
+        }
+        if (acceptedAttempt.type === "already_accepted") {
+            // A durable key means an earlier process may already have crossed the
+            // adapter boundary. Never turn an idempotency replay into duplicate I/O.
+            throw new ControllerError("This physical send attempt already has durable acceptance evidence.", "tool_error", { agent_id: agentId, reason: "accepted_work_already_recorded" });
+        }
+        const attemptWorkGeneration = acceptedAttempt.agent.work_generation;
+        const attemptWorkRevision = acceptedAttempt.agent.work_revision;
+        const stopLeaseHeartbeat = this.maintainAcceptedWorkLease(agentId, acceptanceKey);
+        try {
+            await adapter.sendMessage(handle, {
+                message,
+                metadata: { agentToken: this.issueAgentToken(agentId) }
+            });
+        }
+        catch (error) {
+            stopLeaseHeartbeat();
+            const payload = errorToPayload(error);
+            const pendingEvents = [];
+            const uncertainty = this.store.immediateTransaction(() => {
+                const completion = this.store.completeAgentAcceptedWorkAttempt({
+                    agentId,
+                    acceptanceKey,
+                    claimOwnerId: this.controllerInstanceId,
+                    outcome: "ambiguous",
+                    status: "unknown",
+                    failureReason: "unknown"
+                });
+                if (completion.attemptOwnedAgent &&
+                    completion.agent.status === "unknown") {
+                    pendingEvents.push(this.store.createEvent({
+                        runId: completion.agent.run_id,
+                        agentId,
+                        type: "agent.status_changed",
+                        payload: {
+                            status: "unknown",
+                            failure_reason: "unknown",
+                            reason: "backend_send_outcome_ambiguous",
+                            send_attempt_id: sendAttemptId,
+                            work_generation: attemptWorkGeneration,
+                            work_revision_before_completion: attemptWorkRevision,
+                            work_revision: completion.agent.work_revision,
+                            adapter_error: payload.error,
+                            adapter_failure_reason: payload.reason
+                        }
+                    }));
+                }
+                return completion;
+            });
+            for (const event of pendingEvents) {
+                this.scheduleEventDelivery(event);
+            }
+            if (this.hasDurableStopIntent(uncertainty.agent)) {
+                // A rejected response does not prove the backend rejected the message;
+                // it may have revived the session and then lost the response. Under
+                // durable stop intent, compensate before preserving the caller error.
+                await this.reconcileLateNonNativeWorkAfterStop(uncertainty.agent, handle, adapter, "send");
+            }
+            else if (uncertainty.attemptOwnedAgent &&
+                uncertainty.agent.status === "unknown" &&
+                capabilities.canInspectStatusCheaply) {
+                this.store.touchHeartbeat(agentId);
+                this.armStatusWatcher(uncertainty.agent);
+            }
+            throw error;
+        }
+        stopLeaseHeartbeat();
+        const completion = this.store.completeAgentAcceptedWorkAttempt({
+            agentId,
+            acceptanceKey,
+            claimOwnerId: this.controllerInstanceId,
+            outcome: "succeeded",
             status: "running",
             failureReason: null
         });
+        const completedAfterStop = this.hasDurableStopIntent(completion.agent);
         const event = this.emit({
-            runId: updated.run_id,
+            runId: completion.agent.run_id,
             agentId,
             type: "agent.message",
-            payload: { direction: "outbound", size: message.length }
+            payload: {
+                direction: "outbound",
+                size: message.length,
+                completed_after_stop: completedAfterStop,
+                superseded_by_newer_work: !completion.attemptOwnedAgent && !completedAfterStop,
+                send_attempt_id: sendAttemptId,
+                work_generation: attemptWorkGeneration,
+                work_revision: completion.agent.work_revision
+            }
         });
-        this.store.touchHeartbeat(agentId, event.created_at);
-        this.armStatusWatcher(updated);
-        return { agent: updated, delivered: true };
+        if (completion.attemptOwnedAgent && !completedAfterStop) {
+            this.store.touchHeartbeat(agentId, event.created_at);
+            this.armStatusWatcher(completion.agent);
+            return { agent: completion.agent, delivered: true };
+        }
+        if (!completedAfterStop) {
+            // Another physical attempt advanced the generation while this one was in
+            // flight. Its projection owns the card; this completed attempt must not
+            // rewrite or compensate that newer work.
+            return { agent: completion.agent, delivered: true };
+        }
+        // A backend may accept the send by reviving a session after shutdown's
+        // earlier stop already returned. Logical state preservation is not enough:
+        // stop the actual handle again and keep durable state in `stopping` until
+        // that compensating cleanup reaches a terminal result.
+        const reconciled = await this.reconcileLateNonNativeWorkAfterStop(completion.agent, handle, adapter, "send");
+        return { agent: reconciled, delivered: true };
     }
     async readLatest(agentId, limit = 1) {
         const agent = this.getAgent(agentId);
@@ -963,18 +4418,185 @@ export class AgentController {
         if (!adapter.capabilities().canInspectStatusCheaply) {
             return agent;
         }
+        // Status inspection crosses an external I/O boundary. Stop authority may
+        // already exist now, or another controller may persist it while getStatus
+        // is in flight. Remember the first observation and re-read under a SQLite
+        // write reservation before applying the backend snapshot.
+        const durableStopIntentBeforeStatusRead = this.hasDurableStopIntent(agent);
+        const observedWorkGeneration = agent.work_generation;
+        const observedWorkRevision = agent.work_revision;
+        const observedBackendHandle = agent.backend_handle;
+        let snapshot;
         try {
-            const snapshot = await adapter.getStatus(this.requireHandle(agent));
+            snapshot = await adapter.getStatus(this.requireHandle(agent));
+        }
+        catch (error) {
+            const payload = errorToPayload(error);
+            const pendingEvents = [];
+            const projection = this.store.immediateTransaction(() => {
+                let current = this.getAgent(agent.agent_id);
+                if (current.unregistered_at ||
+                    TERMINAL_STATUSES.has(current.status) ||
+                    current.work_generation !== observedWorkGeneration ||
+                    current.work_revision !== observedWorkRevision ||
+                    !stableJsonEquals(current.backend_handle, observedBackendHandle)) {
+                    // The failed observation belongs to stale lifecycle state. In
+                    // particular, never overwrite a concurrently completed stop or a
+                    // replacement backend session with an error from the old handle.
+                    return { agent: current, ordinaryFailure: false, rearmUncertainty: false };
+                }
+                const invoking = this.store.resolveInvokingAgentAcceptedWork(current.agent_id, current.work_generation, current.work_revision);
+                if (invoking.type === "live") {
+                    // The refresh observed the exact revision currently crossing adapter
+                    // I/O. Neither an inspection error nor a terminal snapshot can prove
+                    // that this send was rejected. Its completion will advance the
+                    // revision and establish the next safe projection boundary.
+                    return { agent: current, ordinaryFailure: false, rearmUncertainty: true };
+                }
+                if (invoking.type === "recovered_ambiguous") {
+                    // Recovery advanced the revision and projected uncertainty. Continue
+                    // this same error path against that durable state so a transport
+                    // failure cannot turn an abandoned, possibly accepted send into a
+                    // definitive agent failure.
+                    current = invoking.agent;
+                }
+                const cleanupPending = durableStopIntentBeforeStatusRead || this.hasDurableStopIntent(current);
+                if (cleanupPending) {
+                    const unresolved = this.store.updateAgent(current.agent_id, {
+                        status: "stopping",
+                        failureReason: payload.reason
+                    });
+                    pendingEvents.push(this.store.createEvent({
+                        runId: unresolved.run_id,
+                        agentId: unresolved.agent_id,
+                        type: "agent.status_changed",
+                        payload: {
+                            status: "stopping",
+                            reason: "status_refresh_failed_during_cleanup",
+                            failure_reason: payload.reason,
+                            error: payload.error
+                        }
+                    }));
+                    return { agent: unresolved, ordinaryFailure: false, rearmUncertainty: false };
+                }
+                if (current.status === "unknown" &&
+                    this.store.agentHasAmbiguousAcceptedWork(current.agent_id, current.work_generation)) {
+                    // A transport/status inspection error cannot disprove work whose
+                    // adapter response was already ambiguous. Preserve the inspectable
+                    // uncertainty so a later healthy refresh can reconcile backend truth.
+                    const uncertain = this.store.updateAgent(current.agent_id, {
+                        status: "unknown",
+                        failureReason: current.failure_reason ?? "unknown"
+                    });
+                    pendingEvents.push(this.store.createEvent({
+                        runId: uncertain.run_id,
+                        agentId: uncertain.agent_id,
+                        type: "agent.status_changed",
+                        payload: {
+                            status: "unknown",
+                            failure_reason: uncertain.failure_reason,
+                            reason: "status_refresh_failed_during_work_uncertainty",
+                            work_generation: uncertain.work_generation,
+                            work_revision: uncertain.work_revision,
+                            adapter_error: payload.error,
+                            adapter_failure_reason: payload.reason
+                        }
+                    }));
+                    return { agent: uncertain, ordinaryFailure: false, rearmUncertainty: true };
+                }
+                const failed = this.store.updateAgent(current.agent_id, {
+                    status: "failed",
+                    failureReason: payload.reason
+                });
+                pendingEvents.push(this.store.createEvent({
+                    runId: failed.run_id,
+                    agentId: failed.agent_id,
+                    type: "agent.failed",
+                    payload
+                }));
+                this.finalizeStoppingRunIfTerminal(failed.run_id, (event) => {
+                    pendingEvents.push(this.store.createEvent(event));
+                });
+                return { agent: failed, ordinaryFailure: true, rearmUncertainty: false };
+            });
+            for (const event of pendingEvents) {
+                this.scheduleEventDelivery(event);
+            }
+            if (projection.ordinaryFailure) {
+                this.disarmStatusWatcher(projection.agent.agent_id);
+            }
+            else if (projection.rearmUncertainty &&
+                adapter.capabilities().canInspectStatusCheaply) {
+                this.armStatusWatcher(projection.agent);
+            }
+            return projection.agent;
+        }
+        const pendingEvents = [];
+        const projection = this.store.immediateTransaction(() => {
+            let current = this.getAgent(agent.agent_id);
+            if (current.unregistered_at ||
+                TERMINAL_STATUSES.has(current.status) ||
+                current.work_generation !== observedWorkGeneration ||
+                current.work_revision !== observedWorkRevision ||
+                !stableJsonEquals(current.backend_handle, observedBackendHandle)) {
+                // The snapshot was taken from lifecycle state that no longer owns this
+                // record. Preserve the newer projection rather than reviving a terminal
+                // worker or applying an old handle's status to a replacement session.
+                return { agent: current, projectedTerminal: false, deferredInvoking: false };
+            }
+            const invoking = this.store.resolveInvokingAgentAcceptedWork(current.agent_id, current.work_generation, current.work_revision);
+            if (invoking.type === "live") {
+                // Defer every projection, including apparently terminal backend state,
+                // until the in-flight acceptance has durably recorded its outcome.
+                // This also preserves `stopping` if cleanup won after getStatus began.
+                return { agent: current, projectedTerminal: false, deferredInvoking: true };
+            }
+            if (invoking.type === "recovered_ambiguous") {
+                // This healthy snapshot was obtained by the restarted controller from
+                // the same backend handle. After atomically closing the expired owner
+                // as ambiguity, it may safely reconcile backend truth in this pass.
+                current = invoking.agent;
+            }
+            const cleanupPending = durableStopIntentBeforeStatusRead || this.hasDurableStopIntent(current);
             const snapshotFailureReason = snapshot.failureReason ?? null;
-            const changed = snapshot.status !== agent.status || snapshotFailureReason !== agent.failure_reason;
+            if (cleanupPending && !TERMINAL_STATUSES.has(snapshot.status)) {
+                // A nonterminal backend observation proves cleanup is not complete; it
+                // cannot revoke the durable stop predicate. Preserve an existing stop
+                // diagnostic unless the adapter supplied a more specific one.
+                const failureReason = snapshotFailureReason ?? current.failure_reason;
+                const unresolved = this.store.updateAgent(current.agent_id, {
+                    status: "stopping",
+                    failureReason
+                });
+                pendingEvents.push(this.store.createEvent({
+                    runId: unresolved.run_id,
+                    agentId: unresolved.agent_id,
+                    type: "agent.status_changed",
+                    payload: {
+                        status: "stopping",
+                        reason: "backend_nonterminal_observed_during_cleanup",
+                        observed_status: snapshot.status,
+                        failure_reason: failureReason,
+                        message: snapshot.message,
+                        data: snapshot.data
+                    }
+                }));
+                this.store.touchHeartbeat(current.agent_id);
+                return { agent: unresolved, projectedTerminal: false, deferredInvoking: false };
+            }
+            // A terminal status from the same backend handle is authoritative proof
+            // that cleanup completed. Without stop intent, retain the ordinary status
+            // refresh behavior.
+            const changed = snapshot.status !== current.status ||
+                snapshotFailureReason !== current.failure_reason;
             const updated = changed
-                ? this.store.updateAgent(agent.agent_id, {
+                ? this.store.updateAgent(current.agent_id, {
                     status: snapshot.status,
                     failureReason: snapshotFailureReason
                 })
-                : this.store.updateAgent(agent.agent_id, {});
+                : this.store.updateAgent(current.agent_id, {});
             if (changed) {
-                this.emit({
+                pendingEvents.push(this.store.createEvent({
                     runId: updated.run_id,
                     agentId: updated.agent_id,
                     type: this.statusEventType(snapshot.status),
@@ -984,28 +4606,28 @@ export class AgentController {
                         message: snapshot.message,
                         data: snapshot.data
                     }
+                }));
+            }
+            const projectedTerminal = TERMINAL_STATUSES.has(updated.status);
+            if (projectedTerminal) {
+                this.finalizeStoppingRunIfTerminal(updated.run_id, (event) => {
+                    pendingEvents.push(this.store.createEvent(event));
                 });
             }
-            if (TERMINAL_STATUSES.has(updated.status)) {
-                this.disarmStatusWatcher(updated.agent_id);
-            }
-            this.store.touchHeartbeat(agent.agent_id);
-            return updated;
+            this.store.touchHeartbeat(current.agent_id);
+            return { agent: updated, projectedTerminal, deferredInvoking: false };
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
         }
-        catch (error) {
-            const payload = errorToPayload(error);
-            const failed = this.store.updateAgent(agent.agent_id, {
-                status: "failed",
-                failureReason: payload.reason
-            });
-            this.emit({
-                runId: failed.run_id,
-                agentId: failed.agent_id,
-                type: "agent.failed",
-                payload
-            });
-            return failed;
+        if (projection.projectedTerminal) {
+            this.disarmStatusWatcher(projection.agent.agent_id);
         }
+        else if (projection.deferredInvoking &&
+            adapter.capabilities().canInspectStatusCheaply) {
+            this.armStatusWatcher(projection.agent);
+        }
+        return projection.agent;
     }
     async pollActiveAgents(runId) {
         const agents = this.store
@@ -1111,51 +4733,337 @@ export class AgentController {
             await sleep(intervalMs);
         }
     }
+    prepareCodexSubagentStopInTransaction(agent, input) {
+        const current = this.getAgent(agent.agent_id);
+        const workStartingActions = this.store
+            .listOrchestratorActions({ agentId: current.agent_id })
+            .filter((action) => action.agent_id === current.agent_id &&
+            ((action.operation === "send_message" || action.operation === "followup_task") ||
+                (input.scope !== "agent_stop" && action.operation === "spawn_agent")) &&
+            (action.status === "pending" || action.status === "claimed"));
+        const cancelledAt = nowIso();
+        const resolvedActions = workStartingActions.map((action) => action.status === "pending"
+            ? this.store.cancelUnclaimedOrchestratorAction({
+                actionId: action.action_id,
+                errorJson: action.operation === "spawn_agent"
+                    ? {
+                        reason: "agent_stopped_before_spawn",
+                        scope: input.scope,
+                        message: input.scope === "flow_route"
+                            ? "The native spawn action was cancelled before execution because its flow step was manually superseded."
+                            : "The native spawn action was cancelled before execution because durable run stop intent was recorded."
+                    }
+                    : {
+                        reason: "native_message_cancelled_by_stop",
+                        scope: input.scope,
+                        message: "The native message action was cancelled before execution because durable stop intent was recorded."
+                    },
+                cancelledAt
+            }).action
+            : action);
+        const claimedActionExists = resolvedActions.some((action) => action.status === "claimed");
+        const updated = input.recordStopIntent || claimedActionExists
+            ? this.store.updateAgent(current.agent_id, {
+                status: "stopping",
+                failureReason: current.failure_reason
+            })
+            : current;
+        return {
+            agent: updated,
+            cancelledActionIds: resolvedActions
+                .filter((action) => action.status === "cancelled")
+                .map((action) => action.action_id),
+            stopCauseAction: this.latestNativeMessageStopCauseAction(current.agent_id)
+        };
+    }
+    latestNativeMessageStopCauseAction(agentId) {
+        const latestMessageAction = this.store
+            .listOrchestratorActions({ agentId })
+            .filter((action) => action.agent_id === agentId &&
+            (action.operation === "send_message" || action.operation === "followup_task"))
+            .at(-1);
+        if (latestMessageAction?.status === "claimed" ||
+            (latestMessageAction?.status === "cancelled" &&
+                recordString(latestMessageAction.error_json, "reason") ===
+                    "native_message_cancelled_by_stop")) {
+            return latestMessageAction;
+        }
+        return null;
+    }
+    prepareHandlelessCodexSubagentStop(agentId) {
+        const pendingEvents = [];
+        const prepared = this.store.immediateTransaction(() => {
+            const projectStopped = (stopped, cancelledActionId) => {
+                pendingEvents.push(this.store.createEvent({
+                    eventId: agentStoppedEventId(stopped),
+                    runId: stopped.run_id,
+                    agentId: stopped.agent_id,
+                    type: "agent.stopped",
+                    payload: {
+                        status: "stopped",
+                        message: cancelledActionId
+                            ? "Pending native spawn was cancelled before execution."
+                            : "Native worker had no executed spawn action.",
+                        ...(cancelledActionId
+                            ? { cancelled_action_id: cancelledActionId }
+                            : {})
+                    }
+                }));
+                this.finalizeStoppingRunIfTerminal(stopped.run_id, (event) => {
+                    pendingEvents.push(this.store.createEvent(event));
+                });
+                return {
+                    outcome: "stopped",
+                    agent: stopped,
+                    cancelledActionId
+                };
+            };
+            const current = this.getAgent(agentId);
+            // Recording the stop predicate before inspecting spawn actions makes the
+            // two possible cross-process orders deterministic. BEGIN IMMEDIATE means
+            // a spawn that committed first is visible and cancellable below; when
+            // this transaction wins first, action creation observes `stopping` and
+            // its guarded INSERT returns no row.
+            const stopping = this.store.updateAgent(current.agent_id, {
+                status: "stopping",
+                failureReason: null
+            });
+            if (stopping.backend_handle) {
+                return { outcome: "handle_available", agent: stopping };
+            }
+            const spawnAction = this.store
+                .listOrchestratorActions({ agentId: stopping.agent_id })
+                .filter((action) => action.agent_id === stopping.agent_id &&
+                action.operation === "spawn_agent")
+                .at(-1) ?? null;
+            if (spawnAction?.status === "pending") {
+                const cancellation = this.store.cancelUnclaimedOrchestratorAction({
+                    actionId: spawnAction.action_id,
+                    errorJson: {
+                        reason: "agent_stopped_before_spawn",
+                        message: "The logical worker was stopped before its native spawn action was claimed."
+                    }
+                });
+                if (cancellation.action.status === "cancelled" ||
+                    cancellation.action.status === "failed") {
+                    return projectStopped(this.store.updateAgent(stopping.agent_id, {
+                        status: "stopped",
+                        failureReason: null
+                    }), cancellation.action.action_id);
+                }
+                return {
+                    outcome: "spawn_resolution_pending",
+                    agent: stopping,
+                    spawnAction: cancellation.action
+                };
+            }
+            if (spawnAction?.status === "claimed") {
+                return {
+                    outcome: "spawn_resolution_pending",
+                    agent: stopping,
+                    spawnAction
+                };
+            }
+            if (spawnAction?.status === "succeeded") {
+                // The ACK may have committed between stopAgent's initial handle read
+                // and this transaction. Recover its validated native identity while
+                // the stop predicate is held, then continue through normal interrupt
+                // cleanup instead of pretending no backend session exists.
+                return {
+                    outcome: "handle_available",
+                    agent: this.store.updateAgent(stopping.agent_id, {
+                        backendHandle: this.spawnBackendHandle(spawnAction, stopping),
+                        status: "stopping",
+                        failureReason: null
+                    })
+                };
+            }
+            return projectStopped(this.store.updateAgent(stopping.agent_id, {
+                status: "stopped",
+                failureReason: null
+            }), null);
+        });
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        return prepared;
+    }
     async stopAgent(agentId, mode = "graceful") {
         let agent = this.getAgent(agentId);
+        // Capture intent before this call writes its own transient `stopping`
+        // projection. A manual route, run shutdown, or earlier cleanup attempt has
+        // already made cleanup durable; an ordinary first-time stop has not. That
+        // distinction decides whether an adapter error may become terminal or must
+        // remain retryable across another explicit call or controller restart.
+        const durableStopIntentAtEntry = this.hasDurableStopIntent(agent);
         const adapter = this.adapters.get(agent.backend);
+        const requiresOrchestratorAction = Boolean(adapter.capabilities().requiresOrchestratorAction);
         if (!agent.backend_handle) {
             const recoveredHandle = this.recoverBackendHandle(agent);
             if (recoveredHandle) {
-                agent = this.store.updateAgent(agentId, { backendHandle: recoveredHandle });
+                const succeededAttempt = this.store.getLatestCompletedAgentStartAttemptWithHandle(agent.agent_id);
+                agent = this.store.immediateTransaction(() => {
+                    if (agent.status === "stopped" && succeededAttempt?.handle_json) {
+                        const run = this.getRun(agent.run_id);
+                        if (run.status === "stopped") {
+                            this.store.updateRunStatus(run.run_id, "stopping");
+                        }
+                        return this.store.updateAgent(agentId, {
+                            backendHandle: recoveredHandle,
+                            status: "stopping",
+                            failureReason: agent.failure_reason
+                        });
+                    }
+                    return this.store.updateAgent(agentId, { backendHandle: recoveredHandle });
+                });
             }
         }
-        if (!agent.backend_handle) {
-            const stopped = this.store.updateAgent(agentId, { status: "stopped", failureReason: null });
-            this.emit({
-                runId: stopped.run_id,
-                agentId,
-                type: "agent.stopped",
-                payload: { status: "stopped", message: "Agent had no active backend session." }
-            });
-            return stopped;
+        if (!requiresOrchestratorAction &&
+            !agent.backend_handle &&
+            TERMINAL_STATUSES.has(agent.status)) {
+            return agent;
         }
-        const stopping = this.store.updateAgent(agentId, { status: "stopping" });
+        if (!requiresOrchestratorAction && !agent.backend_handle) {
+            const prepared = this.prepareHandlelessNonNativeStartStop(agent.agent_id);
+            agent = prepared.agent;
+            if (prepared.outcome === "backend_start_uncertain") {
+                this.emit({
+                    runId: agent.run_id,
+                    agentId: agent.agent_id,
+                    type: "agent.status_changed",
+                    payload: {
+                        status: "stopping",
+                        reason: "backend_start_outcome_uncertain",
+                        start_attempt_id: prepared.attempt?.start_attempt_id ?? null,
+                        attempt_phase: prepared.attempt?.phase ?? null
+                    }
+                });
+                return agent;
+            }
+            if (agent.status === "stopped") {
+                return agent;
+            }
+        }
+        if (TERMINAL_STATUSES.has(agent.status)) {
+            if (!requiresOrchestratorAction) {
+                return agent;
+            }
+            const prepared = this.store.immediateTransaction(() => this.prepareCodexSubagentStopInTransaction(agent, {
+                scope: "agent_stop",
+                recordStopIntent: false
+            }));
+            if (TERMINAL_STATUSES.has(prepared.agent.status)) {
+                return prepared.agent;
+            }
+            agent = prepared.agent;
+        }
+        if (requiresOrchestratorAction && mode === "kill") {
+            throw new ControllerError("codex-subagent does not support force stop.", "unsupported_operation", {
+                backend: agent.backend,
+                mode
+            });
+        }
+        if (requiresOrchestratorAction && !agent.backend_handle) {
+            const prepared = this.prepareHandlelessCodexSubagentStop(agent.agent_id);
+            if (prepared.outcome === "stopped") {
+                return prepared.agent;
+            }
+            if (prepared.outcome === "spawn_resolution_pending") {
+                // A claimed spawn may already have created a native worker even when
+                // its acknowledgement/handle has not reached this controller. Never
+                // invent an interrupt target or claim the logical worker is stopped.
+                return this.markNativeSpawnStopUncertain(prepared.agent, prepared.spawnAction);
+            }
+            agent = prepared.agent;
+        }
+        if (!agent.backend_handle && !requiresOrchestratorAction) {
+            return this.stopAgentWithoutBackendSession(agent, "Agent had no active backend session.");
+        }
+        const nativeStopPreparation = requiresOrchestratorAction
+            ? this.store.immediateTransaction(() => this.prepareCodexSubagentStopInTransaction(agent, {
+                scope: "agent_stop",
+                recordStopIntent: true
+            }))
+            : null;
+        const stopping = nativeStopPreparation?.agent ??
+            this.store.updateAgent(agentId, { status: "stopping" });
         this.emit({
             runId: stopping.run_id,
             agentId,
             type: "agent.status_changed",
-            payload: { status: "stopping" }
-        });
-        try {
-            const result = await adapter.stop(this.requireHandle(stopping), { mode });
-            const stopped = this.store.updateAgent(agentId, {
-                status: result.status,
-                failureReason: result.failureReason ?? null
-            });
-            if (TERMINAL_STATUSES.has(stopped.status)) {
-                this.disarmStatusWatcher(agentId);
+            payload: {
+                status: "stopping",
+                ...(nativeStopPreparation?.cancelledActionIds.length
+                    ? { cancelled_action_ids: nativeStopPreparation.cancelledActionIds }
+                    : {})
             }
-            this.emit({
-                runId: stopped.run_id,
-                agentId,
-                type: this.statusEventType(stopped.status),
-                payload: { status: stopped.status, message: result.message, data: result.data }
-            });
-            return stopped;
+        });
+        let result;
+        try {
+            let operation;
+            if (requiresOrchestratorAction) {
+                const stopCauseAction = nativeStopPreparation?.stopCauseAction ??
+                    this.latestNativeMessageStopCauseAction(agent.agent_id);
+                operation = stopCauseAction
+                    ? this.enqueueCodexSubagentInterrupt(stopping, `interrupt:stop-message:${stopCauseAction.action_id}`, stopCauseAction)
+                    : this.enqueueCodexSubagentInterrupt(stopping);
+            }
+            else {
+                operation = {
+                    type: "completed",
+                    value: await adapter.stop(this.requireHandle(stopping), { mode })
+                };
+            }
+            if (operation.type === "orchestrator_action_required") {
+                const durableAction = this.openOrchestratorActionRef(operation.action.action_id);
+                const current = this.getAgent(stopping.agent_id);
+                if (durableAction) {
+                    this.notifyFlowOwnerOfNativeCleanupActionRef(durableAction);
+                }
+                return durableAction
+                    ? { ...current, orchestrator_action: durableAction }
+                    : current;
+            }
+            result = operation.value;
         }
         catch (error) {
             const payload = errorToPayload(error);
+            if (requiresOrchestratorAction) {
+                const unresolved = this.store.updateAgent(agentId, {
+                    status: "stopping",
+                    failureReason: payload.reason
+                });
+                this.emit({
+                    runId: unresolved.run_id,
+                    agentId,
+                    type: "agent.status_changed",
+                    payload: { status: "stopping", reason: payload.reason, message: payload.message }
+                });
+                return unresolved;
+            }
+            if (durableStopIntentAtEntry) {
+                // External stop I/O is not transactional. Once cleanup intent already
+                // exists, treating a transient adapter error as terminal would suppress
+                // both startup redrive and an explicit retry while the backend session
+                // may still be alive. Keep the durable predicate and expose the last
+                // failure without recursively retrying in this controller instance.
+                const unresolved = this.store.updateAgent(agentId, {
+                    status: "stopping",
+                    failureReason: payload.reason
+                });
+                this.emit({
+                    runId: unresolved.run_id,
+                    agentId,
+                    type: "agent.status_changed",
+                    payload: {
+                        status: "stopping",
+                        reason: "external_stop_retry_pending",
+                        failure_reason: payload.reason,
+                        error: payload.error
+                    }
+                });
+                return unresolved;
+            }
             const failed = this.store.updateAgent(agentId, {
                 status: "failed",
                 failureReason: payload.reason
@@ -1163,18 +5071,92 @@ export class AgentController {
             this.emit({ runId: failed.run_id, agentId, type: "agent.failed", payload });
             return failed;
         }
+        return this.commitAgentStopProjection(agentId, {
+            status: result.status,
+            failureReason: result.failureReason ?? null
+        }, { status: result.status, message: result.message, data: result.data });
     }
-    stopAgents(input) {
+    async stopAgents(input) {
         const mode = input.mode ?? "graceful";
         const agents = this.store
             .listAgents({ runId: input.runId })
             .filter((agent) => !TERMINAL_STATUSES.has(agent.status));
-        const marked = [];
-        for (const agent of agents) {
-            marked.push(this.store.updateAgent(agent.agent_id, { status: "stopping" }));
-            void this.stopAgent(agent.agent_id, mode);
+        return Promise.all(agents.map((agent) => this.stopAgent(agent.agent_id, mode)));
+    }
+    /**
+     * Commit backend stop truth, its lifecycle event, and any last-agent run
+     * finalization under one write reservation. This removes the crash window
+     * where a terminal agent row could survive beside a permanently `stopping`
+     * run. Watcher teardown remains an after-commit in-memory side effect.
+     */
+    commitAgentStopProjection(agentId, patch, payload) {
+        const pendingEvents = [];
+        const projected = this.store.immediateTransaction(() => {
+            const updated = this.store.updateAgent(agentId, patch);
+            pendingEvents.push(this.store.createEvent({
+                runId: updated.run_id,
+                agentId: updated.agent_id,
+                type: this.statusEventType(updated.status),
+                payload
+            }));
+            if (TERMINAL_STATUSES.has(updated.status)) {
+                this.finalizeStoppingRunIfTerminal(updated.run_id, (event) => {
+                    pendingEvents.push(this.store.createEvent(event));
+                });
+            }
+            return updated;
+        });
+        if (TERMINAL_STATUSES.has(projected.status)) {
+            this.disarmStatusWatcher(projected.agent_id);
         }
-        return marked;
+        for (const event of pendingEvents) {
+            this.scheduleEventDelivery(event);
+        }
+        return projected;
+    }
+    stopAgentWithoutBackendSession(agent, message, cancelledActionId) {
+        return this.commitAgentStopProjection(agent.agent_id, { status: "stopped", failureReason: null }, {
+            status: "stopped",
+            message,
+            ...(cancelledActionId ? { cancelled_action_id: cancelledActionId } : {})
+        });
+    }
+    markNativeSpawnStopUncertain(agent, spawnAction) {
+        const stopping = this.store.updateAgent(agent.agent_id, {
+            status: "stopping",
+            failureReason: null
+        });
+        this.emit({
+            runId: stopping.run_id,
+            agentId: stopping.agent_id,
+            type: "agent.status_changed",
+            payload: {
+                status: "stopping",
+                reason: "native_spawn_resolution_pending",
+                action_id: spawnAction.action_id,
+                action_status: spawnAction.status
+            }
+        });
+        return { ...stopping, orchestrator_action: orchestratorActionRef(spawnAction) };
+    }
+    finalizeStoppingRunIfTerminal(runId, eventSink) {
+        const run = this.store.getRun(runId);
+        if (!run || run.status !== "stopping") {
+            return null;
+        }
+        const pending = this.store
+            .listAgents({ runId })
+            .filter((agent) => !TERMINAL_STATUSES.has(agent.status));
+        if (pending.length > 0) {
+            return null;
+        }
+        const stopped = this.store.updateRunStatus(runId, "stopped");
+        this.recordControllerEvent({
+            runId,
+            type: "timer.elapsed",
+            payload: { action: "run_shutdown_completed", stopped_agents: this.store.listAgents({ runId }).length }
+        }, eventSink);
+        return stopped;
     }
     async unregisterAgent(agentId) {
         const agent = this.getAgent(agentId);
@@ -1222,6 +5204,12 @@ export class AgentController {
             }
         }
         const runtimePath = agentRuntimePath(agent.run_id, agent.agent_id);
+        const credentialTargets = !resolved.dryRun && this.credentialStore
+            ? {
+                bridges: this.store.listBridgeGrants({ orchestratorAgentId: agent.agent_id }),
+                actions: this.store.listOrchestratorActions({ agentId: agent.agent_id })
+            }
+            : null;
         const result = createPurgeResult(resolved.dryRun);
         result.purged_agents.push(agent.agent_id);
         result.deleted_rows = mergeRowCounts(result.deleted_rows, this.store.countAgentPurgeRows(agent.agent_id));
@@ -1231,6 +5219,9 @@ export class AgentController {
         if (!resolved.dryRun) {
             this.disarmStatusWatcher(agent.agent_id);
             this.store.purgeAgentRows(agent.agent_id, false);
+            if (credentialTargets && this.credentialStore) {
+                result.credential_cleanup_diagnostics.push(...this.credentialStore.cleanupCredentials(credentialTargets));
+            }
             if (resolved.deleteRuntimeFiles) {
                 deleteRuntimePath(result, runtimePath);
             }
@@ -1274,6 +5265,12 @@ export class AgentController {
             });
         }
         const runtimePath = runRuntimePath(runId);
+        const credentialTargets = !resolved.dryRun && this.credentialStore
+            ? {
+                bridges: this.store.listBridgeGrants({ runId }),
+                actions: this.store.listOrchestratorActions({ runId })
+            }
+            : null;
         const result = createPurgeResult(resolved.dryRun);
         result.purged_runs.push(runId);
         result.purged_agents.push(...agents.map((agent) => agent.agent_id));
@@ -1286,11 +5283,40 @@ export class AgentController {
                 this.disarmStatusWatcher(agent.agent_id);
             }
             this.store.purgeRunRows(runId, false);
+            if (credentialTargets && this.credentialStore) {
+                result.credential_cleanup_diagnostics.push(...this.credentialStore.cleanupCredentials(credentialTargets));
+            }
             if (resolved.deleteRuntimeFiles) {
                 deleteRuntimePath(result, runtimePath);
             }
         }
         return result;
+    }
+    revokeBridgeGrant(bridgeGrantId) {
+        if (!isBridgeGrantId(bridgeGrantId)) {
+            throw new ControllerError("Invalid bridge grant id.", "tool_error", {
+                bridge_grant_id: bridgeGrantId
+            });
+        }
+        const current = this.store.getBridgeGrant(bridgeGrantId);
+        if (!current) {
+            throw new ControllerError("Bridge grant not found.", "tool_error", {
+                bridge_grant_id: bridgeGrantId
+            });
+        }
+        const revoked = this.store.revokeBridgeGrant(bridgeGrantId);
+        if (!revoked?.revoked_at) {
+            throw new ControllerError("Bridge grant could not be revoked.", "tool_error", {
+                bridge_grant_id: bridgeGrantId
+            });
+        }
+        return {
+            bridge_grant_id: revoked.bridge_grant_id,
+            revoked_at: revoked.revoked_at,
+            credential_cleanup_diagnostics: this.credentialStore
+                ? this.credentialStore.cleanupCredentials({ bridges: [revoked] })
+                : []
+        };
     }
     async maintenancePurgeOld(options) {
         const cutoffIso = new Date(Date.now() - options.olderThanMs).toISOString();
@@ -1542,6 +5568,13 @@ export class AgentController {
     async listAgentMessages(agentId, options = {}) {
         const agent = this.getAgent(agentId);
         const limit = Math.max(1, options.limit ?? 5);
+        if (agent.backend === CODEX_SUBAGENT_BACKEND) {
+            const eventMessages = controllerEventMessages(agent, this.listAgents({ runId: agent.run_id, includeUnregistered: true }), this.listEvents({ runId: agent.run_id, limit: Math.max(limit * 2, limit) }));
+            const externalMessage = codexSubagentExternalMessage(agent, this.store.getCodexSubagentExternalState(agent.agent_id));
+            return [...eventMessages, ...(externalMessage ? [externalMessage] : [])]
+                .sort((left, right) => Date.parse(left.created_at) - Date.parse(right.created_at) || left.id.localeCompare(right.id))
+                .slice(-limit);
+        }
         if (!agent.backend_handle && !this.recoverBackendHandle(agent)) {
             return controllerEventMessages(agent, this.listAgents({ runId: agent.run_id, includeUnregistered: true }), this.listEvents({ runId: agent.run_id, limit }));
         }
@@ -1626,7 +5659,11 @@ export class AgentController {
             usage_totals: usageTotals([...latestUsageByAgent.values()])
         };
     }
-    activateFlowStep(config, instance, stepId) {
+    activateFlowStep(config, instance, stepId, activation = {}) {
+        const emitEvent = activation.eventSink ??
+            ((event) => {
+                this.emit(event);
+            });
         const stepConfig = config.steps[stepId];
         if (!stepConfig) {
             throw new ControllerError("Cannot activate undefined flow step.", "tool_error", {
@@ -1641,6 +5678,7 @@ export class AgentController {
         const run = this.getRun(instance.run_id);
         const describedInputs = this.describeStepInputArtifacts(config, stepConfig, inputArtifacts);
         const outputArtifacts = this.resolveStepOutputArtifacts(config, instance, stepConfig);
+        const coordinatorContext = activation.coordinatorContext?.trim() || null;
         const runtimeContract = this.buildFlowStepRuntimeContract({
             flowId: config.id,
             stepId,
@@ -1648,6 +5686,7 @@ export class AgentController {
             roleConfig: stepConfig.role ? config.roles?.[stepConfig.role] : undefined,
             instance,
             run,
+            coordinatorContext,
             inputArtifacts: describedInputs,
             outputArtifacts
         });
@@ -1664,6 +5703,9 @@ export class AgentController {
             output_artifacts: outputArtifacts,
             reporting_contract: reportingContract
         };
+        if (coordinatorContext) {
+            inputJson.coordinator_context = coordinatorContext;
+        }
         if (promptSources.length > 0) {
             inputJson.prompt_sources = promptSources;
         }
@@ -1686,7 +5728,7 @@ export class AgentController {
                 status: "blocked",
                 currentStepId: stepId
             });
-            this.emit({
+            emitEvent({
                 runId: instance.run_id,
                 agentId: stepConfig.agent_id,
                 type: "flow.step_blocked",
@@ -1704,7 +5746,7 @@ export class AgentController {
             status: "active",
             currentStepId: stepId
         });
-        this.emit({
+        emitEvent({
             runId: instance.run_id,
             agentId: stepConfig.agent_id,
             type: "flow.step_started",
@@ -1718,6 +5760,7 @@ export class AgentController {
                 input_artifacts: inputJson.input_artifacts,
                 output_artifacts: outputArtifacts,
                 prompt_sources: promptSources,
+                coordinator_context: coordinatorContext,
                 reporting_contract: reportingContract
             }
         });
@@ -1767,13 +5810,21 @@ export class AgentController {
         if (reportingContract) {
             sections.push(reportingContract);
         }
-        sections.push(section("Backend Constraints", [
+        const backendConstraints = [
             "You are an Agent Control worker executing one flow step.",
             "Use the generated runtime and reporting contracts as the source of truth.",
             "Write the required artifact paths before reporting.",
             "Keep any in-process status terse.",
             "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
-        ].join("\n")));
+        ];
+        const runtimeContractRecord = input.runtime_contract && typeof input.runtime_contract === "object" && !Array.isArray(input.runtime_contract)
+            ? input.runtime_contract
+            : undefined;
+        const runtimeWorker = payloadRecord(runtimeContractRecord, "worker");
+        if (payloadString(runtimeWorker, "backend") === CODEX_SUBAGENT_BACKEND) {
+            backendConstraints.push("Do not call native collaboration/subagent tools and do not spawn sibling agents.", "Perform only this assigned step, write its required artifacts, call `flow_step_report`, and then end.");
+        }
+        sections.push(section("Backend Constraints", backendConstraints.join("\n")));
         return sections.join("\n\n");
     }
     resolveStepOutputArtifacts(config, instance, stepConfig) {
@@ -1791,11 +5842,16 @@ export class AgentController {
         return outputArtifacts;
     }
     buildFlowStepRuntimeContract(input) {
+        const objective = buildEffectiveFlowObjective(input.run.title, input.coordinatorContext);
+        const objectiveSource = input.coordinatorContext ? "coordinator_context_over_run_title" : "run_title";
         return {
             flow_id: input.flowId,
             flow_instance_id: input.instance.flow_instance_id,
             step_id: input.stepId,
             role: input.stepConfig.role ?? null,
+            objective,
+            objective_source: objectiveSource,
+            coordinator_context: input.coordinatorContext,
             run: {
                 run_id: input.run.run_id,
                 title: input.run.title,
@@ -1810,7 +5866,9 @@ export class AgentController {
             input_artifacts: input.inputArtifacts,
             output_artifacts: input.outputArtifacts,
             instructions: [
-                "Use the run title/objective and repository directory from this runtime contract.",
+                input.coordinatorContext
+                    ? "Use `objective` as the source of truth. Its coordinator context supersedes the original run title wherever it adds, clarifies, or conflicts."
+                    : "Use `objective` and the repository directory from this runtime contract as the source of truth.",
                 "Read only the input artifacts that are present and relevant to this step.",
                 "Write every required output artifact to its assigned path before reporting.",
                 "Do not invent artifact paths, filenames, or additional handoff files unless the task itself requires separate repo changes."
@@ -1824,6 +5882,8 @@ export class AgentController {
                 backend: input.roleConfig?.backend ?? null,
                 model: input.roleConfig?.model ?? null,
                 run: input.run,
+                objective,
+                objectiveSource,
                 inputArtifacts: input.inputArtifacts,
                 outputArtifacts: input.outputArtifacts
             })
@@ -2161,23 +6221,127 @@ export class AgentController {
     }
     emit(input) {
         const event = this.store.createEvent(input);
-        if (!this.isDeliverySuppressed(event)) {
-            const delivery = this.deliverSubscriptions(event)
-                .catch(() => {
-                // Delivery errors should never invalidate the source event.
-            })
-                .finally(() => {
-                this.pendingDeliveries.delete(delivery);
-            });
-            this.pendingDeliveries.add(delivery);
-        }
+        this.scheduleEventDelivery(event);
         return event;
+    }
+    recordControllerEvent(input, eventSink) {
+        if (eventSink) {
+            eventSink(input);
+            return;
+        }
+        this.emit(input);
+    }
+    redrivePendingNativeActionOwnerWakeups() {
+        for (const action of this.store
+            .listOrchestratorActions()
+            .filter((candidate) => candidate.status === "pending" || candidate.status === "claimed")) {
+            this.redriveNativeActionOwnerWake(orchestratorActionRef(action));
+        }
+    }
+    redriveNativeActionOwnerWake(action) {
+        const durableAction = this.store.getOrchestratorAction(action.action_id);
+        if (!durableAction ||
+            (durableAction.status !== "pending" && durableAction.status !== "claimed")) {
+            return;
+        }
+        const event = this.store.getEvent(`event_${durableAction.action_id.slice("action_".length)}`);
+        if (!event || !this.nativeActionWakeMatches(event, durableAction)) {
+            return;
+        }
+        this.scheduleEventDelivery(event);
+    }
+    nativeActionWakeMatches(event, action) {
+        const eventAction = payloadRecord(event.payload, "orchestrator_action");
+        return Boolean(event.type === "flow.notification" &&
+            event.payload.reason === "native_orchestrator_action_required" &&
+            event.run_id === action.run_id &&
+            eventAction?.action_id === action.action_id &&
+            eventAction.flow_instance_id === action.flow_instance_id &&
+            eventAction.step_instance_id === action.step_instance_id);
+    }
+    scheduleEventDelivery(event) {
+        this.store.afterCommit(() => {
+            if (!this.isDeliverySuppressed(event)) {
+                const delivery = this.deliverSubscriptions(event)
+                    .catch(() => {
+                    // Delivery errors should never invalidate the source event.
+                })
+                    .finally(() => {
+                    this.pendingDeliveries.delete(delivery);
+                });
+                this.pendingDeliveries.add(delivery);
+            }
+        });
+    }
+    scheduleNativeActionOwnerWakeRetry(event, subscriberAgentId, deliveryKey) {
+        if (this.nativeActionDeliveryRetryDelaysMs.length === 0 ||
+            this.nativeActionDeliveryRetryTasks.has(deliveryKey)) {
+            return;
+        }
+        let retryTask;
+        retryTask = (async () => {
+            for (const delayMs of this.nativeActionDeliveryRetryDelaysMs) {
+                await sleep(delayMs);
+                if (this.nativeActionWakeWasDelivered(event.event_id, subscriberAgentId) ||
+                    !this.nativeActionWakeIsStillRequired(event)) {
+                    return;
+                }
+                await this.deliverSubscriptions(event);
+                if (this.nativeActionWakeWasDelivered(event.event_id, subscriberAgentId)) {
+                    return;
+                }
+            }
+        })()
+            .catch(() => {
+            // The retry loop is best-effort and bounded. A later flow resume will
+            // deterministically re-drive the same event without duplicating it.
+        })
+            .finally(() => {
+            this.nativeActionDeliveryRetryTasks.delete(deliveryKey);
+            this.pendingDeliveries.delete(retryTask);
+        });
+        this.nativeActionDeliveryRetryTasks.set(deliveryKey, retryTask);
+        this.pendingDeliveries.add(retryTask);
+    }
+    nativeActionWakeWasDelivered(eventId, subscriberAgentId) {
+        return this.store
+            .listSubscriptions({ enabledOnly: true })
+            .some((subscription) => subscription.subscriber_agent_id === subscriberAgentId &&
+            subscription.last_delivered_event_id === eventId);
+    }
+    nativeActionWakeIsStillRequired(event) {
+        const eventAction = payloadRecord(event.payload, "orchestrator_action");
+        const actionId = eventAction?.action_id;
+        if (typeof actionId !== "string") {
+            return false;
+        }
+        const action = this.store.getOrchestratorAction(actionId);
+        if (!action ||
+            (action.status !== "pending" && action.status !== "claimed") ||
+            !this.nativeActionWakeMatches(event, action)) {
+            return false;
+        }
+        if (action.operation === "send_message" || action.operation === "followup_task") {
+            const agent = this.store.getAgent(action.agent_id);
+            const run = this.store.getRun(action.run_id);
+            if (agent?.status === "stopping" ||
+                run?.status === "stopping" ||
+                run?.status === "stopped") {
+                return false;
+            }
+        }
+        return true;
     }
     isDeliverySuppressed(event) {
         return Boolean((event.run_id && this.suppressedDeliveryRunIds.has(event.run_id)) ||
             (event.agent_id && this.suppressedDeliveryAgentIds.has(event.agent_id)));
     }
     async deliverSubscriptions(event) {
+        const isNativeActionWake = Boolean(event.type === "flow.notification" &&
+            event.payload.reason === "native_orchestrator_action_required");
+        if (isNativeActionWake && !this.nativeActionWakeIsStillRequired(event)) {
+            return;
+        }
         const subscriptions = this.store
             .listSubscriptions({ enabledOnly: true })
             .filter((subscription) => {
@@ -2197,44 +6361,250 @@ export class AgentController {
             if (!subscriber || subscriber.unregistered_at) {
                 continue;
             }
-            if (!this.store.tryClaimSubscriptionDelivery(subscription.subscription_id, event.event_id)) {
+            const deliveryAdapter = this.adapters.get(subscriber.backend);
+            const capabilities = deliveryAdapter.capabilities();
+            if (!capabilities.canSendMessage || capabilities.requiresOrchestratorAction) {
+                // Subscription delivery has no scoped native-action acknowledgement
+                // contract. Refuse unsupported/manual/native-direct adapters visibly,
+                // without inventing physical work or advancing the agent fence.
+                const claim = this.store.claimSubscriptionDelivery({
+                    eventId: event.event_id,
+                    subscriberAgentId: subscriber.agent_id,
+                    claimOwnerId: this.controllerInstanceId
+                });
+                if (!claim.claimed) {
+                    continue;
+                }
+                const reason = capabilities.requiresOrchestratorAction
+                    ? "subscriber_requires_orchestrator_action"
+                    : "subscriber_cannot_receive_messages";
+                this.store.immediateTransaction(() => {
+                    this.store.failSubscriptionDelivery({
+                        eventId: event.event_id,
+                        subscriberAgentId: subscriber.agent_id,
+                        claimOwnerId: this.controllerInstanceId,
+                        claimAttempt: claim.delivery.claim_attempt,
+                        error: {
+                            reason,
+                            backend: subscriber.backend,
+                            message: "Subscriber backend does not support direct subscription delivery."
+                        }
+                    });
+                    this.store.createEvent({
+                        runId: event.run_id,
+                        agentId: subscriber.agent_id,
+                        type: "agent.delivery_failed",
+                        payload: {
+                            source_event_id: event.event_id,
+                            subscription_id: subscription.subscription_id,
+                            subscriber_agent_id: subscriber.agent_id,
+                            subscriber_backend: subscriber.backend,
+                            delivery_attempt: claim.delivery.claim_attempt,
+                            reason,
+                            failure_reason: "unsupported_operation"
+                        }
+                    });
+                });
+                deliveredSubscriberEventKeys.add(deliveryKey);
+                continue;
+            }
+            let deliveryHandle;
+            try {
+                deliveryHandle = this.requireHandle(subscriber);
+            }
+            catch (error) {
+                const claim = this.store.claimSubscriptionDelivery({
+                    eventId: event.event_id,
+                    subscriberAgentId: subscriber.agent_id,
+                    claimOwnerId: this.controllerInstanceId
+                });
+                if (!claim.claimed) {
+                    continue;
+                }
+                // A duplicate matching row must not turn one logical failure into
+                // another physical attempt during the same delivery pass.
+                deliveredSubscriberEventKeys.add(deliveryKey);
+                const payload = errorToPayload(error);
+                this.store.immediateTransaction(() => {
+                    this.store.releaseSubscriptionDelivery({
+                        eventId: event.event_id,
+                        subscriberAgentId: subscriber.agent_id,
+                        claimOwnerId: this.controllerInstanceId,
+                        claimAttempt: claim.delivery.claim_attempt,
+                        error: payload
+                    });
+                    this.store.createEvent({
+                        runId: event.run_id,
+                        agentId: subscriber.agent_id,
+                        type: "agent.delivery_failed",
+                        payload: {
+                            source_event_id: event.event_id,
+                            subscription_id: subscription.subscription_id,
+                            subscriber_agent_id: subscriber.agent_id,
+                            subscriber_backend: subscriber.backend,
+                            delivery_attempt: claim.delivery.claim_attempt,
+                            reason: payload.error,
+                            failure_reason: payload.reason
+                        }
+                    });
+                });
+                continue;
+            }
+            const claim = this.store.claimSubscriptionDelivery({
+                eventId: event.event_id,
+                subscriberAgentId: subscriber.agent_id,
+                claimOwnerId: this.controllerInstanceId
+            });
+            if (!claim.claimed) {
+                continue;
+            }
+            // The durable claim coalesces rows and processes. This local marker also
+            // coalesces duplicate rows after a released failure in this same pass;
+            // an explicit re-drive owns any later physical retry.
+            deliveredSubscriberEventKeys.add(deliveryKey);
+            if (isNativeActionWake && !this.nativeActionWakeIsStillRequired(event)) {
+                this.store.failSubscriptionDelivery({
+                    eventId: event.event_id,
+                    subscriberAgentId: subscriber.agent_id,
+                    claimOwnerId: this.controllerInstanceId,
+                    claimAttempt: claim.delivery.claim_attempt,
+                    error: { reason: "native_action_wake_no_longer_required" }
+                });
                 continue;
             }
             this.inFlightSubscriberDeliveries.add(deliveryKey);
+            const deliveryAttempt = claim.delivery.claim_attempt;
+            const deliveryAttemptId = `deliveryattempt_${deliveryAttempt}`;
+            const acceptanceKey = `subscription-delivery:${deliveryKey}:attempt:${deliveryAttempt}`;
+            let deliveryInvocationBegan = false;
+            let deliveryInvocationReturned = false;
+            let deliveryAttemptWorkGeneration = null;
+            let deliveryAttemptWorkRevision = null;
+            let stopDeliveryLeaseHeartbeat = null;
             try {
-                const adapter = this.adapters.get(subscriber.backend);
-                await adapter.sendMessage(this.requireHandle(subscriber), {
-                    message: withCodexNativeVisibilityReminder(compactEventMessage(event, subscriber, event.agent_id ? this.store.getAgent(event.agent_id) : null), subscriber)
+                const deliveryMessage = withCodexNativeVisibilityReminder(compactEventMessage(event, subscriber, event.agent_id ? this.store.getAgent(event.agent_id) : null), subscriber);
+                // The logical claim attempt is durable and shared across controllers;
+                // it therefore gives each actual adapter invocation a distinct,
+                // deterministic refresh-fence identity.
+                const acceptedAttempt = this.store.beginSubscriptionDeliveryAttempt({
+                    eventId: event.event_id,
+                    subscriberAgentId: subscriber.agent_id,
+                    claimOwnerId: this.controllerInstanceId,
+                    claimAttempt: deliveryAttempt,
+                    acceptanceKey,
+                    acceptanceLeaseExpiresAt: this.acceptedWorkLeaseExpiresAt()
                 });
-                const updatedSubscriber = this.store.updateAgent(subscriber.agent_id, {
-                    status: "running",
-                    failureReason: null
-                });
-                this.store.touchHeartbeat(subscriber.agent_id);
-                this.armStatusWatcher(updatedSubscriber);
-                for (const deliveredSubscription of subscriptions) {
-                    if (deliveredSubscription.subscriber_agent_id === subscriber.agent_id) {
-                        this.store.updateSubscriptionDelivery(deliveredSubscription.subscription_id, event.event_id);
-                    }
+                if (!acceptedAttempt.began) {
+                    continue;
                 }
-                deliveredSubscriberEventKeys.add(deliveryKey);
+                deliveryAttemptWorkGeneration = acceptedAttempt.agent.work_generation;
+                deliveryAttemptWorkRevision = acceptedAttempt.agent.work_revision;
+                deliveryInvocationBegan = true;
+                stopDeliveryLeaseHeartbeat = this.maintainAcceptedWorkLease(subscriber.agent_id, acceptanceKey);
+                await deliveryAdapter.sendMessage(deliveryHandle, {
+                    message: deliveryMessage
+                });
+                deliveryInvocationReturned = true;
+                stopDeliveryLeaseHeartbeat();
+                const completion = this.store.immediateTransaction(() => {
+                    const acceptedCompletion = this.store.completeAgentAcceptedWorkAttempt({
+                        agentId: subscriber.agent_id,
+                        acceptanceKey,
+                        claimOwnerId: this.controllerInstanceId,
+                        outcome: "succeeded",
+                        status: "running",
+                        failureReason: null
+                    });
+                    const logicalCompletion = this.store.completeSubscriptionDelivery({
+                        event,
+                        subscriberAgentId: subscriber.agent_id,
+                        claimOwnerId: this.controllerInstanceId,
+                        claimAttempt: deliveryAttempt
+                    });
+                    if (!logicalCompletion.completed) {
+                        throw new Error(`Subscription delivery lost its invocation claim: ${deliveryKey}`);
+                    }
+                    return acceptedCompletion;
+                });
+                if (completion.attemptOwnedAgent &&
+                    !this.hasDurableStopIntent(completion.agent)) {
+                    this.store.touchHeartbeat(subscriber.agent_id);
+                    this.armStatusWatcher(completion.agent);
+                }
+                else if (this.hasDurableStopIntent(completion.agent)) {
+                    // Delivery may have revived the same backend session after stop won
+                    // the database race. Completion advanced the attempt revision without
+                    // reviving logical state, so compensate the physical session now.
+                    await this.reconcileLateNonNativeWorkAfterStop(completion.agent, deliveryHandle, deliveryAdapter, "send", "subscription_delivery_completed_after_stop");
+                }
             }
             catch (error) {
-                this.store.createEvent({
-                    runId: event.run_id,
-                    agentId: subscriber.agent_id,
-                    type: "agent.delivery_failed",
-                    payload: {
-                        source_event_id: event.event_id,
-                        subscription_id: subscription.subscription_id,
-                        subscriber_agent_id: subscriber.agent_id,
-                        subscriber_backend: subscriber.backend,
-                        reason: error instanceof Error ? error.message : String(error)
-                    }
+                stopDeliveryLeaseHeartbeat?.();
+                if (deliveryInvocationReturned) {
+                    // The adapter explicitly returned success. Never release this
+                    // logical delivery for another physical send merely because local
+                    // persistence or post-send reconciliation failed.
+                    throw error;
+                }
+                const payload = errorToPayload(error);
+                const failure = this.store.immediateTransaction(() => {
+                    const completion = deliveryInvocationBegan
+                        ? this.store.completeAgentAcceptedWorkAttempt({
+                            agentId: subscriber.agent_id,
+                            acceptanceKey,
+                            claimOwnerId: this.controllerInstanceId,
+                            outcome: "ambiguous",
+                            status: "unknown",
+                            failureReason: "unknown"
+                        })
+                        : null;
+                    const released = this.store.releaseSubscriptionDelivery({
+                        eventId: event.event_id,
+                        subscriberAgentId: subscriber.agent_id,
+                        claimOwnerId: this.controllerInstanceId,
+                        claimAttempt: deliveryAttempt,
+                        error: payload
+                    });
+                    const failureEvent = this.store.createEvent({
+                        runId: event.run_id,
+                        agentId: subscriber.agent_id,
+                        type: "agent.delivery_failed",
+                        payload: {
+                            source_event_id: event.event_id,
+                            subscription_id: subscription.subscription_id,
+                            subscriber_agent_id: subscriber.agent_id,
+                            subscriber_backend: subscriber.backend,
+                            delivery_attempt_id: deliveryAttemptId,
+                            delivery_attempt: deliveryAttempt,
+                            work_generation: deliveryAttemptWorkGeneration,
+                            work_revision_before_completion: deliveryAttemptWorkRevision,
+                            work_revision: completion?.agent.work_revision ?? null,
+                            reason: payload.error,
+                            failure_reason: payload.reason
+                        }
+                    });
+                    return { completion, released, failureEvent };
                 });
-                this.store.clearSubscriptionDeliveryClaim(subscription.subscription_id, event.event_id);
+                if (failure.completion) {
+                    if (this.hasDurableStopIntent(failure.completion.agent)) {
+                        // A rejected delivery response is not proof that the subscriber
+                        // session rejected the message. Its ambiguity revision invalidates
+                        // same-attempt refreshes while this stop compensates possible work.
+                        await this.reconcileLateNonNativeWorkAfterStop(failure.completion.agent, deliveryHandle, deliveryAdapter, "send", "subscription_delivery_rejected_after_stop");
+                    }
+                    else if (failure.completion.attemptOwnedAgent &&
+                        failure.completion.agent.status === "unknown" &&
+                        capabilities.canInspectStatusCheaply) {
+                        this.armStatusWatcher(failure.completion.agent);
+                    }
+                }
+                if (subscriber.backend === "codex-thread" &&
+                    this.nativeActionWakeIsStillRequired(event)) {
+                    this.scheduleNativeActionOwnerWakeRetry(event, subscriber.agent_id, deliveryKey);
+                }
             }
             finally {
+                stopDeliveryLeaseHeartbeat?.();
                 this.inFlightSubscriberDeliveries.delete(deliveryKey);
             }
         }
@@ -2257,6 +6627,10 @@ export class AgentController {
         };
     }
     recoverBackendHandle(agent) {
+        const completedStart = this.store.getLatestCompletedAgentStartAttemptWithHandle(agent.agent_id);
+        if (completedStart?.handle_json) {
+            return completedStart.handle_json;
+        }
         if (agent.backend !== "opencode-server") {
             return null;
         }
@@ -2314,7 +6688,8 @@ export class AgentController {
         this.disarmStatusWatcher(agent.agent_id);
         const adapter = this.adapters.get(agent.backend);
         if (!adapter.watchStatus || !agent.backend_handle) {
-            if (agent.status === "running" && agent.backend_handle) {
+            if ((agent.status === "running" || agent.status === "unknown") &&
+                agent.backend_handle) {
                 const timers = [3000, 10000, 30000].map((delayMs) => setTimeout(() => {
                     void this.refreshAgentStatus(agent.agent_id);
                 }, delayMs));
@@ -2380,6 +6755,177 @@ export class AgentController {
             .filter((agent) => !agent.unregistered_at && !TERMINAL_STATUSES.has(agent.status));
     }
 }
+function flowUsesCodexSubagents(config) {
+    return Object.values(config.steps).some((step) => {
+        const role = step.role ? config.roles?.[step.role] : undefined;
+        return role?.backend === CODEX_SUBAGENT_BACKEND;
+    });
+}
+function normalizeOwnerTaskPath(value) {
+    const trimmed = value.trim().replace(/\/+$/, "");
+    if (!/^\/root(?:\/[a-z0-9_]+)*$/.test(trimmed)) {
+        throw new ControllerError("owner_task_path must be an absolute canonical task path.", "tool_error", {
+            owner_task_path: value
+        });
+    }
+    return trimmed;
+}
+function bridgeCredentialFromGrant(grant, rawToken) {
+    return {
+        bridge_grant_id: grant.bridge_grant_id,
+        bridge_token: rawToken,
+        run_id: grant.run_id,
+        orchestrator_agent_id: grant.orchestrator_agent_id,
+        owner_task_identity: grant.owner_task_identity,
+        owner_task_path: grant.owner_task_path,
+        created_at: grant.created_at,
+        expires_at: grant.expires_at
+    };
+}
+function publicBridgeGrantRefFromGrant(grant) {
+    return {
+        bridge_grant_id: grant.bridge_grant_id,
+        run_id: grant.run_id,
+        orchestrator_agent_id: grant.orchestrator_agent_id,
+        owner_task_identity: grant.owner_task_identity,
+        owner_task_path: grant.owner_task_path,
+        created_at: grant.created_at,
+        expires_at: grant.expires_at
+    };
+}
+function normalizeOptionalIdentity(value) {
+    const normalized = value?.trim();
+    return normalized ? normalized : null;
+}
+function orchestratorActionRef(action) {
+    return {
+        action_id: action.action_id,
+        operation: action.operation,
+        status: action.status,
+        run_id: action.run_id,
+        orchestrator_agent_id: action.orchestrator_agent_id,
+        agent_id: action.agent_id,
+        flow_instance_id: action.flow_instance_id,
+        step_instance_id: action.step_instance_id
+    };
+}
+function stableJsonEquals(left, right) {
+    return JSON.stringify(sortJsonValue(left)) === JSON.stringify(sortJsonValue(right));
+}
+function sortJsonValue(value) {
+    if (Array.isArray(value)) {
+        return value.map(sortJsonValue);
+    }
+    if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, item]) => [key, sortJsonValue(item)]));
+    }
+    return value;
+}
+function isCodexSubagentForkTurns(value) {
+    return value === "none" || value === "all" || /^[1-9]\d*$/.test(value);
+}
+function deterministicCodexSubagentTaskName(role, stepInstanceId) {
+    const roleSlug = role
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 36) || "worker";
+    const instanceSuffix = stepInstanceId
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "")
+        .slice(-12);
+    return `${roleSlug}_${instanceSuffix || "step"}`;
+}
+function requiredRecordString(record, key) {
+    const value = recordString(record, key);
+    if (!value) {
+        throw new ControllerError(`Missing required native bridge field: ${key}.`, "tool_error", { field: key });
+    }
+    return value;
+}
+function nullableRecordString(record, key) {
+    return recordString(record, key) ?? null;
+}
+function startStateFromAttemptPhase(phase) {
+    switch (phase) {
+        case "prepared":
+        case "invoking":
+            return "in_progress";
+        case "ambiguous":
+            return "ambiguous";
+        case "succeeded":
+            return "started";
+        case "superseded":
+            return "superseded";
+        case "cancelled":
+            return "cancelled";
+        case "failed":
+            return "failed";
+    }
+}
+function codexSubagentTarget(agent) {
+    const target = recordString(agent.backend_handle, "native_task_path") ??
+        recordString(agent.backend_handle, "native_agent_id") ??
+        recordString(agent.backend_handle, "expected_task_path");
+    if (!target) {
+        throw new ControllerError("codex-subagent has no recoverable native target.", "tool_error", {
+            agent_id: agent.agent_id
+        });
+    }
+    return target;
+}
+function normalizeObservedAt(value) {
+    if (!value) {
+        return nowIso();
+    }
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) {
+        throw new ControllerError("observed_at must be a valid timestamp.", "tool_error", {
+            observed_at: value
+        });
+    }
+    return new Date(parsed).toISOString();
+}
+function assertMatchingNativeIdentity(handle, input) {
+    const comparisons = [
+        ["native_agent_id", input.nativeAgentId],
+        ["native_task_name", input.nativeTaskName],
+        ["native_task_path", input.nativeTaskPath]
+    ];
+    for (const [key, observed] of comparisons) {
+        const expected = recordString(handle, key);
+        if (expected && observed && expected !== observed) {
+            throw new ControllerError("Native sync identity conflicts with the stored agent handle.", "auth_required", {
+                field: key,
+                agent_expected: expected,
+                observed
+            });
+        }
+    }
+}
+function mapCodexSubagentStatus(nativeStatus) {
+    switch (nativeStatus) {
+        case "pending_init":
+            return { status: "starting", failureReason: null };
+        case "running":
+            return { status: "running", failureReason: null };
+        case "completed":
+            return { status: "completed", failureReason: null };
+        case "interrupted":
+        case "shutdown":
+            return { status: "stopped", failureReason: null };
+        case "errored":
+            return { status: "failed", failureReason: "tool_error" };
+        case "missing":
+            return { status: "unknown", failureReason: null };
+        default:
+            throw new ControllerError("Unsupported native_status.", "unsupported_operation", {
+                native_status: nativeStatus
+            });
+    }
+}
 export function buildGoalConfirmationPrompt(objective) {
     return `You have an active goal: ${objective}
 
@@ -2400,7 +6946,8 @@ function elapsedSince(iso) {
 function compactEventMessage(event, subscriber, source) {
     const status = payloadString(event.payload, "status");
     const message = payloadString(event.payload, "message");
-    const failureReason = payloadString(event.payload, "failure_reason") ?? payloadString(event.payload, "reason");
+    const failureReason = payloadString(event.payload, "failure_reason");
+    const reason = payloadString(event.payload, "reason");
     const data = payloadRecord(event.payload, "data");
     const metadata = payloadRecord(data, "metadata") ?? payloadRecord(source?.backend_handle ?? undefined, "metadata");
     const flowInstanceId = payloadString(event.payload, "flow_instance_id") ?? payloadString(metadata, "flow_instance_id");
@@ -2409,6 +6956,10 @@ function compactEventMessage(event, subscriber, source) {
     const transitionId = payloadString(event.payload, "transition_id");
     const targetStepId = payloadString(event.payload, "target_step_id");
     const notify = payloadString(event.payload, "notify");
+    const orchestratorAction = payloadRecord(event.payload, "orchestrator_action");
+    const orchestratorActionId = payloadString(orchestratorAction, "action_id");
+    const orchestratorActionOperation = payloadString(orchestratorAction, "operation");
+    const orchestratorActionStatus = payloadString(orchestratorAction, "status");
     const logFile = payloadString(data, "logFile");
     const serverAvailable = payloadScalar(data, "serverAvailable");
     const pidRunning = payloadScalar(data, "pidRunning");
@@ -2431,6 +6982,9 @@ function compactEventMessage(event, subscriber, source) {
     if (failureReason) {
         lines.push(`Failure reason: ${failureReason}`);
     }
+    if (reason) {
+        lines.push(`Reason: ${reason}`);
+    }
     if (flowInstanceId) {
         lines.push(`Flow instance: ${flowInstanceId}`);
     }
@@ -2448,6 +7002,15 @@ function compactEventMessage(event, subscriber, source) {
     }
     if (notify) {
         lines.push(`Notify: ${notify}`);
+    }
+    if (orchestratorActionId) {
+        lines.push(`Orchestrator action: ${orchestratorActionId}`);
+    }
+    if (orchestratorActionOperation) {
+        lines.push(`Orchestrator operation: ${orchestratorActionOperation}`);
+    }
+    if (orchestratorActionStatus) {
+        lines.push(`Orchestrator action status: ${orchestratorActionStatus}`);
     }
     if (typeof pidRunning !== "undefined") {
         lines.push(`Process running: ${String(pidRunning)}`);
@@ -2471,7 +7034,11 @@ function compactEventMessage(event, subscriber, source) {
     if (flowInstanceId) {
         lines.push("For this existing flow, do not call `flow_start` again.");
         lines.push("This notification is the complete instruction for this short re-entry; do not reload skills, docs, flow configs, prompt files, logs, or artifacts unless you need them to resolve the blocker or user-feedback request.");
-        if (event.type === "flow.notification") {
+        if (event.type === "flow.notification" &&
+            reason === "native_orchestrator_action_required") {
+            lines.push("A native orchestrator action is ready. Claim and execute the safe action reference above, then continue the existing flow.");
+        }
+        else if (event.type === "flow.notification") {
             lines.push("This is a configured flow notification. Give the user the requested compact feedback or make the explicit manual routing decision requested by the flow.");
         }
         else if (event.type === "flow.step_blocked" || event.type === "agent.delivery_failed") {
@@ -2485,6 +7052,25 @@ function compactEventMessage(event, subscriber, source) {
         }
     }
     return lines.join("\n");
+}
+function codexSubagentExternalMessage(agent, state) {
+    const latestMessage = nullableRecordString(state, "latest_message");
+    const observedAt = nullableRecordString(state, "observed_at");
+    if (latestMessage === null || !observedAt) {
+        return null;
+    }
+    return {
+        id: `native-external-${agent.agent_id}`,
+        role: "assistant",
+        text: latestMessage,
+        created_at: observedAt,
+        metadata: {
+            source: "codex-subagent-external-sync",
+            native_status: nullableRecordString(state, "native_status"),
+            native_agent_id: nullableRecordString(state, "native_agent_id"),
+            native_task_path: nullableRecordString(state, "native_task_path")
+        }
+    };
 }
 function controllerEventMessages(agent, agents, events) {
     const agentById = new Map(agents.map((item) => [item.agent_id, item]));
@@ -2633,8 +7219,12 @@ function buildFlowRuntimeMarkdown(input) {
         `- Backend: ${input.backend ? `\`${input.backend}\`` : "not specified"}`,
         `- Model: ${input.model ? `\`${input.model}\`` : "not specified"}`,
         `- Run: \`${input.run.run_id}\``,
-        `- Objective/title: ${input.run.title}`,
+        `- Objective source: \`${input.objectiveSource}\``,
         `- Repository: ${input.run.repo_dir ? `\`${input.run.repo_dir}\`` : "not specified"}`,
+        "",
+        "Effective objective (source of truth):",
+        "",
+        input.objective,
         "",
         "Input artifacts:",
         "",
@@ -2650,6 +7240,18 @@ function buildFlowRuntimeMarkdown(input) {
         "- Write every required output artifact to the assigned path before reporting.",
         "- If an optional input artifact is absent, continue without it unless the step prompt says it is semantically required.",
         "- Do not put runtime paths or artifact lists into long-term prompts; this contract is the active-step source of truth."
+    ].join("\n");
+}
+function buildEffectiveFlowObjective(runTitle, coordinatorContext) {
+    if (!coordinatorContext) {
+        return runTitle;
+    }
+    return [
+        "Base objective:",
+        runTitle,
+        "",
+        "Latest coordinator context (authoritative wherever it adds, clarifies, or conflicts):",
+        coordinatorContext
     ].join("\n");
 }
 function artifactMarkdownLines(artifacts, emptyText) {
@@ -2732,6 +7334,9 @@ function expectedArtifactsFromStep(step) {
 }
 function declaredFlowAgentTitle(flowId, role) {
     return `${flowId}: ${role}`;
+}
+function freshFlowStepAgentTitle(flowId, role, stepId, stepInstanceId) {
+    return `${flowId}: ${role} [${stepId}:${stepInstanceId}]`;
 }
 function flowActionTargets(action, fallbackLabel) {
     const targets = [];
@@ -2843,6 +7448,10 @@ function normalizePurgeOptions(options) {
         deleteRuntimeFiles: options.deleteRuntimeFiles ?? true
     };
 }
+/** One stopped event per durable work generation makes stop retries idempotent. */
+function agentStoppedEventId(agent) {
+    return `event_agent_stopped_${agent.agent_id}_${agent.work_generation}`;
+}
 function isUnsafeToPurge(agent) {
     return !agent.unregistered_at && !PURGE_SAFE_STATUSES.has(agent.status);
 }
@@ -2853,7 +7462,8 @@ function createPurgeResult(dryRun) {
         purged_agents: [],
         deleted_rows: {},
         deleted_runtime_paths: [],
-        skipped_runtime_paths: []
+        skipped_runtime_paths: [],
+        credential_cleanup_diagnostics: []
     };
 }
 function mergePurgeResult(target, source) {
@@ -2861,6 +7471,7 @@ function mergePurgeResult(target, source) {
     target.purged_agents.push(...source.purged_agents);
     target.deleted_runtime_paths.push(...source.deleted_runtime_paths);
     target.skipped_runtime_paths.push(...source.skipped_runtime_paths);
+    target.credential_cleanup_diagnostics.push(...source.credential_cleanup_diagnostics);
     target.deleted_rows = mergeRowCounts(target.deleted_rows, source.deleted_rows);
 }
 function mergeRowCounts(left, right) {

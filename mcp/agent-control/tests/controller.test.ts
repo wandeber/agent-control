@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CodexSubagentAdapter } from "../src/adapters/codex-subagent-adapter.js";
+import { ManualAdapter } from "../src/adapters/manual-adapter.js";
 import { OpenCodeServerAdapter } from "../src/adapters/opencode-server-adapter.js";
 import { AdapterRegistry } from "../src/adapters/registry.js";
 import { AgentController, buildGoalConfirmationPrompt } from "../src/core/controller.js";
@@ -16,6 +19,7 @@ import type {
   AgentMessageInput,
   AgentStatus,
   AgentStatusSnapshot,
+  EventRecord,
   ReadLatestOptions,
   StartAgentInput,
   StopOptions,
@@ -34,12 +38,23 @@ const CAPABILITIES: AgentCapabilities = {
   canAttachExisting: true
 };
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 class FakeAdapter implements AgentAdapter {
   readonly sent: Array<{ handle: AgentHandle; message: string; metadata?: Record<string, unknown> }> = [];
   readonly starts: StartAgentInput[] = [];
   readonly stopped: AgentHandle[] = [];
   readonly statuses = new Map<string, AgentStatus>();
   stopStatus: AgentStatus = "stopped";
+  statusError: Error | null = null;
 
   constructor(readonly kind = "fake") {}
 
@@ -62,6 +77,9 @@ class FakeAdapter implements AgentAdapter {
   }
 
   async getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot> {
+    if (this.statusError) {
+      throw this.statusError;
+    }
     return {
       status: this.statuses.get(handle.id) ?? "running"
     };
@@ -82,6 +100,117 @@ class FakeAdapter implements AgentAdapter {
     this.stopped.push(handle);
     this.statuses.set(handle.id, this.stopStatus);
     return { status: this.stopStatus, data: { id: handle.id } };
+  }
+}
+
+class DeferredFakeAdapter extends FakeAdapter {
+  startGate: ReturnType<typeof createDeferred<void>> | null = null;
+  startErrorAfterAccept: Error | null = null;
+  stopGate: ReturnType<typeof createDeferred<void>> | null = null;
+  statusGate: ReturnType<typeof createDeferred<void>> | null = null;
+  statusReads = 0;
+  sendGate: ReturnType<typeof createDeferred<void>> | null = null;
+  sendErrorAfterAccept: Error | null = null;
+  sendGates: Array<ReturnType<typeof createDeferred<void>> | null> = [];
+  sendErrorsAfterAccept: Array<Error | null> = [];
+  stopErrorAtCall: number | null = null;
+
+  override async start(input: StartAgentInput): Promise<AgentHandle> {
+    this.starts.push(input);
+    if (this.startGate) {
+      await this.startGate.promise;
+    }
+    this.statuses.set(input.agent.agent_id, "running");
+    if (this.startErrorAfterAccept) {
+      throw this.startErrorAfterAccept;
+    }
+    return {
+      backend: this.kind,
+      id: input.agent.agent_id,
+      data: { id: input.agent.agent_id, late_start: Boolean(this.startGate) }
+    };
+  }
+
+  override async sendMessage(handle: AgentHandle, message: AgentMessageInput): Promise<void> {
+    const attemptIndex = this.sent.length;
+    this.sent.push({ handle, message: message.message, metadata: message.metadata });
+    const attemptGate = attemptIndex < this.sendGates.length
+      ? this.sendGates[attemptIndex]
+      : this.sendGate;
+    if (attemptGate) {
+      await attemptGate.promise;
+    }
+    // Model backends where accepting a message revives the same session. This
+    // makes a send that resolves after shutdown require a second, compensating
+    // stop rather than only preserving the logical database projection.
+    this.statuses.set(handle.id, "running");
+    const attemptError = attemptIndex < this.sendErrorsAfterAccept.length
+      ? this.sendErrorsAfterAccept[attemptIndex]
+      : this.sendErrorAfterAccept;
+    if (attemptError) {
+      throw attemptError;
+    }
+  }
+
+  override async getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot> {
+    this.statusReads += 1;
+    // Capture both successful and failed observations before the gate. Tests
+    // can then advance the same backend session to a newer work generation
+    // while an objectively stale result remains in flight.
+    const observation = super.getStatus(handle).then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error })
+    );
+    if (this.statusGate) {
+      await this.statusGate.promise;
+    }
+    const captured = await observation;
+    if (captured.error) {
+      throw captured.error;
+    }
+    return captured.value!;
+  }
+
+  override async stop(handle: AgentHandle, options: StopOptions): Promise<StopResult> {
+    if (this.stopErrorAtCall === this.stopped.length + 1) {
+      this.stopped.push(handle);
+      throw new Error("Deferred adapter compensating stop failed.");
+    }
+    if (this.stopGate) {
+      this.stopped.push(handle);
+      await this.stopGate.promise;
+      this.statuses.set(handle.id, this.stopStatus);
+      return { status: this.stopStatus, data: { id: handle.id } };
+    }
+    return super.stop(handle, options);
+  }
+}
+
+class NoopWatchingDeferredFakeAdapter extends DeferredFakeAdapter {
+  override watchStatus(
+    _handle: AgentHandle,
+    _onChange: (snapshot: AgentStatusSnapshot) => void | Promise<void>
+  ): () => void {
+    // Cross-controller tests need the watcher registration path without real
+    // timers retaining a secondary SQLite connection after the assertion.
+    return () => undefined;
+  }
+}
+
+class FakeCodexThreadAdapter extends FakeAdapter {
+  constructor() {
+    super("codex-thread");
+  }
+
+  override async start(input: StartAgentInput): Promise<AgentHandle> {
+    this.starts.push(input);
+    this.statuses.set(input.agent.agent_id, "running");
+    const threadId = `thread_${input.agent.agent_id}`;
+    return {
+      backend: this.kind,
+      id: threadId,
+      data: { thread_id: threadId }
+    };
   }
 }
 
@@ -108,6 +237,7 @@ describe("AgentController", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     store.close();
     if (oldControlHome === undefined) {
       delete process.env.AGENT_CONTROL_HOME;
@@ -134,6 +264,105 @@ describe("AgentController", () => {
     process.env.AGENT_CONTROL_ADMIN_KEY = "ack_test_admin";
 
     expect(resolveAdminKey()).toBe("ack_test_admin");
+  });
+
+  it("migrates legacy agent rows with zeroed work observation fences", () => {
+    const legacyPath = join(tmp, "legacy-work-generation.sqlite");
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      create table runs (
+        run_id text primary key,
+        title text not null,
+        repo_dir text,
+        parent_run_id text,
+        created_by_agent_id text,
+        status text not null,
+        created_at text not null,
+        updated_at text not null
+      );
+      create table agents (
+        agent_id text primary key,
+        run_id text not null references runs(run_id) on delete cascade,
+        backend text not null,
+        title text not null,
+        role text,
+        objective text,
+        repo_dir text,
+        model text,
+        backend_handle_json text,
+        status text not null,
+        failure_reason text,
+        unregistered_at text,
+        created_at text not null,
+        updated_at text not null
+      );
+      insert into runs values (
+        'run_legacy_generation', 'Legacy generation', null, null, null,
+        'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      insert into agents values (
+        'agent_legacy_generation', 'run_legacy_generation', 'fake', 'Legacy worker',
+        null, null, null, null, '{"id":"legacy-worker"}', 'unknown', 'unknown', null,
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      create table agent_work_acceptances (
+        acceptance_key text primary key,
+        agent_id text not null references agents(agent_id) on delete cascade,
+        work_generation integer not null,
+        created_at text not null
+      );
+      insert into agent_work_acceptances values (
+        'legacy-acceptance', 'agent_legacy_generation', 0,
+        '2026-01-01T00:00:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    const migrated = new SqliteStore(legacyPath);
+    expect(migrated.getAgent("agent_legacy_generation")).toMatchObject({
+      work_generation: 0,
+      work_revision: 0,
+      status: "unknown",
+      failure_reason: "unknown"
+    });
+    const lifecycleColumns = migrated.db.prepare("pragma table_info(agents)").all() as Array<{
+        name: string;
+        notnull: number;
+        dflt_value: string | null;
+      }>;
+    expect(lifecycleColumns.find((column) => column.name === "work_generation")).toMatchObject({
+      notnull: 1,
+      dflt_value: "0"
+    });
+    expect(lifecycleColumns.find((column) => column.name === "work_revision")).toMatchObject({
+      notnull: 1,
+      dflt_value: "0"
+    });
+    expect(
+      migrated.db
+        .prepare(
+          "select name from sqlite_master where type = 'table' and name = 'subscription_deliveries'"
+        )
+        .get()
+    ).toMatchObject({ name: "subscription_deliveries" });
+    expect(
+      migrated.db
+        .prepare(
+          `select attempt_revision, phase, completion_revision, updated_at, completed_at
+           from agent_work_acceptances where acceptance_key = 'legacy-acceptance'`
+        )
+        .get()
+    ).toMatchObject({
+      attempt_revision: 0,
+      phase: "ambiguous",
+      completion_revision: 0,
+      updated_at: "2026-01-01T00:00:00.000Z",
+      completed_at: "2026-01-01T00:00:00.000Z"
+    });
+    expect(
+      migrated.agentHasAmbiguousAcceptedWork("agent_legacy_generation", 0)
+    ).toBe(true);
+    migrated.close();
   });
 
   it("logs in an orchestrator with an admin key and returns a usable agent token", () => {
@@ -340,6 +569,35 @@ describe("AgentController", () => {
     expect(events.some((event) => event.type === "agent.message")).toBe(true);
   });
 
+  it("rejects unsupported direct messages before projecting or fencing work", async () => {
+    registry.register(new ManualAdapter());
+    const run = controller.createRun({ title: "Unsupported direct message" });
+    const manual = controller.registerAgent({
+      runId: run.run_id,
+      backend: "manual",
+      title: "manual participant",
+      backendHandle: { id: "manual-participant", status: "completed" },
+      status: "completed"
+    });
+
+    await expect(
+      controller.sendMessage(manual.agent_id, "This backend cannot receive work.")
+    ).rejects.toMatchObject({ reason: "unsupported_operation" });
+
+    expect(controller.getAgent(manual.agent_id)).toMatchObject({
+      status: "completed",
+      failure_reason: null,
+      work_generation: 0,
+      work_revision: 0
+    });
+    expect(
+      store.db
+        .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+        .get(manual.agent_id)
+    ).toMatchObject({ count: 0 });
+    expect(controller.listEvents({ agentId: manual.agent_id, type: "agent.message" })).toEqual([]);
+  });
+
   it("does not emit repeated status changes when only missing failure reason normalization differs", async () => {
     const run = controller.createRun({ title: "stable status run" });
     const agent = controller.registerAgent({
@@ -355,6 +613,517 @@ describe("AgentController", () => {
     const statusEvents = controller.listEvents({ runId: run.run_id }).filter((event) => event.type === "agent.status_changed");
 
     expect(statusEvents).toHaveLength(0);
+  });
+
+  it("discards stale same-handle status results and errors after newer work", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Same-handle refresh generation fence" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "generation-fenced worker",
+      backendHandle: { id: "generation-fenced-worker" },
+      status: "running"
+    });
+    expect(worker.work_generation).toBe(0);
+
+    deferredAdapter.statuses.set("generation-fenced-worker", "completed");
+    const completedGate = createDeferred<void>();
+    deferredAdapter.statusGate = completedGate;
+    const staleCompleted = controller.refreshAgentStatus(worker.agent_id);
+    expect(deferredAdapter.statusReads).toBe(1);
+
+    const firstTurn = await controller.sendMessage(worker.agent_id, "Begin a newer turn.");
+    expect(firstTurn.agent).toMatchObject({ status: "running", work_generation: 1 });
+    completedGate.resolve();
+    await expect(staleCompleted).resolves.toMatchObject({
+      status: "running",
+      work_generation: 1
+    });
+    expect(
+      controller.listEvents({ agentId: worker.agent_id, type: "agent.completed" })
+    ).toEqual([]);
+
+    const errorGate = createDeferred<void>();
+    deferredAdapter.statusGate = errorGate;
+    deferredAdapter.statusError = new Error("Captured status failure from the previous turn.");
+    const staleError = controller.refreshAgentStatus(worker.agent_id);
+    expect(deferredAdapter.statusReads).toBe(2);
+
+    const secondTurn = await controller.sendMessage(worker.agent_id, "Begin one more turn.");
+    expect(secondTurn.agent).toMatchObject({ status: "running", work_generation: 2 });
+    // The adapter observation already captured the error; clearing the live
+    // backend state now models a healthy current generation.
+    deferredAdapter.statusError = null;
+    deferredAdapter.statuses.set("generation-fenced-worker", "running");
+    errorGate.resolve();
+    await expect(staleError).resolves.toMatchObject({
+      status: "running",
+      work_generation: 2
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.failed" })).toEqual([]);
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        worker.agent_id
+      )
+    ).toBe(true);
+
+    controller.createHeartbeat({ agentId: worker.agent_id, idleTimeoutMs: 60_000 });
+    await controller.checkHeartbeats();
+    expect(controller.getAgent(worker.agent_id).work_generation).toBe(2);
+    await controller.stopAgent(worker.agent_id);
+    expect(controller.getAgent(worker.agent_id).work_generation).toBe(2);
+  });
+
+  it("discards a refresh captured during the same successful direct-send attempt", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("same-attempt-success-fake");
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    const run = controller.createRun({ title: "Same-attempt successful send refresh" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "same-attempt successful worker",
+      backendHandle: { id: "same-attempt-success-worker" },
+      status: "completed"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Accept this physical attempt.");
+    expect(deferredAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 1
+    });
+
+    // This observation begins after the generation fence, but before the
+    // adapter response closes the physical attempt.
+    deferredAdapter.statuses.set("same-attempt-success-worker", "completed");
+    const statusGate = createDeferred<void>();
+    deferredAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(worker.agent_id);
+    expect(deferredAdapter.statusReads).toBe(1);
+
+    sendGate.resolve();
+    await expect(send).resolves.toMatchObject({
+      delivered: true,
+      agent: { status: "running", work_generation: 1, work_revision: 2 }
+    });
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.completed" })).toEqual([]);
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        worker.agent_id
+      )
+    ).toBe(true);
+
+    deferredAdapter.statusGate = null;
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("defers a terminal refresh that finishes before direct-send I/O and preserves a later stop", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("invoking-refresh-success-fake");
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    const run = controller.createRun({ title: "Invoking send terminal refresh" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "invoking terminal-refresh worker",
+      backendHandle: { id: "invoking-terminal-refresh-worker" },
+      status: "running"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Keep this invocation pending.");
+    expect(deferredAdapter.sent).toHaveLength(1);
+    deferredAdapter.statuses.set("invoking-terminal-refresh-worker", "completed");
+
+    // The status call finishes while the adapter send is still gated. A
+    // terminal projection here would make stopAgent treat this worker as
+    // already done, skip physical cleanup, and let the later send revive it.
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 1
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.completed" })).toEqual([]);
+
+    await expect(controller.stopAgent(worker.agent_id)).resolves.toMatchObject({
+      status: "stopped",
+      work_generation: 1,
+      work_revision: 1
+    });
+    expect(deferredAdapter.stopped).toHaveLength(1);
+
+    sendGate.resolve();
+    await expect(send).resolves.toMatchObject({
+      delivered: true,
+      agent: { status: "stopped", work_generation: 1, work_revision: 2 }
+    });
+    expect(deferredAdapter.stopped).toHaveLength(2);
+    expect(deferredAdapter.statuses.get("invoking-terminal-refresh-worker")).toBe("stopped");
+    expect(controller.getAgent(worker.agent_id).status).toBe("stopped");
+  });
+
+  it("defers a refresh error that finishes before direct-send I/O", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("invoking-refresh-error-fake");
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    const run = controller.createRun({ title: "Invoking send refresh error" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "invoking refresh-error worker",
+      backendHandle: { id: "invoking-refresh-error-worker" },
+      status: "running"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Keep this error-path invocation pending.");
+    deferredAdapter.statusError = new Error("Status inspection failed during adapter I/O.");
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "running",
+      failure_reason: null,
+      work_generation: 1,
+      work_revision: 1
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.failed" })).toEqual([]);
+
+    deferredAdapter.statusError = null;
+    sendGate.resolve();
+    await expect(send).resolves.toMatchObject({
+      delivered: true,
+      agent: { status: "running", work_generation: 1, work_revision: 2 }
+    });
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("keeps same-attempt ambiguous work inspectable through refresh failure and recovery", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("same-attempt-ambiguous-fake");
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    const lostResponse = new Error("The backend accepted work but its response was lost.");
+    deferredAdapter.sendGate = sendGate;
+    deferredAdapter.sendErrorAfterAccept = lostResponse;
+    const run = controller.createRun({ title: "Same-attempt ambiguous send refresh" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "same-attempt ambiguous worker",
+      backendHandle: { id: "same-attempt-ambiguous-worker" },
+      status: "completed"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Accept this uncertain attempt.");
+    deferredAdapter.statuses.set("same-attempt-ambiguous-worker", "completed");
+    const statusGate = createDeferred<void>();
+    deferredAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(worker.agent_id);
+    expect(deferredAdapter.statusReads).toBe(1);
+
+    sendGate.resolve();
+    await expect(send).rejects.toBe(lostResponse);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.completed" })).toEqual([]);
+
+    // A failed inspection cannot turn durable delivery uncertainty into a
+    // terminal failure. A later healthy observation still reconciles it.
+    deferredAdapter.statusGate = null;
+    deferredAdapter.statusError = new Error("Temporary status endpoint failure.");
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(
+      controller
+        .listEvents({ agentId: worker.agent_id, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "status_refresh_failed_during_work_uncertainty")
+    ).toHaveLength(1);
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        worker.agent_id
+      )
+    ).toBe(true);
+
+    deferredAdapter.statusError = null;
+    deferredAdapter.statuses.set("same-attempt-ambiguous-worker", "running");
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "running",
+      failure_reason: null,
+      work_generation: 1,
+      work_revision: 2
+    });
+    deferredAdapter.sendErrorAfterAccept = null;
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("recovers an expired direct-send owner after restart without replaying adapter I/O", async () => {
+    const run = controller.createRun({ title: "Restarted abandoned direct send" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "abandoned direct-send worker",
+      backendHandle: { id: "abandoned-direct-send-worker" },
+      status: "running"
+    });
+    const acceptanceKey = "send:restart-abandoned-direct-send";
+    const accepted = store.advanceAgentWorkGenerationForAcceptedWork(
+      worker.agent_id,
+      acceptanceKey,
+      {
+        claimOwnerId: "controller-that-crashed",
+        leaseExpiresAt: "2000-01-01T00:00:00.000Z",
+        projectStatus: "running",
+        failureReason: null
+      }
+    );
+    expect(accepted).toMatchObject({
+      type: "accepted",
+      agent: { work_generation: 1, work_revision: 1, status: "running" }
+    });
+
+    // Model a process dying after the backend accepted the message but before
+    // its SQLite completion transition. The restarted controller must inspect
+    // backend truth, never issue this physical send a second time.
+    await adapter.sendMessage(
+      {
+        backend: "fake",
+        id: "abandoned-direct-send-worker",
+        data: { id: "abandoned-direct-send-worker" }
+      },
+      { message: "Possibly accepted before the process crashed." }
+    );
+    adapter.statuses.set("abandoned-direct-send-worker", "running");
+    expect(adapter.sent).toHaveLength(1);
+
+    store.close();
+    store = new SqliteStore(join(tmp, "state.sqlite"));
+    registry = new AdapterRegistry();
+    registry.register(adapter);
+    controller = new AgentController(store, registry);
+
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(
+      store.db
+        .prepare(
+          "select phase, claim_owner_id, lease_expires_at from agent_work_acceptances where acceptance_key = ?"
+        )
+        .get(acceptanceKey)
+    ).toMatchObject({
+      phase: "ambiguous",
+      claim_owner_id: "controller-that-crashed",
+      lease_expires_at: null
+    });
+    expect(adapter.sent).toHaveLength(1);
+
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "running",
+      failure_reason: null,
+      work_revision: 2
+    });
+    expect(adapter.sent).toHaveLength(1);
+
+    // Stop after reconciliation remains authoritative and performs cleanup;
+    // recovery cannot revive or resend the abandoned work.
+    await expect(controller.stopAgent(worker.agent_id)).resolves.toMatchObject({
+      status: "stopped",
+      work_revision: 2
+    });
+    expect(adapter.sent).toHaveLength(1);
+    expect(adapter.stopped).toHaveLength(1);
+  });
+
+  it("refuses an accepted-work boundary after durable stop intent", () => {
+    const run = controller.createRun({ title: "Stopped accepted-work fence" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "stopping accepted-work worker",
+      backendHandle: { id: "stopping-accepted-work-worker" },
+      status: "stopping"
+    });
+
+    const first = store.advanceAgentWorkGenerationForAcceptedWork(
+      worker.agent_id,
+      "accepted-work:test-replay",
+      {
+        claimOwnerId: "stopped-acceptance-test",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+      }
+    );
+    const replay = store.advanceAgentWorkGenerationForAcceptedWork(
+      worker.agent_id,
+      "accepted-work:test-replay",
+      {
+        claimOwnerId: "stopped-acceptance-test",
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+      }
+    );
+
+    expect(first).toMatchObject({
+      type: "stop_intent",
+      advanced: false,
+      agent: { status: "stopping", work_generation: 0 }
+    });
+    expect(replay).toMatchObject({
+      type: "stop_intent",
+      advanced: false,
+      agent: { status: "stopping", work_generation: 0 }
+    });
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopping",
+      work_generation: 0
+    });
+    expect(
+      store.db
+        .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+        .get(worker.agent_id)
+    ).toMatchObject({ count: 0 });
+  });
+
+  it("does not cross direct-send I/O when another controller wins the stop race", async () => {
+    const sharedAdapter = new NoopWatchingDeferredFakeAdapter("cross-controller-stop-send");
+    registry.register(sharedAdapter);
+    const run = controller.createRun({ title: "Cross-controller stopped send" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: sharedAdapter.kind,
+      title: "cross-controller stopped-send worker",
+      backendHandle: { id: "cross-controller-stopped-send-worker" },
+      status: "running"
+    });
+    const secondStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const secondRegistry = new AdapterRegistry();
+    secondRegistry.register(sharedAdapter);
+    const secondController = new AgentController(secondStore, secondRegistry);
+    const originalAcceptance = store.advanceAgentWorkGenerationForAcceptedWork.bind(store);
+
+    vi.spyOn(store, "advanceAgentWorkGenerationForAcceptedWork").mockImplementation(
+      (agentId, acceptanceKey, options) => {
+        // The first controller already passed its optimistic precheck. Model a
+        // second controller committing stop immediately before the durable
+        // acceptance boundary; BEGIN IMMEDIATE must observe this winner.
+        secondStore.immediateTransaction(() => {
+          secondStore.updateAgent(worker.agent_id, { status: "stopping" });
+        });
+        return originalAcceptance(agentId, acceptanceKey, options);
+      }
+    );
+
+    try {
+      await expect(
+        controller.sendMessage(worker.agent_id, "This must never reach the adapter.")
+      ).rejects.toMatchObject({
+        reason: "tool_error",
+        details: expect.objectContaining({ reason: "durable_stop_intent" })
+      });
+      expect(sharedAdapter.sent).toEqual([]);
+      expect(secondController.getAgent(worker.agent_id)).toMatchObject({
+        status: "stopping",
+        work_generation: 0,
+        work_revision: 0
+      });
+      expect(
+        store.db
+          .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+          .get(worker.agent_id)
+      ).toMatchObject({ count: 0 });
+    } finally {
+      secondStore.close();
+    }
+  });
+
+  it("advances work generation once when a backend start is accepted", async () => {
+    const run = controller.createRun({ title: "Start work generation" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "new worker",
+      status: "planned"
+    });
+
+    const started = await controller.startAgent({
+      agentId: worker.agent_id,
+      prompt: "Start exactly once."
+    });
+    expect(started).toMatchObject({ status: "running", work_generation: 1 });
+
+    await controller.refreshAgentStatus(worker.agent_id);
+    expect(controller.getAgent(worker.agent_id).work_generation).toBe(1);
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("advances native work generation only when an idempotent action is first inserted", () => {
+    const run = controller.createRun({ title: "Native action work generation" });
+    const orchestrator = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "native action owner",
+      status: "waiting_for_input"
+    });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "native action worker",
+      status: "planned"
+    });
+    const grant = store.createBridgeGrant({
+      runId: run.run_id,
+      orchestratorAgentId: orchestrator.agent_id,
+      ownerTaskPath: "/root",
+      tokenHash: "native-action-work-generation-grant"
+    });
+    const actionInput = {
+      idempotencyKey: "generation-idempotent-spawn",
+      runId: run.run_id,
+      orchestratorAgentId: orchestrator.agent_id,
+      originatingBridgeGrantId: grant.bridge_grant_id,
+      agentId: worker.agent_id,
+      operation: "spawn_agent" as const,
+      payloadJson: { message: "Spawn once." }
+    };
+
+    const first = store.createOrGetOrchestratorAction(actionInput)!;
+    const replay = store.createOrGetOrchestratorAction(actionInput)!;
+    expect(replay.action_id).toBe(first.action_id);
+    expect(controller.getAgent(worker.agent_id).work_generation).toBe(1);
+
+    store.updateAgentForOpenOrchestratorAction(first.action_id, worker.agent_id, {
+      status: "starting",
+      failureReason: null
+    });
+    store.updateAgentForOpenOrchestratorAction(first.action_id, worker.agent_id, {
+      status: "starting",
+      failureReason: null
+    });
+    expect(controller.getAgent(worker.agent_id).work_generation).toBe(1);
   });
 
   it("runs a simple multi-step flow, selects a transition, and binds artifacts", () => {
@@ -806,6 +1575,1649 @@ describe("AgentController", () => {
     expect(controller.listSubscriptions({ runId: login.run.run_id })).toHaveLength(10);
   });
 
+  it("creates one clean Codex thread agent per fresh step instance and keeps redispatch idempotent", async () => {
+    process.env.AGENT_CONTROL_ADMIN_KEY = "ack_fresh_review_flow_test";
+    const codexThreadAdapter = new FakeCodexThreadAdapter();
+    registry.register(codexThreadAdapter);
+    const login = controller.orchestratorLogin({
+      adminKey: "ack_fresh_review_flow_test",
+      title: "Fresh review run",
+      repoDir: "/repo",
+      backend: "fake"
+    });
+    const started = controller.startFlow({
+      runId: login.run.run_id,
+      agentToken: login.agent_token,
+      config: {
+        id: "fresh-review-flow",
+        initial_step: "final_review",
+        roles: {
+          final_reviewer: {
+            backend: "codex-thread",
+            model: "review-model",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          final_review: {
+            role: "final_reviewer",
+            report: {
+              schema: {
+                required: ["verdict"],
+                properties: {
+                  verdict: { enum: ["approved", "changes"] }
+                }
+              }
+            },
+            on: {
+              reported: {
+                transitions: [
+                  {
+                    id: "rerun-final-review",
+                    when: { equals: { var: "result.verdict", value: "changes" } },
+                    to: "final_review"
+                  },
+                  {
+                    id: "approve-final-review",
+                    when: { equals: { var: "result.verdict", value: "approved" } },
+                    finish: true
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Fresh roles do not create a dormant persistent role card at flow start.
+    expect(
+      controller
+        .listAgents({ runId: login.run.run_id })
+        .filter((agent) => agent.role === "final_reviewer")
+    ).toHaveLength(0);
+
+    const firstDispatch = await controller.dispatchActiveFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      subscriberAgentId: login.agent.agent_id,
+      agentToken: login.agent_token
+    });
+    const firstAgentId = String(firstDispatch.agent.agent_id);
+    const firstAgent = controller.getAgent(firstAgentId);
+    const firstThreadId = String(firstAgent.backend_handle?.thread_id);
+    expect(firstAgent.title).toBe(
+      `fresh-review-flow: final_reviewer [final_review:${started.active_step!.step_instance_id}]`
+    );
+    expect(firstThreadId).toBe(`thread_${firstAgentId}`);
+    expect(codexThreadAdapter.starts).toHaveLength(1);
+    expect(codexThreadAdapter.starts[0]?.agent.backend_handle).toBeNull();
+
+    const firstReplay = await controller.dispatchActiveFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      subscriberAgentId: login.agent.agent_id,
+      agentToken: login.agent_token
+    });
+    expect(firstReplay.agent.agent_id).toBe(firstAgentId);
+    expect(codexThreadAdapter.starts).toHaveLength(1);
+
+    const rerun = await controller.reportFlowStepAndContinue({
+      stepInstanceId: started.active_step!.step_instance_id,
+      status: "completed",
+      result: { verdict: "changes" },
+      summary: "Run an independent final review again."
+    });
+    const secondStep = rerun.report.active_step!;
+    const secondAgentId = rerun.continuation!.agent!.agent_id;
+
+    expect(rerun.continuation?.action).toBe("dispatched");
+    expect(secondStep.step_instance_id).not.toBe(started.active_step!.step_instance_id);
+    expect(secondAgentId).not.toBe(firstAgentId);
+    expect(codexThreadAdapter.starts).toHaveLength(2);
+    expect(codexThreadAdapter.starts[1]?.agent.backend_handle).toBeNull();
+    const secondThreadId = String(controller.getAgent(secondAgentId).backend_handle?.thread_id);
+    expect(controller.getAgent(secondAgentId).title).toBe(
+      `fresh-review-flow: final_reviewer [final_review:${secondStep.step_instance_id}]`
+    );
+    expect(secondThreadId).toBe(`thread_${secondAgentId}`);
+    expect(secondThreadId).not.toBe(firstThreadId);
+    const firstAttempt = store.listAgentStartAttempts(firstAgentId)[0]!;
+    const secondAttempt = store.listAgentStartAttempts(secondAgentId)[0]!;
+    expect(firstAttempt).toMatchObject({
+      step_instance_id: started.active_step!.step_instance_id,
+      phase: "succeeded"
+    });
+    expect(secondAttempt).toMatchObject({
+      step_instance_id: secondStep.step_instance_id,
+      phase: "succeeded"
+    });
+    expect(secondAttempt.start_attempt_id).not.toBe(firstAttempt.start_attempt_id);
+
+    const secondReplay = await controller.dispatchActiveFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      subscriberAgentId: login.agent.agent_id,
+      agentToken: login.agent_token
+    });
+    expect(secondReplay.agent.agent_id).toBe(secondAgentId);
+    expect(codexThreadAdapter.starts).toHaveLength(2);
+
+    const finalReviewAgents = controller
+      .listAgents({ runId: login.run.run_id })
+      .filter((agent) => agent.role === "final_reviewer");
+    expect(finalReviewAgents).toHaveLength(2);
+    expect(new Set(finalReviewAgents.map((agent) => agent.title)).size).toBe(2);
+    expect(
+      controller.listAgentLinks({ runId: login.run.run_id })
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source_agent_id: login.agent.agent_id,
+          target_agent_id: firstAgentId,
+          type: "parent_child",
+          label: "final_reviewer"
+        }),
+        expect.objectContaining({
+          source_agent_id: login.agent.agent_id,
+          target_agent_id: secondAgentId,
+          type: "parent_child",
+          label: "final_reviewer"
+        }),
+        expect.objectContaining({
+          source_agent_id: firstAgentId,
+          target_agent_id: secondAgentId,
+          type: "handoff",
+          label: "rerun-final-review"
+        })
+      ])
+    );
+    const terminalSubscriptions = controller
+      .listSubscriptions({ runId: login.run.run_id })
+      .filter(
+        (subscription) =>
+          [firstAgentId, secondAgentId].includes(subscription.source_agent_id ?? "") &&
+          subscription.subscriber_agent_id === login.agent.agent_id &&
+          ["agent.completed", "agent.failed", "agent.blocked", "agent.stopped"].includes(
+            subscription.event_type
+          )
+      );
+    expect(terminalSubscriptions).toHaveLength(8);
+  });
+
+  it("retries a fresh Codex thread after prompt construction fails post-assignment", async () => {
+    process.env.AGENT_CONTROL_ADMIN_KEY = "ack_fresh_prompt_retry_test";
+    const codexThreadAdapter = new FakeCodexThreadAdapter();
+    registry.register(codexThreadAdapter);
+    const login = controller.orchestratorLogin({
+      adminKey: "ack_fresh_prompt_retry_test",
+      title: "Fresh prompt retry",
+      repoDir: "/repo",
+      backend: "fake"
+    });
+    const promptPath = join(tmp, "late-final-review.md");
+    const started = controller.startFlow({
+      runId: login.run.run_id,
+      agentToken: login.agent_token,
+      config: {
+        id: "fresh-prompt-retry-flow",
+        initial_step: "final_review",
+        roles: {
+          final_reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          final_review: {
+            role: "final_reviewer",
+            prompt_path: promptPath,
+            on: { reported: { finish: true } }
+          }
+        }
+      }
+    });
+
+    await expect(
+      controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id })
+    ).rejects.toThrow(/prompt source file is unavailable/);
+
+    const strandedSnapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    const assignedStep = strandedSnapshot.steps.find((step) => step.status === "active")!;
+    const assignedAgent = controller.getAgent(assignedStep.agent_id!);
+    expect(assignedAgent).toMatchObject({
+      status: "queued",
+      backend_handle: null
+    });
+    expect(codexThreadAdapter.starts).toHaveLength(0);
+
+    // `starting` is written before a backend call and may survive a process
+    // crash, so it cannot replace handle/action/session evidence on retry.
+    store.updateAgent(assignedAgent.agent_id, { status: "starting" });
+    const abandoned = store.claimAgentStartAttempt({
+      agentId: assignedAgent.agent_id,
+      flowInstanceId: started.instance.flow_instance_id,
+      stepInstanceId: assignedStep.step_instance_id,
+      generation: 1,
+      leaseExpiresAt: "2000-01-01T00:00:00.000Z"
+    });
+    expect(abandoned).toMatchObject({
+      type: "claimed",
+      attempt: { phase: "prepared", invocation_started_at: null }
+    });
+    writeFileSync(promptPath, "# Final review\n\nReview independently.\n", "utf8");
+    const recovered = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(recovered).toMatchObject({
+      action: "dispatched",
+      active_step: {
+        step_instance_id: assignedStep.step_instance_id,
+        agent_id: assignedAgent.agent_id
+      },
+      agent: { agent_id: assignedAgent.agent_id }
+    });
+    expect(codexThreadAdapter.starts).toHaveLength(1);
+    expect(store.listAgentStartAttempts(assignedAgent.agent_id)[0]).toMatchObject({
+      phase: "succeeded",
+      step_instance_id: assignedStep.step_instance_id
+    });
+
+    rmSync(promptPath);
+    const replay = await controller.dispatchActiveFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      subscriberAgentId: login.agent.agent_id,
+      agentToken: login.agent_token
+    });
+    expect(replay.agent.agent_id).toBe(assignedAgent.agent_id);
+    expect(codexThreadAdapter.starts).toHaveLength(1);
+  });
+
+  it("serializes concurrent fresh Codex-thread starts behind one durable attempt", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Concurrent fresh start", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "concurrent-fresh-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const owner = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+
+    // Use a second SQLite connection/controller to exercise the cross-process
+    // CAS path rather than relying only on JavaScript promise interleaving.
+    const competingStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const competingController = new AgentController(competingStore, registry);
+    const concurrent = await competingController.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(concurrent).toMatchObject({
+      action: "start_in_progress",
+      active_step: { step_instance_id: assigned.step_instance_id },
+      agent: { agent_id: assigned.agent_id },
+      notification: "backend_start_in_progress"
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    expect(store.listAgentStartAttempts(assigned.agent_id!)).toEqual([
+      expect.objectContaining({
+        step_instance_id: assigned.step_instance_id,
+        generation: 1,
+        phase: "invoking"
+      })
+    ]);
+    competingStore.close();
+
+    startGate.resolve();
+    const dispatched = await owner;
+    expect(dispatched).toMatchObject({
+      action: "dispatched",
+      agent: { agent_id: assigned.agent_id, status: "running" },
+      dispatch: { start_state: "started" }
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    expect(store.listAgentStartAttempts(assigned.agent_id!)).toEqual([
+      expect.objectContaining({
+        phase: "succeeded",
+        handle_json: { id: assigned.agent_id, late_start: true }
+      })
+    ]);
+  });
+
+  it("keeps a manual route authoritative when an invoking start returns afterward", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Manual route beats invoking start", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "manual-route-invoking-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          planner: { backend: "fake" }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const original = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    expect(store.listAgentStartAttempts(oldStep.agent_id!)[0]).toMatchObject({
+      phase: "invoking"
+    });
+
+    const advanced = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-while-review-starts"
+    });
+    expect(advanced.active_step).toMatchObject({ step_id: "planning", status: "active" });
+
+    startGate.resolve();
+    const superseded = await original;
+    expect(superseded).toMatchObject({
+      action: "start_superseded",
+      active_step: { step_id: "planning", status: "active" },
+      notification: "flow_route_advanced_during_backend_start",
+      dispatch: { start_state: "superseded" }
+    });
+    expect(store.listAgentStartAttempts(oldStep.agent_id!)[0]).toMatchObject({
+      phase: "superseded",
+      error_json: { reason: "later_flow_step_exists" }
+    });
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "active", current_step_id: "planning" });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([
+      expect.objectContaining({ step_id: "planning" })
+    ]);
+    expect(snapshot.steps.find((step) => step.step_instance_id === oldStep.step_instance_id)).toMatchObject({
+      status: "cancelled"
+    });
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({ status: "stopped" });
+    expect(deferredAdapter.stopped).toEqual([
+      expect.objectContaining({ id: oldStep.agent_id })
+    ]);
+  });
+
+  it("awaits cleanup of a running fresh worker before returning a manual route", async () => {
+    const run = controller.createRun({ title: "Manual route cleans fresh worker", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "manual-route-cleans-fresh-worker-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: { backend: "fake", agent_lifecycle: "fresh_per_step" as const },
+          planner: { backend: "fake", agent_lifecycle: "fresh_per_step" as const }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const dispatched = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = dispatched.active_step!;
+    expect(dispatched.agent).toMatchObject({ status: "running" });
+
+    const rerouted = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-clean-running-review"
+    });
+
+    expect(rerouted).toMatchObject({
+      instance: { status: "active", current_step_id: "planning" },
+      active_step: { step_id: "planning", status: "active" },
+      cleanup: [
+        {
+          agent_id: oldStep.agent_id,
+          status: "stopped",
+          failure_reason: null,
+          orchestrator_action: null
+        }
+      ]
+    });
+    expect(adapter.stopped).toEqual([
+      expect.objectContaining({ id: oldStep.agent_id })
+    ]);
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({ status: "stopped" });
+    expect(
+      controller
+        .getFlowSnapshot(started.instance.flow_instance_id)
+        .steps.filter((step) => step.status === "active")
+    ).toEqual([expect.objectContaining({ step_id: "planning" })]);
+  });
+
+  it("preserves manual cleanup across stale status refreshes and retries it after restart", async () => {
+    const initialAdapter = new DeferredFakeAdapter("codex-thread");
+    initialAdapter.stopErrorAtCall = 1;
+    registry.register(initialAdapter);
+    const run = controller.createRun({ title: "Retry durable manual cleanup", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "retry-durable-manual-cleanup-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          planner: { backend: "fake", agent_lifecycle: "fresh_per_step" as const }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const dispatched = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = dispatched.active_step!;
+
+    // Hold a running observation across the manual route. The eventual result
+    // is stale with respect to the stop intent that the route persists while
+    // getStatus is in flight, so projection must re-read lifecycle authority.
+    const statusGate = createDeferred<void>();
+    initialAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(oldStep.agent_id!);
+    expect(initialAdapter.statusReads).toBe(1);
+
+    const rerouted = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-cleanup-needs-retry"
+    });
+
+    expect(rerouted).toMatchObject({
+      instance: { status: "active", current_step_id: "planning" },
+      active_step: { step_id: "planning", status: "active" },
+      cleanup: [
+        {
+          agent_id: oldStep.agent_id,
+          status: "stopping",
+          failure_reason: "unknown",
+          orchestrator_action: null
+        }
+      ]
+    });
+    expect(initialAdapter.stopped).toHaveLength(1);
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({
+      status: "stopping",
+      failure_reason: "unknown",
+      backend_handle: { id: oldStep.agent_id }
+    });
+    expect(
+      controller
+        .listEvents({ agentId: oldStep.agent_id!, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "external_stop_retry_pending")
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          status: "stopping",
+          failure_reason: "unknown",
+          error: "Deferred adapter compensating stop failed."
+        })
+      })
+    ]);
+
+    statusGate.resolve();
+    const staleProjection = await staleRefresh;
+    expect(staleProjection).toMatchObject({ status: "stopping", failure_reason: "unknown" });
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({
+      status: "stopping",
+      failure_reason: "unknown"
+    });
+    expect(
+      controller
+        .listEvents({ agentId: oldStep.agent_id!, type: "agent.status_changed" })
+        .filter(
+          (event) =>
+            event.payload.reason === "backend_nonterminal_observed_during_cleanup"
+        )
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          status: "stopping",
+          observed_status: "running",
+          failure_reason: "unknown"
+        })
+      })
+    ]);
+
+    initialAdapter.statusError = new Error("Status endpoint is temporarily unavailable.");
+    const failedPoll = await controller.pollActiveAgents(run.run_id);
+    expect(failedPoll.find((candidate) => candidate.agent_id === oldStep.agent_id)).toMatchObject({
+      status: "stopping",
+      failure_reason: "unknown"
+    });
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({
+      status: "stopping",
+      failure_reason: "unknown"
+    });
+    expect(
+      controller
+        .listEvents({ agentId: oldStep.agent_id!, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "status_refresh_failed_during_cleanup")
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          status: "stopping",
+          failure_reason: "unknown",
+          error: "Status endpoint is temporarily unavailable."
+        })
+      })
+    ]);
+
+    // A new controller performs one startup redrive. Its own first stop also
+    // fails, proving that transient failures remain visible and pending without
+    // recursively scheduling a busy retry loop in the same process.
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    const restartedAdapter = new DeferredFakeAdapter("codex-thread");
+    restartedAdapter.stopErrorAtCall = 1;
+    restartedRegistry.register(restartedAdapter);
+    restartedRegistry.register(new FakeAdapter());
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+    expect(restartedAdapter.stopped).toHaveLength(1);
+    expect(restartedController.getAgent(oldStep.agent_id!)).toMatchObject({
+      status: "stopping",
+      failure_reason: "unknown"
+    });
+    await restartedController.drainDeliveries();
+    expect(restartedAdapter.stopped).toHaveLength(1);
+    expect(
+      restartedController
+        .listEvents({ agentId: oldStep.agent_id!, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "external_stop_retry_pending")
+    ).toHaveLength(2);
+
+    const retried = await restartedController.stopAgent(oldStep.agent_id!);
+    expect(retried).toMatchObject({ status: "stopped", failure_reason: null });
+    expect(restartedAdapter.stopped).toHaveLength(2);
+    const snapshot = restartedController.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "active", current_step_id: "planning" });
+    expect(snapshot.steps.find((step) => step.step_instance_id === oldStep.step_instance_id)).toMatchObject({
+      status: "cancelled"
+    });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([
+      expect.objectContaining({ step_id: "planning" })
+    ]);
+    restartedStore.close();
+  });
+
+  it("retains a reused worker that is still owned by the manually selected step", async () => {
+    const run = controller.createRun({ title: "Manual route retains reused worker", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "manual-route-retains-reused-worker-flow",
+        initial_step: "first",
+        roles: {
+          worker: { backend: "fake", agent_lifecycle: "reuse" as const }
+        },
+        steps: {
+          first: { role: "worker", on: { reported: { to: "second" } } },
+          second: { role: "worker", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const first = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const workerId = first.agent!.agent_id;
+
+    const rerouted = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "second",
+      fromStepInstanceId: first.active_step!.step_instance_id,
+      transitionId: "manual-reuse-same-worker"
+    });
+
+    expect(rerouted).toMatchObject({
+      active_step: { step_id: "second", status: "active" },
+      cleanup: []
+    });
+    expect(controller.getAgent(workerId)).toMatchObject({ status: "running" });
+    expect(adapter.stopped).toEqual([]);
+    const second = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(second).toMatchObject({
+      action: "dispatched",
+      active_step: { step_id: "second", agent_id: workerId },
+      agent: { agent_id: workerId, status: "running" }
+    });
+    expect(adapter.stopped).toEqual([]);
+  });
+
+  it("cancels a prepared fresh start when stop wins before invocation", async () => {
+    const codexThreadAdapter = new FakeCodexThreadAdapter();
+    registry.register(codexThreadAdapter);
+    const run = controller.createRun({ title: "Prepared fresh start stop", repoDir: "/repo" });
+    const promptPath = join(tmp, "not-yet-available-review.md");
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "prepared-fresh-start-stop-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: {
+            role: "reviewer",
+            prompt_path: promptPath,
+            on: { reported: { finish: true } }
+          }
+        }
+      }
+    });
+    await expect(
+      controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id })
+    ).rejects.toThrow(/prompt source file is unavailable/);
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    store.claimAgentStartAttempt({
+      agentId: assigned.agent_id!,
+      flowInstanceId: started.instance.flow_instance_id,
+      stepInstanceId: assigned.step_instance_id,
+      generation: 1,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+    });
+
+    const stopped = await controller.stopAgent(assigned.agent_id!);
+    expect(stopped).toMatchObject({ status: "stopped", backend_handle: null });
+    expect(store.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "cancelled",
+      invocation_started_at: null,
+      error_json: { reason: "agent_stop_before_backend_start_invocation" }
+    });
+    expect(codexThreadAdapter.starts).toHaveLength(0);
+  });
+
+  it("atomically blocks a fresh step when stop cancels its prepared start boundary", async () => {
+    const run = controller.createRun({ title: "Prepared boundary stop interleaving", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "prepared-boundary-stop-interleaving-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: { backend: "fake", agent_lifecycle: "fresh_per_step" as const }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const observer = new SqliteStore(join(tmp, "state.sqlite"));
+    const begin = store.beginAgentStartAttempt.bind(store);
+    let stop: Promise<unknown> | null = null;
+    vi.spyOn(store, "beginAgentStartAttempt").mockImplementation((input) => {
+      const row = store.db
+        .prepare("select agent_id from agent_start_attempts where start_attempt_id = ?")
+        .get(input.startAttemptId) as { agent_id: string };
+      // stopAgent reaches the handleless cancellation transaction before its
+      // returned promise settles. A second connection must observe either the
+      // old prepared/starting pair or the final cancelled/stopped pair, never a
+      // cancelled attempt attached to a startable agent.
+      stop = controller.stopAgent(row.agent_id);
+      const observedAttempt = observer.listAgentStartAttempts(row.agent_id)[0];
+      const observedAgent = observer.getAgent(row.agent_id)!;
+      expect({ phase: observedAttempt?.phase, status: observedAgent.status }).toEqual({
+        phase: "cancelled",
+        status: "stopped"
+      });
+      return begin(input);
+    });
+
+    const continuation = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    await stop;
+    observer.close();
+
+    expect(continuation).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_cancelled",
+      active_step: { status: "blocked" },
+      agent: { status: "stopped" },
+      dispatch: { start_state: "cancelled" }
+    });
+    expect(adapter.starts).toHaveLength(0);
+    const blocked = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(blocked.instance.status).toBe("blocked");
+    expect(blocked.steps[0]).toMatchObject({
+      status: "blocked",
+      summary: expect.stringMatching(/^Backend start attempt .* cancelled before adapter invocation\.$/)
+    });
+    expect(store.listAgentStartAttempts(continuation.agent!.agent_id)[0]).toMatchObject({
+      phase: "cancelled",
+      error_json: { reason: "agent_stop_before_backend_start_invocation" }
+    });
+  });
+
+  it("maps a failed durable start attempt to a precise blocked flow without adapter I/O", async () => {
+    const run = controller.createRun({ title: "Failed start attempt mapping", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "failed-start-attempt-mapping-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: { backend: "fake", agent_lifecycle: "fresh_per_step" as const }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const begin = store.beginAgentStartAttempt.bind(store);
+    vi.spyOn(store, "beginAgentStartAttempt").mockImplementation((input) => {
+      const failedAt = new Date().toISOString();
+      store.db
+        .prepare(
+          `update agent_start_attempts
+           set phase = 'failed', error_json = ?, completed_at = ?, updated_at = ?
+           where start_attempt_id = ? and phase = 'prepared'`
+        )
+        .run(
+          JSON.stringify({
+            reason: "backend_start_failed_before_invocation",
+            message: "The durable start failed before adapter invocation."
+          }),
+          failedAt,
+          failedAt,
+          input.startAttemptId
+        );
+      return begin(input);
+    });
+
+    const continuation = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+
+    expect(continuation).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_failed",
+      active_step: { status: "blocked" },
+      agent: { status: "failed", failure_reason: "unknown" },
+      dispatch: { start_state: "failed" }
+    });
+    expect(adapter.starts).toHaveLength(0);
+    expect(store.listAgentStartAttempts(continuation.agent!.agent_id)[0]).toMatchObject({
+      phase: "failed",
+      error_json: { reason: "backend_start_failed_before_invocation" }
+    });
+    const replay = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(replay).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_failed",
+      active_step: { status: "blocked" }
+    });
+  });
+
+  it("blocks an expired invoking start without retry and reconciles its late owner success", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Ambiguous fresh start", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "ambiguous-fresh-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const owner = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    store.db
+      .prepare(
+        "update agent_start_attempts set lease_expires_at = ? where agent_id = ? and step_instance_id = ?"
+      )
+      .run("2000-01-01T00:00:00.000Z", assigned.agent_id, assigned.step_instance_id);
+
+    const blocked = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(blocked).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_ambiguous",
+      active_step: { status: "blocked" }
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    expect(store.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "ambiguous",
+      error_json: { reason: "backend_start_invocation_lease_expired" }
+    });
+    const blockedReplay = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(blockedReplay).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_ambiguous",
+      notification: "automatic_backend_start_retry_disabled"
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+
+    // Only the original lease owner may turn the ambiguous attempt into a
+    // success. Its valid late handle atomically completes the attempt and
+    // reopens the block created for this exact attempt id.
+    startGate.resolve();
+    const recovered = await owner;
+    expect(recovered.action).toBe("dispatched");
+    expect(deferredAdapter.starts).toHaveLength(1);
+    expect(store.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "succeeded",
+      handle_json: { id: assigned.agent_id, late_start: true }
+    });
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id)).toMatchObject({
+      instance: { status: "active" },
+      steps: [expect.objectContaining({ step_instance_id: assigned.step_instance_id, status: "active" })]
+    });
+    const replay = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(replay.action).toBe("waiting_for_report");
+    expect(deferredAdapter.starts).toHaveLength(1);
+  });
+
+  it("keeps a manually advanced route authoritative over a late ambiguous start", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Manual route beats late start", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "manual-route-late-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          planner: { backend: "fake" }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const lateDispatch = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    store.db
+      .prepare("update agent_start_attempts set lease_expires_at = ? where agent_id = ?")
+      .run("2000-01-01T00:00:00.000Z", oldStep.agent_id);
+    await controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id });
+
+    const advanced = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-review-to-planning",
+      reason: "The coordinator accepted the review timeout and advanced manually."
+    });
+    expect(advanced.active_step?.step_id).toBe("planning");
+
+    startGate.resolve();
+    const lateResult = await lateDispatch;
+    expect(lateResult).toMatchObject({
+      action: "start_superseded",
+      notification: "flow_route_advanced_during_backend_start",
+      dispatch: { start_state: "superseded" }
+    });
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "active", current_step_id: "planning" });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([
+      expect.objectContaining({ step_id: "planning" })
+    ]);
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({
+      status: "stopped",
+      backend_handle: { id: oldStep.agent_id, late_start: true }
+    });
+    expect(deferredAdapter.stopped).toEqual([
+      expect.objectContaining({ id: oldStep.agent_id })
+    ]);
+  });
+
+  it("cleans a reconciled late worker when the manual route commits immediately after it", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Manual route after late recovery", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "manual-route-after-recovery-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          planner: { backend: "fake" }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+    const lateDispatch = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    store.db
+      .prepare("update agent_start_attempts set lease_expires_at = ? where agent_id = ?")
+      .run("2000-01-01T00:00:00.000Z", oldStep.agent_id);
+    await controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id });
+
+    startGate.resolve();
+    const recovered = await lateDispatch;
+    expect(recovered.action).toBe("dispatched");
+    expect(
+      controller.getFlowSnapshot(started.instance.flow_instance_id).steps[0]?.summary
+    ).toMatch(/^Late backend start attempt /);
+    await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-after-late-recovery"
+    });
+    await controller.drainDeliveries();
+
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "active", current_step_id: "planning" });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([
+      expect.objectContaining({ step_id: "planning" })
+    ]);
+    expect(controller.getAgent(oldStep.agent_id!).status).toBe("stopped");
+    expect(deferredAdapter.stopped).toHaveLength(1);
+  });
+
+  it("never reopens a completed flow when an old ambiguous start returns late", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Completed route beats late start", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "completed-route-late-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          finisher: { backend: "fake" }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "finish" } } },
+          finish: { role: "finisher", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const lateDispatch = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    store.db
+      .prepare("update agent_start_attempts set lease_expires_at = ? where agent_id = ?")
+      .run("2000-01-01T00:00:00.000Z", oldStep.agent_id);
+    await controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id });
+    const advanced = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "finish",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-review-to-finish"
+    });
+    const finishDispatch = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(finishDispatch.action).toBe("dispatched");
+    controller.reportFlowStep({
+      stepInstanceId: advanced.active_step!.step_instance_id,
+      status: "completed",
+      result: {},
+      summary: "The replacement route completed."
+    });
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id).instance.status).toBe(
+      "completed"
+    );
+
+    startGate.resolve();
+    const lateResult = await lateDispatch;
+    expect(lateResult.action).toBe("start_superseded");
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "completed", current_step_id: null });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([]);
+    expect(controller.getAgent(oldStep.agent_id!).status).toBe("stopped");
+    expect(deferredAdapter.stopped).toHaveLength(1);
+  });
+
+  it("treats a rejected post-invocation start response as ambiguous and never retries it", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    deferredAdapter.startErrorAfterAccept = new Error(
+      "The backend accepted thread/start but its response was lost."
+    );
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Rejected start response", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "rejected-start-response-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const blocked = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(blocked).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_ambiguous",
+      active_step: { status: "blocked" },
+      dispatch: { start_state: "ambiguous" }
+    });
+    const agentId = blocked.agent!.agent_id;
+    expect(store.listAgentStartAttempts(agentId)[0]).toMatchObject({
+      phase: "ambiguous",
+      error_json: { reason: "backend_start_outcome_ambiguous" }
+    });
+
+    const replay = await controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(replay).toMatchObject({
+      action: "blocked",
+      blocked_reason: "backend_start_ambiguous"
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+  });
+
+  it("keeps a stop race pending until a late fresh start handle is compensated", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Fresh start stop race", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "fresh-start-stop-race-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const dispatch = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+
+    const stopping = await controller.stopAgent(assigned.agent_id!);
+    expect(stopping).toMatchObject({ status: "stopping", backend_handle: null });
+    expect(deferredAdapter.stopped).toHaveLength(0);
+
+    startGate.resolve();
+    await dispatch;
+    expect(deferredAdapter.starts).toHaveLength(1);
+    expect(deferredAdapter.stopped).toEqual([
+      expect.objectContaining({ id: assigned.agent_id })
+    ]);
+    expect(controller.getAgent(assigned.agent_id!)).toMatchObject({
+      status: "stopped",
+      backend_handle: { id: assigned.agent_id, late_start: true }
+    });
+    expect(store.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "succeeded",
+      handle_json: { id: assigned.agent_id, late_start: true }
+    });
+  });
+
+  it("restores a succeeded start handle after restart before compensating stop", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("codex-thread");
+    const startGate = createDeferred<void>();
+    const stopGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    deferredAdapter.stopGate = stopGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Restart-safe late start cleanup", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "restart-safe-late-start-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "codex-thread",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const lateDispatch = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    await controller.stopAgent(assigned.agent_id!);
+    startGate.resolve();
+    for (let turn = 0; turn < 20 && deferredAdapter.stopped.length === 0; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(deferredAdapter.stopped).toHaveLength(1);
+    expect(controller.getAgent(assigned.agent_id!)).toMatchObject({
+      status: "stopping",
+      backend_handle: { id: assigned.agent_id, late_start: true }
+    });
+    expect(store.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "succeeded",
+      handle_json: { id: assigned.agent_id, late_start: true }
+    });
+
+    // Simulate a database produced by the old crash window where only the
+    // succeeded attempt retained the handle. Startup must restore it before a
+    // handleless stop can incorrectly declare the backend session absent.
+    store.db
+      .prepare("update agents set backend_handle_json = null where agent_id = ?")
+      .run(assigned.agent_id);
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    const restartedAdapter = new DeferredFakeAdapter("codex-thread");
+    restartedRegistry.register(restartedAdapter);
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    expect(restartedController.getAgent(assigned.agent_id!)).toMatchObject({
+      status: "stopping",
+      backend_handle: { id: assigned.agent_id, late_start: true }
+    });
+    await restartedController.drainDeliveries();
+    expect(restartedController.getAgent(assigned.agent_id!).status).toBe("stopped");
+    expect(restartedAdapter.stopped).toEqual([
+      expect.objectContaining({ id: assigned.agent_id })
+    ]);
+    restartedStore.close();
+
+    stopGate.resolve();
+    await lateDispatch;
+  });
+
+  it("rolls back a handleless non-native stop when its terminal event cannot commit", async () => {
+    const run = controller.createRun({ title: "Atomic handleless non-native event" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "handleless non-native worker",
+      status: "stopping"
+    });
+    store.updateRunStatus(run.run_id, "stopping");
+    store.db.exec(`
+      create trigger reject_handleless_non_native_stopped_event
+      before insert on events
+      when new.type = 'agent.stopped'
+      begin
+        select raise(abort, 'test non-native stopped event failure');
+      end;
+    `);
+
+    await expect(controller.stopAgent(worker.agent_id)).rejects.toThrow(
+      /test non-native stopped event failure/
+    );
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({ status: "stopping" });
+    expect(controller.getRun(run.run_id)).toMatchObject({ status: "stopping" });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })).toEqual([]);
+
+    store.db.exec("drop trigger reject_handleless_non_native_stopped_event");
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    restartedRegistry.register(new FakeAdapter());
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+
+    expect(restartedController.getAgent(worker.agent_id)).toMatchObject({ status: "stopped" });
+    expect(restartedController.getRun(run.run_id)).toMatchObject({ status: "stopped" });
+    expect(
+      restartedController.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })
+    ).toHaveLength(1);
+    expect(
+      restartedController
+        .listEvents({ runId: run.run_id, type: "timer.elapsed" })
+        .filter((event) => event.payload.action === "run_shutdown_completed")
+    ).toHaveLength(1);
+    restartedStore.close();
+  });
+
+  it("rolls back native handleless cancellation when its terminal event cannot commit", async () => {
+    registry.register(new CodexSubagentAdapter());
+    const run = controller.createRun({ title: "Atomic handleless native event" });
+    const owner = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "terminal native action owner",
+      status: "stopped"
+    });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "codex-subagent",
+      title: "handleless native worker",
+      status: "planned"
+    });
+    const grant = store.createBridgeGrant({
+      runId: run.run_id,
+      orchestratorAgentId: owner.agent_id,
+      ownerTaskPath: "/root",
+      tokenHash: "atomic-handleless-native-grant"
+    });
+    const spawnAction = store.createOrGetOrchestratorAction({
+      idempotencyKey: "atomic-handleless-native-spawn",
+      runId: run.run_id,
+      orchestratorAgentId: owner.agent_id,
+      originatingBridgeGrantId: grant.bridge_grant_id,
+      agentId: worker.agent_id,
+      operation: "spawn_agent",
+      payloadJson: { message: "Remain pending until stop wins." }
+    })!;
+    store.immediateTransaction(() => {
+      store.updateRunStatus(run.run_id, "stopping");
+      store.updateAgent(worker.agent_id, { status: "stopping" });
+    });
+    store.db.exec(`
+      create trigger reject_handleless_native_stopped_event
+      before insert on events
+      when new.type = 'agent.stopped'
+      begin
+        select raise(abort, 'test native stopped event failure');
+      end;
+    `);
+
+    await expect(controller.stopAgent(worker.agent_id)).rejects.toThrow(
+      /test native stopped event failure/
+    );
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopping",
+      work_generation: 1
+    });
+    expect(controller.getRun(run.run_id)).toMatchObject({ status: "stopping" });
+    expect(store.getOrchestratorAction(spawnAction.action_id)).toMatchObject({ status: "pending" });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })).toEqual([]);
+
+    store.db.exec("drop trigger reject_handleless_native_stopped_event");
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    restartedRegistry.register(new CodexSubagentAdapter());
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+
+    expect(restartedController.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopped",
+      work_generation: 1
+    });
+    expect(restartedController.getRun(run.run_id)).toMatchObject({ status: "stopped" });
+    expect(restartedStore.getOrchestratorAction(spawnAction.action_id)).toMatchObject({
+      status: "cancelled"
+    });
+    expect(
+      restartedController.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })
+    ).toHaveLength(1);
+    expect(
+      restartedController
+        .listEvents({ runId: run.run_id, type: "timer.elapsed" })
+        .filter((event) => event.payload.action === "run_shutdown_completed")
+    ).toHaveLength(1);
+    restartedStore.close();
+  });
+
+  it("re-drives a persisted stopping worker after restart without a start attempt", async () => {
+    const run = controller.createRun({ title: "Restart durable manual cleanup", repoDir: "/repo" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "abandoned reusable worker",
+      backendHandle: { id: "abandoned-reusable-worker" },
+      status: "running"
+    });
+    store.updateAgent(worker.agent_id, { status: "stopping" });
+
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    const restartedAdapter = new FakeAdapter();
+    restartedRegistry.register(restartedAdapter);
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+
+    expect(restartedController.getAgent(worker.agent_id)).toMatchObject({ status: "stopped" });
+    expect(restartedAdapter.stopped).toEqual([
+      expect.objectContaining({ id: "abandoned-reusable-worker" })
+    ]);
+    restartedStore.close();
+  });
+
+  it("repairs terminal stopping runs at startup but preserves runs with live agents", async () => {
+    const terminalRun = controller.createRun({ title: "Legacy terminal stopping run" });
+    const terminalWorker = controller.registerAgent({
+      runId: terminalRun.run_id,
+      backend: "fake",
+      title: "already stopped worker",
+      backendHandle: { id: "already-stopped-worker" },
+      status: "stopped"
+    });
+    store.updateRunStatus(terminalRun.run_id, "stopping");
+
+    const liveRun = controller.createRun({ title: "Still-live stopping run" });
+    const liveWorker = controller.registerAgent({
+      runId: liveRun.run_id,
+      backend: "fake",
+      title: "still-live worker",
+      backendHandle: { id: "still-live-worker" },
+      status: "running"
+    });
+    store.updateRunStatus(liveRun.run_id, "stopping");
+
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    const restartedAdapter = new FakeAdapter();
+    restartedRegistry.register(restartedAdapter);
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+
+    expect(restartedController.getAgent(terminalWorker.agent_id).status).toBe("stopped");
+    expect(restartedController.getRun(terminalRun.run_id).status).toBe("stopped");
+    expect(restartedController.getAgent(liveWorker.agent_id).status).toBe("running");
+    expect(restartedController.getRun(liveRun.run_id).status).toBe("stopping");
+    expect(restartedAdapter.stopped).toEqual([]);
+    expect(
+      restartedController
+        .listEvents({ runId: terminalRun.run_id, type: "timer.elapsed" })
+        .filter((event) => event.payload.action === "run_shutdown_completed")
+    ).toHaveLength(1);
+    restartedStore.close();
+  });
+
+  it("reconciles authoritative OpenCode launch metadata before an expired start can block", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("opencode-server");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Recovered OpenCode launch", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "recovered-opencode-launch-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "opencode-server",
+            agent_lifecycle: "fresh_per_step" as const
+          }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const original = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const assigned = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    const runtimeDir = agentRuntimePath(run.run_id, assigned.agent_id!);
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "opencode-launch.json"),
+      JSON.stringify({
+        id: "recovered-opencode-session",
+        server: "http://localhost:53910",
+        title: "Recovered OpenCode review"
+      }),
+      "utf8"
+    );
+    store.db
+      .prepare("update agent_start_attempts set lease_expires_at = ? where agent_id = ?")
+      .run("2000-01-01T00:00:00.000Z", assigned.agent_id);
+
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedController = new AgentController(restartedStore, registry);
+    const recovered = await restartedController.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(recovered).toMatchObject({
+      action: "waiting_for_report",
+      active_step: { step_instance_id: assigned.step_instance_id, status: "active" },
+      agent: {
+        agent_id: assigned.agent_id,
+        status: "running",
+        backend_handle: { id: "recovered-opencode-session" }
+      }
+    });
+    expect(restartedStore.listAgentStartAttempts(assigned.agent_id!)[0]).toMatchObject({
+      phase: "succeeded",
+      handle_json: { id: "recovered-opencode-session" }
+    });
+    expect(restartedController.getFlowSnapshot(started.instance.flow_instance_id).instance.status).toBe(
+      "active"
+    );
+    expect(deferredAdapter.starts).toHaveLength(1);
+    restartedStore.close();
+
+    startGate.resolve();
+    const originalResult = await original;
+    expect(originalResult).toMatchObject({
+      action: "dispatched",
+      active_step: { step_instance_id: assigned.step_instance_id, status: "active" },
+      agent: {
+        agent_id: assigned.agent_id,
+        status: "running",
+        backend_handle: { id: "recovered-opencode-session" }
+      },
+      dispatch: { start_state: "started" }
+    });
+    expect(deferredAdapter.starts).toHaveLength(1);
+  });
+
+  it("surfaces a recovered start as superseded when its route advances before the owner returns", async () => {
+    const deferredAdapter = new DeferredFakeAdapter("opencode-server");
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Recovered start loses route", repoDir: "/repo" });
+    const started = controller.startFlow({
+      runId: run.run_id,
+      config: {
+        id: "recovered-opencode-superseded-flow",
+        initial_step: "review",
+        roles: {
+          reviewer: {
+            backend: "opencode-server",
+            agent_lifecycle: "fresh_per_step" as const
+          },
+          planner: { backend: "fake" }
+        },
+        steps: {
+          review: { role: "reviewer", on: { reported: { to: "planning" } } },
+          planning: { role: "planner", on: { reported: { finish: true } } }
+        }
+      }
+    });
+
+    const original = controller.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    const oldStep = controller
+      .getFlowSnapshot(started.instance.flow_instance_id)
+      .steps.find((step) => step.status === "active")!;
+    const runtimeDir = agentRuntimePath(run.run_id, oldStep.agent_id!);
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "opencode-launch.json"),
+      JSON.stringify({
+        id: oldStep.agent_id,
+        server: "http://localhost:53910",
+        title: "Recovered OpenCode review"
+      }),
+      "utf8"
+    );
+
+    const recoveringStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const recoveringController = new AgentController(recoveringStore, registry);
+    const recovered = await recoveringController.continueFlow({
+      flowInstanceId: started.instance.flow_instance_id
+    });
+    expect(recovered).toMatchObject({
+      action: "waiting_for_report",
+      active_step: { step_instance_id: oldStep.step_instance_id, status: "active" },
+      agent: { agent_id: oldStep.agent_id, status: "running" }
+    });
+    expect(recoveringStore.listAgentStartAttempts(oldStep.agent_id!)[0]).toMatchObject({
+      phase: "succeeded",
+      handle_json: { id: oldStep.agent_id }
+    });
+
+    const rerouted = await controller.startFlowStep({
+      flowInstanceId: started.instance.flow_instance_id,
+      stepId: "planning",
+      fromStepInstanceId: oldStep.step_instance_id,
+      transitionId: "manual-after-metadata-recovery"
+    });
+    expect(rerouted).toMatchObject({
+      active_step: { step_id: "planning", status: "active" },
+      cleanup: [
+        {
+          agent_id: oldStep.agent_id,
+          status: "stopped",
+          orchestrator_action: null
+        }
+      ]
+    });
+    expect(deferredAdapter.stopped).toEqual([
+      expect.objectContaining({ id: oldStep.agent_id })
+    ]);
+    // Cleanup no longer depends on the original adapter invocation returning.
+    // Its eventual response can still represent a revived session, so it must
+    // be compensated a second time without changing the new route.
+    startGate.resolve();
+    const superseded = await original;
+    expect(superseded).toMatchObject({
+      action: "start_superseded",
+      active_step: { step_id: "planning", status: "active" },
+      dispatch: { start_state: "superseded" }
+    });
+    expect(store.listAgentStartAttempts(oldStep.agent_id!)[0]).toMatchObject({
+      phase: "superseded",
+      error_json: { reason: "later_flow_step_exists" }
+    });
+    expect(controller.getAgent(oldStep.agent_id!)).toMatchObject({ status: "stopped" });
+    expect(deferredAdapter.stopped).toHaveLength(2);
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance).toMatchObject({ status: "active", current_step_id: "planning" });
+    expect(snapshot.steps.filter((step) => step.status === "active")).toEqual([
+      expect.objectContaining({ step_id: "planning" })
+    ]);
+    recoveringStore.close();
+  });
+
   it("auto-continues reported flow steps without routing through an orchestrator", async () => {
     const run = controller.createRun({ title: "auto flow run", repoDir: "/repo" });
     const started = controller.startFlow({
@@ -1171,7 +3583,7 @@ describe("AgentController", () => {
     expect(controller.listEvents({ runId: run.run_id }).map((event) => event.type)).toContain("flow.step_blocked");
   });
 
-  it("lets an orchestrator manually start the next step after a notify action", () => {
+  it("delivers manual orchestrator context to the next step after a notify action", async () => {
     const run = controller.createRun({ title: "manual flow run" });
     const analysisPath = join(tmp, "manual-analysis.md");
     const planPath = join(tmp, "manual-plan.md");
@@ -1184,6 +3596,9 @@ describe("AgentController", () => {
           analysis: { path: analysisPath },
           plan: { path: planPath }
         },
+        roles: {
+          planner: { backend: "fake" }
+        },
         steps: {
           analysis: {
             outputs: {
@@ -1194,6 +3609,7 @@ describe("AgentController", () => {
             }
           },
           planning: {
+            role: "planner",
             inputs: {
               analysis: { artifact: "analysis", required: true }
             },
@@ -1219,7 +3635,7 @@ describe("AgentController", () => {
     expect(waiting.instance.status).toBe("waiting_for_orchestrator");
     expect(waiting.notification).toBe("orchestrator");
 
-    const planning = controller.startFlowStep({
+    const planning = await controller.startFlowStep({
       flowInstanceId: waiting.instance.flow_instance_id,
       stepId: "planning",
       fromStepInstanceId: waiting.reported_step.step_instance_id,
@@ -1229,8 +3645,26 @@ describe("AgentController", () => {
 
     expect(planning.selected_transition?.transition_id).toBe("manual-analysis-to-planning");
     expect(planning.active_step?.step_id).toBe("planning");
-    expect(planning.active_step?.input_json).toMatchObject({ analysis: analysisPath });
+    expect(planning.active_step?.input_json).toMatchObject({
+      analysis: analysisPath,
+      coordinator_context: "orchestrator approved planning",
+      runtime_contract: {
+        objective_source: "coordinator_context_over_run_title",
+        coordinator_context: "orchestrator approved planning"
+      }
+    });
+    const runtimeContract = planning.active_step?.input_json.runtime_contract as Record<string, unknown>;
+    expect(String(runtimeContract.objective)).toContain(
+      "Latest coordinator context (authoritative wherever it adds, clarifies, or conflicts):\norchestrator approved planning"
+    );
     expect(planning.instance.status).toBe("active");
+
+    const dispatched = await controller.continueFlow({ flowInstanceId: planning.instance.flow_instance_id });
+    expect(dispatched.action).toBe("dispatched");
+    expect(adapter.starts.at(-1)?.prompt).toContain("- Objective source: `coordinator_context_over_run_title`");
+    expect(adapter.starts.at(-1)?.prompt).toContain(
+      "Latest coordinator context (authoritative wherever it adds, clarifies, or conflicts):\norchestrator approved planning"
+    );
   });
 
   it("records visual links, usage snapshots, and dashboard aggregates", () => {
@@ -1386,7 +3820,543 @@ describe("AgentController", () => {
     expect(adapter.sent[0]?.message).toContain("Status: completed");
     expect(adapter.sent[0]?.message).toContain("React to worker completion.");
     expect(adapter.sent[0]?.message.trim().startsWith("{")).toBe(false);
-    expect(controller.getAgent(orchestrator.agent_id).status).toBe("running");
+    expect(controller.getAgent(orchestrator.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1
+    });
+  });
+
+  it("discards a refresh captured during the same successful subscription attempt", async () => {
+    const subscriberAdapter = new DeferredFakeAdapter("same-attempt-subscription-success");
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Same-attempt subscription success" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "subscription source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "successful subscriber",
+      backendHandle: { id: "same-attempt-subscription-success" },
+      status: "completed"
+    });
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "same_attempt_success" }
+    });
+    const deliveryController = controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    };
+    const sendGate = createDeferred<void>();
+    subscriberAdapter.sendGate = sendGate;
+
+    const delivery = deliveryController.deliverSubscriptions(sourceEvent);
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 1
+    });
+
+    subscriberAdapter.statuses.set("same-attempt-subscription-success", "completed");
+    const statusGate = createDeferred<void>();
+    subscriberAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(subscriber.agent_id);
+    expect(subscriberAdapter.statusReads).toBe(1);
+
+    sendGate.resolve();
+    await delivery;
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: sourceEvent.event_id
+    });
+
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(
+      controller.listEvents({ agentId: subscriber.agent_id, type: "agent.completed" })
+    ).toEqual([]);
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        subscriber.agent_id
+      )
+    ).toBe(true);
+
+    subscriberAdapter.statusGate = null;
+    await controller.stopAgent(subscriber.agent_id);
+  });
+
+  it("defers a terminal refresh while subscription delivery still owns adapter I/O", async () => {
+    const subscriberAdapter = new DeferredFakeAdapter("invoking-subscription-refresh");
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Invoking subscription refresh" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "invoking subscription source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "invoking subscription target",
+      backendHandle: { id: "invoking-subscription-target" },
+      status: "running"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "invoking_subscription_refresh" }
+    });
+    const sendGate = createDeferred<void>();
+    subscriberAdapter.sendGate = sendGate;
+
+    const delivery = (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    subscriberAdapter.statuses.set("invoking-subscription-target", "completed");
+
+    await expect(controller.refreshAgentStatus(subscriber.agent_id)).resolves.toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 1
+    });
+    expect(
+      controller.listEvents({ agentId: subscriber.agent_id, type: "agent.completed" })
+    ).toEqual([]);
+
+    await controller.stopAgent(subscriber.agent_id);
+    sendGate.resolve();
+    await delivery;
+
+    expect(subscriberAdapter.stopped).toHaveLength(2);
+    expect(subscriberAdapter.statuses.get("invoking-subscription-target")).toBe("stopped");
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "stopped",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "delivered",
+      claim_attempt: 1
+    });
+  });
+
+  it("recovers an expired delivery owner after restart without duplicate delivery", async () => {
+    const run = controller.createRun({ title: "Restarted abandoned delivery" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "abandoned delivery source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "abandoned delivery subscriber",
+      backendHandle: { id: "abandoned-delivery-subscriber" },
+      status: "running"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "abandoned_delivery_restart" }
+    });
+    const claimOwnerId = "delivery-controller-that-crashed";
+    const claim = store.claimSubscriptionDelivery({
+      eventId: sourceEvent.event_id,
+      subscriberAgentId: subscriber.agent_id,
+      claimOwnerId
+    });
+    const acceptanceKey =
+      `subscription-delivery:${sourceEvent.event_id}:${subscriber.agent_id}:attempt:${claim.delivery.claim_attempt}`;
+    const began = store.beginSubscriptionDeliveryAttempt({
+      eventId: sourceEvent.event_id,
+      subscriberAgentId: subscriber.agent_id,
+      claimOwnerId,
+      claimAttempt: claim.delivery.claim_attempt,
+      acceptanceKey,
+      acceptanceLeaseExpiresAt: "2000-01-01T00:00:00.000Z"
+    });
+    expect(began).toMatchObject({
+      type: "began",
+      agent: { work_generation: 1, work_revision: 1 }
+    });
+
+    await adapter.sendMessage(
+      {
+        backend: "fake",
+        id: "abandoned-delivery-subscriber",
+        data: { id: "abandoned-delivery-subscriber" }
+      },
+      { message: "Possibly delivered before the process crashed." }
+    );
+    adapter.statuses.set("abandoned-delivery-subscriber", "running");
+    expect(adapter.sent).toHaveLength(1);
+
+    store.close();
+    store = new SqliteStore(join(tmp, "state.sqlite"));
+    registry = new AdapterRegistry();
+    registry.register(adapter);
+    controller = new AgentController(store, registry);
+
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "ambiguous",
+      claim_attempt: 1,
+      claim_owner_id: null,
+      last_error: {
+        reason: "delivery_outcome_ambiguous_after_owner_lease_expired",
+        acceptance_key: acceptanceKey
+      }
+    });
+    expect(
+      controller.listEvents({
+        agentId: subscriber.agent_id,
+        type: "agent.delivery_failed"
+      })
+    ).toEqual([
+      expect.objectContaining({
+        run_id: run.run_id,
+        agent_id: subscriber.agent_id,
+        type: "agent.delivery_failed",
+        payload: {
+          source_event_id: sourceEvent.event_id,
+          subscriber_agent_id: subscriber.agent_id,
+          delivery_claim_attempt: 1,
+          status: "ambiguous",
+          reason: "delivery_outcome_ambiguous_after_owner_lease_expired"
+        }
+      })
+    ]);
+
+    await (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+    expect(adapter.sent).toHaveLength(1);
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)?.status).toBe(
+      "ambiguous"
+    );
+
+    await controller.refreshAgentStatus(subscriber.agent_id);
+    await controller.stopAgent(subscriber.agent_id);
+    expect(adapter.sent).toHaveLength(1);
+    expect(adapter.stopped).toHaveLength(1);
+  });
+
+  it("discards a refresh captured during the same ambiguous subscription attempt", async () => {
+    const subscriberAdapter = new DeferredFakeAdapter("same-attempt-subscription-ambiguous");
+    registry.register(subscriberAdapter);
+    const sendGate = createDeferred<void>();
+    const lostResponse = new Error("Subscription work was accepted but the response was lost.");
+    subscriberAdapter.sendGate = sendGate;
+    subscriberAdapter.sendErrorAfterAccept = lostResponse;
+    const run = controller.createRun({ title: "Same-attempt subscription ambiguity" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "ambiguous subscription source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "ambiguous subscriber",
+      backendHandle: { id: "same-attempt-subscription-ambiguous" },
+      status: "completed"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "same_attempt_ambiguity" }
+    });
+    const deliveryController = controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    };
+
+    const delivery = deliveryController.deliverSubscriptions(sourceEvent);
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    subscriberAdapter.statuses.set("same-attempt-subscription-ambiguous", "completed");
+    const statusGate = createDeferred<void>();
+    subscriberAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(subscriber.agent_id);
+    expect(subscriberAdapter.statusReads).toBe(1);
+
+    sendGate.resolve();
+    await delivery;
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "pending",
+      claim_attempt: 1
+    });
+
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        subscriber.agent_id
+      )
+    ).toBe(true);
+    expect(
+      controller.listEvents({ agentId: subscriber.agent_id, type: "agent.completed" })
+    ).toEqual([]);
+
+    subscriberAdapter.statusGate = null;
+    subscriberAdapter.sendErrorAfterAccept = null;
+    await controller.stopAgent(subscriber.agent_id);
+  });
+
+  it("fences a stale stopped refresh while a stop-won subscription delivery is compensated", async () => {
+    const subscriberAdapter = new DeferredFakeAdapter("subscriber-fake");
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Accepted subscription stale-refresh fence" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "completion source",
+      backendHandle: { id: "subscription-source" },
+      status: "running"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "stop-won subscriber",
+      backendHandle: { id: "stop-won-subscriber" },
+      status: "running"
+    });
+    controller.createSubscription({
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+
+    subscriberAdapter.statuses.set("stop-won-subscriber", "stopped");
+    const statusGate = createDeferred<void>();
+    subscriberAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(subscriber.agent_id);
+    expect(subscriberAdapter.statusReads).toBe(1);
+
+    const sendGate = createDeferred<void>();
+    const stopGate = createDeferred<void>();
+    subscriberAdapter.sendGate = sendGate;
+    subscriberAdapter.stopGate = stopGate;
+    adapter.statuses.set("subscription-source", "completed");
+    await controller.refreshAgentStatus(source.agent_id);
+    for (let turn = 0; turn < 20 && subscriberAdapter.sent.length === 0; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1
+    });
+
+    store.immediateTransaction(() => {
+      store.updateRunStatus(run.run_id, "stopping");
+      store.updateAgent(subscriber.agent_id, { status: "stopping" });
+    });
+    sendGate.resolve();
+    for (let turn = 0; turn < 20 && subscriberAdapter.stopped.length === 0; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(subscriberAdapter.stopped).toHaveLength(1);
+    expect(subscriberAdapter.statuses.get("stop-won-subscriber")).toBe("running");
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "stopping",
+      work_generation: 1
+    });
+
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "stopping",
+      work_generation: 1
+    });
+    expect(
+      controller.listEvents({ agentId: subscriber.agent_id, type: "agent.stopped" })
+    ).toEqual([]);
+
+    stopGate.resolve();
+    await controller.drainDeliveries();
+    expect(subscriberAdapter.statuses.get("stop-won-subscriber")).toBe("stopped");
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "stopped",
+      work_generation: 1
+    });
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("advances a new refresh fence for every physical subscription retry", async () => {
+    const subscriberAdapter = new DeferredFakeAdapter("retrying-subscriber-fake");
+    const retryGate = createDeferred<void>();
+    const lostResponse = new Error("The first subscription attempt was accepted but its response was lost.");
+    subscriberAdapter.sendGates = [null, retryGate];
+    subscriberAdapter.sendErrorsAfterAccept = [lostResponse, null];
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Physical subscription retry fences" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "retry event source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "retrying subscriber",
+      backendHandle: { id: "retrying-subscriber" },
+      status: "running"
+    });
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "physical_retry_test" }
+    });
+    const deliveryController = controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    };
+
+    await deliveryController.deliverSubscriptions(sourceEvent);
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "unknown",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: null
+    });
+
+    subscriberAdapter.statuses.set("retrying-subscriber", "completed");
+    const statusGate = createDeferred<void>();
+    subscriberAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(subscriber.agent_id);
+    expect(subscriberAdapter.statusReads).toBe(1);
+
+    const retry = deliveryController.deliverSubscriptions(sourceEvent);
+    for (let turn = 0; turn < 20 && subscriberAdapter.sent.length < 2; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(subscriberAdapter.sent).toHaveLength(2);
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 2
+    });
+    const attempts = store.db
+      .prepare(
+        `select acceptance_key, work_generation
+         from agent_work_acceptances
+         where agent_id = ? and acceptance_key like 'subscription-delivery:%'
+         order by work_generation asc`
+      )
+      .all(subscriber.agent_id) as Array<{
+        acceptance_key: string;
+        work_generation: number;
+      }>;
+    expect(attempts).toEqual([
+      {
+        acceptance_key: expect.stringContaining(":attempt:1"),
+        work_generation: 1
+      },
+      {
+        acceptance_key: expect.stringContaining(":attempt:2"),
+        work_generation: 2
+      }
+    ]);
+    expect(attempts[0]?.acceptance_key).not.toBe(attempts[1]?.acceptance_key);
+
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "running",
+      work_generation: 2
+    });
+    expect(
+      controller.listEvents({ agentId: subscriber.agent_id, type: "agent.completed" })
+    ).toEqual([]);
+
+    retryGate.resolve();
+    await retry;
+    expect(subscriberAdapter.statuses.get("retrying-subscriber")).toBe("running");
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 2,
+      work_revision: 4
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: sourceEvent.event_id
+    });
+    expect(store.getEvent(sourceEvent.event_id)).toEqual(sourceEvent);
+    expect(
+      controller
+        .listEvents({ runId: run.run_id, type: "agent.delivery_failed" })
+        .filter((event) => event.payload.source_event_id === sourceEvent.event_id)
+    ).toHaveLength(1);
+
+    subscriberAdapter.statusGate = null;
+    await controller.stopAgent(subscriber.agent_id);
   });
 
   it("delivers one message when duplicate subscriptions match the same subscriber event", async () => {
@@ -1423,6 +4393,352 @@ describe("AgentController", () => {
 
     expect(adapter.sent).toHaveLength(1);
     expect(adapter.sent[0]?.message).toContain("agent.completed");
+  });
+
+  it("records manual subscription delivery as unsupported without projecting work", async () => {
+    registry.register(new ManualAdapter());
+    const run = controller.createRun({ title: "Unsupported manual subscription" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "manual delivery source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "manual",
+      title: "manual subscriber",
+      backendHandle: { id: "manual-subscriber", status: "waiting_for_input" },
+      status: "waiting_for_input"
+    });
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "manual_unsupported" }
+    });
+
+    await (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "waiting_for_input",
+      failure_reason: null,
+      work_generation: 0,
+      work_revision: 0
+    });
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "failed",
+      claim_attempt: 1,
+      last_error: { reason: "subscriber_cannot_receive_messages" }
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: null
+    });
+    expect(
+      controller
+        .listEvents({ agentId: subscriber.agent_id, type: "agent.delivery_failed" })
+        .map((event) => event.payload.reason)
+    ).toEqual(["subscriber_cannot_receive_messages"]);
+    expect(
+      store.db
+        .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+        .get(subscriber.agent_id)
+    ).toMatchObject({ count: 0 });
+  });
+
+  it("fails Codex subagent subscriptions visibly instead of invoking the native adapter directly", async () => {
+    registry.register(new CodexSubagentAdapter());
+    const run = controller.createRun({ title: "Unsupported native subscription" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "native delivery source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "codex-subagent",
+      title: "native subscriber without direct delivery",
+      status: "waiting_for_input"
+    });
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "native_unsupported" }
+    });
+
+    await (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "waiting_for_input",
+      failure_reason: null,
+      work_generation: 0,
+      work_revision: 0
+    });
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "failed",
+      claim_attempt: 1,
+      last_error: { reason: "subscriber_requires_orchestrator_action" }
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: null
+    });
+    expect(
+      controller
+        .listEvents({ agentId: subscriber.agent_id, type: "agent.delivery_failed" })
+        .map((event) => event.payload.reason)
+    ).toEqual(["subscriber_requires_orchestrator_action"]);
+    expect(store.listOrchestratorActions()).toEqual([]);
+    expect(
+      store.db
+        .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+        .get(subscriber.agent_id)
+    ).toMatchObject({ count: 0 });
+  });
+
+  it("does not cross delivery I/O when stop wins between claim and begin", async () => {
+    const subscriberAdapter = new NoopWatchingDeferredFakeAdapter(
+      "delivery-stop-before-begin"
+    );
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Stopped claimed delivery" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "stopped delivery source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "stopped delivery subscriber",
+      backendHandle: { id: "delivery-stop-before-begin" },
+      status: "running"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "stop_between_claim_and_begin" }
+    });
+    const secondStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const originalBegin = store.beginSubscriptionDeliveryAttempt.bind(store);
+
+    vi.spyOn(store, "beginSubscriptionDeliveryAttempt").mockImplementation((input) => {
+      // `claimSubscriptionDelivery` has already committed. A separate process
+      // now wins stop before this controller can record the invocation phase.
+      secondStore.immediateTransaction(() => {
+        secondStore.updateAgent(subscriber.agent_id, { status: "stopping" });
+      });
+      return originalBegin(input);
+    });
+
+    try {
+      await (controller as unknown as {
+        deliverSubscriptions(event: EventRecord): Promise<void>;
+      }).deliverSubscriptions(sourceEvent);
+
+      expect(subscriberAdapter.sent).toEqual([]);
+      expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+        status: "stopping",
+        work_generation: 0,
+        work_revision: 0
+      });
+      expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+        status: "failed",
+        claim_attempt: 1,
+        last_error: { reason: "durable_stop_intent" }
+      });
+      expect(
+        store.db
+          .prepare("select count(*) as count from agent_work_acceptances where agent_id = ?")
+          .get(subscriber.agent_id)
+      ).toMatchObject({ count: 0 });
+    } finally {
+      secondStore.close();
+    }
+  });
+
+  it("coalesces duplicate subscriptions across concurrent controllers", async () => {
+    const subscriberAdapter = new NoopWatchingDeferredFakeAdapter(
+      "cross-controller-subscriber"
+    );
+    registry.register(subscriberAdapter);
+    const run = controller.createRun({ title: "Cross-controller logical delivery" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "cross-controller source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: subscriberAdapter.kind,
+      title: "cross-controller subscriber",
+      backendHandle: { id: "cross-controller-subscriber" },
+      status: "completed"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    controller.createSubscription({
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "cross_controller_delivery" }
+    });
+
+    const secondStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const secondRegistry = new AdapterRegistry();
+    secondRegistry.register(subscriberAdapter);
+    const secondController = new AgentController(secondStore, secondRegistry);
+    const sendGate = createDeferred<void>();
+    subscriberAdapter.sendGate = sendGate;
+    const firstDelivery = (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+    const secondDelivery = (secondController as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "invoking",
+      claim_attempt: 1
+    });
+    sendGate.resolve();
+    await Promise.all([firstDelivery, secondDelivery]);
+
+    expect(subscriberAdapter.sent).toHaveLength(1);
+    expect(
+      controller
+        .listSubscriptions()
+        .filter((candidate) => candidate.subscriber_agent_id === subscriber.agent_id)
+        .map((candidate) => candidate.last_delivered_event_id)
+    ).toEqual([sourceEvent.event_id, sourceEvent.event_id]);
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "delivered",
+      claim_attempt: 1
+    });
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1,
+      work_revision: 2
+    });
+    expect(
+      store.db
+        .prepare("select count(*) as count from events where event_id = ?")
+        .get(sourceEvent.event_id)
+    ).toMatchObject({ count: 1 });
+
+    await controller.stopAgent(subscriber.agent_id);
+    secondStore.close();
+  });
+
+  it("reclaims only a stale pre-invocation logical delivery after restart", async () => {
+    const run = controller.createRun({ title: "Stale prepared delivery recovery" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "stale delivery source",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "recovered subscriber",
+      backendHandle: { id: "recovered-subscriber" },
+      status: "completed"
+    });
+    controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "stale_pre_invocation_claim" }
+    });
+    const abandoned = store.claimSubscriptionDelivery({
+      eventId: sourceEvent.event_id,
+      subscriberAgentId: subscriber.agent_id,
+      claimOwnerId: "controller_that_exited_before_invocation"
+    });
+    expect(abandoned).toMatchObject({
+      claimed: true,
+      delivery: { status: "claimed", claim_attempt: 1 }
+    });
+    store.db
+      .prepare(
+        `update subscription_deliveries
+         set claimed_at = ?, updated_at = ?
+         where event_id = ? and subscriber_agent_id = ?`
+      )
+      .run(
+        "2000-01-01T00:00:00.000Z",
+        "2000-01-01T00:00:00.000Z",
+        sourceEvent.event_id,
+        subscriber.agent_id
+      );
+
+    await (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+
+    expect(adapter.sent).toHaveLength(1);
+    expect(store.getSubscriptionDelivery(sourceEvent.event_id, subscriber.agent_id)).toMatchObject({
+      status: "delivered",
+      claim_attempt: 2
+    });
+    expect(
+      store.db
+        .prepare(
+          `select acceptance_key, work_generation
+           from agent_work_acceptances
+           where agent_id = ? and acceptance_key like 'subscription-delivery:%'`
+        )
+        .get(subscriber.agent_id)
+    ).toMatchObject({
+      acceptance_key: expect.stringContaining(":attempt:2"),
+      work_generation: 1
+    });
+
+    await controller.stopAgent(subscriber.agent_id);
   });
 
   it("requires Codex thread subscribers to use native delivery for visible wakeups", async () => {
@@ -1587,6 +4903,498 @@ describe("AgentController", () => {
     expect(unregistered.unregistered_at).not.toBeNull();
     expect(controller.listAgents({ runId: run.run_id })).toHaveLength(0);
     expect(controller.listAgents({ runId: run.run_id, includeUnregistered: true })).toHaveLength(1);
+  });
+
+  it("keeps an ordinary first stop failure terminal when no durable cleanup intent exists", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    deferredAdapter.stopErrorAtCall = 1;
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Ordinary stop failure" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "ordinary stop worker",
+      backendHandle: { id: "ordinary-stop-worker" },
+      status: "running"
+    });
+
+    const failed = await controller.stopAgent(worker.agent_id);
+
+    expect(failed).toMatchObject({ status: "failed", failure_reason: "unknown" });
+    expect(deferredAdapter.stopped).toHaveLength(1);
+    expect(
+      controller.listEvents({ agentId: worker.agent_id, type: "agent.failed" })
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          error: "Deferred adapter compensating stop failed.",
+          reason: "unknown"
+        })
+      })
+    ]);
+  });
+
+  it("awaits non-native bulk shutdown while preserving terminal stop results", async () => {
+    const run = controller.createRun({ title: "bulk stop run" });
+    const first = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "first worker",
+      backendHandle: { id: "bulk-first" },
+      status: "running"
+    });
+    const second = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "second worker",
+      backendHandle: { id: "bulk-second" },
+      status: "running"
+    });
+
+    const shutdown = await controller.shutdownRun(run.run_id);
+
+    expect(shutdown).toMatchObject({
+      run: { status: "stopped" },
+      complete: true,
+      pending_agent_ids: [],
+      orchestrator_actions: []
+    });
+    expect(shutdown.stopped.map((agent) => agent.agent_id)).toEqual([
+      first.agent_id,
+      second.agent_id
+    ]);
+    expect(shutdown.stopped.every((agent) => agent.status === "stopped")).toBe(true);
+  });
+
+  it("finalizes a failed shutdown when startup redrive later stops the last worker", async () => {
+    const initialAdapter = new DeferredFakeAdapter();
+    initialAdapter.stopErrorAtCall = 1;
+    adapter = initialAdapter;
+    registry.register(initialAdapter);
+    const run = controller.createRun({ title: "Restart-finalized shutdown" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: initialAdapter.kind,
+      title: "shutdown retry worker",
+      backendHandle: { id: "shutdown-retry-worker" },
+      status: "running"
+    });
+
+    const firstShutdown = await controller.shutdownRun(run.run_id);
+    expect(firstShutdown).toMatchObject({
+      run: { status: "stopping" },
+      complete: false,
+      pending_agent_ids: [worker.agent_id],
+      stopped: [
+        {
+          agent_id: worker.agent_id,
+          status: "stopping",
+          failure_reason: "unknown"
+        }
+      ]
+    });
+
+    const restartedStore = new SqliteStore(join(tmp, "state.sqlite"));
+    const restartedRegistry = new AdapterRegistry();
+    const restartedAdapter = new FakeAdapter();
+    restartedRegistry.register(restartedAdapter);
+    const restartedController = new AgentController(restartedStore, restartedRegistry);
+    await restartedController.drainDeliveries();
+
+    expect(restartedAdapter.stopped).toEqual([
+      expect.objectContaining({ id: "shutdown-retry-worker" })
+    ]);
+    expect(restartedController.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopped",
+      failure_reason: null
+    });
+    expect(restartedController.getRun(run.run_id)).toMatchObject({ status: "stopped" });
+    expect(
+      restartedController
+        .listEvents({ runId: run.run_id, type: "timer.elapsed" })
+        .filter((event) => event.payload.action === "run_shutdown_completed")
+    ).toHaveLength(1);
+    restartedStore.close();
+  });
+
+  it("rolls back a terminal agent projection when run finalization cannot commit", async () => {
+    const run = controller.createRun({ title: "Atomic terminal stop projection" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "atomic stop worker",
+      backendHandle: { id: "atomic-stop-worker" },
+      status: "running"
+    });
+    store.updateRunStatus(run.run_id, "stopping");
+    store.db.exec(`
+      create trigger reject_test_run_finalization
+      before update of status on runs
+      when new.status = 'stopped'
+      begin
+        select raise(abort, 'test run finalization failure');
+      end;
+    `);
+
+    await expect(controller.stopAgent(worker.agent_id)).rejects.toThrow(
+      /test run finalization failure/
+    );
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({ status: "stopping" });
+    expect(controller.getRun(run.run_id)).toMatchObject({ status: "stopping" });
+    expect(
+      controller.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })
+    ).toEqual([]);
+
+    store.db.exec("drop trigger reject_test_run_finalization");
+    const retried = await controller.stopAgent(worker.agent_id);
+    expect(retried).toMatchObject({ status: "stopped", failure_reason: null });
+    expect(controller.getRun(run.run_id)).toMatchObject({ status: "stopped" });
+  });
+
+  it("keeps an accepted terminal-agent send inspectable when its response is lost", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    const lostResponse = new Error("The backend accepted the terminal follow-up but lost its response.");
+    deferredAdapter.sendGate = sendGate;
+    deferredAdapter.sendErrorAfterAccept = lostResponse;
+    const run = controller.createRun({ title: "Terminal direct-send ambiguity" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "completed follow-up worker",
+      backendHandle: { id: "completed-follow-up-worker" },
+      status: "completed"
+    });
+    deferredAdapter.statuses.set("completed-follow-up-worker", "completed");
+
+    const send = controller.sendMessage(worker.agent_id, "Start another physical turn.");
+    expect(deferredAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "running",
+      failure_reason: null,
+      work_generation: 1
+    });
+
+    sendGate.resolve();
+    await expect(send).rejects.toBe(lostResponse);
+    expect(deferredAdapter.statuses.get("completed-follow-up-worker")).toBe("running");
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1
+    });
+    expect(
+      controller
+        .listEvents({ agentId: worker.agent_id, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "backend_send_outcome_ambiguous")
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          work_generation: 1,
+          adapter_error: lostResponse.message
+        })
+      })
+    ]);
+    expect(
+      (controller as unknown as { statusWatchers: Map<string, unknown> }).statusWatchers.has(
+        worker.agent_id
+      )
+    ).toBe(true);
+
+    await expect(controller.refreshAgentStatus(worker.agent_id)).resolves.toMatchObject({
+      status: "running",
+      failure_reason: null,
+      work_generation: 1
+    });
+    deferredAdapter.sendErrorAfterAccept = null;
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("fences a stale stopped refresh while a stop-won send is compensated", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const run = controller.createRun({ title: "Accepted send stale-refresh fence" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "accepted send worker",
+      backendHandle: { id: "accepted-send-worker" },
+      status: "running"
+    });
+
+    deferredAdapter.statuses.set("accepted-send-worker", "stopped");
+    const statusGate = createDeferred<void>();
+    deferredAdapter.statusGate = statusGate;
+    const staleRefresh = controller.refreshAgentStatus(worker.agent_id);
+    expect(deferredAdapter.statusReads).toBe(1);
+
+    const sendGate = createDeferred<void>();
+    const stopGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    deferredAdapter.stopGate = stopGate;
+    const send = controller.sendMessage(worker.agent_id, "Revive after durable stop wins.");
+    expect(deferredAdapter.sent).toHaveLength(1);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 1
+    });
+
+    // Model a durable shutdown winner without completing backend cleanup. The
+    // accepted send may now revive the physical session, but its fence already
+    // makes the older terminal observation stale while status stays stopping.
+    store.immediateTransaction(() => {
+      store.updateRunStatus(run.run_id, "stopping");
+      store.updateAgent(worker.agent_id, { status: "stopping" });
+    });
+    sendGate.resolve();
+    for (let turn = 0; turn < 20 && deferredAdapter.stopped.length === 0; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(deferredAdapter.stopped).toHaveLength(1);
+    expect(deferredAdapter.statuses.get("accepted-send-worker")).toBe("running");
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopping",
+      work_generation: 1
+    });
+
+    statusGate.resolve();
+    await expect(staleRefresh).resolves.toMatchObject({
+      status: "stopping",
+      work_generation: 1
+    });
+    expect(controller.listEvents({ agentId: worker.agent_id, type: "agent.stopped" })).toEqual([]);
+
+    stopGate.resolve();
+    await expect(send).resolves.toMatchObject({
+      delivered: true,
+      agent: { status: "stopped", work_generation: 1 }
+    });
+    expect(deferredAdapter.statuses.get("accepted-send-worker")).toBe("stopped");
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("preserves stop intent when a non-native send resolves after shutdown", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    const run = controller.createRun({ title: "late send completion run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "late send worker",
+      backendHandle: { id: "late-send-worker" },
+      status: "running"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Complete after shutdown.");
+    expect(deferredAdapter.sent).toHaveLength(1);
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopped" }, complete: true });
+    expect(deferredAdapter.stopped).toHaveLength(1);
+    expect(deferredAdapter.statuses.get("late-send-worker")).toBe("stopped");
+
+    sendGate.resolve();
+    const result = await send;
+    expect(result).toMatchObject({ delivered: true, agent: { status: "stopped" } });
+    expect(deferredAdapter.stopped).toHaveLength(2);
+    expect(deferredAdapter.statuses.get("late-send-worker")).toBe("stopped");
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopped",
+      work_generation: 1
+    });
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("compensates an accepted non-native send whose response rejects after shutdown", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    const lostResponse = new Error("The backend accepted the message but lost its response.");
+    deferredAdapter.sendGate = sendGate;
+    deferredAdapter.sendErrorAfterAccept = lostResponse;
+    const run = controller.createRun({ title: "uncertain rejected send run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "uncertain rejected send worker",
+      backendHandle: { id: "uncertain-rejected-send-worker" },
+      status: "running"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Reactivate, then lose the response.");
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopped" }, complete: true });
+    expect(deferredAdapter.stopped).toHaveLength(1);
+
+    sendGate.resolve();
+    await expect(send).rejects.toBe(lostResponse);
+    expect(deferredAdapter.stopped).toHaveLength(2);
+    expect(deferredAdapter.statuses.get("uncertain-rejected-send-worker")).toBe(
+      "stopped"
+    );
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopped",
+      work_generation: 1
+    });
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("preserves an ambiguous non-native rejection while exposing possible work", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const rejection = new Error("Normal backend send failure.");
+    deferredAdapter.sendErrorAfterAccept = rejection;
+    const run = controller.createRun({ title: "normal rejected send run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "normal rejected send worker",
+      backendHandle: { id: "normal-rejected-send-worker" },
+      status: "running"
+    });
+
+    await expect(
+      controller.sendMessage(worker.agent_id, "Reject without a concurrent stop.")
+    ).rejects.toBe(rejection);
+    expect(deferredAdapter.stopped).toEqual([]);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "unknown",
+      failure_reason: "unknown",
+      work_generation: 1
+    });
+    expect(controller.getRun(run.run_id).status).toBe("active");
+    deferredAdapter.sendErrorAfterAccept = null;
+    await controller.stopAgent(worker.agent_id);
+  });
+
+  it("keeps late non-native send cleanup unresolved when compensating stop fails", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const sendGate = createDeferred<void>();
+    deferredAdapter.sendGate = sendGate;
+    deferredAdapter.stopErrorAtCall = 2;
+    const run = controller.createRun({ title: "late send failed cleanup run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "late send failed cleanup worker",
+      backendHandle: { id: "late-send-failed-cleanup-worker" },
+      status: "running"
+    });
+
+    const send = controller.sendMessage(worker.agent_id, "Reactivate after shutdown.");
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopped" }, complete: true });
+
+    sendGate.resolve();
+    const result = await send;
+    expect(result).toMatchObject({
+      delivered: true,
+      agent: { status: "stopping", failure_reason: "unknown" }
+    });
+    expect(deferredAdapter.stopped).toHaveLength(2);
+    expect(deferredAdapter.statuses.get("late-send-failed-cleanup-worker")).toBe(
+      "running"
+    );
+    expect(controller.getAgent(worker.agent_id).status).toBe("stopping");
+    expect(controller.getRun(run.run_id).status).toBe("stopping");
+  });
+
+  it("compensates a non-native start that returns a live handle after shutdown", async () => {
+    const deferredAdapter = new DeferredFakeAdapter();
+    adapter = deferredAdapter;
+    registry.register(deferredAdapter);
+    const startGate = createDeferred<void>();
+    deferredAdapter.startGate = startGate;
+    const run = controller.createRun({ title: "late start completion run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: deferredAdapter.kind,
+      title: "late start worker",
+      status: "planned"
+    });
+
+    const start = controller.startAgent({ agentId: worker.agent_id, prompt: "Start slowly." });
+    expect(deferredAdapter.starts).toHaveLength(1);
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopped" }, complete: true });
+
+    startGate.resolve();
+    const result = await start;
+    expect(result).toMatchObject({
+      status: "stopped",
+      backend_handle: { id: worker.agent_id, late_start: true }
+    });
+    expect(deferredAdapter.stopped).toEqual([
+      expect.objectContaining({ id: worker.agent_id })
+    ]);
+    expect(controller.getAgent(worker.agent_id)).toMatchObject({
+      status: "stopped",
+      backend_handle: { id: worker.agent_id, late_start: true }
+    });
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("finalizes an asynchronous non-native shutdown after a terminal status refresh", async () => {
+    adapter.stopStatus = "stopping";
+    const run = controller.createRun({ title: "asynchronous stop run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "asynchronous worker",
+      backendHandle: { id: "asynchronous-worker" },
+      status: "running"
+    });
+
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopping" }, complete: false });
+
+    adapter.statuses.set("asynchronous-worker", "stopped");
+    const refreshed = await controller.refreshAgentStatus(worker.agent_id);
+
+    expect(refreshed.status).toBe("stopped");
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
+  });
+
+  it("keeps an asynchronous shutdown pending when status refresh fails", async () => {
+    adapter.stopStatus = "stopping";
+    const run = controller.createRun({ title: "failed status refresh run" });
+    const worker = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "failed refresh worker",
+      backendHandle: { id: "failed-refresh-worker" },
+      status: "running"
+    });
+
+    const shutdown = await controller.shutdownRun(run.run_id);
+    expect(shutdown).toMatchObject({ run: { status: "stopping" }, complete: false });
+
+    adapter.statusError = new Error("Backend status endpoint failed.");
+    const refreshed = await controller.refreshAgentStatus(worker.agent_id);
+
+    expect(refreshed).toMatchObject({ status: "stopping", failure_reason: "unknown" });
+    expect(controller.getRun(run.run_id).status).toBe("stopping");
+    expect(
+      controller
+        .listEvents({ agentId: worker.agent_id, type: "agent.status_changed" })
+        .filter((event) => event.payload.reason === "status_refresh_failed_during_cleanup")
+    ).toHaveLength(1);
+
+    adapter.statusError = null;
+    adapter.statuses.set("failed-refresh-worker", "stopped");
+    const terminal = await controller.refreshAgentStatus(worker.agent_id);
+    expect(terminal).toMatchObject({ status: "stopped", failure_reason: null });
+    expect(controller.getRun(run.run_id).status).toBe("stopped");
   });
 
   it("purges one agent rows and controller-owned runtime files", async () => {

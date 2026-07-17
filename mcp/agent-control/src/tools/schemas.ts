@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 
 export const emptySchema = z.object({});
@@ -235,7 +236,9 @@ export const flowStartSchema = z.object({
   run_title: z.string().min(1).optional(),
   repo_dir: z.string().min(1).optional(),
   admin_key: z.string().min(1).optional(),
-  agent_token: z.string().min(1).optional()
+  agent_token: z.string().min(1).optional(),
+  owner_task_identity: z.string().min(1).optional(),
+  owner_task_path: z.string().min(1).optional()
 });
 
 export const flowGetSchema = z.object({
@@ -246,14 +249,16 @@ export const flowDispatchActiveSchema = z.object({
   flow_instance_id: z.string().min(1),
   subscriber_agent_id: z.string().min(1).optional(),
   server: z.string().min(1).optional(),
-  agent_token: z.string().min(1).optional()
+  agent_token: z.string().min(1).optional(),
+  bridge_token: z.string().min(1).optional()
 });
 
 export const flowContinueSchema = z.object({
   flow_instance_id: z.string().min(1),
   subscriber_agent_id: z.string().min(1).optional(),
   server: z.string().min(1).optional(),
-  agent_token: z.string().min(1).optional()
+  agent_token: z.string().min(1).optional(),
+  bridge_token: z.string().min(1).optional()
 });
 
 export const flowStepStartSchema = z.object({
@@ -272,6 +277,39 @@ export const flowStepReportSchema = z.object({
   summary: z.string().min(1).optional(),
   server: z.string().min(1).optional(),
   auto_continue: z.boolean().optional()
+});
+
+export const orchestratorActionClaimSchema = z.object({
+  action_id: z.string().regex(ORCHESTRATOR_ACTION_ID_RE),
+  bridge_token: z.string().min(1)
+});
+
+export const orchestratorActionAckSchema = z.object({
+  action_id: z.string().regex(ORCHESTRATOR_ACTION_ID_RE),
+  action_token: z.string().min(1),
+  status: z.enum(["succeeded", "failed"]),
+  result: z.record(z.unknown()).optional(),
+  error: z.record(z.unknown()).optional()
+});
+
+export const agentExternalSyncSchema = z.object({
+  agent_id: z.string().min(1),
+  bridge_token: z.string().min(1),
+  native_agent_id: z.string().min(1).optional(),
+  native_task_name: z.string().min(1).optional(),
+  native_task_path: z.string().min(1).optional(),
+  native_status: z.enum([
+    "pending_init",
+    "running",
+    "completed",
+    "interrupted",
+    "shutdown",
+    "errored",
+    "missing"
+  ]),
+  latest_message: z.string().optional(),
+  observed_at: z.string().min(1).optional(),
+  confirmed_absent: z.boolean().optional()
 });
 
 export const agentStatusEnum = z.enum(AGENT_STATUSES);

@@ -6,6 +6,7 @@ the same TypeScript core.
 
 The plugin also ships Agent Control skills:
 
+- `development-flow` for clarifying and running the bundled development workflow
 - `flow-author` for designing declarative flow packages
 - `flow-configurator` for setting backend/model environment overrides
 - `flow-runner` for launching, resuming, and inspecting flows
@@ -21,7 +22,12 @@ This repository is a Codex plugin marketplace. The marketplace manifest is
 plugin with its MCP server, CLI, web console runtime, bundled flows, and flow
 skills.
 
-Install from this local checkout while developing:
+Register this local checkout as a marketplace while developing:
+
+The local marketplace materializes the repository's Git `HEAD`. Commit the
+Agent Control files that should be installed before registering or refreshing
+the checkout; uncommitted and untracked files are intentionally excluded from
+the plugin snapshot.
 
 ```bash
 agentctl marketplace install
@@ -33,7 +39,27 @@ That command is equivalent to:
 codex plugin marketplace add "$(pwd)"
 ```
 
-Install from Git once the repository is published:
+Then install the plugin, which makes the MCP server, CLI integration, bundled
+flows, and skills available to Codex:
+
+```bash
+codex plugin add agent-control@agent-control
+```
+
+Expose the packaged CLI through the user's local binary directory after the
+plugin installation:
+
+```bash
+plugin_version="$(codex plugin list --json | jq -er '.installed[] | select(.pluginId == "agent-control@agent-control" and .installed == true and .enabled == true) | .version')"
+plugin_root="${CODEX_HOME:-$HOME/.codex}/plugins/cache/agent-control/agent-control/$plugin_version"
+"$plugin_root/scripts/install-agentctl-link.sh"
+```
+
+The linker validates the packaged CLI before replacing a legacy Agent Control
+wrapper or an older standalone symlink. It refuses to overwrite an unrelated
+user-managed `agentctl` executable.
+
+Register the Git marketplace once the repository is published:
 
 ```bash
 agentctl marketplace install wandeber/agent-control
@@ -44,6 +70,15 @@ or directly:
 ```bash
 codex plugin marketplace add wandeber/agent-control --ref main
 ```
+
+Then install the same plugin selector:
+
+```bash
+codex plugin add agent-control@agent-control
+```
+
+Run the CLI linker above after a fresh install or marketplace refresh so the
+stable `agentctl` command points at the active plugin cache version.
 
 Refresh an existing Git marketplace installation after changes are pushed:
 
@@ -57,8 +92,9 @@ or directly:
 codex plugin marketplace upgrade agent-control
 ```
 
-Local path marketplaces read from the checkout directly, so they usually do not
-need an upgrade command after file edits.
+After a Git marketplace refresh or a local plugin version/cachebuster change,
+rerun `codex plugin add agent-control@agent-control` and start a new Codex task
+so the updated MCP server and skills are loaded together.
 
 ## Identity
 
@@ -114,9 +150,38 @@ Inside Codex, open the native side-panel console with the MCP tool:
 open_agent_control_console
 ```
 
+Pass `run_id` to pin a specific run. With no `run_id`, the panel follows the
+latest run. The tool result includes the initial snapshot and that selection
+mode so the panel can paint immediately; later app-only reads run through one
+serial refresh coordinator instead of overlapping polling loops. Explicit URL,
+tool, and sidebar selections remain pinned until the user returns to an
+unpinned URL.
+
+The bundled `development-flow` skill calls `open_agent_control_console`
+exactly once after clarification and catalog discovery, immediately before the
+first launch. Opening the native console is a required pre-dispatch gate for
+that skill: a missing or failed tool stops the launch, and Browser/local-web
+fallbacks are not substituted. Agent Control wakeups and resumed turns never
+reopen it.
+
 The native panel reads compact snapshots, agent messages, and log tails through
-app-only MCP tools. It falls back to the local API/WebSocket server when opened
-as a normal browser page.
+app-only MCP tools. Snapshot reads ask the controller to refresh only adapters
+that declare cheap status inspection; native Codex collaboration is synchronized
+explicitly and is never polled by the console. The same UI falls back to the
+local API/WebSocket server when opened as a normal browser page.
+
+Automated bridge and refresh tests cover notification parsing, source
+validation, initial-state replay, selection metadata, and serial request
+coalescing. A full visual proof of live native Codex side-panel refresh must
+still be performed from a new Codex task after installing the rebuilt plugin;
+the current task cannot hot-reload its already-loaded MCP App bundle.
+
+That follow-up visual check should run the complete bundled
+`demo-age-duration` flow with the literal input `10/10/1991`, keeping its
+current backends. Without pressing Refresh, verify that the panel follows the
+new run, paints all seven steps/workers/reports as they advance, and reaches
+the final transition. Also verify the visible Codex wakeup separately; the
+headless/web tests in this repository cannot prove host-side task repainting.
 
 Start the full console with:
 
@@ -241,10 +306,19 @@ Flow config files support shell-style environment placeholders in string values:
 - `${VAR-default}` uses `default` only when `VAR` is unset.
 - `${VAR:-default}` uses `default` when `VAR` is unset or empty.
 
-Use `${VAR:-default}` for most flow backend/model settings. Agent Control reads
-the process environment only; it does not source `.env` files.
+Use `${VAR:-default}` for most settings. When the same role can opt into
+`codex-subagent`, use `${MODEL_VAR-default}` for its model so an explicitly
+empty environment value survives expansion and tells the native backend to
+inherit the root model. Agent Control reads the process environment only; it
+does not source `.env` files.
 When validation receives `--config-file`, prompt file references are checked
 relative to the flow config file.
+
+Roles use a persistent Agent Control identity by default. An independent
+reviewer that may request corrections should keep `agent_lifecycle: reuse`: its
+backend worker starts with clean context on the first review and the same worker
+handles every later review iteration. Reserve `fresh_per_step` for workflows
+that intentionally require a different worker for every step instance.
 
 Agent Control also exposes flow catalogs for discovery. The bundled catalog,
 `repo-flows`, points at this repository's top-level `flows/` directory or the
@@ -274,9 +348,11 @@ then step prompt. They also include structured `input_artifacts`,
 `output_artifacts`, a generated `runtime_contract`, and a generated
 `reporting_contract`.
 
-The runtime contract carries the active run title/objective, repository
-directory, input artifact paths, output artifact paths, artifact descriptions,
-and artifact handling rules. The reporting contract carries the exact MCP tool
+The runtime contract carries the effective objective, repository directory,
+input artifact paths, output artifact paths, artifact descriptions, and
+artifact handling rules. A manual transition can add coordinator context; that
+latest context is authoritative wherever it adds to, clarifies, or conflicts
+with the original run title. The reporting contract carries the exact MCP tool
 name, CLI fallback command, `step_instance_id`, result schema, allowed routing
 values, report artifact payload, and examples for that active step.
 
@@ -300,6 +376,50 @@ bindings, selects the configured transition, activates the next step, and
 auto-continues by default. The orchestrator is subscribed only to configured
 flow notifications and blockers; ordinary step-to-step transitions do not need a
 coordinator wakeup.
+
+Native-only roles can request the Codex subagent v2 bridge explicitly:
+
+```yaml
+roles:
+  native_worker:
+    backend: codex-subagent
+    model: ""
+    backend_options:
+      codex_subagent:
+        fork_turns: none
+```
+
+`fork_turns` accepts `none`, `all`, or a positive integer string. Native roles
+inherit the root model, so nonempty model overrides are rejected. The bundled
+demo/development flows retain their existing backend/model defaults; set a
+role's backend to `codex-subagent` and its model variable to an explicit empty
+value to opt in with the safe default `fork_turns: none`. Because
+`backend_options` are rejected on non-native backends, configurable bundled
+roles do not carry dormant native options.
+
+For `codex-subagent`, the root coordinator claims each persisted logical action,
+executes exactly one native collaboration tool (`spawn_agent`, `send_message`,
+`followup_task`, or `interrupt_agent`), and acknowledges the result. Recovery
+first uses `list_agents` and then `agent_external_sync`; an exact existing task
+is reused instead of duplicated. Workers only implement and report their own
+step—they never orchestrate siblings.
+
+The CLI writes bridge and action-claim credentials to Agent Control's private
+local credential store with restrictive directory/file permissions.
+`agentctl flow launch` returns only `bridge_grant.bridge_grant_id`;
+`agentctl action claim` accepts that public reference, stores its one-time
+action token, and returns only claim metadata plus the native request.
+`agentctl action ack` resolves the token locally. Later continue, dispatch,
+claim, and external-sync commands accept `--bridge-grant <id>`. Raw token flags
+are advanced-only and no normal CLI output prints them. Neither tokens nor
+their public control references belong in chat, events, logs, UI, artifacts,
+prompts, worker messages, or summaries.
+The private request returned by claim is used only to call its exact native
+tool; workers receive the intended task message, never bridge/action control
+data.
+
+Missing, revoked, expired, unsafe, or ambiguous local credentials block the
+operation instead of falling back to a new login or broader credential.
 
 For authoring semantics, transition patterns, subscriptions, and visual
 relationship guidance, see [`docs/flow-patterns.md`](docs/flow-patterns.md).
@@ -330,6 +450,12 @@ coordinators. The stable fields are `next`, `run_id`, `flow_instance_id`,
 `worker_dispatched_end_turn_until_agent_control_wakeup` or
 `worker_already_running_end_turn_until_agent_control_wakeup` means the
 coordinator should stop its turn until Agent Control wakes it again.
+`native_subagent_action_required` means the root must claim the returned safe
+action reference, execute its exact native collaboration tool, acknowledge it,
+and then end the turn after a successful spawn. The CLI returns a public
+`bridge_grant` reference while persisting the scoped bridge credential
+privately; neither the reference nor any token is copied into the user-facing
+launch summary.
 `orchestrator_action_required`, `flow_blocked`, `flow_completed`, and
 `flow_cancelled` are terminal or human-decision control states.
 
@@ -337,7 +463,9 @@ The same surface is available through MCP as `flow_catalog_list`,
 `flow_catalog_get`, `flow_validate_config`, `flow_start`, `flow_get`,
 `flow_continue`, `flow_step_start`, and `flow_step_report`. Use
 `flow_step_start` when a `notify` transition asks the orchestrator to choose the
-next configured step. When a worker reports invalid structured data, omits a
+next configured step. Put the complete correction, newly clarified user answer,
+or approval context in its `reason` so the target worker receives the effective
+objective. When a worker reports invalid structured data, omits a
 required artifact, or terminates without reporting, the flow instance moves to
 `blocked` so an orchestrator can correct, retry, or cancel.
 
@@ -436,6 +564,12 @@ The first backend adapters are:
 	  a Codex coordinator, report that current app-server delivery cannot guarantee
 	  it. External Agent Control app-server delivery should be treated as durable
 	  wakeup plumbing, not as a UI-refresh guarantee.
+- `codex-subagent`: persists native Codex subagent v2 actions for execution by
+  the visible root coordinator. Agent Control never calls collaboration tools
+  from the MCP process. The root claims an action, maps it to exactly one native
+  call, acknowledges success/failure, and synchronizes observed native state.
+  This keeps Desktop-visible orchestration native while retaining durable flow,
+  artifact, and transition state in Agent Control.
 
 ## Standalone Workers
 
@@ -453,6 +587,22 @@ agentctl worker launch \
   --output-artifact /tmp/implementation-report.md \
   --watch
 ```
+
+For a clean worker execution that needs compact workflow state from earlier
+phases, pass one JSON array with `--input-handoffs-json`:
+
+```text
+--input-handoffs-json '[{"label":"accepted_analysis","kind":"phase_report","payload":{"verdict":"passed","summary":"Use the accepted design."}}]'
+```
+
+The option may appear only once. It accepts at most 16 uniquely labelled
+handoffs; labels and kinds use lowercase stable tokens, each payload is a JSON
+object limited to 16 KiB, and the full collection is limited to 64 KiB. Payload
+content is opaque caller-owned data: Agent Control validates only the envelope,
+cardinality, size, and lossless JSON rendering. Accepted handoffs are rendered
+once in the worker's in-memory dispatch prompt; Agent Control does not create a
+prompt file or expose them as artifacts. Use `--input-artifact` for larger
+persisted input.
 
 `agentctl worker launch --watch` starts the worker and arms a detached
 deterministic watcher in the same operation. Use `agentctl watch start` only for
@@ -509,3 +659,7 @@ Use the CLI after building:
 pnpm --dir mcp/agent-control build
 mcp/agent-control/bin/agentctl --admin-key "$AGENT_CONTROL_ADMIN_KEY" run create --title "pull refresh"
 ```
+
+## License
+
+Agent Control is available under the [MIT License](LICENSE).

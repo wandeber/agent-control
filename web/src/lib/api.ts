@@ -1,9 +1,17 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getMcpAppClient, shouldTryMcpApp } from "./mcp-app";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  getCachedMcpConsoleState,
+  getMcpAppClient,
+  shouldTryMcpApp,
+  subscribeMcpConsoleState
+} from "./mcp-app";
+import { SerialRefreshCoordinator } from "./refresh-coordinator";
+import { snapshotStreamIsLoading } from "./snapshot-stream-state";
 import type { AgentLogTail, AgentMessage, DashboardSnapshot, SocketPayload } from "./types";
+import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
 
 export type ConnectionState = "connecting" | "live" | "offline";
 
@@ -144,67 +152,112 @@ export function artifactImageUrl(artifactId: string): string {
   return `${controlApiBase()}/api/control/artifacts/${encodeURIComponent(artifactId)}/file`;
 }
 
-export function useSnapshotStream(selectedRunId: string | null, selectedAgentId: string | null, followLatestRun = false) {
+export function useSnapshotStream(
+  selectedRunId: string | null,
+  selectedAgentId: string | null,
+  followLatestRun = false,
+  selectedAgentMessageLimit = 48
+) {
   const queryClient = useQueryClient();
-  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const mcpMode = shouldTryMcpApp();
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(() => getCachedMcpConsoleState().snapshot);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [agentLog, setAgentLog] = useState<AgentLogTail | null>(null);
+  const [streamError, setStreamError] = useState<Error | null>(null);
   const lastEventIds = useRef<Set<string>>(new Set());
+  const refreshCoordinator = useRef<SerialRefreshCoordinator<McpRefreshPayload> | null>(null);
+  refreshCoordinator.current ??= new SerialRefreshCoordinator<McpRefreshPayload>(1400);
   const requestedRunId = followLatestRun ? null : selectedRunId;
+  const requestedMessageLimit = Math.max(1, Math.trunc(selectedAgentMessageLimit));
+  // Keep browser/WebSocket effect dependencies stable when only its separate
+  // React Query history limit changes. The serial coordinator is the sole
+  // consumer of this value, so zero is an unused browser-mode sentinel.
+  const mcpMessageLimit = mcpMode ? requestedMessageLimit : 0;
 
   const query = useQuery({
     queryKey: ["snapshot", requestedRunId],
     queryFn: () => fetchSnapshot(requestedRunId),
-    refetchInterval: connection === "live" ? false : 2500
+    // MCP mode has its own serial coordinator. Enabling this query there would
+    // create a second polling loop whose tool calls can overlap and return in
+    // the wrong selection order.
+    enabled: !mcpMode,
+    refetchInterval: !mcpMode && connection !== "live" ? 2500 : false
   });
 
   useEffect(() => {
-    if (query.data) {
+    if (!mcpMode && query.data) {
       setSnapshot(query.data);
     }
-  }, [query.data]);
+  }, [mcpMode, query.data]);
 
   useEffect(() => {
-    if (shouldTryMcpApp()) {
-      let cancelled = false;
-      let timer: ReturnType<typeof setInterval> | null = null;
-      setConnection("connecting");
+    if (!mcpMode) {
+      return;
+    }
+    return subscribeMcpConsoleState((state) => {
+      if (!state.snapshot) {
+        return;
+      }
+      // The host-provided opening result is the fastest authoritative seed.
+      // Regular app polling is applied by the generation-aware coordinator
+      // below, not through this notification cache.
+      setSnapshot(state.snapshot);
+      setConnection("live");
+      setStreamError(null);
+    });
+  }, [mcpMode]);
 
-      const tick = async () => {
-        try {
+  useEffect(() => {
+    if (mcpMode) {
+      setConnection("connecting");
+      refreshCoordinator.current?.start({
+        task: async () => {
           const nextSnapshot = await fetchSnapshot(requestedRunId);
-          if (cancelled) {
-            return;
+          if (!selectedAgentId || !nextSnapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
+            return {
+              snapshot: nextSnapshot,
+              selectedAgentId: null,
+              messageLimit: mcpMessageLimit,
+              messages: null,
+              log: null
+            };
           }
+
+          // Keep all reads inside one serialized task. Snapshot, messages, and
+          // log therefore describe one selection generation and cannot overlap
+          // the next 1.4-second refresh cycle.
+          const messages = await fetchAgentMessages(selectedAgentId, mcpMessageLimit);
+          const log = await fetchAgentLog(selectedAgentId, 24000);
+          return { snapshot: nextSnapshot, selectedAgentId, messageLimit: mcpMessageLimit, messages, log };
+        },
+        onResult: (result) => {
           setConnection("live");
-          setSnapshot(nextSnapshot);
-          for (const item of nextSnapshot.latest_events) {
+          setStreamError(null);
+          setSnapshot(result.snapshot);
+          for (const item of result.snapshot.latest_events) {
             lastEventIds.current.add(item.event_id);
           }
-          if (selectedAgentId && nextSnapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
-            const messages = await fetchAgentMessages(selectedAgentId, 96);
-            if (!cancelled) {
-              queryClient.setQueriesData<AgentMessage[]>({ queryKey: ["messages", selectedAgentId] }, messages);
-            }
-            const log = await fetchAgentLog(selectedAgentId, 8000);
-            if (!cancelled) {
-              setAgentLog(log);
+          if (result.selectedAgentId && result.messages) {
+            // WorkspacePanel creates this exact disabled query in MCP mode.
+            // Updating only the current history generation prevents a smaller
+            // cached page from replacing a user-requested older-message page.
+            queryClient.setQueryData<AgentMessage[]>(
+              agentMessagesQueryKey(result.selectedAgentId, result.messageLimit),
+              result.messages
+            );
+            if (result.log) {
+              queryClient.setQueryData<AgentLogTail>(agentLogQueryKey(result.selectedAgentId), result.log);
             }
           }
-        } catch {
-          if (!cancelled) {
-            setConnection("offline");
-          }
+          setAgentLog(result.log);
+        },
+        onError: (error) => {
+          setConnection("offline");
+          setStreamError(error instanceof Error ? error : new Error(String(error)));
         }
-      };
-
-      void tick();
-      timer = setInterval(() => void tick(), 1400);
+      });
       return () => {
-        cancelled = true;
-        if (timer) {
-          clearInterval(timer);
-        }
+        refreshCoordinator.current?.stop();
       };
     }
 
@@ -260,7 +313,15 @@ export function useSnapshotStream(selectedRunId: string | null, selectedAgentId:
       }
       socket?.close();
     };
-  }, [queryClient, requestedRunId, selectedAgentId]);
+  }, [mcpMessageLimit, mcpMode, queryClient, requestedRunId, selectedAgentId]);
+
+  const refresh = useCallback(() => {
+    if (mcpMode) {
+      refreshCoordinator.current?.request();
+      return;
+    }
+    void query.refetch();
+  }, [mcpMode, query.refetch]);
 
   const selectedRun = useMemo(
     () => snapshot?.runs.find((run) => run.run_id === snapshot.selected_run_id) ?? null,
@@ -272,7 +333,21 @@ export function useSnapshotStream(selectedRunId: string | null, selectedAgentId:
     selectedRun,
     connection,
     agentLog,
-    isLoading: query.isLoading && !snapshot,
-    error: query.error
+    refresh,
+    isLoading: snapshotStreamIsLoading({
+      hasSnapshot: Boolean(snapshot),
+      hasError: Boolean(mcpMode ? streamError : query.error),
+      mcpMode,
+      queryLoading: query.isLoading
+    }),
+    error: mcpMode ? streamError : query.error
   };
+}
+
+interface McpRefreshPayload {
+  snapshot: DashboardSnapshot;
+  selectedAgentId: string | null;
+  messageLimit: number;
+  messages: AgentMessage[] | null;
+  log: AgentLogTail | null;
 }

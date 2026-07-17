@@ -30,6 +30,44 @@ export const FAILURE_REASONS = [
 
 export type FailureReason = (typeof FAILURE_REASONS)[number];
 
+/**
+ * Durable phases for a non-native backend start. `prepared` is the only phase
+ * that may be reclaimed after its lease expires because no adapter call has
+ * crossed the invocation boundary yet. An expired `invoking` attempt becomes
+ * `ambiguous`: the backend may have accepted the request, so automatic retry
+ * would risk creating a duplicate session.
+ * `succeeded` retains a route-owned handle; `superseded` retains a concrete
+ * handle that must be compensated because its original route lost ownership.
+ */
+export const AGENT_START_ATTEMPT_PHASES = [
+  "prepared",
+  "invoking",
+  "succeeded",
+  "superseded",
+  "failed",
+  "ambiguous",
+  "cancelled"
+] as const;
+
+export type AgentStartAttemptPhase = (typeof AGENT_START_ATTEMPT_PHASES)[number];
+
+export interface AgentStartAttemptRecord {
+  start_attempt_id: string;
+  agent_id: string;
+  flow_instance_id: string;
+  step_instance_id: string;
+  generation: number;
+  phase: AgentStartAttemptPhase;
+  claim_owner_id: string;
+  lease_expires_at: string;
+  invocation_started_at: string | null;
+  handle_json: Record<string, unknown> | null;
+  error_json: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
 export const EVENT_TYPES = [
   "agent.started",
   "agent.status_changed",
@@ -113,6 +151,10 @@ export interface AgentRecord {
   repo_dir: string | null;
   model: string | null;
   backend_handle: Record<string, unknown> | null;
+  /** Monotonic fence for status observations made across backend I/O. */
+  work_generation: number;
+  /** Changes when the current physical work attempt enters or leaves I/O. */
+  work_revision: number;
   status: AgentStatus;
   failure_reason: FailureReason | null;
   unregistered_at: string | null;
@@ -137,6 +179,28 @@ export interface SubscriptionRecord {
   event_type: EventType;
   enabled: boolean;
   last_delivered_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type SubscriptionDeliveryStatus =
+  | "pending"
+  | "claimed"
+  | "invoking"
+  | "ambiguous"
+  | "delivered"
+  | "failed";
+
+/** Durable logical delivery shared by duplicate subscriptions and controllers. */
+export interface SubscriptionDeliveryRecord {
+  event_id: string;
+  subscriber_agent_id: string;
+  status: SubscriptionDeliveryStatus;
+  claim_attempt: number;
+  claim_owner_id: string | null;
+  claimed_at: string | null;
+  last_error: Record<string, unknown> | null;
+  delivered_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -199,9 +263,188 @@ export interface AgentTokenRecord {
   revoked_at: string | null;
 }
 
+export interface BridgeGrantRecord {
+  bridge_grant_id: string;
+  run_id: string;
+  orchestrator_agent_id: string;
+  owner_task_identity: string | null;
+  owner_task_path: string;
+  token_hash: string;
+  created_at: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+/**
+ * The raw bridge token is intentionally returned only when a flow creates the
+ * grant. Persisted records and every later public response expose metadata but
+ * never reproduce this credential.
+ */
+export interface BridgeCredential {
+  bridge_grant_id: string;
+  bridge_token: string;
+  run_id: string;
+  orchestrator_agent_id: string;
+  owner_task_identity: string | null;
+  owner_task_path: string;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface PublicBridgeGrantRef extends Omit<BridgeCredential, "bridge_token"> {}
+
+export interface PublicActionClaimRef {
+  action_id: string;
+  run_id: string;
+  orchestrator_agent_id: string;
+  claim_attempt: number;
+  lease_expires_at: string;
+}
+
+export interface CredentialCleanupDiagnostic {
+  kind: "bridge" | "action_claim";
+  id: string;
+  code: "credential_cleanup_failed" | "credential_store_invalid_record";
+}
+
+export const ORCHESTRATOR_ACTION_OPERATIONS = [
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+  "interrupt_agent"
+] as const;
+
+export type OrchestratorActionOperation = (typeof ORCHESTRATOR_ACTION_OPERATIONS)[number];
+
+export const ORCHESTRATOR_ACTION_STATUSES = [
+  "pending",
+  "claimed",
+  "succeeded",
+  "failed",
+  "cancelled"
+] as const;
+
+export type OrchestratorActionStatus = (typeof ORCHESTRATOR_ACTION_STATUSES)[number];
+
+export interface OrchestratorActionRecord {
+  action_id: string;
+  idempotency_key: string;
+  run_id: string;
+  orchestrator_agent_id: string;
+  agent_id: string;
+  flow_instance_id: string | null;
+  step_instance_id: string | null;
+  operation: OrchestratorActionOperation;
+  status: OrchestratorActionStatus;
+  payload_json: Record<string, unknown>;
+  result_json: Record<string, unknown> | null;
+  error_json: Record<string, unknown> | null;
+  /** Exact bridge grant authorized to execute this action. */
+  originating_bridge_grant_id: string | null;
+  claimed_by_bridge_grant_id: string | null;
+  claim_owner_identity: string | null;
+  claim_attempt: number;
+  claimed_at: string | null;
+  claim_lease_expires_at: string | null;
+  action_token_hash: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+/** A deliberately compact action reference safe for events and normal APIs. */
+export interface OrchestratorActionRef {
+  action_id: string;
+  operation: OrchestratorActionOperation;
+  status: OrchestratorActionStatus;
+  run_id: string;
+  orchestrator_agent_id: string;
+  agent_id: string;
+  flow_instance_id: string | null;
+  step_instance_id: string | null;
+}
+
+export interface OrchestratorActionAcknowledgementResult {
+  action: OrchestratorActionRef;
+  agent: AgentRecord;
+  /**
+   * Follow-up work that became possible only after the acknowledged action
+   * supplied a native target. In particular, a late spawn acknowledgement can
+   * expose the interrupt required by a stop request that arrived during spawn.
+   */
+  orchestrator_action?: OrchestratorActionRef;
+}
+
+export type AgentStopResult = AgentRecord & {
+  orchestrator_action?: OrchestratorActionRef;
+};
+
+export interface RunShutdownResult {
+  run: RunRecord;
+  stopped: AgentStopResult[];
+  orchestrator_actions: OrchestratorActionRef[];
+  pending_agent_ids: string[];
+  complete: boolean;
+}
+
+export type CodexSubagentForkTurns = "none" | "all" | `${number}`;
+
+export interface OrchestratorActionClaimedEnvelope {
+  action_id: string;
+  action_token: string;
+  operation: OrchestratorActionOperation;
+  backend: "codex-subagent";
+  run_id: string;
+  orchestrator_agent_id: string;
+  agent_id: string;
+  flow_instance_id: string | null;
+  step_instance_id: string | null;
+  request: Record<string, unknown>;
+}
+
+export type OrchestratorActionClaimResult =
+  | OrchestratorActionClaimedEnvelope
+  | { status: "already_claimed"; action_id: string; retry_after_ms: number };
+
+/**
+ * Adapters are normalized internally to these two outcomes. Existing backends
+ * are immediately unwrapped at the controller boundary so the opt-in native
+ * bridge does not change their established public response shapes.
+ */
+export type AgentOperationResult<T> =
+  | { type: "completed"; value: T }
+  | { type: "orchestrator_action_required"; action: OrchestratorActionRef };
+
 export type AgentWithToken = AgentRecord & {
   agent_token: string;
 };
+
+export type AgentWithOrchestratorAction = AgentRecord & {
+  orchestrator_action: OrchestratorActionRef;
+};
+
+export type AgentStartState =
+  | "started"
+  | "in_progress"
+  | "ambiguous"
+  | "superseded"
+  | "cancelled"
+  | "failed";
+
+export type AgentStartResult = (
+  | AgentWithToken
+  | AgentWithOrchestratorAction
+  | (AgentRecord & { agent_token?: never; orchestrator_action?: never })
+) & { start_state?: AgentStartState };
+
+export type AgentSendResult =
+  | { agent: AgentRecord; delivered: true }
+  | {
+      agent: AgentRecord;
+      delivered: false;
+      orchestrator_action: OrchestratorActionRef | null;
+    };
 
 export interface OrchestratorLoginResult {
   run: RunRecord;
@@ -237,6 +480,8 @@ export interface FlowInstanceRecord {
   flow_instance_id: string;
   flow_record_id: string;
   run_id: string;
+  orchestrator_agent_id: string | null;
+  originating_bridge_grant_id: string | null;
   status: FlowInstanceStatus;
   current_step_id: string | null;
   created_at: string;
@@ -313,9 +558,17 @@ export interface FlowPromptReferenceConfig {
   prompt_path?: string;
 }
 
+export type FlowAgentLifecycle = "reuse" | "fresh_per_step";
+
 export interface FlowRoleConfig {
   backend?: string;
-  model?: string;
+  model?: string | null;
+  agent_lifecycle?: FlowAgentLifecycle;
+  backend_options?: {
+    codex_subagent?: {
+      fork_turns?: CodexSubagentForkTurns;
+    };
+  };
   description?: string;
   prompt?: string;
   prompt_ref?: string;
@@ -384,6 +637,8 @@ export interface FlowStartResult {
   active_step: FlowStepInstanceRecord | null;
   reused?: boolean;
   blocked_reason?: string;
+  bridge_grant?: PublicBridgeGrantRef;
+  bridge_credential?: BridgeCredential;
 }
 
 export interface FlowSnapshot {
@@ -406,6 +661,19 @@ export interface FlowStepStartResult extends FlowSnapshot {
   selected_transition: FlowTransitionRecord | null;
   active_step: FlowStepInstanceRecord | null;
   notification: string | null;
+  /**
+   * Safe lifecycle projections for workers abandoned by the manual route.
+   * Native cleanup exposes only the compact action reference, never bridge or
+   * action credentials and never the private native request payload.
+   */
+  cleanup: FlowStepCleanupResult[];
+}
+
+export interface FlowStepCleanupResult {
+  agent_id: string;
+  status: AgentStatus;
+  failure_reason: FailureReason | null;
+  orchestrator_action: OrchestratorActionRef | null;
 }
 
 export interface FlowDispatchActiveResult {
@@ -415,11 +683,16 @@ export interface FlowDispatchActiveResult {
   subscriptions: Array<Record<string, unknown>>;
   expected_artifacts: string[];
   prompt_size: number;
+  orchestrator_action: OrchestratorActionRef | null;
+  start_state: AgentStartState | null;
 }
 
 export type FlowContinueAction =
   | "dispatched"
+  | "orchestrator_action_required"
   | "waiting_for_report"
+  | "start_in_progress"
+  | "start_superseded"
   | "waiting_for_orchestrator"
   | "blocked"
   | "completed"
@@ -435,6 +708,7 @@ export interface FlowContinueResult {
   agent: AgentRecord | null;
   notification: string | null;
   blocked_reason: string | null;
+  orchestrator_action: OrchestratorActionRef | null;
 }
 
 export interface FlowStepReportAndContinueResult {
@@ -496,6 +770,7 @@ export interface PurgeResult {
   deleted_rows: Record<string, number>;
   deleted_runtime_paths: string[];
   skipped_runtime_paths: string[];
+  credential_cleanup_diagnostics: CredentialCleanupDiagnostic[];
 }
 
 export interface AgentCapabilities {
@@ -507,6 +782,8 @@ export interface AgentCapabilities {
   canStreamMessages: boolean;
   canInspectStatusCheaply: boolean;
   canAttachExisting: boolean;
+  requiresOrchestratorAction?: boolean;
+  canInterrupt?: boolean;
 }
 
 export interface AgentHandle {

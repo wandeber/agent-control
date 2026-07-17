@@ -95,6 +95,14 @@ steps:
 The orchestrator receives a compact notification and then chooses a configured
 step with `flow_step_start` or stops for user feedback.
 
+When `flow_step_start` returns work to a worker, put the complete correction,
+newly clarified user answer, or approval context in `reason`. Agent Control
+records that value on the transition and uses it to build the target worker's
+effective runtime objective. The latest coordinator context is explicitly
+authoritative wherever it adds to, clarifies, or conflicts with the original
+run title. Do not use an opaque reason when the worker needs the actual decision
+to proceed correctly.
+
 ## Automatic Routing Pattern
 
 Use this when a worker can reliably report a small structured routing value and
@@ -156,6 +164,80 @@ steps:
 
 The loop is explicit in the config. The coordinator does not infer it from chat
 history or visual edges.
+
+## Role Agent Lifecycle
+
+Roles reuse one persistent Agent Control agent by default. Use that `reuse`
+lifecycle for an independent review gate that can loop through corrections:
+the backend worker is created with clean context when the role is first
+dispatched, and every later review iteration resumes that exact reviewer.
+
+```yaml
+roles:
+  final_reviewer:
+    backend: codex-thread
+    agent_lifecycle: reuse
+```
+
+Declare `agent_lifecycle: fresh_per_step` only when every new step instance
+intentionally requires a different agent and backend context. Do not use it for
+an iterative independent-review gate, because that would replace the reviewer
+after each correction instead of preserving review ownership.
+
+Fresh-per-step roles are not pre-registered. Dispatch creates one deterministically
+titled agent for the concrete step instance, without copying a backend handle;
+for `codex-thread`, that means a new `thread/start`. Redispatching that same
+step instance reuses its durable agent assignment (and any open native action),
+while a transition to a new instance of the same step creates a different
+agent. Do not combine `fresh_per_step` with a step-level `agent_id`, because a
+persistent explicit agent would contradict the lifecycle.
+
+## Native Codex Subagent Bridge Pattern
+
+Use `backend: codex-subagent` only when a visible root Codex coordinator owns
+the run and can execute native collaboration tools. A native-only role can set:
+
+```yaml
+roles:
+  implementation_worker:
+    backend: codex-subagent
+    model: ""
+    backend_options:
+      codex_subagent:
+        fork_turns: none
+```
+
+`model: ""` means inherit the root model; nonempty model overrides are not
+supported. `fork_turns` accepts `none`, `all`, or a positive integer string and
+defaults to `none`. Do not attach dormant `backend_options` to a role whose
+resolved backend is not `codex-subagent`; validation rejects that mismatch so
+the declared config cannot silently differ from the native operation.
+
+The root coordinator is the only bridge executor. For each claimed action it
+maps `spawn_agent`, `send_message`, `followup_task`, or `interrupt_agent` to
+exactly one tool call with the same name and then acknowledges the result.
+Workers implement their assigned step and report; they never coordinate
+sibling agents.
+
+If a spawn outcome is uncertain, recover before retrying: use `list_agents`
+with the expected task path, reuse an exact match, and call
+`agent_external_sync`. On the CLI path, `flow launch` persists the scoped
+credential privately and returns only `bridge_grant.bridge_grant_id`. Pass that
+reference through `--bridge-grant` to continue, dispatch, claim, and
+external-sync commands. `action claim` likewise persists its one-time action
+token, and `action ack --action <id> --status <status>` resolves it locally.
+Raw token flags are advanced-only and normal CLI output never prints their
+values.
+
+Tokens and grant/claim references are root control state; never include them in
+prompts, chat, logs, UI, artifacts, events, reports, summaries, or worker
+messages. Keep the private claim envelope off those public surfaces and pass
+only its declared arguments to the exact native tool. The worker receives its
+intended task message, never bridge/action control data. A missing, revoked,
+expired, unsafe, or ambiguous credential blocks the flow instead of triggering
+a new login or broader fallback. Normal flows end the root turn after dispatch.
+`wait_agent` is reserved for an explicit foreground smoke test with a wide
+timeout, not normal supervision.
 
 ## Visual Relationships
 

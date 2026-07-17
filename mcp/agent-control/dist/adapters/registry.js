@@ -1,5 +1,6 @@
 import { ControllerError } from "../core/errors.js";
 import { CodexThreadAdapter } from "./codex-thread-adapter.js";
+import { CodexSubagentAdapter } from "./codex-subagent-adapter.js";
 import { ManualAdapter } from "./manual-adapter.js";
 import { OpenCodeServerAdapter } from "./opencode-server-adapter.js";
 export class AdapterRegistry {
@@ -25,6 +26,7 @@ export function createDefaultAdapterRegistry() {
     const registry = new AdapterRegistry();
     registry.register(new OpenCodeServerAdapter());
     registry.register(new CodexThreadAdapter());
+    registry.register(new CodexSubagentAdapter());
     registry.register(new ManualAdapter());
     return registry;
 }

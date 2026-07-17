@@ -1,0 +1,17 @@
+id: native-cli-contract
+version: 1.0.0
+description: Exercise the scoped Codex subagent bridge from the CLI.
+initial_step: work
+roles:
+  worker:
+    backend: codex-subagent
+    backend_options:
+      codex_subagent:
+        fork_turns: none
+steps:
+  work:
+    role: worker
+    prompt: Perform the assigned native CLI contract check.
+    on:
+      reported:
+        finish: true

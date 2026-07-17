@@ -1,11 +1,16 @@
 "use client";
 
-import { useQueryClient } from "@tanstack/react-query";
 import { Bot, Clock3, Info, PanelBottom, Workflow, X, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useSnapshotStream } from "@/lib/api";
 import { latestAgentFlowStep } from "@/lib/flow-steps";
+import { subscribeMcpConsoleState } from "@/lib/mcp-app";
 import type { DashboardSnapshot } from "@/lib/types";
+import {
+  AGENT_MESSAGE_LOAD_STEP,
+  INITIAL_AGENT_MESSAGE_LIMIT,
+  MAX_AGENT_MESSAGE_LIMIT
+} from "@/lib/workspace-refresh-policy";
 import { AgentGraph } from "./agent-graph";
 import { AgentInspector } from "./agent-inspector";
 import { FlowPhaseGraph, type FlowStepSelection } from "./flow-phase-graph";
@@ -41,12 +46,12 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 };
 
 export function ConsoleShell() {
-  const queryClient = useQueryClient();
   const [selectedRunId, setSelectedRunId] = useState<string | null>(() => readRunIdFromLocation());
-  const [followLatestRun, setFollowLatestRun] = useState(true);
+  const [followLatestRun, setFollowLatestRun] = useState(() => !readRunIdFromLocation());
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [selectedStepInstanceId, setSelectedStepInstanceId] = useState<string | null>(null);
+  const [selectedAgentMessageLimit, setSelectedAgentMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [graphMode, setGraphMode] = useState<GraphMode>("flow");
   const [layout, setLayout] = useState<ConsoleLayoutState>(DEFAULT_LAYOUT);
   const [layoutHydrated, setLayoutHydrated] = useState(false);
@@ -54,24 +59,66 @@ export function ConsoleShell() {
   const [renderedBottomPanel, setRenderedBottomPanel] = useState<BottomPanel>("agent");
   const [resizing, setResizing] = useState<ResizeTarget | null>(null);
   const latestStepByAgentRef = useRef<Map<string, string | null>>(new Map());
+  const runSelectionPinnedRef = useRef(Boolean(selectedRunId));
   const { bottomPanel, runsOpen, threadOpen } = layout;
-  const { agentLog, connection, error, isLoading, selectedRun, snapshot } = useSnapshotStream(
+  const { agentLog, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
-    followLatestRun
+    followLatestRun,
+    selectedAgentMessageLimit
   );
+
+  useEffect(() => {
+    // A history expansion belongs to one agent/step selection. Resetting here
+    // also advances the MCP refresh generation, so an older large-page result
+    // cannot populate the newly selected thread.
+    setSelectedAgentMessageLimit(INITIAL_AGENT_MESSAGE_LIMIT);
+  }, [selectedAgentId, selectedStepInstanceId]);
 
   useEffect(() => {
     const syncRunFromHistory = () => {
       const nextRunId = readRunIdFromLocation();
+      runSelectionPinnedRef.current = Boolean(nextRunId);
       setSelectedRunId(nextRunId);
       setFollowLatestRun(!nextRunId);
       setSelectedAgentId(null);
       setSelectedStepId(null);
       setSelectedStepInstanceId(null);
     };
+    // Static MCP App HTML is rendered without request-specific query state.
+    // Re-read the live iframe URL on mount so an explicit `run_id` is pinned
+    // even when the server render could not see it.
+    syncRunFromHistory();
     window.addEventListener("popstate", syncRunFromHistory);
     return () => window.removeEventListener("popstate", syncRunFromHistory);
+  }, []);
+
+  useEffect(() => {
+    return subscribeMcpConsoleState((state) => {
+      const selection = state.console;
+      if (!selection) {
+        return;
+      }
+
+      if (selection.requested_run_id) {
+        // A run passed to open_agent_control_console is just as explicit as a
+        // URL/sidebar selection. Pin it and keep future snapshots on that run.
+        runSelectionPinnedRef.current = true;
+        setSelectedRunId(selection.requested_run_id);
+        setFollowLatestRun(false);
+        setSelectedAgentId(null);
+        setSelectedStepId(null);
+        setSelectedStepInstanceId(null);
+        replaceRunIdInLocation(selection.requested_run_id);
+        return;
+      }
+
+      // A no-run opening request means "follow latest" only when no explicit
+      // URL/tool/click selection has already pinned the console.
+      if (selection.follow_latest && !runSelectionPinnedRef.current) {
+        setFollowLatestRun(true);
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -82,7 +129,6 @@ export function ConsoleShell() {
     setSelectedAgentId(null);
     setSelectedStepId(null);
     setSelectedStepInstanceId(null);
-    replaceRunIdInLocation(snapshot.selected_run_id);
   }, [followLatestRun, selectedRunId, snapshot?.selected_run_id]);
 
   useEffect(() => {
@@ -301,7 +347,7 @@ export function ConsoleShell() {
           onOpenAgent={() => toggleBottomPanel("agent")}
           onOpenRuns={toggleRunsPanel}
           onOpenThread={toggleThreadPanel}
-          onRefresh={() => queryClient.invalidateQueries({ queryKey: ["snapshot"] })}
+          onRefresh={refresh}
           run={selectedRun}
           runsOpen={runsOpen}
           threadOpen={threadOpen}
@@ -309,13 +355,13 @@ export function ConsoleShell() {
       </div>
 
       <section className="console-graph">
-        {isLoading ? (
-          <Panel className="h-full">
-            <EmptyState detail="Connecting to Agent Control API and WebSocket." title="Loading controller state" />
-          </Panel>
-        ) : error ? (
+        {error ? (
           <Panel className="h-full">
             <EmptyState detail={error instanceof Error ? error.message : "Unknown connection error"} title="Controller unavailable" />
+          </Panel>
+        ) : isLoading ? (
+          <Panel className="h-full">
+            <EmptyState detail="Connecting to Agent Control API and WebSocket." title="Loading controller state" />
           </Panel>
         ) : selectedSnapshot && (selectedSnapshot.agents.length > 0 || flowGraphAvailable) ? (
           <div className="graph-stack h-full min-h-0 min-w-0">
@@ -358,9 +404,9 @@ export function ConsoleShell() {
           <div className="console-panel-body">
             <RunSidebar
               onSelectRun={(runId) => {
-                const latestRunId = selectedSnapshot.runs[0]?.run_id ?? null;
+                runSelectionPinnedRef.current = true;
                 setSelectedRunId(runId);
-                setFollowLatestRun(!latestRunId || runId === latestRunId);
+                setFollowLatestRun(false);
                 setSelectedAgentId(null);
                 setSelectedStepId(null);
                 setSelectedStepInstanceId(null);
@@ -386,6 +432,12 @@ export function ConsoleShell() {
           <div className="console-panel-body">
             <WorkspacePanel
               liveLog={agentLog}
+              messageLimit={selectedAgentMessageLimit}
+              onRequestOlderMessages={() =>
+                setSelectedAgentMessageLimit((value) =>
+                  Math.min(MAX_AGENT_MESSAGE_LIMIT, value + AGENT_MESSAGE_LOAD_STEP)
+                )
+              }
               selectedAgentId={selectedAgentId}
               selectedStepInstanceId={selectedStepInstanceId}
               snapshot={selectedSnapshot}
