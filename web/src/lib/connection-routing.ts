@@ -1,5 +1,5 @@
 import { TEAM_NODE_ID } from "./graph";
-import { agentRoutePath, fitAgentPortShifts, routeAgentConnection } from "./agent-routing";
+import { agentRoutePath, routeAgentConnection } from "./agent-routing";
 import { cardBounds, teamBounds, type AgentConnection, type AgentTeam, type GraphCard } from "./team-graph";
 
 const DEFAULT_NODE_WIDTH = 300;
@@ -8,9 +8,8 @@ const EDGE_ARROW_LENGTH = 12;
 const EDGE_ARROW_HALF_WIDTH = 4;
 const RELATION_ANCHOR_SIDES: FloatingSide[] = ["left", "right", "top", "bottom"];
 type FloatingSide = "bottom" | "left" | "right" | "top";
-type RelationRoute = { sourceSide: FloatingSide; targetSide: FloatingSide; sourceTangentShift: number; targetTangentShift: number };
+type RelationRoute = { sourceSide: FloatingSide; targetSide: FloatingSide };
 type RoutedRelation = AgentConnection & { route: RelationRoute };
-type RoutedEndpoint = { agentId: string; endpoint: "source" | "target"; otherAgentId: string; relation: RoutedRelation; side: FloatingSide };
 
 export function routeConnections(connections: AgentConnection[], cards: GraphCard[], team: AgentTeam | null) {
   const bounds = teamBounds(cards, team);
@@ -22,19 +21,14 @@ export function routeConnections(connections: AgentConnection[], cards: GraphCar
     // A member observes the team through the inside of its shared header.
     if (source.id === TEAM_NODE_ID && team?.members.includes(target.id)) { sourceSide = "bottom"; targetSide = "top"; }
     if (target.id === TEAM_NODE_ID && team?.members.includes(source.id)) { sourceSide = "top"; targetSide = "bottom"; }
-    return [{ ...connection, route: { sourceSide, targetSide, sourceTangentShift: 0, targetTangentShift: 0 } }];
+    return [{ ...connection, route: { sourceSide, targetSide } }];
   });
-  applyAnchorFanoutShifts(routed, nodes);
   return routed.flatMap((connection) => {
     const source = nodes.find((node) => node.id === connection.source)!, target = nodes.find((node) => node.id === connection.target)!;
     const start = sideAnchor(source, connection.route.sourceSide), end = sideAnchor(target, connection.route.targetSide);
-    if (tangentAxis(connection.route.sourceSide) === "horizontal") start.x += connection.route.sourceTangentShift;
-    else start.y += connection.route.sourceTangentShift;
-    if (tangentAxis(connection.route.targetSide) === "horizontal") end.x += connection.route.targetTangentShift;
-    else end.y += connection.route.targetTangentShift;
     const points = routeAgentConnection(start, end, directionForSide(connection.route.sourceSide), directionForSide(connection.route.targetSide), nodes.map(cardBounds));
     if (points.length < 2) return [];
-    return [{ ...connection, points, path: agentRoutePath(points), startArrow: makeArrowPath(points[0]!, points[1]!), endArrow: makeArrowPath(points.at(-1)!, points.at(-2)!) }];
+    return [{ ...connection, startPortKey: portKey(connection.source, connection.route.sourceSide), endPortKey: portKey(connection.target, connection.route.targetSide), points, path: agentRoutePath(points), startArrow: makeArrowPath(points[0]!, points[1]!), endArrow: makeArrowPath(points.at(-1)!, points.at(-2)!) }];
   });
 }
 function chooseInputOutputSides(
@@ -77,52 +71,8 @@ function chooseInputOutputSides(
   return best ?? { sourceSide: "right", targetSide: "left" };
 }
 
-function applyAnchorFanoutShifts(relations: RoutedRelation[], nodes: GraphCard[]) {
-  const groups = new Map<string, RoutedEndpoint[]>();
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  for (const relation of relations) {
-    for (const endpoint of ["source", "target"] as const) {
-      const agentId = relation[endpoint];
-      const side = endpoint === "source" ? relation.route.sourceSide : relation.route.targetSide;
-      const otherAgentId = relation[endpoint === "source" ? "target" : "source"];
-      const key = `${agentId}:${side}`;
-      const group = groups.get(key) ?? [];
-      group.push({ agentId, endpoint, otherAgentId, relation, side }); groups.set(key, group);
-    }
-  }
-  for (const group of groups.values()) {
-    group.sort((a, b) => compareFanoutEndpoints(a, b, nodeById));
-    const node = nodeById.get(group[0]!.agentId);
-    if (!node) continue;
-    const horizontal = group[0]!.side === "top" || group[0]!.side === "bottom";
-    const shifts = fitAgentPortShifts(group.map((_, index) => (index - (group.length - 1) / 2) * 18), horizontal ? nodeWidth(node) : nodeHeight(node));
-    group.forEach((endpoint, index) => {
-      if (endpoint.endpoint === "source") endpoint.relation.route.sourceTangentShift = shifts[index]!;
-      else endpoint.relation.route.targetTangentShift = shifts[index]!;
-    });
-  }
-}
-
 function tangentAxis(side: FloatingSide): "horizontal" | "vertical" {
   return side === "top" || side === "bottom" ? "horizontal" : "vertical";
-}
-
-function compareFanoutEndpoints(a: RoutedEndpoint, b: RoutedEndpoint, nodeById: Map<string, GraphCard>): number {
-  const aRank = fanoutSortRank(a, nodeById);
-  const bRank = fanoutSortRank(b, nodeById);
-  if (aRank !== bRank) {
-    return aRank - bRank;
-  }
-  return `${relationSortKey(a.relation)}:${a.endpoint}`.localeCompare(`${relationSortKey(b.relation)}:${b.endpoint}`);
-}
-
-function fanoutSortRank(endpoint: RoutedEndpoint, nodeById: Map<string, GraphCard>): number {
-  const otherNode = nodeById.get(endpoint.otherAgentId);
-  if (!otherNode) {
-    return 0;
-  }
-  const center = nodeCenter(otherNode);
-  return endpoint.side === "left" || endpoint.side === "right" ? center.y : center.x;
 }
 
 function nodeCenter(node: GraphCard): { x: number; y: number } {
@@ -153,10 +103,6 @@ function nodeWidth(node: GraphCard): number {
 
 function nodeHeight(node: GraphCard): number {
   return node.measured?.height ?? DEFAULT_NODE_HEIGHT;
-}
-
-function relationSortKey(relation: AgentConnection): string {
-  return relation.id;
 }
 
 function directionForSide(side: FloatingSide): { x: number; y: number } {
@@ -194,4 +140,46 @@ function makeArrowPath(tip: { x: number; y: number }, previousControl: { x: numb
   const wing2X = baseX - normalX * EDGE_ARROW_HALF_WIDTH;
   const wing2Y = baseY - normalY * EDGE_ARROW_HALF_WIDTH;
   return `M ${tip.x},${tip.y} L ${wing1X},${wing1Y} L ${wing2X},${wing2Y} Z`;
+}
+
+
+export interface ConnectionJunction {
+  id: string;
+  nodeId: string;
+  side: FloatingSide;
+  path: string;
+  arrow: string | null;
+  connectionIds: string[];
+  relations: AgentConnection["relations"];
+}
+
+function portKey(nodeId: string, side: FloatingSide): string {
+  return `junction:${JSON.stringify([nodeId, side])}`;
+}
+
+/** Merge incoming and outgoing branches at one point on each card side. */
+export function connectionJunctions(routes: ReturnType<typeof routeConnections>): ConnectionJunction[] {
+  const ports = new Map<string, ConnectionJunction & { length: number }>();
+  for (const route of routes) {
+    for (const endpoint of ["source", "target"] as const) {
+      const source = endpoint === "source";
+      const id = source ? route.startPortKey : route.endPortKey;
+      const side = source ? route.route.sourceSide : route.route.targetSide;
+      const tip = source ? route.points[0]! : route.points.at(-1)!;
+      const next = source ? route.points[1]! : route.points.at(-2)!;
+      const length = Math.min(24, Math.hypot(next.x - tip.x, next.y - tip.y));
+      const incoming = source ? route.arrowAtSource : route.arrowAtTarget;
+      const port = ports.get(id) ?? { id, nodeId: route[endpoint], side, path: "", arrow: null,
+        connectionIds: [], relations: [], length };
+      port.length = Math.min(port.length, length);
+      const direction = directionForSide(side);
+      port.path = agentRoutePath([tip, { x: tip.x + direction.x * port.length, y: tip.y + direction.y * port.length }]);
+      if (incoming) port.arrow = source ? route.startArrow : route.endArrow;
+      port.connectionIds.push(route.id);
+      for (const relation of route.relations) if (!port.relations.some((existing) => existing.id === relation.id)) port.relations.push(relation);
+      ports.set(id, port);
+    }
+  }
+  // Single connections already expose their own interaction and arrowheads.
+  return [...ports.values()].filter((port) => port.connectionIds.length > 1);
 }

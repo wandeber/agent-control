@@ -5,11 +5,12 @@ import { Users, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { RELATION_META, TEAM_NODE_ID } from "@/lib/graph";
-import { routeConnections } from "@/lib/connection-routing";
+import { connectionJunctions, routeConnections, type ConnectionJunction } from "@/lib/connection-routing";
 import { teamBounds, type AgentConnection, type AgentTeam, type TeamRelation } from "@/lib/team-graph";
 import type { AgentFlowNode } from "./agent-node";
 
 type OpenConnection = { id: string; x: number; y: number; pinned: boolean };
+type ConnectionTarget = AgentConnection | ConnectionJunction;
 
 export function AgentConnectionOverlay({ nodes, connections, team }: {
   nodes: AgentFlowNode[]; connections: AgentConnection[]; team: AgentTeam | null;
@@ -20,14 +21,17 @@ export function AgentConnectionOverlay({ nodes, connections, team }: {
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const triggerRef = useRef<SVGGElement | null>(null);
   const rendered = useMemo(() => routeConnections(connections, nodes, team), [connections, nodes, team]);
-  const active = connections.find((connection) => connection.id === open?.id);
+  const junctions = useMemo(() => connectionJunctions(rendered), [rendered]);
+  const mergedPorts = new Set(junctions.map((junction) => junction.id));
+  const active = [...connections, ...junctions].find((connection) => connection.id === open?.id);
   const name = (id: string) => id === TEAM_NODE_ID ? "Team" : nodes.find((node) => node.id === id)?.data.presentation.title ?? "Agent";
+  const title = (target: ConnectionTarget) => "nodeId" in target ? `${name(target.nodeId)} · Shared connections` : `${name(target.source)} · ${name(target.target)}`;
   const cancelClose = () => { if (closeTimer.current) clearTimeout(closeTimer.current); };
   const closeLater = () => {
     cancelClose();
     closeTimer.current = setTimeout(() => setOpen((current) => current?.pinned ? current : null), 180);
   };
-  const show = (edge: AgentConnection, target: SVGGElement, pinned: boolean, point?: { x: number; y: number }) => {
+  const show = (edge: ConnectionTarget, target: SVGGElement, pinned: boolean, point?: { x: number; y: number }) => {
     cancelClose();
     const rect = target.getBoundingClientRect();
     if (!open?.pinned || pinned) triggerRef.current = target;
@@ -77,8 +81,22 @@ export function AgentConnectionOverlay({ nodes, connections, team }: {
             <path d={edge.path} fill="none" stroke="transparent" strokeWidth={18} pointerEvents="stroke" className="cursor-pointer" />
             <path d={edge.path} fill="none" stroke={open?.id === edge.id ? "#0f766e" : "#778594"} strokeWidth={2}
               strokeLinecap="round" strokeLinejoin="round" />
-            {edge.arrowAtSource ? <path data-arrow="source" d={edge.startArrow} fill="#778594" /> : null}
-            {edge.arrowAtTarget ? <path data-arrow="target" d={edge.endArrow} fill="#778594" /> : null}
+            {edge.arrowAtSource && !mergedPorts.has(edge.startPortKey) ? <path data-arrow="source" d={edge.startArrow} fill="#778594" /> : null}
+            {edge.arrowAtTarget && !mergedPorts.has(edge.endPortKey) ? <path data-arrow="target" d={edge.endArrow} fill="#778594" /> : null}
+          </g>)}
+          {junctions.map((junction) => <g key={junction.id} role="button" tabIndex={0} aria-haspopup="dialog" style={{ outline: "none" }}
+            aria-label={`${name(junction.nodeId)}, ${junction.side} side: ${junction.relations.length} relationships`}
+            aria-expanded={open?.id === junction.id} data-junction-id={junction.id}
+            onMouseEnter={(event) => show(junction, event.currentTarget, false, { x: event.clientX, y: event.clientY })}
+            onMouseLeave={closeLater} onFocus={(event) => show(junction, event.currentTarget, false)} onBlur={closeLater}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => { event.stopPropagation(); show(junction, event.currentTarget, true, { x: event.clientX, y: event.clientY }); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); show(junction, event.currentTarget, true); }
+            }}>
+            <path d={junction.path} fill="none" stroke="transparent" strokeWidth={18} pointerEvents="stroke" className="cursor-pointer" />
+            <path d={junction.path} fill="none" stroke={open?.id === junction.id ? "#0f766e" : "#778594"} strokeWidth={2} strokeLinecap="round" />
+            {junction.arrow ? <path data-arrow="merged" d={junction.arrow} fill="#778594" /> : null}
           </g>)}
         </svg>
       </div>
@@ -88,7 +106,7 @@ export function AgentConnectionOverlay({ nodes, connections, team }: {
       onMouseEnter={cancelClose} onMouseLeave={closeLater}
       style={{ left: Math.max(12, Math.min(open.x + 12, window.innerWidth - 352)), top: Math.max(12, Math.min(open.y + 12, window.innerHeight - 330)) }}>
       <div className="mb-3 flex items-start justify-between gap-2">
-        <div><div className="text-sm font-semibold">{name(active.source)} · {name(active.target)}</div>
+        <div><div className="text-sm font-semibold">{title(active)}</div>
           <div className="mt-1 text-[11px] text-ink-400">{open.pinned ? "Connection details" : "Click the line to keep this open"}</div></div>
         <button className="rounded p-1 hover:bg-slate-100" aria-label="Close relationships" onClick={() => { triggerRef.current?.focus(); setOpen(null); }}><X className="size-4" /></button>
       </div>

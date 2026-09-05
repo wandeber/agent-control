@@ -104,11 +104,3 @@ class MinQueue {
     return first?.key;
   }
 }
-
-/** Keep a crowded bundle on the straight part of a compact card's edge. */
-export function fitAgentPortShifts(shifts: number[], sideLength: number): number[] {
-  const extent = Math.max(0, sideLength / 2 - 14);
-  const maximum = Math.max(0, ...shifts.map(Math.abs));
-  const scale = maximum ? Math.min(1, extent / maximum) : 1;
-  return shifts.map((shift) => shift * scale);
-}

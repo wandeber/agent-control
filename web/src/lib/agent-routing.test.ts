@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { crossesCard, fitAgentPortShifts, routeAgentConnection, type AgentRect } from "./agent-routing";
+import { crossesCard, routeAgentConnection, type AgentRect } from "./agent-routing";
 
 describe("agent routes around cards", () => {
   const cases: AgentRect[][] = [
@@ -34,11 +34,6 @@ describe("agent routes around cards", () => {
       { x: 0, y: 0, width: 300, height: 130 }, { x: 280, y: 0, width: 100, height: 130 }, { x: 600, y: 0, width: 300, height: 130 }
     ])).toEqual([]);
   });
-  it("keeps eight distinct parallel endpoints inside a compact 99px card", () => {
-    const shifts = fitAgentPortShifts([-54, -45, -27, -9, 9, 27, 45, 54], 99);
-    expect(new Set(shifts).size).toBe(8);
-    expect(Math.max(...shifts.map(Math.abs))).toBeLessThanOrEqual(35.5);
-    expect(fitAgentPortShifts([0], 99)).toEqual([0]);
-  });
+
 
 });

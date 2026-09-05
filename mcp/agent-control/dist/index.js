@@ -11,7 +11,7 @@ import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 const { controller, store } = createController();
-const MCP_APP_VERSION = "0.1.5";
+const MCP_APP_VERSION = "0.1.6";
 const CONSOLE_RESOURCE_URI = `ui://agent-control/${MCP_APP_VERSION}/console.html`;
 const CONSOLE_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));

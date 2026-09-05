@@ -290,7 +290,10 @@ relationships, or the active phase worker when no agent is selected. Other
 agents retain main declared phase connections (or real structural links for
 free workers). One connection per unordered pair combines all visible relation
 types and conditions. Each endpoint has an arrowhead only when at least one
-relation points toward it. Hovering or focusing a line reveals the directed
+relation points toward it. Connections meeting the same side of a card share
+one centered junction and one arrowhead when any branch points into the card.
+Incoming and outgoing branches can share that junction; its popover retains
+all their directed relationships. Hovering or focusing a line reveals the directed
 relationships; clicking or pressing Enter keeps the popover open. Connection
 styles do not encode combinations of relationship types.
 
