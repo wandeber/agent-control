@@ -61,6 +61,22 @@ describe("run observation", () => {
       cursor: observation.cursor, timeoutMs: 20, intervalMs: 1, ...extra });
   }
 
+  it("projects global subscriptions into the selected dashboard without including foreign participants or run scopes", () => {
+    const first = run(), other = run();
+    const owner = controller.registerAgent({ runId: first.run_id, backend: "fake", title: "Owner" });
+    const worker = controller.registerAgent({ runId: first.run_id, backend: "fake", title: "Worker" });
+    const foreign = controller.registerAgent({ runId: other.run_id, backend: "fake", title: "Other" });
+    const global = controller.createSubscription({ subscriberAgentId: owner.agent_id, eventType: "agent.completed" });
+    const scoped = controller.createSubscription({ runId: first.run_id, sourceAgentId: worker.agent_id, subscriberAgentId: owner.agent_id, eventType: "agent.blocked" });
+    controller.createSubscription({ runId: other.run_id, subscriberAgentId: owner.agent_id, eventType: "agent.failed" });
+    controller.createSubscription({ subscriberAgentId: foreign.agent_id, eventType: "agent.completed" });
+    controller.createSubscription({ sourceAgentId: foreign.agent_id, subscriberAgentId: owner.agent_id, eventType: "agent.stopped" });
+    const snapshot = controller.getDashboardSnapshot(first.run_id);
+    expect(snapshot.subscriptions.map((subscription) => subscription.subscription_id)).toEqual([global.subscription_id, scoped.subscription_id]);
+    expect(snapshot.subscriptions[0]).toMatchObject({ run_id: null, source_agent_id: null });
+    expect(controller.listSubscriptions({ runId: first.run_id }).map((subscription) => subscription.subscription_id)).toEqual([scoped.subscription_id]);
+  });
+
   it("attaches a distinct conversation without tokens, ownership grants or parent links", () => {
     const owner = controller.orchestratorLogin({ title: "Owner", adminKey: "observer-test-admin", backend: "codex-thread",
       backendHandle: { thread_id: "owner-thread", agent_control_role: "orchestrator" } });

@@ -288,9 +288,24 @@ rather than storing it as control state.
 The agents view defaults to the selected agent's incoming and outgoing
 relationships, or the active phase worker when no agent is selected. Other
 agents retain main declared phase connections (or real structural links for
-free workers). Parallel conditions share one arrow with all explanations in
-its tooltip. Cards show state, current or last phase, and a public activity
-line; technical metrics remain in the inspector. Activity is the latest public
+free workers). One connection per unordered pair combines all visible relation
+types and conditions. Each endpoint has an arrowhead only when at least one
+relation points toward it. Hovering or focusing a line reveals the directed
+relationships; clicking or pressing Enter keeps the popover open. Connection
+styles do not encode combinations of relationship types.
+
+Workers appear inside a Team frame; orchestrators and observers stay outside,
+including after cards move. A relationship type that connects an outside role
+to every current member uses the Team header as its endpoint. Its detail keeps
+each original member, direction, and condition; this does not imply coverage
+of future members. Explicit subscriptions with no source-agent filter target
+the Team directly and do cover future members. Members can subscribe through
+the inside of the shared header. Particular relationships remain attached to
+individual cards. The dashboard includes applicable subscriptions with no run
+filter and preserves each enabled event filter rather than inferring scope
+from an observer's union of event types.
+
+Cards show state, current or last phase, and a public activity line; technical metrics remain in the inspector. Activity is the latest public
 output or tool use, including a completed tool. Running/completed labels come
 from observed item state, never inferred private reasoning. Native workers
 publish an explicit `public_activity` through external sync; private

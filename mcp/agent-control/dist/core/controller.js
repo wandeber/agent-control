@@ -5686,8 +5686,12 @@ export class AgentController {
         const flowReports = flowInstances.flatMap((instance) => this.store.listFlowStepReports(instance.flow_instance_id));
         const flowTransitions = flowInstances.flatMap((instance) => this.store.listFlowTransitions(instance.flow_instance_id));
         const flowArtifactBindings = flowInstances.flatMap((instance) => this.store.listFlowArtifactBindings(instance.flow_instance_id));
-        const subscriptions = selectedRunId ? this.listSubscriptions({ runId: selectedRunId }) : [];
         const agentIds = new Set(agents.map((agent) => agent.agent_id));
+        // Global subscriptions also apply to the selected run. Limit this projection
+        // to visible participants without changing the subscription listing API.
+        const subscriptions = selectedRunId ? this.listSubscriptions().filter((subscription) => (!subscription.run_id || subscription.run_id === selectedRunId) &&
+            agentIds.has(subscription.subscriber_agent_id) &&
+            (!subscription.source_agent_id || agentIds.has(subscription.source_agent_id))) : [];
         const heartbeats = this.listHeartbeats().filter((heartbeat) => agentIds.has(heartbeat.agent_id));
         const goals = this.listGoals().filter((goal) => agentIds.has(goal.agent_id));
         const artifacts = selectedRunId ? this.listArtifacts({ runId: selectedRunId }) : [];

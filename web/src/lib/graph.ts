@@ -3,8 +3,7 @@ import type {
   AgentLinkRecord,
   AgentLinkType,
   AgentRecord,
-  DashboardSnapshot,
-  SubscriptionRecord
+  DashboardSnapshot
 } from "./types";
 import { buildFlowVisualModel } from "./flow-graph";
 import { flowDiagramEdges } from "./flow-diagram";
@@ -19,7 +18,10 @@ export interface GraphRelation {
   label: string;
   emphasized?: boolean;
   details?: string;
+  scope?: "run";
 }
+
+export const TEAM_NODE_ID = "agent-control-team";
 
 export const RENDERABLE_RELATION_TYPES: RenderableAgentLinkType[] = [
   "parent_child",
@@ -59,38 +61,24 @@ export function buildRelations(snapshot: DashboardSnapshot): GraphRelation[] {
       label: link.label ?? RELATION_META[link.type].label
     }));
 
-  const relationKeys = new Set(relations.map((link) => relationKey(link)));
-  const subscriptionRelations = snapshot.subscriptions
-    .filter((subscription): subscription is SubscriptionRecord & { source_agent_id: string } =>
-      Boolean(subscription.source_agent_id) && subscription.enabled
-    )
-    .map((subscription) => ({
+  const ids = new Set(snapshot.agents.map((agent) => agent.agent_id));
+  // Preserve every event filter. A manual relationship is distinct from an
+  // enabled subscription, even when it shares the same endpoints and type.
+  for (const subscription of snapshot.subscriptions) {
+    if (!subscription.enabled || !ids.has(subscription.subscriber_agent_id) ||
+      subscription.run_id && subscription.run_id !== snapshot.selected_run_id) continue;
+    relations.push({
       id: `subscription-${subscription.subscription_id}`,
       source: subscription.subscriber_agent_id,
-      target: subscription.source_agent_id,
-      type: "subscribed_to" as const,
-      label: subscription.event_type.replace("agent.", "")
-    }))
-    .filter((relation) => !relationKeys.has(relationKey(relation)));
-
-  for (const relation of subscriptionRelations) {
-    pushUniqueRelation(relations, relationKeys, relation);
+      target: subscription.source_agent_id ?? TEAM_NODE_ID,
+      type: "subscribed_to",
+      label: subscription.event_type,
+      scope: subscription.source_agent_id ? undefined : "run"
+    });
   }
+  return relations.filter((relation) => ids.has(relation.source) &&
+    (ids.has(relation.target) || relation.target === TEAM_NODE_ID) && relation.source !== relation.target);
 
-  for (const observer of snapshot.run_observers ?? []) {
-    if (!observer.event_types.length) continue;
-    for (const agent of snapshot.agents) {
-      if (agent.run_id !== observer.run_id || agent.agent_id === observer.observer_agent_id || agent.role === "observer") continue;
-      pushUniqueRelation(relations, relationKeys, {
-        id: `observe:${observer.observer_agent_id}:${agent.agent_id}`,
-        source: observer.observer_agent_id, target: agent.agent_id, type: "subscribed_to",
-        label: `Run events: ${observer.event_types.join(", ")}`
-      });
-    }
-  }
-
-  const ids = new Set(snapshot.agents.map((agent) => agent.agent_id));
-  return relations.filter((relation) => ids.has(relation.source) && ids.has(relation.target) && relation.source !== relation.target);
 }
 
 export function focusedAgentId(snapshot: DashboardSnapshot, selected: string | null): string | null {
@@ -122,24 +110,6 @@ export function primaryAgentRelations(snapshot: DashboardSnapshot, relations: Gr
   const participants = new Set([...agentForNode.values()].filter(Boolean));
   return relations.filter((relation) => relation.type === "handoff" && pairs.has(`${relation.source}:${relation.target}`) ||
     relation.type === "parent_child" && !participants.has(relation.target));
-}
-
-export function visibleAgentRelations(relations: GraphRelation[], primary: GraphRelation[], focus: string | null, all: boolean): GraphRelation[] {
-  const primaryIds = new Set(primary.map((relation) => relation.id));
-  const groups = new Map<string, GraphRelation[]>();
-  for (const relation of relations) {
-    if (!all && relation.source !== focus && relation.target !== focus && !primaryIds.has(relation.id)) continue;
-    const key = relationKey(relation);
-    groups.set(key, [...(groups.get(key) ?? []), relation]);
-  }
-  // Conditions sharing endpoints use one arrow; every condition remains in its tooltip.
-  return [...groups.values()].map((group) => {
-    const first = group[0]!;
-    const emphasized = first.source === focus || first.target === focus;
-    const labels = [...new Set(group.map((relation) => relation.label))];
-    return { ...first, emphasized, label: all || emphasized ? `${RELATION_META[first.type].label}${labels.length > 1 ? ` · ${labels.length} routes` : ""}` : "",
-      details: labels.join("\n") };
-  });
 }
 
 export function initialLayout(agents: AgentRecord[], relations: GraphRelation[], snapshot?: DashboardSnapshot) {
@@ -208,21 +178,4 @@ export function initialLayout(agents: AgentRecord[], relations: GraphRelation[],
       });
   }
   return positions;
-}
-
-function relationKey(relation: Pick<GraphRelation, "source" | "target" | "type">) {
-  return `${relation.source}:${relation.target}:${relation.type}`;
-}
-
-function pushUniqueRelation(
-  relations: GraphRelation[],
-  relationKeys: Set<string>,
-  relation: GraphRelation
-) {
-  const key = relationKey(relation);
-  if (relationKeys.has(key)) {
-    return;
-  }
-  relations.push(relation);
-  relationKeys.add(key);
 }
