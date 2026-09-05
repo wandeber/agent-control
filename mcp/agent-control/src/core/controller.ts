@@ -2,6 +2,8 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
+import { RunObservation, isPassiveObserver, type ObserveRunInput, type WaitRunInput } from "./run-observation.js";
+import { parseActivity, activityText, type AgentActivity } from "./agent-activity.js";
 import {
   parseFlowConfig,
   resolveFlowAgentLifecycle,
@@ -116,6 +118,7 @@ interface AgentControllerOptions {
 
 export class AgentController {
   private readonly controllerInstanceId = newId("controller");
+  private readonly observations: RunObservation;
   private readonly statusWatchers = new Map<string, () => void>();
   private readonly pendingDeliveries = new Set<Promise<void>>();
   private readonly inFlightSubscriberDeliveries = new Set<string>();
@@ -130,6 +133,7 @@ export class AgentController {
     private readonly credentialStore: LocalCredentialStore | null = null,
     options: AgentControllerOptions = {}
   ) {
+    this.observations = new RunObservation(store, this, adapters);
     const configuredDelays =
       options.nativeActionDeliveryRetryDelaysMs ??
       DEFAULT_NATIVE_ACTION_DELIVERY_RETRY_DELAYS_MS;
@@ -273,6 +277,43 @@ export class AgentController {
       }
     });
     return pendingEvents;
+  }
+
+  observeRun(input: ObserveRunInput) {
+    return this.observations.observe(input);
+  }
+
+  waitForRun(input: WaitRunInput) {
+    return this.observations.wait(input);
+  }
+
+  private isAttachedParticipant(agent: AgentRecord): boolean {
+    return isPassiveObserver(agent) || this.observations.isAttached(agent.agent_id);
+  }
+
+  private samePublicActivity(previous: AgentActivity | undefined, value: unknown): boolean {
+    const activity = parseActivity(value);
+    return activity ? previous?.kind === activity.kind && previous.text === activity.text && previous.state === activity.state &&
+      (activity.observed_at === undefined || previous.observed_at === activity.observed_at) : previous === undefined;
+  }
+
+  private saveActivity(agent: AgentRecord, value: unknown): void {
+    const activity = parseActivity(value);
+    if (!activity) {
+      this.store.db.prepare("delete from agent_activity where agent_id = ?").run(agent.agent_id);
+      return;
+    }
+    const existing = this.readActivity(agent);
+    if (existing?.kind === activity.kind && existing.text === activity.text && existing.state === activity.state && existing.observed_at === activity.observed_at) return;
+    this.store.db.prepare("insert into agent_activity values (?, ?) on conflict(agent_id) do update set activity_json = excluded.activity_json")
+      .run(agent.agent_id, JSON.stringify({ ...activity, work_generation: agent.work_generation }));
+  }
+
+  private readActivity(agent: AgentRecord): AgentActivity | undefined {
+    const row = this.store.db.prepare("select activity_json from agent_activity where agent_id = ?").get(agent.agent_id) as { activity_json: string } | undefined;
+    if (!row) return undefined;
+    const value = JSON.parse(row.activity_json);
+    return value.work_generation === agent.work_generation ? parseActivity(value) ?? undefined : undefined;
   }
 
   listBackends(): ReturnType<AdapterRegistry["list"]> {
@@ -2375,7 +2416,7 @@ export class AgentController {
     );
     let pendingAgentIds = this.store
       .listAgents({ runId })
-      .filter((agent) => !TERMINAL_STATUSES.has(agent.status))
+      .filter((agent) => !this.isAttachedParticipant(agent) && !TERMINAL_STATUSES.has(agent.status))
       .map((agent) => agent.agent_id);
     let complete = pendingAgentIds.length === 0;
     let run = this.store.updateRunStatus(runId, complete ? "stopped" : "stopping");
@@ -2764,6 +2805,7 @@ export class AgentController {
       | "errored"
       | "missing";
     latestMessage?: string | null;
+    publicActivity?: unknown;
     observedAt?: string | null;
     confirmedAbsent?: boolean;
   }): {
@@ -2773,6 +2815,9 @@ export class AgentController {
     orchestrator_action?: OrchestratorActionRef;
   } {
     const agent = this.getAgent(input.agentId);
+    if (input.publicActivity !== undefined && input.publicActivity !== null && !parseActivity(input.publicActivity)) {
+      throw new ControllerError("Public activity must be a short public message or tool description.", "tool_error");
+    }
     if (agent.backend !== CODEX_SUBAGENT_BACKEND) {
       throw new ControllerError("External native sync requires a codex-subagent agent.", "unsupported_operation", {
         agent_id: agent.agent_id,
@@ -2859,7 +2904,8 @@ export class AgentController {
             nullableRecordString(existing, "native_agent_id") === (nativeAgentId ?? null) &&
             nullableRecordString(existing, "native_task_name") === (nativeTaskName ?? null) &&
             nullableRecordString(existing, "native_task_path") === (nativeTaskPath ?? null) &&
-            existingLatestMessage === (latestMessage ?? null);
+            existingLatestMessage === (latestMessage ?? null) &&
+            (input.publicActivity === undefined || this.samePublicActivity(this.readActivity(current), input.publicActivity));
           if (!sameObservation) {
             throw new ControllerError(
               "Conflicting native observations cannot share the same observed_at timestamp.",
@@ -2938,6 +2984,13 @@ export class AgentController {
         missingSince,
         missingObservationCount
       });
+      if (input.publicActivity !== undefined) {
+        const activity = parseActivity(input.publicActivity);
+        const previous = this.readActivity(current);
+        const originalTimestamp = activity?.observed_at ??
+          (this.samePublicActivity(previous, activity) ? previous?.observed_at : undefined) ?? observedAt;
+        this.saveActivity(current, activity ? { ...activity, observed_at: originalTimestamp } : null);
+      }
       const cancelledInterruptActionIds = TERMINAL_STATUSES.has(projectedStatus)
         ? this.cancelPendingCodexSubagentInterruptsForTerminalSync(
             current,
@@ -5079,6 +5132,7 @@ export class AgentController {
     forkTurns?: CodexSubagentForkTurns;
   }): Promise<AgentStartResult> {
     let agent = this.getAgent(input.agentId);
+    if (this.isAttachedParticipant(agent)) throw new ControllerError("An attached conversation cannot be started as a worker.", "unsupported_operation");
     if (input.agentToken) {
       const caller = this.requireAgentToken(input.agentToken);
       if (!this.canAgentAccessRun(caller, agent.run_id)) {
@@ -5704,6 +5758,12 @@ export class AgentController {
 
   async sendMessage(agentId: string, message: string): Promise<AgentSendResult> {
     const agent = this.getAgent(agentId);
+    if (this.isAttachedParticipant(agent)) {
+      const adapter = this.adapters.get(agent.backend);
+      if (!adapter.stageNotification) throw new ControllerError("Safe notification staging is unavailable.", "unsupported_operation");
+      await adapter.stageNotification(this.requireHandle(agent), { message });
+      return { agent, delivered: true };
+    }
     this.assertNewWorkAllowed(agent.run_id, "agent_send_message", agent);
     const adapter = this.adapters.get(agent.backend);
     const capabilities = adapter.capabilities();
@@ -5891,6 +5951,17 @@ export class AgentController {
     const agent = this.getAgent(agentId);
     const adapter = this.adapters.get(agent.backend);
     const messages = await adapter.readLatest(this.requireHandle(agent), { limit });
+    const latest = [...messages].reverse().find((message) => {
+      if (message.role !== "assistant" || !activityText(message.text)) return false;
+      const metadata = message.metadata ?? {};
+      if (metadata.source === "opencode-log-tail") return false;
+      return [metadata.type, metadata.kind, metadata.itemType].every((kind) =>
+        kind === undefined || kind === "text" || kind === "message" || kind === "agentMessage");
+    });
+    const current = this.getAgent(agentId);
+    if (latest && agent.backend !== "codex-thread" && this.readActivity(current)?.state !== "running" && current.work_generation === agent.work_generation && current.work_revision === agent.work_revision) {
+      this.saveActivity(current, { kind: "message", text: latest.text, observed_at: latest.created_at });
+    }
     this.store.touchHeartbeat(agentId);
     return messages;
   }
@@ -6113,6 +6184,9 @@ export class AgentController {
       // A terminal status from the same backend handle is authoritative proof
       // that cleanup completed. Without stop intent, retain the ordinary status
       // refresh behavior.
+      if (snapshot.data && Object.prototype.hasOwnProperty.call(snapshot.data, "activity")) {
+        this.saveActivity(current, snapshot.data.activity);
+      }
       const changed =
         snapshot.status !== current.status ||
         snapshotFailureReason !== current.failure_reason;
@@ -6163,7 +6237,7 @@ export class AgentController {
   async pollActiveAgents(runId?: string): Promise<AgentRecord[]> {
     const agents = this.store
       .listAgents({ runId })
-      .filter((agent) => !TERMINAL_STATUSES.has(agent.status));
+      .filter((agent) => !this.isAttachedParticipant(agent) && !TERMINAL_STATUSES.has(agent.status));
     const refreshed: AgentRecord[] = [];
     for (const agent of agents) {
       refreshed.push(await this.refreshAgentStatus(agent.agent_id));
@@ -6496,6 +6570,7 @@ export class AgentController {
     mode: "graceful" | "interrupt" | "kill" = "graceful"
   ): Promise<AgentStopResult> {
     let agent = this.getAgent(agentId);
+    if (this.isAttachedParticipant(agent)) return agent;
     // Capture intent before this call writes its own transient `stopping`
     // projection. A manual route, run shutdown, or earlier cleanup attempt has
     // already made cleanup durable; an ordinary first-time stop has not. That
@@ -6708,7 +6783,7 @@ export class AgentController {
     const mode = input.mode ?? "graceful";
     const agents = this.store
       .listAgents({ runId: input.runId })
-      .filter((agent) => !TERMINAL_STATUSES.has(agent.status));
+      .filter((agent) => !this.isAttachedParticipant(agent) && !TERMINAL_STATUSES.has(agent.status));
     return Promise.all(agents.map((agent) => this.stopAgent(agent.agent_id, mode)));
   }
 
@@ -6802,7 +6877,7 @@ export class AgentController {
     }
     const pending = this.store
       .listAgents({ runId })
-      .filter((agent) => !TERMINAL_STATUSES.has(agent.status));
+      .filter((agent) => !this.isAttachedParticipant(agent) && !TERMINAL_STATUSES.has(agent.status));
     if (pending.length > 0) {
       return null;
     }
@@ -6818,7 +6893,7 @@ export class AgentController {
   async unregisterAgent(agentId: string): Promise<AgentRecord> {
     const agent = this.getAgent(agentId);
     const adapter = this.adapters.get(agent.backend);
-    if (agent.backend_handle && adapter.unregister) {
+    if (!this.isAttachedParticipant(agent) && agent.backend_handle && adapter.unregister) {
       await adapter.unregister(this.requireHandle(agent), { archiveRecord: true });
     }
     const unregistered = this.store.updateAgent(agentId, { unregisteredAt: nowIso() });
@@ -7062,6 +7137,7 @@ export class AgentController {
       .listSubscriptions({ runId: input.runId ?? undefined, enabledOnly: true })
       .find(
         (subscription) =>
+          !this.observations.ownsSubscription(subscription.subscription_id) &&
           subscription.source_agent_id === (input.sourceAgentId ?? null) &&
           subscription.subscriber_agent_id === input.subscriberAgentId &&
           subscription.event_type === input.eventType
@@ -7439,13 +7515,15 @@ export class AgentController {
         elapsed_ms: Number.isFinite(created) ? Math.max(0, elapsedEnd - created) : 0,
         status_age_ms: Number.isFinite(updated) ? Math.max(0, now - updated) : 0,
         is_terminal: isTerminal,
-        latest_usage: latestUsageByAgent.get(agent.agent_id) ?? null
+        latest_usage: latestUsageByAgent.get(agent.agent_id) ?? null,
+        activity: this.readActivity(agent)
       };
     });
 
     return {
       generated_at: new Date(now).toISOString(),
       selected_run_id: selectedRunId,
+      run_observers: selectedRunId ? this.observations.listPublic(selectedRunId) : [],
       runs,
       agents,
       agent_links: agentLinks,
@@ -8175,7 +8253,8 @@ export class AgentController {
   private scheduleEventDelivery(event: EventRecord): void {
     this.store.afterCommit(() => {
       if (!this.isDeliverySuppressed(event)) {
-        const delivery = this.deliverSubscriptions(event)
+        const delivery = Promise.all([this.deliverSubscriptions(event), this.observations.notify(event)])
+          .then(() => undefined)
           .catch(() => {
             // Delivery errors should never invalidate the source event.
           })
@@ -8291,6 +8370,7 @@ export class AgentController {
     const deliveredSubscriberEventKeys = new Set<string>();
 
     for (const subscription of subscriptions) {
+      if (this.observations.coversEvent(subscription.subscriber_agent_id, event) || this.observations.ownsSubscription(subscription.subscription_id)) continue;
       const deliveryKey = `${event.event_id}:${subscription.subscriber_agent_id}`;
       if (
         deliveredSubscriberEventKeys.has(deliveryKey) ||
@@ -8748,7 +8828,7 @@ export class AgentController {
     return [...descendants]
       .map((id) => this.store.getAgent(id))
       .filter((agent): agent is AgentRecord => Boolean(agent))
-      .filter((agent) => !agent.unregistered_at && !TERMINAL_STATUSES.has(agent.status));
+      .filter((agent) => !agent.unregistered_at && !this.isAttachedParticipant(agent) && !TERMINAL_STATUSES.has(agent.status));
   }
 }
 

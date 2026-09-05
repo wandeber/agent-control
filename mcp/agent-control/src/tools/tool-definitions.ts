@@ -38,6 +38,8 @@ import {
   orchestratorLoginSchema,
   orchestratorActionAckSchema,
   orchestratorActionClaimSchema,
+  runObserveSchema,
+  runWaitSchema,
   runCreateSchema,
   runIdSchema,
   runListSchema,
@@ -58,6 +60,21 @@ import {
 } from "./json-schema.js";
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    name: "run_observe",
+    description: "Identify the user conversation in a run and subscribe to selected events without transferring workflow or native bridge ownership. Default delivery is through run_wait; notify uses safe in-turn injection only.",
+    inputSchema: objectSchema({ run_id: stringProperty("Run to observe."), thread_id: stringProperty("Actual Codex thread id; defaults to current CODEX_THREAD_ID."),
+      title: stringProperty("Participant title."), event_types: { type: "array", items: { type: "string", enum: [...EVENT_TYPES] } },
+      delivery: enumProperty(["wait", "notify"], "wait or notify; default wait."), admin_key: stringProperty("Admin authorization."), agent_token: stringProperty("Authorized caller identity.") }, ["run_id"]),
+    schema: runObserveSchema
+  },
+  {
+    name: "run_wait",
+    description: "Wait for subscribed run events. Reuse the returned cursor to avoid repeats. Omit timeout for indefinite wait or use 3600000 for one hour. Cancellation ends the wait without starting a competing Codex turn.",
+    inputSchema: objectSchema({ run_id: stringProperty("Observed run."), observer_agent_id: stringProperty("Observing participant id."),
+      cursor: stringProperty("Durable cursor from run_observe or run_wait."), timeout_ms: numberProperty("Optional positive timeout; 3600000 is one hour."), limit: numberProperty("Maximum batch size, up to 100.") }, ["run_id", "observer_agent_id", "cursor"]),
+    schema: runWaitSchema
+  },
   {
     name: "backend_list",
     description: "List registered backend adapters and their capability flags.",
@@ -199,6 +216,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           "Observed subagent v2 status."
         ),
         latest_message: stringProperty("Private latest message, limited to 4 KiB and excluded from dashboards/events."),
+        public_activity: { type: ["object", "null"], description: "Explicit public card summary, never hidden reasoning or raw logs. Null clears it.",
+          properties: { kind: { type: "string", enum: ["message", "tool"] }, text: { type: "string", maxLength: 240 },
+            state: { type: "string", enum: ["running", "completed", "failed"] }, observed_at: { type: "string", format: "date-time" } }, required: ["kind", "text"] },
         observed_at: stringProperty("Observation timestamp. Defaults to now."),
         confirmed_absent: booleanProperty("Confirm exact absence after the recovery delay.")
       },

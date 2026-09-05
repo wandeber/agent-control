@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "../core/ids.js";
 import { defaultStatePath } from "../core/paths.js";
+import { initializeObservationSchema } from "./observation-schema.js";
 const NATIVE_ORIGIN_GRANT_MIGRATION_ID = "2026-07-16-native-origin-grant-fk-v5";
 function parseJsonObject(value) {
     if (typeof value !== "string" || value.length === 0) {
@@ -39,6 +40,7 @@ export class SqliteStore {
         this.db.pragma("foreign_keys = ON");
         try {
             this.migrate();
+            initializeObservationSchema(this.db);
         }
         catch (error) {
             // A failed transactional migration has already rolled its data changes

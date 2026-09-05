@@ -272,9 +272,11 @@ export interface AgentComputedState {
   status_age_ms: number;
   is_terminal: boolean;
   latest_usage: UsageSnapshotRecord | null;
+  activity?: { kind: "message" | "tool"; text: string; observed_at?: string; state?: "running" | "completed" | "failed" } | null;
 }
 
 export interface DashboardSnapshot {
+  run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
   selected_run_id: string | null;
   runs: RunRecord[];

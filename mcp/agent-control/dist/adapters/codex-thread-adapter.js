@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { ControllerError } from "../core/errors.js";
+import { codexThreadActivity } from "../core/agent-activity.js";
 const DEFAULT_APP_SERVER_URL = "unix://";
 const DEFAULT_STDIO_COMMAND = "codex app-server";
 const DEFAULT_UNIX_SOCKET_PATH = join(process.env.HOME ?? "", ".codex/app-server-control/app-server-control.sock");
@@ -76,6 +77,20 @@ export class CodexThreadAdapter {
             client.close();
         }
     }
+    async stageNotification(handle, message) {
+        const data = parseHandle(handle);
+        const client = new CodexAppServerClient(resolveAppServerUrl(undefined, undefined, data), resolveAuthToken(undefined, data));
+        try {
+            await client.initialize();
+            await client.request("thread/inject_items", {
+                threadId: data.thread_id,
+                items: [{ type: "message", role: "user", content: [{ type: "input_text", text: message.message }] }]
+            });
+        }
+        finally {
+            client.close();
+        }
+    }
     async sendMessage(handle, message) {
         const data = parseHandle(handle);
         await startTurn(data, message.message);
@@ -95,7 +110,8 @@ export class CodexThreadAdapter {
                 threadId: thread.id,
                 threadStatus: thread.status,
                 latestTurnId: latestTurn?.id,
-                latestTurnStatus: latestTurn?.status
+                latestTurnStatus: latestTurn?.status,
+                activity: codexThreadActivity(thread.turns ?? [])
             }
         };
     }
@@ -713,7 +729,7 @@ function mapThreadStatus(thread, latestTurn, data) {
     // completed or interrupted while the thread is still perfectly able to
     // receive subscription wakeups, so expose it as waiting for input instead of
     // making the run graph look like the supervisor stopped.
-    if (data.agent_control_role === "orchestrator" && latestTurn?.status !== "inProgress") {
+    if ((data.agent_control_role === "orchestrator" || data.agent_control_role === "observer") && latestTurn?.status !== "inProgress") {
         return "waiting_for_input";
     }
     if (thread.status.type === "active" || latestTurn?.status === "inProgress") {

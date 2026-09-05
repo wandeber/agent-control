@@ -2314,6 +2314,18 @@ describe("codex-subagent durable orchestrator bridge", () => {
         .get(workerId)
     ).toMatchObject({ latest_message: secretLatestMessage });
 
+    const publicObservedAt = new Date(Date.parse(completedObservedAt) + 1).toISOString();
+    controller.syncCodexSubagent({ agentId: workerId, bridgeToken, nativeAgentId: "native-agent-sync", nativeStatus: "completed",
+      observedAt: publicObservedAt, publicActivity: { kind: "message", text: "Public completion summary" } });
+    controller.syncCodexSubagent({ agentId: workerId, bridgeToken, nativeAgentId: "native-agent-sync", nativeStatus: "completed",
+      observedAt: new Date(Date.parse(publicObservedAt) + 1).toISOString() });
+    controller.syncCodexSubagent({ agentId: workerId, bridgeToken, nativeAgentId: "native-agent-sync", nativeStatus: "completed",
+      observedAt: new Date(Date.parse(publicObservedAt) + 2).toISOString(), publicActivity: { kind: "message", text: "Public completion summary" } });
+    const projected = controller.getDashboardSnapshot(launched.login.run.run_id);
+    expect(projected.computed_agents.find((agent) => agent.agent_id === workerId)?.activity)
+      .toEqual({ kind: "message", text: "Public completion summary", observed_at: publicObservedAt });
+    expect(JSON.stringify(projected)).not.toContain(secretLatestMessage);
+
     const blocked = await controller.continueFlow({
       flowInstanceId: launched.start.instance.flow_instance_id,
       bridgeToken

@@ -686,3 +686,19 @@ mcp/agent-control/bin/agentctl --admin-key "$AGENT_CONTROL_ADMIN_KEY" run create
 ## License
 
 Agent Control is available under the [MIT License](LICENSE).
+
+## Conversational run observation
+
+Flow and worker launches attach the initiating Codex conversation to the run
+before dispatch. Pass `--requester-thread-id` when a different thread executes
+the launch. `agentctl run observe` attaches to an existing run; `agentctl run
+wait` consumes its subscribed events with a durable cursor, indefinitely or
+with `--timeout 1h`. The conversational observer stays available when the run
+stops and does not acquire worker or native bridge ownership. See
+[flow patterns](docs/flow-patterns.md#initiating-thread-observation) for filters,
+notification delivery, and same-thread coordinator behavior.
+
+Agent cards show state, current or last phase, and the latest public text or
+tool use. The agents view highlights the selected agent's relationships (or the
+active phase worker), keeps other main connections visible, and routes arrows
+around cards. Use **Relations > Show all relationships** for the full graph.

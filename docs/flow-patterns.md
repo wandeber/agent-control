@@ -235,9 +235,42 @@ messages. Keep the private claim envelope off those public surfaces and pass
 only its declared arguments to the exact native tool. The worker receives its
 intended task message, never bridge/action control data. A missing, revoked,
 expired, unsafe, or ambiguous credential blocks the flow instead of triggering
-a new login or broader fallback. Normal flows end the root turn after dispatch.
-`wait_agent` is reserved for an explicit foreground smoke test with a wide
-timeout, not normal supervision.
+a new login or broader fallback. After dispatch, the conversational thread
+consumes `run_wait` or resumes from configured observer notifications. A
+separate executing root may end its turn while the requester waits.
+`wait_agent` remains reserved for explicit native diagnostics; it is not the
+Agent Control run event stream.
+
+## Initiating Thread Observation
+
+Identify the conversational requester in the run before dispatching either
+free workers or a declared flow. The coordinator registers its own thread;
+`run_observe` attaches the requester separately when those identities differ.
+One thread serving both purposes reuses its existing agent record. Observation
+does not grant native bridge ownership and does not make the conversation a
+worker that run shutdown should interrupt.
+
+`agentctl flow launch` and `agentctl worker launch` accept
+`--requester-thread-id`, repeated `--requester-event`, and
+`--requester-delivery wait|notify`. They attach observation before dispatch and
+return its control record. Forward the original requester identity through
+nested delegation instead of replacing it with the executor's current thread.
+For separate MCP calls, use `run_observe` after run creation and before the
+first `flow_start` or worker dispatch.
+
+The default `wait` mode uses `run_wait` with the returned durable cursor,
+without a timeout or with `timeout_ms: 3600000` (`--timeout 1h` in the CLI).
+Consume the batch, retain its new cursor, and resume the long wait. Timeout is
+not completion. Filters cover present and future agents in the run, including
+phase changes, blockers, and completion. A completion-only flow observer uses
+`flow.completed`; a free-worker observer chooses its agent terminal events.
+
+Explicit `notify` delivers a compact informational injection to the requester.
+It never falls back to starting a competing turn. Acceptance means context was
+appended, not that an idle thread resumed. Use waiting for reliable event
+wakeups. Delivery failure preserves the event for cursor-based consumption. Native action notifications do not
+instruct the observer to claim the executor's bridge. Same-thread observation
+must not create a second copy of the owner's delivery.
 
 ## Visual Relationships
 
@@ -251,3 +284,14 @@ Render relationships from actual records:
 Avoid `waits_for` for workflow meaning. If a future UI wants a dependency view,
 derive it from active step inputs, selected transitions, and subscriptions
 rather than storing it as control state.
+
+The agents view defaults to the selected agent's incoming and outgoing
+relationships, or the active phase worker when no agent is selected. Other
+agents retain main declared phase connections (or real structural links for
+free workers). Parallel conditions share one arrow with all explanations in
+its tooltip. Cards show state, current or last phase, and a public activity
+line; technical metrics remain in the inspector. Activity is the latest public
+output or tool use, including a completed tool. Running/completed labels come
+from observed item state, never inferred private reasoning. Native workers
+publish an explicit `public_activity` through external sync; private
+`latest_message` content stays out of the card.

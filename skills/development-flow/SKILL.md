@@ -49,8 +49,11 @@ Open questions: none
 ```
 
 This normalized objective is coordinator-owned launch context, not a flow-step
-artifact. Preserve the same visible coordinator as the clarification owner so
-it can perform the analysis-intent gate later.
+artifact. Preserve the same conversational thread as the clarification owner
+and attach it to the run as an observer. If another thread executes the flow,
+forward the original requester identity on launch and keep the two roles
+distinct. The clarification owner still performs the analysis-intent gate;
+the executing coordinator waits for its decision before advancing.
 
 ## Analysis Intent Gate
 
@@ -99,9 +102,12 @@ on the analyst's behalf.
    objective, not the raw request, as the run title or objective.
 6. Handle the configured analysis notification with the analysis-intent gate
    above before starting `planning`.
-7. Keep the coordinator terse. After Agent Control dispatches a worker, end the
-   coordinator turn until Agent Control sends a notification, blocker, or user
-   follow-up.
+7. Keep updates concise. The initiating conversational thread retains the
+   observer record returned by launch and uses `run_wait` with its cursor,
+   indefinitely or with a one-hour timeout. It can report phase changes,
+   blockers, or just completion according to its filters. A separate executing
+   coordinator may end its turn after dispatch. If both roles share the same
+   thread, waiting does not transfer or duplicate orchestration ownership.
 
 Do not ask the user for the flow path unless discovery fails. Do not manually
 search the repository for flow files before using Agent Control discovery.

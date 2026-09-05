@@ -17,7 +17,7 @@ import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 
 const { controller, store } = createController();
-const MCP_APP_VERSION = "0.1.3";
+const MCP_APP_VERSION = "0.1.4";
 const CONSOLE_RESOURCE_URI = `ui://agent-control/${MCP_APP_VERSION}/console.html`;
 const CONSOLE_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -147,7 +147,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === request.params.name);
 
   try {
@@ -166,7 +166,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const input = tool.schema.parse(request.params.arguments ?? {});
-    const result = await handleTool(controller, tool.name, input as Record<string, unknown>);
+    const result = await handleTool(controller, tool.name, input as Record<string, unknown>, extra.signal);
     await controller.drainDeliveries();
     return jsonResult(result);
   } catch (error) {

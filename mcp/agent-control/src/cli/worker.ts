@@ -1,3 +1,4 @@
+import { addRequesterOptions, attachRequester, type RequesterOptions } from "./observation.js";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -21,7 +22,7 @@ import {
   withTimeout
 } from "./shared.js";
 
-export type WorkerLaunchOptions = {
+export type WorkerLaunchOptions = RequesterOptions & {
   backend: string;
   server?: string;
   repo?: string;
@@ -114,8 +115,8 @@ const MAX_WORKER_INPUT_HANDOFF_COLLECTION_BYTES = 64 * 1024;
 export function registerWorkerCommands(program: Command, deps: CliDeps): void {
   const worker = program.command("worker").description("Launch standalone workers through Agent Control.");
 
-  worker
-    .command("launch")
+  addRequesterOptions(worker
+    .command("launch"))
     .description("Register/start a worker, wire optional subscriptions, and optionally arm a detached watcher.")
     .option("--backend <backend>", "Backend kind.", "codex-thread")
     .option("--server <url>", "Backend server URL.")
@@ -266,6 +267,8 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
     );
   }
 
+  const observer = attachRequester(workerAgent.run_id, options, deps, agentToken);
+
   const artifact = deps.controller.createArtifact({
     runId: workerAgent.run_id,
     agentId: workerAgent.agent_id,
@@ -384,6 +387,7 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
 
   return {
     run_id: workerAgent.run_id,
+    observer,
     agent_id: workerAgent.agent_id,
     backend: workerAgent.backend,
     title: workerAgent.title,

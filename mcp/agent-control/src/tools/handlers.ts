@@ -6,9 +6,17 @@ import type { AgentLinkType, AgentStatus, EventType, FlowStepInstanceStatus } fr
 export async function handleTool(
   controller: AgentController,
   name: string,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<unknown> {
   switch (name) {
+    case "run_observe":
+      return controller.observeRun({ runId: String(input.run_id), threadId: maybeString(input.thread_id),
+        title: maybeString(input.title), eventTypes: maybeStringArray(input.event_types) as EventType[] | undefined,
+        delivery: input.delivery as "wait" | "notify" | undefined, adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
+    case "run_wait":
+      return controller.waitForRun({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id),
+        cursor: String(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit), signal });
     case "backend_list":
       return controller.listBackends();
     case "flow_validate_config":
@@ -78,6 +86,7 @@ export async function handleTool(
           | "errored"
           | "missing",
         latestMessage: maybeString(input.latest_message),
+        publicActivity: input.public_activity,
         observedAt: maybeString(input.observed_at),
         confirmedAbsent: maybeBoolean(input.confirmed_absent)
       });

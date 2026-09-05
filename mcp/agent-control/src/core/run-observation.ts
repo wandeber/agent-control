@@ -1,0 +1,252 @@
+import type { AgentController } from "./controller.js";
+import type { SqliteStore } from "../storage/sqlite-store.js";
+import type { AdapterRegistry } from "../adapters/registry.js";
+import { ControllerError } from "./errors.js";
+import { verifyAdminKey } from "./identity.js";
+import { EVENT_TYPES, type AgentRecord, type EventRecord, type EventType } from "./types.js";
+
+// Match the complete subscription before applying the event batch limit. Owner subscriptions may be source-scoped.
+const MATCHING_OBSERVER_SUBSCRIPTION = `exists (
+  select 1 from subscriptions s
+  where s.enabled = 1 and s.subscriber_agent_id = ?
+    and (? = 1 or exists (
+      select 1 from observer_subscriptions os
+      where os.subscription_id = s.subscription_id and os.observer_agent_id = s.subscriber_agent_id
+    ))
+    and s.event_type = e.type
+    and (s.run_id is null or s.run_id = e.run_id)
+    and (s.source_agent_id is null or s.source_agent_id = e.agent_id)
+)`;
+
+export const DEFAULT_OBSERVER_EVENTS: EventType[] = [
+  "flow.step_started", "flow.step_blocked", "flow.completed", "flow.notification",
+  "agent.completed", "agent.failed", "agent.blocked", "agent.stopped",
+  "goal.completed", "goal.blocked"
+];
+
+export interface ObserveRunInput {
+  runId: string;
+  threadId?: string;
+  title?: string;
+  eventTypes?: EventType[];
+  delivery?: "wait" | "notify";
+  adminKey?: string | null;
+  agentToken?: string | null;
+}
+
+export interface WaitRunInput {
+  runId: string;
+  observerAgentId: string;
+  cursor: string;
+  timeoutMs?: number;
+  limit?: number;
+  signal?: AbortSignal;
+  intervalMs?: number;
+}
+
+interface ObserverRow {
+  observer_agent_id: string;
+  run_id: string;
+  thread_id: string;
+  events_json: string;
+  delivery: "wait" | "notify";
+  start_sequence: number;
+}
+
+export function isPassiveObserver(agent: AgentRecord): boolean {
+  return agent.role === "observer" && agent.backend === "codex-thread" && agent.backend_handle?.agent_control_role === "observer";
+}
+
+export class RunObservation {
+  constructor(private store: SqliteStore, private controller: AgentController, private adapters: AdapterRegistry) {}
+
+  listPublic(runId: string) {
+    return (this.store.db.prepare("select o.* from run_observers o join agents a on a.agent_id = o.observer_agent_id where o.run_id = ? and a.unregistered_at is null").all(runId) as ObserverRow[])
+      .map((observer) => ({ observer_agent_id: observer.observer_agent_id, run_id: observer.run_id,
+        event_types: this.eventTypes(observer.observer_agent_id), delivery: observer.delivery }));
+  }
+
+  isAttached(agentId: string): boolean {
+    return Boolean(this.store.db.prepare("select 1 from run_observers where observer_agent_id = ?").get(agentId));
+  }
+
+  coversEvent(agentId: string, event: EventRecord): boolean {
+    if (!event.run_id || !this.store.db.prepare("select 1 from run_observers where observer_agent_id = ? and run_id = ?").get(agentId, event.run_id)) return false;
+    const owner = this.store.getAgent(agentId)?.role === "orchestrator";
+    return Boolean(this.store.db.prepare(`select 1 from events e where e.event_id = ? and ${MATCHING_OBSERVER_SUBSCRIPTION}`)
+      .get(event.event_id, agentId, owner ? 1 : 0));
+  }
+
+  ownsSubscription(subscriptionId: string): boolean {
+    return Boolean(this.store.db.prepare("select 1 from observer_subscriptions where subscription_id = ?").get(subscriptionId));
+  }
+
+  observe(input: ObserveRunInput) {
+    const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
+    if (caller ? !this.controller.canAgentAccessRun(caller, input.runId) : !input.adminKey || !verifyAdminKey(input.adminKey)) {
+      throw new ControllerError("Run observation requires an authorized run identity.", "auth_required");
+    }
+    const run = this.controller.getRun(input.runId);
+    const threadId = (input.threadId ?? process.env.CODEX_THREAD_ID)?.trim();
+    if (!threadId || threadId.length > 256 || /[\r\n\0]/.test(threadId)) {
+      throw new ControllerError("Run observation requires the actual Codex thread id.", "tool_error");
+    }
+    const previousObservation = this.store.db.prepare("select * from run_observers where run_id = ? and thread_id = ?").get(run.run_id, threadId) as ObserverRow | undefined;
+    const events = [...new Set(input.eventTypes ?? (previousObservation ? JSON.parse(previousObservation.events_json) as EventType[] : DEFAULT_OBSERVER_EVENTS))];
+    if (!events.length || events.some((type) => !(EVENT_TYPES as readonly string[]).includes(type))) {
+      throw new ControllerError("Select at least one supported observation event.", "tool_error");
+    }
+    const delivery = input.delivery ?? previousObservation?.delivery ?? "wait";
+    if (delivery !== "wait" && delivery !== "notify") throw new ControllerError("Invalid observation delivery mode.", "tool_error");
+    this.adapters.get("codex-thread");
+    return this.store.immediateTransaction(() => {
+      const previous = this.store.db.prepare("select * from run_observers where run_id = ? and thread_id = ?").get(run.run_id, threadId) as ObserverRow | undefined;
+      let agent = previous ? this.controller.getAgent(previous.observer_agent_id) : this.controller.listAgents({ runId: run.run_id }).find((candidate) =>
+        !candidate.unregistered_at && candidate.backend === "codex-thread" &&
+        candidate.backend_handle?.thread_id === threadId && (candidate.role === "orchestrator" || isPassiveObserver(candidate))
+      );
+      if (agent?.unregistered_at) throw new ControllerError("The observing participant has been detached.", "tool_error");
+      if (!agent) {
+        agent = this.store.createAgent({ runId: run.run_id, backend: "codex-thread", title: input.title ?? "User conversation",
+          role: "observer", status: "waiting_for_input", repoDir: run.repo_dir,
+          backendHandle: { thread_id: threadId, agent_control_role: "observer", cwd: run.repo_dir } });
+      }
+      const start = previous?.start_sequence ?? this.currentSequence();
+      this.store.db.prepare(`insert into run_observers(observer_agent_id, run_id, thread_id, events_json, delivery, start_sequence, created_at)
+        values (?, ?, ?, ?, ?, ?, ?) on conflict(observer_agent_id) do update set events_json = excluded.events_json, delivery = excluded.delivery`)
+        .run(agent.agent_id, run.run_id, threadId, JSON.stringify(events), delivery, start, new Date().toISOString());
+      const existing = this.store.db.prepare(`select s.* from subscriptions s join observer_subscriptions o using(subscription_id)
+        where o.observer_agent_id = ?`).all(agent.agent_id) as Array<{ subscription_id: string; event_type: EventType }>;
+      for (const sub of existing) if (!events.includes(sub.event_type)) this.store.deleteSubscription(sub.subscription_id);
+      for (const eventType of events) {
+        if (existing.some((sub) => sub.event_type === eventType)) continue;
+        const sub = this.store.createSubscription({ runId: run.run_id, subscriberAgentId: agent.agent_id, eventType });
+        this.store.db.prepare("insert into observer_subscriptions values (?, ?)").run(sub.subscription_id, agent.agent_id);
+      }
+      return { run_id: run.run_id, observer_agent_id: agent.agent_id, thread_id: threadId, event_types: events,
+        delivery, cursor: encodeCursor(run.run_id, start), reused: Boolean(previous) };
+    });
+  }
+
+  async wait(input: WaitRunInput) {
+    const sequence = decodeCursor(input.cursor, input.runId);
+    if (input.timeoutMs !== undefined && (!Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0)) {
+      throw new ControllerError("Observation timeout must be a positive duration.", "tool_error");
+    }
+    const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 20)));
+    const started = Date.now();
+    const empty = (timedOut: boolean, closed: boolean) => ({ run_id: input.runId, observer_agent_id: input.observerAgentId,
+      events: [] as ReturnType<typeof publicEvent>[], cursor: input.cursor, timed_out: timedOut, closed });
+    while (true) {
+      input.signal?.throwIfAborted();
+      const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
+        .get(input.observerAgentId, input.runId) as ObserverRow | undefined;
+      const run = this.store.getRun(input.runId);
+      const agent = this.store.getAgent(input.observerAgentId);
+      if (!observer || !run || !agent || agent.unregistered_at) return empty(false, true);
+      if (sequence < observer.start_sequence || sequence > this.currentSequence()) {
+        throw new ControllerError("Observation cursor is outside this subscription's history.", "tool_error");
+      }
+      const types = this.eventTypes(observer.observer_agent_id);
+      if (!types.length) return empty(false, true);
+      const rows = this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
+        where e.run_id = ? and o.sequence > ? and ${MATCHING_OBSERVER_SUBSCRIPTION}
+        order by o.sequence limit ?`).all(input.runId, sequence, agent.agent_id, agent.role === "orchestrator" ? 1 : 0, limit) as Array<Record<string, unknown>>;
+      if (rows.length) {
+        return { run_id: input.runId, observer_agent_id: input.observerAgentId,
+          events: rows.map((row) => publicEvent({ event_id: String(row.event_id), run_id: input.runId,
+            agent_id: row.agent_id === null ? null : String(row.agent_id), type: String(row.type) as EventType,
+            created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) }, agent, this.notificationStatus(agent.agent_id, String(row.event_id)))),
+          cursor: encodeCursor(input.runId, Number(rows.at(-1)!.sequence)), timed_out: false, closed: false };
+      }
+      if (run.status === "stopped") return empty(false, true);
+      const remaining = input.timeoutMs === undefined ? Infinity : input.timeoutMs - (Date.now() - started);
+      if (remaining <= 0) return empty(true, false);
+      // Refresh workers in deterministic code; the observing conversation itself is never polled or restarted.
+      await this.controller.pollActiveAgents(input.runId);
+      await cancellableDelay(Math.min(input.intervalMs ?? 1000, remaining), input.signal);
+    }
+  }
+
+  async notify(event: EventRecord): Promise<void> {
+    if (!event.run_id) return;
+    const observers = this.store.db.prepare("select * from run_observers where run_id = ? and delivery = 'notify' and start_sequence < (select sequence from event_order where event_id = ?)").all(event.run_id, event.event_id) as ObserverRow[];
+    for (const observer of observers) {
+      const agent = this.store.getAgent(observer.observer_agent_id);
+      if (!agent || agent.unregistered_at) continue;
+      const matches = this.store.db.prepare(`select 1 from events e where e.event_id = ? and ${MATCHING_OBSERVER_SUBSCRIPTION}`)
+        .get(event.event_id, agent.agent_id, agent.role === "orchestrator" ? 1 : 0);
+      if (!matches) continue;
+      const claim = this.store.db.prepare("insert or ignore into observer_notifications values (?, ?, 'invoking')").run(agent.agent_id, event.event_id);
+      if (!claim.changes) continue;
+      try {
+        const adapter = this.adapters.get(agent.backend);
+        if (!adapter.stageNotification || !agent.backend_handle) throw new Error("Notification staging unavailable");
+        const item = publicEvent(event, agent);
+        await adapter.stageNotification({ backend: agent.backend, id: observer.thread_id, data: agent.backend_handle }, {
+          message: `Agent Control observation\nRun: ${event.run_id}\nObserver: ${agent.agent_id}\nEvent ID: ${event.event_id}\n${item.summary}\n` +
+            (agent.role === "orchestrator"
+              ? `You remain the workflow owner. React to configured notifications using the existing run and flow. Safe action reference: ${JSON.stringify(item.orchestrator_action ?? null)}. Never restart the flow.`
+              : "This is an observation for the user's conversation. Give a concise update when useful. The workflow owner retains routing and native-action authority; do not claim or execute its actions.")
+        });
+        this.store.db.prepare("update observer_notifications set status = 'injected' where observer_agent_id = ? and event_id = ?").run(agent.agent_id, event.event_id);
+      } catch {
+        // An uncertain injection is never retried automatically: the durable event remains available to run_wait.
+        this.store.db.prepare("update observer_notifications set status = 'failed' where observer_agent_id = ? and event_id = ?").run(agent.agent_id, event.event_id);
+      }
+    }
+  }
+
+  private notificationStatus(agentId: string, eventId: string): string | undefined {
+    return (this.store.db.prepare("select status from observer_notifications where observer_agent_id = ? and event_id = ?").get(agentId, eventId) as { status: string } | undefined)?.status;
+  }
+
+  private eventTypes(agentId: string): EventType[] {
+    const owner = this.store.getAgent(agentId)?.role === "orchestrator";
+    // Owner subscriptions still carry mandatory coordination work. Move their delivery into the same cursor stream.
+    const rows = owner
+      ? this.store.db.prepare("select event_type from subscriptions where subscriber_agent_id = ? and enabled = 1").all(agentId)
+      : this.store.db.prepare(`select s.event_type from subscriptions s join observer_subscriptions o using(subscription_id)
+          where o.observer_agent_id = ? and s.enabled = 1`).all(agentId);
+    return [...new Set((rows as Array<{ event_type: EventType }>).map((row) => row.event_type))];
+  }
+
+  private currentSequence(): number {
+    const row = this.store.db.prepare("select seq from sqlite_sequence where name = 'event_order'").get() as { seq: number } | undefined;
+    return row?.seq ?? 0;
+  }
+}
+
+function encodeCursor(runId: string, sequence: number): string {
+  return Buffer.from(JSON.stringify([1, runId, sequence])).toString("base64url");
+}
+
+function decodeCursor(cursor: string, runId: string): number {
+  try {
+    const [version, run, sequence] = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (version === 1 && run === runId && Number.isSafeInteger(sequence) && sequence >= 0) return sequence;
+  } catch { /* Reject malformed and cross-run cursors uniformly. */ }
+  throw new ControllerError("Invalid observation cursor for this run.", "tool_error");
+}
+
+function publicEvent(event: EventRecord, observer?: AgentRecord, notificationStatus?: string) {
+  const action = event.payload.orchestrator_action as Record<string, unknown> | undefined;
+  const ownerAction = observer?.role === "orchestrator" && action?.orchestrator_agent_id === observer.agent_id
+    ? Object.fromEntries(["action_id", "run_id", "orchestrator_agent_id", "agent_id", "operation", "status", "flow_instance_id", "step_instance_id"].filter((key) => action[key] !== undefined).map((key) => [key, action[key]]))
+    : undefined;
+  const phase = typeof event.payload.step_id === "string" ? event.payload.step_id : typeof event.payload.target_step_id === "string" ? event.payload.target_step_id : undefined;
+  const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
+  return { event_id: event.event_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
+    summary: `${event.type.replace(/[._]/g, " ")}${phase ? `: ${phase}` : ""}`,
+    ...(flow ? { flow_instance_id: flow } : {}), ...(phase ? { step_id: phase } : {}),
+    ...(ownerAction ? { orchestrator_action: ownerAction } : {}), ...(notificationStatus ? { notification_status: notificationStatus } : {}) };
+}
+
+function cancellableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(signal?.reason ?? new Error("Observation cancelled")); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}

@@ -718,6 +718,7 @@ export interface FlowStepReportAndContinueResult {
 }
 
 export interface AgentComputedState {
+  activity?: import("./agent-activity.js").AgentActivity;
   agent_id: string;
   elapsed_ms: number;
   status_age_ms: number;
@@ -726,6 +727,7 @@ export interface AgentComputedState {
 }
 
 export interface DashboardSnapshot {
+  run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
   selected_run_id: string | null;
   runs: RunRecord[];
@@ -845,6 +847,8 @@ export interface UnregisterOptions {
 }
 
 export interface AgentAdapter {
+  /** Append an observation without creating a competing turn. No fallback is allowed. */
+  stageNotification?(handle: AgentHandle, message: AgentMessageInput): Promise<void>;
   kind: string;
   capabilities(): AgentCapabilities;
   start(input: StartAgentInput): Promise<AgentHandle>;

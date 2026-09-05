@@ -371,6 +371,7 @@ function createCliHarness(): {
   const registerAgent = vi.fn(() => agent);
   const startAgent = vi.fn(async () => ({ ...agent, status: "running" as const }));
   const controller = {
+    observeRun: vi.fn(() => ({ observer_agent_id: "observer_handoff_test", run_id: agent.run_id })),
     createRun: vi.fn(() => ({ run_id: agent.run_id })),
     registerAgent,
     createArtifact: vi.fn(() => ({

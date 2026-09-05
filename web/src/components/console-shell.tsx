@@ -3,6 +3,7 @@
 import { Bot, Clock3, Info, PanelBottom, Workflow, X, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useSnapshotStream } from "@/lib/api";
+import { focusedAgentId } from "@/lib/graph";
 import { latestAgentFlowStep } from "@/lib/flow-steps";
 import { useConsoleSelection } from "./console-selection";
 import type { DashboardSnapshot } from "@/lib/types";
@@ -47,6 +48,8 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 
 export function ConsoleShell() {
   const { selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
+  const [agentSelectionPinned, setAgentSelectionPinned] = useState(Boolean(selectedAgentId));
+  const selectionRunRef = useRef<string | null | undefined>(undefined);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [selectedStepInstanceId, setSelectedStepInstanceId] = useState<string | null>(null);
   const [selectedAgentMessageLimit, setSelectedAgentMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
@@ -84,18 +87,17 @@ export function ConsoleShell() {
 
   useEffect(() => {
     if (!snapshot || (!followLatestRun && selectedRunId && snapshot.selected_run_id !== selectedRunId)) return;
-    if (!selectedAgentId && snapshot?.agents[0]) {
-      const preferred =
-        snapshot.agents.find((agent) => agent.status === "running") ??
-        snapshot.agents.find((agent) => agent.status === "waiting_for_input") ??
-        snapshot.agents.find((agent) => agent.status === "blocked" || agent.status === "failed") ??
-        snapshot.agents[0];
-      setSelectedAgentId(preferred.agent_id);
+    if (selectionRunRef.current !== undefined && selectionRunRef.current !== snapshot.selected_run_id) {
+      setAgentSelectionPinned(false);
     }
-    if (selectedAgentId && snapshot && !snapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
-      setSelectedAgentId(snapshot.agents[0]?.agent_id ?? null);
+    selectionRunRef.current = snapshot.selected_run_id;
+    const valid = snapshot.agents.some((agent) => agent.agent_id === selectedAgentId);
+    if (!valid) setAgentSelectionPinned(false);
+    if (!agentSelectionPinned || !valid) {
+      const preferred = focusedAgentId(snapshot, null) ?? snapshot.agents[0]?.agent_id ?? null;
+      if (preferred !== selectedAgentId) setSelectedAgentId(preferred);
     }
-  }, [selectedAgentId, snapshot, followLatestRun, selectedRunId]);
+  }, [selectedAgentId, snapshot, followLatestRun, selectedRunId, agentSelectionPinned]);
 
   const selectedSnapshot = useMemo(() => snapshot, [snapshot]);
   const flowGraphAvailable = Boolean(selectedSnapshot?.flows.length && selectedSnapshot.flow_instances.length);
@@ -132,6 +134,7 @@ export function ConsoleShell() {
 
   const selectAgent = useCallback(
     (agentId: string) => {
+      setAgentSelectionPinned(true);
       const latestStep = selectedSnapshot ? latestAgentFlowStep(selectedSnapshot, agentId) : null;
       setSelectedAgentId(agentId);
       setSelectedStepId(latestStep?.step_id ?? null);
@@ -141,6 +144,7 @@ export function ConsoleShell() {
   );
 
   const selectFlowStep = useCallback((selection: FlowStepSelection) => {
+    setAgentSelectionPinned(true);
     const agentId = resolveFlowSelectionAgentId(selectedSnapshot, selection);
     if (agentId) {
       setSelectedAgentId(agentId);
@@ -150,6 +154,7 @@ export function ConsoleShell() {
   }, [selectedSnapshot]);
 
   const selectStepInstance = useCallback((stepInstanceId: string | null) => {
+    setAgentSelectionPinned(true);
     const step = selectedSnapshot?.flow_steps.find((candidate) => candidate.step_instance_id === stepInstanceId) ?? null;
     if (step?.agent_id) {
       setSelectedAgentId(step.agent_id);
@@ -332,7 +337,8 @@ export function ConsoleShell() {
             ) : (
               <AgentGraph
                 onSelectAgent={selectAgent}
-                selectedAgentId={selectedAgentId}
+                onClearSelection={() => setAgentSelectionPinned(false)}
+                selectedAgentId={agentSelectionPinned ? selectedAgentId : null}
                 snapshot={selectedSnapshot}
                 toolbarLeading={graphModeSwitch}
               />

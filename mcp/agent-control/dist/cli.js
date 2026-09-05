@@ -4,6 +4,7 @@ import { registerMarketplaceCommands } from "./cli/marketplace.js";
 import { registerSmokeCommands } from "./cli/smoke.js";
 import { collect, commanderExitInfo, outputError, parseIntOption, parseJsonObjectOption } from "./cli/shared.js";
 import { registerWatchCommands, registerWorkerCommands } from "./cli/worker.js";
+import { addRequesterOptions, attachRequester, registerObservationCommands } from "./cli/observation.js";
 import { registerWebCommands } from "./cli/web.js";
 import { startControlServer } from "./control-server.js";
 import { parseDurationMs } from "./core/duration.js";
@@ -16,7 +17,7 @@ const program = new Command();
 program
     .name("agentctl")
     .description("Control local agent workers through the Agent Control core.")
-    .version("0.1.3")
+    .version("0.1.4")
     .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
     .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();
@@ -71,6 +72,7 @@ auth
     output(controller.requireAgentToken(token));
 });
 const run = program.command("run").description("Manage controller runs.");
+registerObservationCommands(run, cliDeps);
 run
     .command("create")
     .requiredOption("--title <title>", "Run title.")
@@ -176,8 +178,8 @@ flow
         ? compactFlowStartResult(result, bridgeGrant)
         : publicFlowStartResult(result, bridgeGrant));
 });
-flow
-    .command("launch")
+addRequesterOptions(flow
+    .command("launch"))
     .description("Authenticate a local orchestrator, start or resume a flow, dispatch the active step, and return.")
     .requiredOption("--config-file <path>", "Read flow config JSON/YAML from this file.")
     .requiredOption("--title <title>", "Run title/objective. This is passed to workers through the runtime contract.")
@@ -211,6 +213,7 @@ flow
         objective: options.title,
         backendHandle
     });
+    const observer = attachRequester(login.run.run_id, options, cliDeps, login.agent_token);
     const start = controller.startFlow({
         config: await readConfigOption({ configFile: options.configFile }),
         runId: login.run.run_id,
@@ -241,6 +244,7 @@ flow
         runId: login.run.run_id,
         runTitle: login.run.title,
         orchestratorAgentId: login.agent.agent_id,
+        observer,
         start,
         continuation,
         bridgeGrant,
@@ -487,6 +491,7 @@ agent
     .option("--native-task-name <name>", "Native task name.")
     .option("--native-task-path <path>", "Canonical native task path.")
     .option("--latest-message <message>", "Private latest message, limited to 4 KiB.")
+    .option("--public-activity-json <json>", "Explicit short public card activity: kind, text, optional state and observed_at.")
     .option("--observed-at <timestamp>", "Observation timestamp.")
     .option("--confirmed-absent", "Confirm exact absence after the recovery delay.")
     .action((options) => {
@@ -505,6 +510,7 @@ agent
         nativeTaskPath: options.nativeTaskPath,
         nativeStatus: options.nativeStatus,
         latestMessage: options.latestMessage,
+        publicActivity: options.publicActivityJson ? parseJsonObjectOption(options.publicActivityJson) : undefined,
         observedAt: options.observedAt,
         confirmedAbsent: options.confirmedAbsent
     }));
@@ -877,6 +883,7 @@ function compactFlowLaunchResult(input) {
         run_id: input.runId,
         run_title: input.runTitle,
         orchestrator_agent_id: input.orchestratorAgentId,
+        observer: input.observer ?? null,
         flow_id: input.start.flow.flow_id,
         flow_record_id: input.start.flow.flow_record_id,
         flow_instance_id: input.start.instance.flow_instance_id,

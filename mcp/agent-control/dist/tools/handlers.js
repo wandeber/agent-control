@@ -1,7 +1,14 @@
 import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
-export async function handleTool(controller, name, input) {
+export async function handleTool(controller, name, input, signal) {
     switch (name) {
+        case "run_observe":
+            return controller.observeRun({ runId: String(input.run_id), threadId: maybeString(input.thread_id),
+                title: maybeString(input.title), eventTypes: maybeStringArray(input.event_types),
+                delivery: input.delivery, adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
+        case "run_wait":
+            return controller.waitForRun({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id),
+                cursor: String(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit), signal });
         case "backend_list":
             return controller.listBackends();
         case "flow_validate_config":
@@ -64,6 +71,7 @@ export async function handleTool(controller, name, input) {
                 nativeTaskPath: maybeString(input.native_task_path),
                 nativeStatus: String(input.native_status),
                 latestMessage: maybeString(input.latest_message),
+                publicActivity: input.public_activity,
                 observedAt: maybeString(input.observed_at),
                 confirmedAbsent: maybeBoolean(input.confirmed_absent)
             });

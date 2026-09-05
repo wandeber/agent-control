@@ -2,6 +2,16 @@ import { z } from "zod";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 
+export const runObserveSchema = z.object({
+  run_id: z.string().min(1), thread_id: z.string().min(1).optional(), title: z.string().min(1).optional(),
+  event_types: z.array(z.enum(EVENT_TYPES)).min(1).optional(), delivery: z.enum(["wait", "notify"]).optional(),
+  admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
+});
+export const runWaitSchema = z.object({
+  run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1),
+  timeout_ms: z.number().int().positive().optional(), limit: z.number().int().positive().max(100).optional()
+});
+
 export const emptySchema = z.object({});
 
 export const runCreateSchema = z.object({
@@ -308,6 +318,8 @@ export const agentExternalSyncSchema = z.object({
     "missing"
   ]),
   latest_message: z.string().optional(),
+  public_activity: z.object({ kind: z.enum(["message", "tool"]), text: z.string().min(1).max(240),
+    state: z.enum(["running", "completed", "failed"]).optional(), observed_at: z.string().datetime().optional() }).nullable().optional(),
   observed_at: z.string().min(1).optional(),
   confirmed_absent: z.boolean().optional()
 });

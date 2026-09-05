@@ -36,6 +36,8 @@ import type {
   UsageSnapshotRecord
 } from "../core/types.js";
 
+import { initializeObservationSchema } from "./observation-schema.js";
+
 type Row = Record<string, unknown>;
 
 const NATIVE_ORIGIN_GRANT_MIGRATION_ID =
@@ -87,6 +89,7 @@ export class SqliteStore {
     this.db.pragma("foreign_keys = ON");
     try {
       this.migrate();
+      initializeObservationSchema(this.db);
     } catch (error) {
       // A failed transactional migration has already rolled its data changes
       // back. Close this constructor-owned connection as well so a caller can

@@ -12,17 +12,21 @@ import {
   type NodeChange,
   type ReactFlowInstance
 } from "@xyflow/react";
-import { Check, Crosshair, Layers3, LocateFixed, type LucideIcon } from "lucide-react";
+import { Check, Crosshair, LayoutGrid, Layers3, LocateFixed, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildRelations,
-  computedByAgent,
+  focusedAgentId,
+  primaryAgentRelations,
+  visibleAgentRelations,
   initialLayout,
   RELATION_META,
   RENDERABLE_RELATION_TYPES,
   type GraphRelation,
   type RenderableAgentLinkType
 } from "@/lib/graph";
+import { routeAgentConnection, agentRoutePath, agentRouteLabel, fitAgentPortShifts } from "@/lib/agent-routing";
+import { agentPresentation } from "@/lib/agent-presentation";
 import type { DashboardSnapshot } from "@/lib/types";
 import { AgentNode, type AgentFlowNode, type AgentNodeData } from "./agent-node";
 
@@ -33,13 +37,11 @@ const GRAPH_MAX_ZOOM = 1.75;
 const SAFE_AREA_MARGIN = 16;
 const SAFE_AREA_PADDING = 28;
 const PARALLEL_EDGE_GAP = 24;
-const MIN_EDGE_CONTROL_DISTANCE = 48;
-const MAX_EDGE_CONTROL_DISTANCE = 180;
 const ANCHOR_FAN_GAP = 18;
 const MAX_ANCHOR_FAN_SHIFT = 54;
-const EDGE_ARROW_LENGTH = 11;
-const EDGE_ARROW_HALF_WIDTH = 3.2;
-const DEFAULT_NODE_WIDTH = 270;
+const EDGE_ARROW_LENGTH = 14;
+const EDGE_ARROW_HALF_WIDTH = 5;
+const DEFAULT_NODE_WIDTH = 300;
 const DEFAULT_NODE_HEIGHT = 132;
 const FOLLOW_ACTIVE_MAX_ZOOM = 1.12;
 const FOLLOW_ACTIVE_MIN_ZOOM = 0.72;
@@ -75,15 +77,19 @@ export function AgentGraph({
   snapshot,
   selectedAgentId,
   onSelectAgent,
+  onClearSelection,
   toolbarLeading
 }: {
   snapshot: DashboardSnapshot;
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string) => void;
+  onClearSelection?: () => void;
   toolbarLeading?: React.ReactNode;
 }) {
   const relations = useMemo(() => buildRelations(snapshot), [snapshot]);
-  const computed = useMemo(() => computedByAgent(snapshot), [snapshot]);
+  const primary = useMemo(() => primaryAgentRelations(snapshot, relations), [snapshot, relations]);
+  const focusId = focusedAgentId(snapshot, selectedAgentId);
+  const [allRelations, setAllRelations] = useState(false);
   const [layers, setLayers] = useState<Set<RenderableAgentLinkType>>(() => new Set(ALL_LAYERS));
   const [layersOpen, setLayersOpen] = useState(false);
   const [nodes, setNodes] = useState<AgentFlowNode[]>([]);
@@ -91,43 +97,34 @@ export function AgentGraph({
   const [flowReady, setFlowReady] = useState(false);
   const flowRef = useRef<ReactFlowInstance<AgentFlowNode, RelationFlowEdge> | null>(null);
   const graphRootRef = useRef<HTMLDivElement | null>(null);
-  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const positionedRunRef = useRef<string | null>(null);
   const layerPopoverRef = useRef<HTMLDivElement | null>(null);
   const programmaticViewportRef = useRef(false);
-  const storageKey = `agent-control:graph:${snapshot.selected_run_id ?? "none"}`;
+  const storageKey = `agent-control:graph:v2:${snapshot.selected_run_id ?? "none"}`;
 
   useEffect(() => {
     const stored = readStoredPositions(storageKey);
-    const layout = initialLayout(snapshot.agents, relations);
-    setNodes(
-      snapshot.agents.map((agent) => {
-        const position = stored.get(agent.agent_id) ?? layout.get(agent.agent_id) ?? { x: 0, y: 0 };
-        return {
-          id: agent.agent_id,
-          type: "agent",
-          position,
-          data: {
-            agent,
-            computed: computed.get(agent.agent_id),
-            flowInstanceCount: snapshot.flow_steps.filter((step) => step.agent_id === agent.agent_id).length,
-            goals: snapshot.goals.filter((goal) => goal.agent_id === agent.agent_id),
-            heartbeats: snapshot.heartbeats.filter((heartbeat) => heartbeat.agent_id === agent.agent_id),
-            selected: agent.agent_id === selectedAgentId
-          }
-        };
-      })
-    );
-  }, [computed, relations, selectedAgentId, snapshot, storageKey]);
+    const layout = initialLayout(snapshot.agents, primary, snapshot);
+    const sameRun = positionedRunRef.current === storageKey;
+    positionedRunRef.current = storageKey;
+    setNodes((current) => snapshot.agents.map((agent) => {
+      const previous = sameRun ? current.find((node) => node.id === agent.agent_id) : undefined;
+      return {
+        ...previous,
+        id: agent.agent_id,
+        type: "agent",
+        focusable: false,
+        position: previous?.position ?? stored.get(agent.agent_id) ?? layout.get(agent.agent_id) ?? { x: 0, y: 0 },
+        data: { agent, presentation: agentPresentation(snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
+      };
+    }));
+  }, [primary, focusId, snapshot, storageKey, onSelectAgent]);
 
   const visibleRelations = useMemo(
-    () => assignParallelOffsets(relations.filter((relation) => layers.has(relation.type))),
-    [layers, relations]
+    () => assignParallelOffsets(visibleAgentRelations(relations.filter((relation) => layers.has(relation.type)), primary, focusId, allRelations)),
+    [layers, relations, primary, focusId, allRelations]
   );
   const routedRelations = useMemo(() => assignAnchorRoutes(visibleRelations, nodes), [nodes, visibleRelations]);
-  const activeAgentNodeId = useMemo(
-    () => nodes.find((node) => isFollowFocusAgentStatus(node.data.agent.status))?.id ?? null,
-    [nodes]
-  );
 
   const onNodesChange = useCallback(
     (changes: NodeChange<AgentFlowNode>[]) => {
@@ -140,15 +137,11 @@ export function AgentGraph({
     [storageKey]
   );
 
-  const disableFollowTemporarily = useCallback(() => {
+  const disableFollow = useCallback(() => {
     if (programmaticViewportRef.current) {
       return;
     }
     setFollow(false);
-    if (idleTimerRef.current) {
-      clearTimeout(idleTimerRef.current);
-    }
-    idleTimerRef.current = setTimeout(() => setFollow(true), 20000);
   }, []);
 
   const toggleLayer = useCallback((layer: RenderableAgentLinkType) => {
@@ -179,8 +172,8 @@ export function AgentGraph({
     const boundedHeight = Math.max(1, bounds.height);
     const rawZoom = Math.min(availableWidth / boundedWidth, availableHeight / boundedHeight);
     const focusedNode = focusActive
-      ? (fittedNodes.find((node) => isFollowFocusAgentStatus(node.data.agent.status)) ??
-        fittedNodes.find((node) => node.data.selected) ??
+      ? (fittedNodes.find((node) => node.data.selected) ??
+        fittedNodes.find((node) => isFollowFocusAgentStatus(node.data.agent.status)) ??
         null)
       : null;
     const focusedWidth = focusedNode?.measured?.width ?? DEFAULT_NODE_WIDTH;
@@ -211,6 +204,17 @@ export function AgentGraph({
     });
   }, []);
 
+  const organizeGraph = useCallback(() => {
+    const layout = initialLayout(snapshot.agents, primary, snapshot);
+    setFollow(false);
+    setNodes((current) => {
+      const arranged = current.map((node) => ({ ...node, position: layout.get(node.id) ?? node.position }));
+      storePositions(storageKey, arranged);
+      return arranged;
+    });
+    window.setTimeout(() => fitGraphToSafeArea(), 80);
+  }, [snapshot, primary, storageKey, fitGraphToSafeArea]);
+
   useEffect(() => {
     if (!layersOpen) {
       return undefined;
@@ -239,7 +243,7 @@ export function AgentGraph({
       return () => clearTimeout(timer);
     }
     return undefined;
-  }, [activeAgentNodeId, fitGraphToSafeArea, flowReady, follow, nodes.length, routedRelations.length, selectedAgentId]);
+  }, [focusId, fitGraphToSafeArea, flowReady, follow, nodes.length, routedRelations.length, selectedAgentId]);
 
   useEffect(() => {
     const graphRoot = graphRootRef.current;
@@ -267,9 +271,9 @@ export function AgentGraph({
             type="button"
           >
             <Layers3 className="size-4 text-ink-400" />
-            Layers
+            Relations
             <span className="rounded bg-black/6 px-1.5 py-0.5 text-[10px] font-semibold text-ink-400">
-              {layers.size}/{ALL_LAYERS.length}
+              {allRelations ? "All" : "Focused"}
             </span>
           </button>
 
@@ -280,7 +284,11 @@ export function AgentGraph({
             >
               <div className="px-2 pb-2 pt-1">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.1em] text-ink-300">Relationship layers</div>
-                <div className="mt-0.5 text-[11px] leading-4 text-ink-400">Toggle graph connections without changing the run.</div>
+                <div className="mt-0.5 text-[11px] leading-4 text-ink-400">Full relations for the focused agent; main connections for the others.</div>
+                <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-ink-700">
+                  <input type="checkbox" checked={allRelations} onChange={(event) => setAllRelations(event.target.checked)} />
+                  Show all relationships
+                </label>
               </div>
               <div className="mt-1 space-y-1">
                 {ALL_LAYERS.map((layer) => (
@@ -303,11 +311,12 @@ export function AgentGraph({
           <GraphActionButton
             active={follow}
             icon={LocateFixed}
-            label={follow ? "Disable follow active agents" : "Follow active agents"}
+            label={follow ? "Disable follow focused agent" : "Follow focused agent"}
             onClick={() => setFollow((value) => !value)}
             switchControl
           />
-          <GraphActionButton icon={Crosshair} label="Fit graph" onClick={() => fitGraphToSafeArea()} />
+          <GraphActionButton icon={Crosshair} label="Fit graph" onClick={() => { setFollow(false); fitGraphToSafeArea(); }} />
+          <GraphActionButton icon={LayoutGrid} label="Organize agents" onClick={organizeGraph} />
         </div>
       </div>
 
@@ -322,9 +331,10 @@ export function AgentGraph({
             flowRef.current = instance;
             setFlowReady(true);
           }}
-          onMoveStart={disableFollowTemporarily}
+          onMoveStart={disableFollow}
           onNodeClick={(_, node) => onSelectAgent(node.id)}
-          onNodeDragStart={disableFollowTemporarily}
+          onPaneClick={onClearSelection}
+          onNodeDragStart={disableFollow}
           onNodesChange={onNodesChange}
           onlyRenderVisibleElements={false}
           panOnDrag
@@ -332,7 +342,7 @@ export function AgentGraph({
         >
           <GraphRelationOverlay nodes={nodes} relations={routedRelations} />
           <Background gap={22} size={1} />
-          <Controls onFitView={() => fitGraphToSafeArea()} position="bottom-left" showInteractive={false} />
+          <Controls onFitView={() => { setFollow(false); fitGraphToSafeArea(); }} position="bottom-left" showInteractive={false} />
           <MiniMap
             maskColor="rgba(238, 242, 246, 0.68)"
             nodeBorderRadius={8}
@@ -389,6 +399,7 @@ function GraphActionButton({
 }
 
 function GraphRelationOverlay({ nodes, relations }: { nodes: AgentFlowNode[]; relations: RoutedRelation[] }) {
+  const [hoveredRelation, setHoveredRelation] = useState<string | null>(null);
   const rendered = relations
     .map((relation) => relationPathData(relation, nodes))
     .filter((edge): edge is NonNullable<typeof edge> => Boolean(edge));
@@ -401,14 +412,25 @@ function GraphRelationOverlay({ nodes, relations }: { nodes: AgentFlowNode[]; re
           className="pointer-events-none absolute left-0 top-0 size-px overflow-visible"
         >
           {rendered.map((edge) => (
-            <g data-relation-type={edge.relationType} key={edge.id}>
+            <g data-relation-type={edge.relationType} data-focused={edge.emphasized} key={edge.id}>
+              <title>{edge.details}</title>
+              {/* Keep labels on demand so parallel routes remain readable. */}
               <path
                 d={edge.path}
                 fill="none"
-                opacity={0.88}
+                stroke="transparent"
+                strokeWidth={16}
+                pointerEvents="stroke"
+                onMouseEnter={() => setHoveredRelation(edge.id)}
+                onMouseLeave={() => setHoveredRelation(null)}
+              />
+              <path
+                d={edge.path}
+                fill="none"
+                opacity={edge.emphasized ? 1 : 0.65}
                 stroke={edge.color}
-                strokeDasharray={edge.dash}
                 strokeLinecap="round"
+                strokeLinejoin="round"
                 strokeWidth={edge.strokeWidth}
               />
               {edge.directed ? (
@@ -418,9 +440,10 @@ function GraphRelationOverlay({ nodes, relations }: { nodes: AgentFlowNode[]; re
           ))}
         </svg>
         {rendered.map((edge) =>
-          edge.label ? (
+          edge.label && hoveredRelation === edge.id ? (
             <div
-              className="pointer-events-none absolute max-w-28 truncate rounded bg-white/86 px-1.5 py-0.5 text-[10px] font-semibold text-ink-500 shadow-[0_0_0_1px_rgba(21,25,29,0.08)]"
+              className="pointer-events-none absolute max-w-44 truncate rounded bg-white/95 px-2 py-1 text-[11px] font-medium text-ink-600 shadow-[0_0_0_1px_rgba(21,25,29,0.08)]"
+              title={edge.details}
               data-parallel-offset={edge.parallelOffset}
               data-relation-type={edge.relationType}
               data-source-tangent-shift={edge.sourceTangentShift}
@@ -451,40 +474,27 @@ function relationPathData(relation: RoutedRelation, nodes: AgentFlowNode[]) {
   const targetHandle = relation.route.targetHandle;
   const resolvedSourcePosition = positionForHandle(sourceHandle, undefined);
   const resolvedTargetPosition = positionForHandle(targetHandle, undefined);
-  const sourceAnchor = anchorToCardEdge(sideAnchor(sourceNode, relation.route.sourceSide), resolvedSourcePosition, sourceHandle);
-  const targetAnchor = anchorToCardEdge(sideAnchor(targetNode, relation.route.targetSide), resolvedTargetPosition, targetHandle);
-  const dx = targetAnchor.x - sourceAnchor.x;
-  const dy = targetAnchor.y - sourceAnchor.y;
-  const length = Math.hypot(dx, dy) || 1;
-  const normalX = -dy / length;
-  const normalY = dx / length;
+  const sourceAnchor = sideAnchor(sourceNode, relation.route.sourceSide);
+  const targetAnchor = sideAnchor(targetNode, relation.route.targetSide);
   const sourceDirection = directionForPosition(resolvedSourcePosition);
   const targetDirection = directionForPosition(resolvedTargetPosition);
   const sourceTangent = tangentForPosition(resolvedSourcePosition);
   const targetTangent = tangentForPosition(resolvedTargetPosition);
-  const startX = sourceAnchor.x + sourceTangent.x * relation.route.sourceTangentShift;
-  const startY = sourceAnchor.y + sourceTangent.y * relation.route.sourceTangentShift;
-  const endX = targetAnchor.x + targetTangent.x * relation.route.targetTangentShift;
-  const endY = targetAnchor.y + targetTangent.y * relation.route.targetTangentShift;
-  const controlDistance = clamp(length * 0.42, MIN_EDGE_CONTROL_DISTANCE, MAX_EDGE_CONTROL_DISTANCE);
-  const control1X = startX + sourceDirection.x * controlDistance + normalX * relation.parallelOffset;
-  const control1Y = startY + sourceDirection.y * controlDistance + normalY * relation.parallelOffset;
-  const control2X = endX + targetDirection.x * controlDistance + normalX * relation.parallelOffset;
-  const control2Y = endY + targetDirection.y * controlDistance + normalY * relation.parallelOffset;
-  const arrow = makeArrowPath({ x: endX, y: endY }, { x: control2X, y: control2Y });
-  const labelPoint = cubicPoint(
-    { x: startX, y: startY },
-    { x: control1X, y: control1Y },
-    { x: control2X, y: control2Y },
-    { x: endX, y: endY },
-    0.5
-  );
-  const path = `M ${startX},${startY} C ${control1X},${control1Y} ${control2X},${control2Y} ${endX},${endY}`;
+  const start = { x: sourceAnchor.x + sourceTangent.x * relation.route.sourceTangentShift, y: sourceAnchor.y + sourceTangent.y * relation.route.sourceTangentShift };
+  const end = { x: targetAnchor.x + targetTangent.x * relation.route.targetTangentShift, y: targetAnchor.y + targetTangent.y * relation.route.targetTangentShift };
+  const points = routeAgentConnection(start, end, sourceDirection, targetDirection, nodes.map((node) => ({
+    ...node.position, width: node.measured?.width ?? DEFAULT_NODE_WIDTH, height: node.measured?.height ?? DEFAULT_NODE_HEIGHT
+  })), relation.parallelOffset);
+  if (points.length < 2) return null;
+  const arrow = makeArrowPath(points.at(-1)!, points.at(-2)!);
+  const labelPoint = agentRouteLabel(points);
+  const path = agentRoutePath(points);
 
   return {
     arrow,
-    color: meta.color,
-    dash: meta.dash ?? (relation.type === "handoff" ? "6 4" : undefined),
+    color: relation.emphasized ? meta.color : "#94a3b8",
+    emphasized: relation.emphasized,
+    details: relation.details,
     directed: Boolean(meta.directed),
     id: relation.id,
     label: relation.label,
@@ -493,7 +503,7 @@ function relationPathData(relation: RoutedRelation, nodes: AgentFlowNode[]) {
     path,
     relationType: relation.type,
     sourceTangentShift: relation.route.sourceTangentShift,
-    strokeWidth: relation.type === "blocks" ? 2.4 : 1.8,
+    strokeWidth: relation.emphasized ? 2.5 : 1.8,
     targetTangentShift: relation.route.targetTangentShift
   };
 }
@@ -628,6 +638,17 @@ function applyAnchorFanoutShifts(relations: RoutedRelation[], nodes: AgentFlowNo
   }
 
   alignParallelPairEndpoints(relations);
+  for (const group of groups.values()) {
+    const node = nodeById.get(group[0]!.agentId);
+    if (!node) continue;
+    const horizontalEdge = group[0]!.side === "top" || group[0]!.side === "bottom";
+    const shifts = fitAgentPortShifts(group.map((endpoint) => endpoint.endpoint === "source"
+      ? endpoint.relation.route.sourceTangentShift : endpoint.relation.route.targetTangentShift), horizontalEdge ? nodeWidth(node) : nodeHeight(node));
+    group.forEach((endpoint, index) => {
+      if (endpoint.endpoint === "source") endpoint.relation.route.sourceTangentShift = shifts[index]!;
+      else endpoint.relation.route.targetTangentShift = shifts[index]!;
+    });
+  }
 }
 
 function bundleEndpoints(endpoints: RoutedEndpoint[]): Map<string, RoutedEndpoint[]> {
@@ -783,42 +804,11 @@ function positionForHandle(handleId: string, fallback: Position | undefined): Po
   return fallback;
 }
 
-function anchorToCardEdge(
-  point: { x: number; y: number },
-  position: Position | undefined,
-  handleId: string
-): { x: number; y: number } {
-  const direction = directionForPosition(position);
-  const inset = handleId === "in" || handleId === "out" ? 3 : 1.5;
-  return {
-    x: point.x - direction.x * inset,
-    y: point.y - direction.y * inset
-  };
-}
-
 function tangentForPosition(position: Position | undefined): { x: number; y: number } {
   if (position === Position.Top || position === Position.Bottom) {
     return { x: 1, y: 0 };
   }
   return { x: 0, y: 1 };
-}
-
-function cubicPoint(
-  start: { x: number; y: number },
-  control1: { x: number; y: number },
-  control2: { x: number; y: number },
-  end: { x: number; y: number },
-  t: number
-): { x: number; y: number } {
-  const inverse = 1 - t;
-  const startWeight = inverse ** 3;
-  const control1Weight = 3 * inverse ** 2 * t;
-  const control2Weight = 3 * inverse * t ** 2;
-  const endWeight = t ** 3;
-  return {
-    x: start.x * startWeight + control1.x * control1Weight + control2.x * control2Weight + end.x * endWeight,
-    y: start.y * startWeight + control1.y * control1Weight + control2.y * control2Weight + end.y * endWeight
-  };
 }
 
 function makeArrowPath(tip: { x: number; y: number }, previousControl: { x: number; y: number }): string {
@@ -883,7 +873,6 @@ function RelationLineSample({ active, layer }: { active: boolean; layer: Rendera
     >
       <line
         stroke={meta.color}
-        strokeDasharray={meta.dash ?? (layer === "handoff" ? "6 4" : undefined)}
         strokeLinecap="round"
         strokeWidth={layer === "blocks" ? 2.4 : 1.8}
         x1="7"

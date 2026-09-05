@@ -1,8 +1,23 @@
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
-import { agentLinkCreateSchema, agentLinkDeleteSchema, agentLinkListSchema, agentIdSchema, agentListSchema, agentReadLatestSchema, agentRegisterSchema, agentPurgeSchema, agentSendSchema, agentStartSchema, agentStopSchema, agentWaitSchema, agentExternalSyncSchema, artifactReadHeaderSchema, artifactRegisterSchema, emptySchema, eventListSchema, flowCatalogGetSchema, flowCatalogListSchema, flowContinueSchema, flowDispatchActiveSchema, flowGetSchema, flowStartSchema, flowStepReportSchema, flowStepStartSchema, flowValidateConfigSchema, goalGetSchema, goalRegisterSchema, goalUpdateSchema, goalWaitConfirmationSchema, heartbeatCreateSchema, heartbeatDeleteSchema, heartbeatListSchema, maintenancePurgeOldSchema, orchestratorLoginSchema, orchestratorActionAckSchema, orchestratorActionClaimSchema, runCreateSchema, runIdSchema, runListSchema, runPurgeSchema, subscriptionCreateSchema, subscriptionDeleteSchema, subscriptionListSchema, subscriptionWaitSchema } from "./schemas.js";
+import { agentLinkCreateSchema, agentLinkDeleteSchema, agentLinkListSchema, agentIdSchema, agentListSchema, agentReadLatestSchema, agentRegisterSchema, agentPurgeSchema, agentSendSchema, agentStartSchema, agentStopSchema, agentWaitSchema, agentExternalSyncSchema, artifactReadHeaderSchema, artifactRegisterSchema, emptySchema, eventListSchema, flowCatalogGetSchema, flowCatalogListSchema, flowContinueSchema, flowDispatchActiveSchema, flowGetSchema, flowStartSchema, flowStepReportSchema, flowStepStartSchema, flowValidateConfigSchema, goalGetSchema, goalRegisterSchema, goalUpdateSchema, goalWaitConfirmationSchema, heartbeatCreateSchema, heartbeatDeleteSchema, heartbeatListSchema, maintenancePurgeOldSchema, orchestratorLoginSchema, orchestratorActionAckSchema, orchestratorActionClaimSchema, runObserveSchema, runWaitSchema, runCreateSchema, runIdSchema, runListSchema, runPurgeSchema, subscriptionCreateSchema, subscriptionDeleteSchema, subscriptionListSchema, subscriptionWaitSchema } from "./schemas.js";
 import { booleanProperty, enumProperty, numberProperty, objectSchema, stringArrayProperty, stringProperty } from "./json-schema.js";
 export const TOOL_DEFINITIONS = [
+    {
+        name: "run_observe",
+        description: "Identify the user conversation in a run and subscribe to selected events without transferring workflow or native bridge ownership. Default delivery is through run_wait; notify uses safe in-turn injection only.",
+        inputSchema: objectSchema({ run_id: stringProperty("Run to observe."), thread_id: stringProperty("Actual Codex thread id; defaults to current CODEX_THREAD_ID."),
+            title: stringProperty("Participant title."), event_types: { type: "array", items: { type: "string", enum: [...EVENT_TYPES] } },
+            delivery: enumProperty(["wait", "notify"], "wait or notify; default wait."), admin_key: stringProperty("Admin authorization."), agent_token: stringProperty("Authorized caller identity.") }, ["run_id"]),
+        schema: runObserveSchema
+    },
+    {
+        name: "run_wait",
+        description: "Wait for subscribed run events. Reuse the returned cursor to avoid repeats. Omit timeout for indefinite wait or use 3600000 for one hour. Cancellation ends the wait without starting a competing Codex turn.",
+        inputSchema: objectSchema({ run_id: stringProperty("Observed run."), observer_agent_id: stringProperty("Observing participant id."),
+            cursor: stringProperty("Durable cursor from run_observe or run_wait."), timeout_ms: numberProperty("Optional positive timeout; 3600000 is one hour."), limit: numberProperty("Maximum batch size, up to 100.") }, ["run_id", "observer_agent_id", "cursor"]),
+        schema: runWaitSchema
+    },
     {
         name: "backend_list",
         description: "List registered backend adapters and their capability flags.",
@@ -114,6 +129,9 @@ export const TOOL_DEFINITIONS = [
             native_task_path: stringProperty("Canonical native task path when known."),
             native_status: enumProperty(["pending_init", "running", "completed", "interrupted", "shutdown", "errored", "missing"], "Observed subagent v2 status."),
             latest_message: stringProperty("Private latest message, limited to 4 KiB and excluded from dashboards/events."),
+            public_activity: { type: ["object", "null"], description: "Explicit public card summary, never hidden reasoning or raw logs. Null clears it.",
+                properties: { kind: { type: "string", enum: ["message", "tool"] }, text: { type: "string", maxLength: 240 },
+                    state: { type: "string", enum: ["running", "completed", "failed"] }, observed_at: { type: "string", format: "date-time" } }, required: ["kind", "text"] },
             observed_at: stringProperty("Observation timestamp. Defaults to now."),
             confirmed_absent: booleanProperty("Confirm exact absence after the recovery delay.")
         }, ["agent_id", "bridge_token", "native_status"]),

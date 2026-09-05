@@ -43,6 +43,8 @@ Use Agent Control MCP tools when available:
 - `flow_step_start`
 - `flow_step_report`
 - `subscription_create`
+- `run_observe`
+- `run_wait`
 - `event_list`
 
 Use `agentctl flow ...` only when MCP tools are unavailable or for manual/debug
@@ -156,9 +158,8 @@ public `bridge_grant_id` only as private coordinator control state and inspect
 the public `orchestrator_action` reference. When `next` is
 `native_subagent_action_required`, claim, execute, and acknowledge that action
 in the same root turn. After a successful `spawn_agent` ACK and every explicitly
-returned follow-up action have been acknowledged, end the turn as soon as the
-latest ACK contains no further action. A normal spawn ACK therefore still ends
-the turn immediately. Do not call `flow_continue` as a polling substitute.
+returned follow-up action have been acknowledged, enter the configured observer wait or end the turn for notification delivery
+as soon as the latest ACK contains no further action. Do not call `flow_continue` as a polling substitute.
 
 For spawn recovery, call
 `list_agents({ path_prefix: expected_task_path })` first. Reuse an exact native
@@ -172,15 +173,23 @@ agentctl agent external-sync \
 ```
 
 On the direct MCP path, use
-`agent_external_sync({ agent_id, bridge_token, native_agent_id?, native_task_name?, native_task_path?, native_status, latest_message?, observed_at?, confirmed_absent? })`
-instead. Spawn only when no exact match exists. Use the same `list_agents` then
+`agent_external_sync({ agent_id, bridge_token, native_agent_id?, native_task_name?, native_task_path?, native_status, latest_message?, public_activity?, observed_at?, confirmed_absent? })`
+instead. To populate a native worker card, send an explicitly public compact
+`public_activity` object with `kind: "message" | "tool"`, `text` (up to 240
+characters), optional `state: "running" | "completed" | "failed"`, and its
+original emission `observed_at`. CLI uses `--public-activity-json`. Preserve the
+emission time when syncing unchanged activity. The private `latest_message`
+field never becomes card text automatically; do not put private reasoning,
+raw logs, credentials, or tool arguments in the public summary. Use `null` to
+clear it. Spawn only when no exact match exists. Use the same `list_agents` then
 external-sync sequence after an ambiguous delivery, restart, or stale
 controller state; do not create duplicate workers as recovery.
 
 `wait_agent` is forbidden during normal flow execution. It may be used only
 for an explicit foreground smoke test, with a single wide timeout rather than
-short polling. Normal coordinators end their turn after dispatch and resume
-only from Agent Control wakeups or user input.
+short polling. Coordinators consume Agent Control events with `run_wait` or resume from
+configured notification delivery. Native `wait_agent` is not the run event
+stream and does not replace either route.
 
 ## Flow Discovery
 
@@ -222,26 +231,29 @@ agentctl flow launch \
 ```
 
 This command authenticates/registers the local coordinator, starts or reuses the
-flow instance, subscribes the coordinator only to configured flow notifications
-and blockers, asks Agent Control to continue the flow, dispatches the currently
+flow instance, attaches the initiating conversational thread as a run observer
+before dispatch, preserves the coordinator's flow notifications and blockers,
+asks Agent Control to continue the flow, dispatches the currently
 active worker when one is ready, and returns immediately. The response is a
 compact control contract: read `next`, `run_id`, `flow_instance_id`,
 `active_step`, `worker_agent_id`, `expected_artifacts`, `blocked_reason`, and
-`ui_url`. A native CLI launch can also return a safe `orchestrator_action`
+`ui_url`, and `observer`. Retain the observer id and durable cursor for event
+consumption. A native CLI launch can also return a safe `orchestrator_action`
 reference plus a public `bridge_grant` reference; the scoped credential itself
 is persisted privately and never appears in CLI output.
 
 Treat `next: "worker_dispatched_end_turn_until_agent_control_wakeup"` and
-`next: "worker_already_running_end_turn_until_agent_control_wakeup"` as hard
-turn boundaries: show the `run_id`, `worker_agent_id` when returned,
-`expected_artifacts`, and `ui_url`, then end the coordinator turn. Treat
+`next: "worker_already_running_end_turn_until_agent_control_wakeup"` as dispatch boundaries: report compactly, then enter `run_wait` when the
+current thread is the waiting observer. If a separate observer owns the wait
+or notification delivery was selected, end the coordinator turn. Treat
 `next: "orchestrator_action_required"` as a compact decision request, and
 `next: "flow_blocked"` as an intervention point.
 
 Treat `next: "native_subagent_action_required"` as a root bridge action, not a
 human routing decision: claim the referenced action, execute the exact native
 tool, acknowledge it, process only the follow-up actions explicitly returned by
-ACKs, and then end the turn. This is still part of the single one-shot launch
+ACKs, and then apply the observer wait or notification turn boundary. This is
+still part of the single one-shot launch
 path; do not replace it with an MCP-only or manual worker-registration detour.
 
 Do not call `open_agent_control_console` from this generic runner during a
@@ -255,13 +267,22 @@ setup, causing the wakeup to arrive before the coordinator has truly ended its
 turn. Do not start, health-check, or open the web console from the visible
 coordinator before launch either; `agentctl flow launch` does not need UI
 preflight. Let the caller/supervising thread keep the console visible. After
-launch, only print the returned URL and end the turn.
+launch, report the returned URL and enter the configured event wait or end
+the turn for notification delivery.
 
 When run from a visible Codex coordinator, `agentctl flow launch` automatically
 attaches that coordinator to the current Codex thread through `CODEX_THREAD_ID`
 when the environment provides it. Do not pass the thread id in the user prompt
 or manually rewrite the orchestrator backend handle unless the user explicitly
 asks for a non-Codex coordinator backend.
+
+The initiating conversational thread must also be identified in the run. When
+a separate thread executes the launch, pass the original requester as
+`--requester-thread-id "$REQUESTER_THREAD_ID"`. Preserve this identity in the
+delegation metadata: the executor's `CODEX_THREAD_ID` remains its own identity,
+while `source_thread_id` identifies the requester. Never substitute one for
+the other. If both identities are the same, Agent Control reuses one agent.
+An attached observer has no worker lifecycle or native execution grant.
 
 Do not inspect the full flow config, prompt files, implementation files, CLI
 help, or backend logs before using this path. Agent Control owns config
@@ -296,26 +317,58 @@ commands as a substitute for `agentctl`.
 
 ## Turn Boundary Contract
 
-For a visible Codex coordinator, a normal flow turn is intentionally short:
+A run has an executing coordinator and an initiating conversational observer;
+they may be the same Codex thread. Register both identities before dispatch.
+The one-shot launch does this automatically. For separate MCP operations,
+call `run_observe` after coordinator login and before `flow_start` or the first
+worker launch. Attaching again is idempotent and preserves the observation.
 
-1. prepare the flow state needed for the next action;
-2. register/authenticate the coordinator if needed;
-3. start or resume the flow;
-4. call `flow_continue` once so Agent Control dispatches the active worker or
-   stops at a configured notification/blocker;
-5. end the coordinator turn.
+The default observer delivery mode is `wait`. Retain the returned observer id
+and cursor and consume events in the conversational thread:
 
-After a worker dispatch succeeds, do not call
-`agent_wait`, `subscription_wait`, `goal_wait_confirm`, `agentctl agent wait`,
-`agentctl sub wait`, or shell polling loops. Do not read worker logs, full
-transcripts, or flow artifacts while waiting. Normal transitions happen when
-workers report through Agent Control; the next coordinator action must happen
-only after Agent Control delivers a configured flow notification, blocker, or
-explicit user follow-up.
+```bash
+agentctl run wait \
+  --run "$RUN_ID" \
+  --observer-agent-id "$OBSERVER_AGENT_ID" \
+  --cursor "$OBSERVER_CURSOR" \
+  --timeout 1h
+```
 
-The coordinator's final message for such a turn should be compact: flow/run id,
-worker id, watcher/subscription id when available, and the fact that the turn is
-ending until Agent Control wakes it again.
+The MCP equivalent is `run_wait` with `timeout_ms: 3600000`. Omit the timeout
+for an indefinite wait. Process each returned batch, retain its new cursor,
+and renew the long wait after a timeout. A timeout does not imply completion.
+If the host interrupts or caps a tool call, resume from the last acknowledged
+cursor rather than polling worker status or replaying earlier events. Stop on
+user cancellation, `closed`, or the selected completion condition.
+
+Default observation covers phases, blockers, notifications, and completion,
+including workers registered later. Select specific events with repeated
+`--requester-event` options on launch or `--event` on `agentctl run observe`.
+For a completion-only flow observation, select `flow.completed`. Independent
+worker terminal events do not mean the entire run has completed.
+
+The observer may inspect Agent Control run/flow state and compact agent
+summaries to answer the user. Keep its updates relevant and concise. It must
+not claim a native action from an informational notification. If the same
+thread is already the authorized coordinator, it acts under that existing
+role; attaching observation does not create a second owner or grant.
+
+Explicit `--requester-delivery notify` appends an informational injection without
+starting a competing turn. Transport acceptance does not prove that an idle
+thread resumed or processed the event. Keep `run_wait` for reliable event
+wakeups in the conversational thread. If injection is unavailable or fails,
+the event remains available through `run_wait`; report the delivery failure.
+
+After worker dispatch, a separate executing coordinator can end its turn while
+the initiating thread waits. When the current thread holds both roles, it may
+wait and then perform the next authorized coordinator action. Complete any
+claimed native action and its explicitly returned follow-up ACKs before
+waiting. Do not use legacy `agent_wait`, `subscription_wait`, `wait_agent`,
+short timeout loops, or shell polling as a substitute for the cursor-based
+run event stream. Keep detached backend supervision running independently.
+
+Stopping the run leaves the attached conversational thread available to the
+user. It does not keep worker goals open after all executing descendants end.
 
 ## Prompt Resolution
 
@@ -367,7 +420,9 @@ result schema, allowed routing values, report artifact payload, and examples.
    `orchestrator_login`/`agentctl auth login`, or prefer the one-shot
    `agentctl flow launch` command when available. This creates or attaches the
    Agent Control run, registers or reuses the coordinator/orchestrator agent,
-   and returns the `agent_token` for that launch turn.
+   and returns the `agent_token` for that launch turn. Attach the initiating
+   thread with `run_observe` before starting flow steps when using the separate
+   MCP path; retain its event cursor in the initiating conversation.
    - Prefer `agentctl auth login` for local Codex coordinators. It may use the
      controller's local stored admin key without printing it.
    - Do not print admin keys, agent tokens, or raw auth files in chat or logs.
@@ -413,16 +468,15 @@ result schema, allowed routing values, report artifact payload, and examples.
 
 If a deterministic end-to-end flow runner command is unavailable, do not emulate
 one by keeping the coordinator model turn open and manually polling every worker.
-Use only `flow_continue` for the next deterministic action, then end the turn.
+Use `flow_continue` for the next deterministic action, then consume run events
+through the configured observation route.
 If that is not enough to continue safely, stop and report the missing runner
 capability instead of hand-rolling a foreground loop.
 
 For external detached backends such as OpenCode server, Agent Control should
-launch the worker in detached mode and then the coordinator should end its
-current turn. Do not keep a model turn open just to poll, read logs, or watch
-the worker. Foreground/debug wait modes are opt-in only and are forbidden for
-normal visible Codex coordinator flow execution because they keep the
-coordinator turn open.
+launch the worker in detached mode. The conversational observer can remain
+in `run_wait` while deterministic supervision refreshes backend state. Do not
+keep a model turn open to poll status or repeatedly read worker logs.
 
 The coordinator must not implement a flow step, write step artifacts, or
 generate semantic step reports. Its job is to launch/resume the flow, react to
