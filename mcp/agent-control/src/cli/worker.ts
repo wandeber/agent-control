@@ -28,6 +28,7 @@ export type WorkerLaunchOptions = {
   repoDir?: string;
   dir?: string;
   model?: string;
+  reasoningEffort?: string;
   title: string;
   promptFile: string;
   phase: string;
@@ -116,12 +117,13 @@ export function registerWorkerCommands(program: Command, deps: CliDeps): void {
   worker
     .command("launch")
     .description("Register/start a worker, wire optional subscriptions, and optionally arm a detached watcher.")
-    .requiredOption("--backend <backend>", "Backend kind.")
+    .option("--backend <backend>", "Backend kind.", "codex-thread")
     .option("--server <url>", "Backend server URL.")
     .option("--repo <dir>", "Repository directory.")
     .option("--repo-dir <dir>", "Repository directory.")
     .option("--dir <dir>", "Repository directory.")
     .option("--model <model>", "Backend model.")
+    .option("--reasoning-effort <effort>", "Codex-thread reasoning effort (for example max).")
     .requiredOption("--title <title>", "Worker title.")
     .requiredOption("--prompt-file <path>", "Canonical prompt file. Do not use per-run temporary prompt files.")
     .requiredOption("--phase <name>", "Phase or operation name.")
@@ -197,6 +199,9 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
   // Validate the complete handoff envelope before authentication can lead to
   // run/agent registration. Invalid workflow state must never reach a backend.
   const normalizedInputHandoffsJson = parseWorkerInputHandoffs(options.inputHandoffsJson);
+  if (options.reasoningEffort && options.backend !== "codex-thread") {
+    throw new Error("--reasoning-effort is only supported by codex-thread.");
+  }
   const auth = deps.authOptions();
   const agentToken = options.agentToken ?? auth.agentToken;
   const caller = agentToken ? deps.controller.requireAgentToken(agentToken) : null;
@@ -212,6 +217,8 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
   assertReadableFiles([...inputArtifacts.map((artifact) => artifact.path), ...attachments]);
 
   const agentId = options.agentId ?? options.agent;
+  const model = options.model ?? (!agentId && options.backend === "codex-thread" ? "gpt-5.6-luna" : undefined);
+  const reasoningEffort = options.reasoningEffort ?? (model === "gpt-5.6-luna" ? "max" : undefined);
   const runId = options.runId ?? options.run ?? caller?.run_id;
   let workerAgent: AgentRecord;
   let createdAgent = false;
@@ -238,7 +245,7 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
       role: options.role ?? options.phase,
       objective: options.objective,
       repoDir,
-      model: options.model,
+      model,
       status: "queued",
       adminKey: auth.adminKey,
       agentToken
@@ -342,7 +349,8 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
         agentId: workerAgent.agent_id,
         prompt,
         server: options.server ?? (options.backend === "opencode-server" ? DEFAULT_OPENCODE_SERVER : undefined),
-        model: options.model,
+        model,
+        metadata: reasoningEffort ? { reasoning_effort: reasoningEffort } : undefined,
         expectedArtifacts,
         attachments,
         agentToken

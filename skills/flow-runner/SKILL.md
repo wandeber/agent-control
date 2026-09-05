@@ -218,8 +218,7 @@ new flow, prefer the deterministic one-shot CLI path:
 agentctl flow launch \
   --config-file "$FLOW_CONFIG" \
   --title "$RUN_OBJECTIVE" \
-  --repo-dir "$PWD" \
-  --server "${AGENT_CONTROL_OPENCODE_SERVER:-http://localhost:53910}"
+  --repo-dir "$PWD"
 ```
 
 This command authenticates/registers the local coordinator, starts or reuses the
@@ -289,7 +288,7 @@ checks before the flow operation. If the direct command fails because
 1. if the current checkout contains
    `mcp/agent-control/bin/agentctl`, use that path.
 2. otherwise, use the installed plugin cache path:
-   `$HOME/.codex/plugins/cache/agent-control/agent-control/0.1.0/mcp/agent-control/bin/agentctl`.
+   `$HOME/.codex/plugins/cache/agent-control/agent-control/<installed-version>/mcp/agent-control/bin/agentctl`.
 
 If none of those paths exists, stop and report that Agent Control CLI is
 unavailable. Do not inspect implementation files or hand-roll equivalent

@@ -13,7 +13,6 @@ const PURGE_SAFE_STATUSES = new Set(["planned", "completed", "failed", "blocked"
 const STOP_INTENT_AGENT_STATUSES = new Set(["stopping", "stopped"]);
 const STOP_INTENT_RUN_STATUSES = new Set(["stopping", "stopped"]);
 const DEFAULT_OPENCODE_SERVER = "http://localhost:53910";
-const DEFAULT_OPENCODE_MODEL = "opencode-go/deepseek-v4-pro";
 const CODEX_SUBAGENT_BACKEND = "codex-subagent";
 const ORCHESTRATOR_ACTION_CLAIM_LEASE_MS = 60_000;
 const NON_NATIVE_START_ATTEMPT_LEASE_MS = 60_000;
@@ -906,13 +905,14 @@ export class AgentController {
             started = await this.startAgent({
                 agentId: registered.agent_id,
                 prompt: prompt,
-                server: backend === CODEX_SUBAGENT_BACKEND ? undefined : input.server ?? DEFAULT_OPENCODE_SERVER,
+                server: backend === CODEX_SUBAGENT_BACKEND ? undefined : input.server ?? (backend === "opencode-server" ? defaultOpenCodeServer() : undefined),
                 model: roleConfig?.model ?? undefined,
                 expectedArtifacts,
                 metadata: {
                     flow_instance_id: snapshot.instance.flow_instance_id,
                     step_instance_id: activeStep.step_instance_id,
-                    step_id: activeStep.step_id
+                    step_id: activeStep.step_id,
+                    ...(roleConfig?.reasoning_effort ? { reasoning_effort: roleConfig.reasoning_effort } : {})
                 },
                 agentToken: input.agentToken,
                 bridgeGrantId: flowBridgeGrant?.bridge_grant_id ?? input.bridgeGrantId ?? null,
@@ -6649,7 +6649,8 @@ export class AgentController {
                 ...metadata,
                 id: metadata.id ?? agent.agent_id,
                 server: metadata.server ?? defaultOpenCodeServer(),
-                model: metadata.model ?? agent.model ?? DEFAULT_OPENCODE_MODEL,
+                // Recover inspection/stop state without inventing a model for a future prompt.
+                model: metadata.model ?? agent.model ?? "",
                 title: metadata.title ?? agent.title,
                 repoDir: metadata.repoDir ?? agent.repo_dir ?? "",
                 pidFile: metadata.pidFile ?? pidFile,
@@ -6667,7 +6668,7 @@ export class AgentController {
         return {
             id: agent.agent_id,
             server: defaultOpenCodeServer(),
-            model: agent.model ?? DEFAULT_OPENCODE_MODEL,
+            model: agent.model ?? "",
             title: agent.title,
             repoDir: agent.repo_dir ?? "",
             pidFile,

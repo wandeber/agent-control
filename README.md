@@ -4,6 +4,11 @@ Agent Control is a local deterministic control plane for agent workers. It is
 packaged as a Codex plugin with an MCP server and an `agentctl` CLI that share
 the same TypeScript core.
 
+Default workers and bundled flow roles use Codex (`codex-thread`) with
+`gpt-5.6-luna` and `max` reasoning. Existing explicit Codex selections, such as
+the development-v1 final reviewer, are preserved. OpenCode is an optional backend
+that requires an explicit backend and provider/model choice.
+
 The plugin also ships Agent Control skills:
 
 - `development-flow` for clarifying and running the bundled development workflow
@@ -390,10 +395,9 @@ roles:
 ```
 
 `fork_turns` accepts `none`, `all`, or a positive integer string. Native roles
-inherit the root model, so nonempty model overrides are rejected. The bundled
-demo/development flows retain their existing backend/model defaults; set a
-role's backend to `codex-subagent` and its model variable to an explicit empty
-value to opt in with the safe default `fork_turns: none`. Because
+inherit the root model and reasoning effort, so nonempty overrides are rejected.
+Set a bundled role's backend to `codex-subagent` and clear both its model and
+reasoning-effort variables to opt in with the safe default `fork_turns: none`. Because
 `backend_options` are rejected on non-native backends, configurable bundled
 roles do not carry dormant native options.
 
@@ -577,16 +581,23 @@ Use native `agentctl` commands for worker-style tasks outside a declared flow:
 
 ```bash
 agentctl worker launch \
-  --backend opencode-server \
-  --server http://localhost:53910 \
+  --backend codex-thread \
   --repo /path/to/repo \
-  --model opencode-go/deepseek-v4-pro \
+  --model gpt-5.6-luna \
+  --reasoning-effort max \
   --title "Implementation" \
   --phase implementation \
   --prompt-file /path/to/canonical-prompt.md \
   --output-artifact /tmp/implementation-report.md \
   --watch
 ```
+
+`worker launch` defaults to `codex-thread`. New Codex workers without a model
+selection use Luna Max; `--model` and `--reasoning-effort` can override those
+settings. Flow roles declare `reasoning_effort`, and direct agent starts can pass
+`metadata.reasoning_effort`. The Codex adapter sends it as `turn/start.effort`
+and retains it for subsequent turns. Omitting the effort for other explicit
+Codex models preserves their configured default.
 
 For a clean worker execution that needs compact workflow state from earlier
 phases, pass one JSON array with `--input-handoffs-json`:

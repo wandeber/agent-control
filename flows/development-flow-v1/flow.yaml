@@ -1,8 +1,8 @@
-# Agent Control flow config. Backend placeholders use ${VAR:-default}. Model placeholders intentionally
-# use ${VAR-default}: an explicitly empty model lets the opt-in codex-subagent backend inherit the root model.
+# Backend placeholders use ${VAR:-default}. Model and reasoning placeholders use ${VAR-default}:
+# clear both values when opting into codex-subagent to inherit the root settings.
 
 id: development-flow-v1
-version: 1.1.0
+version: 1.1.1
 description: Development workflow with coordinator-owned pre-launch clarification. Normal worker
   handoffs, downstream intent reviews, corrections, and final review rollbacks are handled by Agent
   Control transitions; the same visible orchestrator validates analysis intent and handles new
@@ -41,20 +41,23 @@ prompts:
     description: Final independent review-loop instructions.
 roles:
   analyst:
-    backend: ${DEVFLOW_ANALYST_BACKEND:-opencode-server}
-    model: ${DEVFLOW_ANALYST_MODEL-opencode-go/deepseek-v4-pro}
+    backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
+    model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
     prompt_ref: role_analyst
     description: Understands the task and repository context, writes analysis, and later checks whether
       planning preserved analysis intent.
   planner:
-    backend: ${DEVFLOW_PLANNER_BACKEND:-opencode-server}
-    model: ${DEVFLOW_PLANNER_MODEL-opencode-go/deepseek-v4-pro}
+    backend: ${DEVFLOW_PLANNER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_PLANNER_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_PLANNER_REASONING_EFFORT-max}
     prompt_ref: role_planner
     description: Turns analysis into a worker-ready plan and later checks whether implementation
       preserved plan intent.
   implementer:
-    backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-opencode-server}
-    model: ${DEVFLOW_IMPLEMENTER_MODEL-opencode-go/deepseek-v4-pro}
+    backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_IMPLEMENTER_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_IMPLEMENTER_REASONING_EFFORT-max}
     prompt_ref: role_implementer
     description: Implements the accepted plan, integrates internal work, runs mechanical checks, and
       reports one coherent result.

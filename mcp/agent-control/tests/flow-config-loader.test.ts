@@ -11,6 +11,30 @@ import { parseFlowConfig, resolveFlowAgentLifecycle } from "../src/core/flow.js"
 import { flowConfigJsonSchema } from "../src/core/flow-config-schema.js";
 
 describe("flow config loader", () => {
+  it("loads migrated bundled workers as Codex Luna Max and preserves the existing reviewer", () => {
+    for (const name of ["development-flow-v0", "development-flow-v1", "demo-age-duration"]) {
+      const config = parseFlowConfig(loadFlowConfigFile(resolve(import.meta.dirname, "../../../flows", name, "flow.yaml"), { env: {} }));
+      for (const [role, settings] of Object.entries(config.roles ?? {})) {
+        if (role === "orchestrator") continue;
+        expect(settings.backend).toBe("codex-thread");
+        if (name === "development-flow-v1" && role === "final_reviewer") {
+          expect(settings.model).toBe("gpt-5.5");
+          expect(settings.reasoning_effort).toBeUndefined();
+        } else {
+          expect(settings.model).toBe("gpt-5.6-luna");
+          expect(settings.reasoning_effort).toBe("max");
+        }
+      }
+    }
+  });
+
+  it("keeps native inheritance available by clearing both Codex overrides", () => {
+    const path = resolve(import.meta.dirname, "../../../flows/development-flow-v1/flow.yaml");
+    const env = { DEVFLOW_ANALYST_BACKEND: "codex-subagent", DEVFLOW_ANALYST_MODEL: "", DEVFLOW_ANALYST_REASONING_EFFORT: "" };
+    expect(parseFlowConfig(loadFlowConfigFile(path, { env })).roles?.analyst).toMatchObject({ backend: "codex-subagent", model: undefined, reasoning_effort: "" });
+    expect(() => parseFlowConfig(loadFlowConfigFile(path, { env: { ...env, DEVFLOW_ANALYST_REASONING_EFFORT: "max" } }))).toThrow(/reasoning_effort is only supported/);
+  });
+
   let tmp: string;
 
   beforeEach(() => {

@@ -19,6 +19,7 @@ const CODEX_SUBAGENT_BACKEND = "codex-subagent";
 const CODEX_SUBAGENT_ROLE_KEYS = new Set([
   "backend",
   "model",
+  "reasoning_effort",
   "description",
   "prompt",
   "prompt_ref",
@@ -125,6 +126,7 @@ const codexSubagentOptionsSchema = z.object({
 const roleSchema = z.object({
   backend: z.string().min(1).optional(),
   model: z.string().nullable().optional(),
+  reasoning_effort: z.string().nullable().optional(),
   agent_lifecycle: z.enum(["reuse", "fresh_per_step"]).optional(),
   backend_options: z
     .object({
@@ -188,6 +190,11 @@ function assertSupportedCodexSubagentOptions(value: unknown): void {
       continue;
     }
     const role = roleValue as Record<string, unknown>;
+    if (role.reasoning_effort && role.backend !== "codex-thread") {
+      throw new ControllerError("reasoning_effort is only supported by the codex-thread backend; clear it to inherit native settings.", "unsupported_operation", {
+        role: roleId, backend: role.backend ?? null
+      });
+    }
     if (role.backend !== CODEX_SUBAGENT_BACKEND) {
       if ("model" in role && (typeof role.model !== "string" || role.model.length === 0)) {
         throw new ControllerError("Invalid flow config.", "tool_error", {

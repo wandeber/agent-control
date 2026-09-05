@@ -1,7 +1,7 @@
 # Agent Control flow config. Environment placeholders use ${VAR:-default} and are resolved by agentctl.
 
 id: development-flow
-version: 0.1.0
+version: 0.1.1
 description: Orchestrator-driven development workflow with stable phase owners, artifact handoffs,
   implementation-owned mechanical checks, and one persistent independent expert-review loop at the end.
 initial_step: analysis
@@ -35,18 +35,30 @@ prompts:
     description: Final independent review-loop instructions.
 roles:
   analyst:
+    backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
+    model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
     prompt_ref: role_analyst
     description: Understands the task and repository context, then writes analysis or correction-focused
       analysis.
   planner:
+    backend: ${DEVFLOW_PLANNER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_PLANNER_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_PLANNER_REASONING_EFFORT-max}
     prompt_ref: role_planner
     description: Turns analysis into a worker-ready implementation plan and reviews implementation
       intent preservation.
   implementer:
+    backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_IMPLEMENTER_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_IMPLEMENTER_REASONING_EFFORT-max}
     prompt_ref: role_implementer
     description: Implements the plan, performs mechanical checks, fixes failures, and writes one
       coherent report.
   final_reviewer:
+    backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
+    model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_FINAL_REVIEWER_REASONING_EFFORT-max}
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
     description: Clean-context reviewer created on first entry and reused for every final-review iteration.

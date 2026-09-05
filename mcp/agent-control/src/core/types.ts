@@ -563,6 +563,7 @@ export type FlowAgentLifecycle = "reuse" | "fresh_per_step";
 export interface FlowRoleConfig {
   backend?: string;
   model?: string | null;
+  reasoning_effort?: string | null;
   agent_lifecycle?: FlowAgentLifecycle;
   backend_options?: {
     codex_subagent?: {

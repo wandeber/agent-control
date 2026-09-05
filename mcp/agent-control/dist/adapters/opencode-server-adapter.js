@@ -25,7 +25,7 @@ export class OpenCodeServerAdapter {
     async start(input) {
         const server = requiredString(input.server ?? input.metadata?.server, "server");
         const repoDir = requiredString(input.agent.repo_dir, "repo_dir");
-        const model = input.model ?? input.agent.model ?? "opencode-go/deepseek-v4-pro";
+        const model = requiredString(input.model ?? input.agent.model, "model");
         const prompt = requiredString(input.prompt, "prompt");
         const runtimeDir = agentRuntimeDir(input.agent.run_id, input.agent.agent_id);
         const logFile = join(runtimeDir, "opencode.log");
@@ -107,9 +107,9 @@ export class OpenCodeServerAdapter {
     }
     async sendMessage(handle, message) {
         const data = parseHandle(handle);
+        const model = parseOpenCodeModel(data.model);
         assertOpenCodeAvailable();
         await ensureServerReachable(data.server);
-        const model = parseOpenCodeModel(data.model);
         const sessionId = data.sessionId ?? (await findSessionId(data));
         if (!sessionId) {
             throw new ControllerError("OpenCode session could not be found for follow-up message.", "tool_error", {

@@ -13,6 +13,33 @@ const CANONICAL_PROMPT_FILE = resolve(REPOSITORY_ROOT, "flows/development-flow-v
 const OUTPUT_ARTIFACT = resolve(tmpdir(), "agent-control-worker-input-handoffs-report.md");
 
 describe("worker launch input handoffs", () => {
+  it("defaults CLI workers to Codex Luna Max without an OpenCode server", async () => {
+    const harness = createCliHarness();
+    const program = new Command().name("agentctl").exitOverride();
+    registerWorkerCommands(program, harness.deps);
+    await program.parseAsync([
+      "worker", "launch", "--repo", REPOSITORY_ROOT, "--title", "Default worker",
+      "--prompt-file", CANONICAL_PROMPT_FILE, "--phase", "analysis",
+      "--output-artifact", OUTPUT_ARTIFACT
+    ], { from: "user" });
+    expect(harness.registerAgent).toHaveBeenCalledWith(expect.objectContaining({ backend: "codex-thread", model: "gpt-5.6-luna" }));
+    expect(harness.startAgent).toHaveBeenCalledWith(expect.objectContaining({
+      model: "gpt-5.6-luna", metadata: { reasoning_effort: "max" }, server: undefined
+    }));
+  });
+
+  it("preserves explicit Codex model and effort choices", async () => {
+    const harness = createCliHarness();
+    await launchWorker(createLaunchOptions({ backend: "codex-thread", model: "gpt-5.5", reasoningEffort: "high" }), harness.deps);
+    expect(harness.startAgent).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.5", metadata: { reasoning_effort: "high" } }));
+  });
+
+  it("rejects Codex reasoning on another backend before registering work", async () => {
+    const harness = createCliHarness();
+    await expect(launchWorker(createLaunchOptions({ backend: "opencode-server", reasoningEffort: "max" }), harness.deps)).rejects.toThrow(/only supported by codex-thread/);
+    expect(harness.registerAgent).not.toHaveBeenCalled();
+  });
+
   it("renders accepted handoffs exactly once as a dedicated JSON block", async () => {
     const harness = createCliHarness();
     const handoffs = [

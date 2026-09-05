@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
 import { CodexThreadAdapter } from "../src/adapters/codex-thread-adapter.js";
-import type { AgentHandle } from "../src/core/types.js";
+import type { AgentHandle, StartAgentInput } from "../src/core/types.js";
 
 describe("CodexThreadAdapter", () => {
   let server: WebSocketServer;
@@ -39,6 +39,10 @@ describe("CodexThreadAdapter", () => {
           return;
         }
         if (message.method === "initialized") {
+          return;
+        }
+        if (message.method === "thread/start") {
+          socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { thread: { id: "thread-1", cwd: "/repo", status: { type: "idle" } } } }));
           return;
         }
         if (message.method === "thread/resume") {
@@ -166,6 +170,26 @@ describe("CodexThreadAdapter", () => {
       cwd: "/repo",
       input: [{ type: "text", text: "Worker completed; continue orchestration.", text_elements: [] }]
     });
+  });
+
+  it("sends max effort to Codex and retains it when the worker is reused", async () => {
+    const adapter = new CodexThreadAdapter();
+    const handle = await adapter.start({
+      agent: { repo_dir: "/repo", model: "gpt-5.6-luna", backend_handle: null } as StartAgentInput["agent"],
+      server: appServerUrl, model: "gpt-5.6-luna", prompt: "Run analysis.", metadata: { reasoning_effort: "max" }
+    });
+    expect(handle.data.reasoning_effort).toBe("max");
+    expect(requests.find((request) => request.method === "thread/start")?.params.model).toBe("gpt-5.6-luna");
+    expect(requests.find((request) => request.method === "turn/start")?.params).toMatchObject({ model: "gpt-5.6-luna", effort: "max" });
+    requests.length = 0;
+    await adapter.sendMessage(handle, { message: "Continue analysis." });
+    expect(requests.find((request) => request.method === "turn/start")?.params.effort).toBe("max");
+  });
+
+  it("omits effort when an existing Codex selection does not override it", async () => {
+    const adapter = new CodexThreadAdapter();
+    await adapter.sendMessage({ backend: "codex-thread", id: "thread-1", data: { thread_id: "thread-1", app_server_url: appServerUrl } }, { message: "Continue." });
+    expect(requests.find((request) => request.method === "turn/start")?.params).not.toHaveProperty("effort");
   });
 
   it("falls back to the registered handle cwd when resume omits cwd", async () => {

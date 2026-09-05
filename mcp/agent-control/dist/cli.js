@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { registerMarketplaceCommands } from "./cli/marketplace.js";
 import { registerSmokeCommands } from "./cli/smoke.js";
-import { collect, commanderExitInfo, DEFAULT_OPENCODE_SERVER, outputError, parseIntOption, parseJsonObjectOption } from "./cli/shared.js";
+import { collect, commanderExitInfo, outputError, parseIntOption, parseJsonObjectOption } from "./cli/shared.js";
 import { registerWatchCommands, registerWorkerCommands } from "./cli/worker.js";
 import { registerWebCommands } from "./cli/web.js";
 import { startControlServer } from "./control-server.js";
@@ -16,7 +16,7 @@ const program = new Command();
 program
     .name("agentctl")
     .description("Control local agent workers through the Agent Control core.")
-    .version("0.1.0")
+    .version("0.1.1")
     .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
     .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();
@@ -189,7 +189,7 @@ flow
     .option("--orchestrator-backend-handle-json <json>", "Explicit orchestrator backend handle JSON.")
     .option("--owner-task-identity <id>", "Optional root CODEX_THREAD_ID binding for the native bridge.")
     .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
-    .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
+    .option("--server <url>", "Optional backend server URL; otherwise use the selected adapter default.")
     .option("--ui-host <host>", "Web console host for the returned ui_url.", "localhost")
     .option("--ui-port <port>", "Web console port for the returned ui_url.", parseIntOption, 3766)
     .option("--ui-api-port <port>", "Web console API port for the returned ui_url.", parseIntOption, 3767)
@@ -259,7 +259,7 @@ flow
     .description("Dispatch the active flow step to its configured backend worker and return immediately.")
     .requiredOption("--flow <flowInstanceId>", "Flow instance id.")
     .option("--subscriber-agent <agentId>", "Agent to notify on worker terminal events.")
-    .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
+    .option("--server <url>", "Optional backend server URL; otherwise use the selected adapter default.")
     .option("--bridge-grant <grantId>", "Local scoped bridge grant id returned by flow start/launch.")
     .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
     .action(async (options) => {
@@ -281,7 +281,7 @@ flow
     .description("Advance a flow deterministically and return immediately.")
     .requiredOption("--flow <flowInstanceId>", "Flow instance id.")
     .option("--subscriber-agent <agentId>", "Optional agent to notify on dispatched worker terminal events.")
-    .option("--server <url>", "Backend server URL for server-backed adapters.", DEFAULT_OPENCODE_SERVER)
+    .option("--server <url>", "Optional backend server URL; otherwise use the selected adapter default.")
     .option("--bridge-grant <grantId>", "Local scoped bridge grant id returned by flow start/launch.")
     .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
     .action(async (options) => {
@@ -318,7 +318,7 @@ flow
     .option("--result-json <json>", "Structured result JSON object.")
     .option("--artifact <key=path>", "Output artifact path by output name or artifact key.", collect, [])
     .option("--summary <summary>", "Compact step summary.")
-    .option("--server <url>", "Backend server URL for server-backed adapters when auto-continuing.", DEFAULT_OPENCODE_SERVER)
+    .option("--server <url>", "Optional backend server URL when auto-continuing.")
     .option("--no-auto-continue", "Do not dispatch the next active step after reporting.")
     .action(async (options) => output(compactFlowReportResult(await controller.reportFlowStepAndContinue({
     stepInstanceId: options.step,

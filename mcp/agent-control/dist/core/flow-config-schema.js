@@ -83,6 +83,7 @@ export const flowConfigJsonSchema = {
             properties: {
                 backend: { type: "string", minLength: 1 },
                 model: { type: ["string", "null"] },
+                reasoning_effort: { type: ["string", "null"], description: "Codex-thread reasoning effort. Omit or clear to inherit the Codex default." },
                 agent_lifecycle: {
                     type: "string",
                     enum: ["reuse", "fresh_per_step"],

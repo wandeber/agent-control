@@ -37,6 +37,7 @@ const CAPABILITIES: AgentCapabilities = {
 
 interface CodexThreadHandleData {
   thread_id: string;
+  reasoning_effort?: string;
   app_server_url?: string;
   auth_token?: string;
   auth_token_file?: string;
@@ -92,10 +93,12 @@ export class CodexThreadAdapter implements AgentAdapter {
     const handleData = parseOptionalHandle(input.agent.backend_handle);
     const appServerUrl = resolveAppServerUrl(input.server, input.metadata, handleData);
     const authToken = resolveAuthToken(input.metadata, handleData);
+    const reasoningEffort = stringValue(input.metadata?.reasoning_effort) ?? handleData?.reasoning_effort;
 
     if (handleData?.thread_id) {
       const data: CodexThreadHandleData = {
         ...handleData,
+        reasoning_effort: reasoningEffort,
         app_server_url: appServerUrl,
         auth_token: stringValue(input.metadata?.auth_token) ?? stringValue(input.metadata?.authToken) ?? handleData.auth_token,
         auth_token_file: resolveAuthTokenFile(input.metadata, handleData) ?? handleData.auth_token_file
@@ -121,6 +124,7 @@ export class CodexThreadAdapter implements AgentAdapter {
       const thread = readThreadFromResponse(startResponse, "thread/start");
       const data: CodexThreadHandleData = {
         thread_id: thread.id,
+        reasoning_effort: reasoningEffort,
         app_server_url: appServerUrl,
         auth_token: stringValue(input.metadata?.auth_token) ?? stringValue(input.metadata?.authToken),
         auth_token_file: resolveAuthTokenFile(input.metadata, handleData),
@@ -269,7 +273,9 @@ async function startTurnOnLoadedThread(
     clientUserMessageId: `agent-control-${randomUUID()}`,
     input: [{ type: "text", text: message, text_elements: [] }],
     cwd: turnCwd ?? undefined,
-    model: model ?? undefined
+    model: model ?? undefined,
+    // Retain the explicit effort when this worker receives another turn.
+    effort: data.reasoning_effort ?? undefined
   });
   const turnResponse = result as { turn?: { id: string } };
   if (turnResponse.turn?.id) {
@@ -706,6 +712,7 @@ function parseOptionalHandle(value: Record<string, unknown> | null): CodexThread
   }
   return {
     thread_id: String(value.thread_id ?? value.threadId ?? value.id ?? ""),
+    reasoning_effort: stringValue(value.reasoning_effort),
     app_server_url:
       typeof value.app_server_url === "string"
         ? value.app_server_url
@@ -769,6 +776,9 @@ function compactHandle(data: CodexThreadHandleData): Record<string, unknown> {
   }
   if (data.cwd) {
     handle.cwd = data.cwd;
+  }
+  if (data.reasoning_effort) {
+    handle.reasoning_effort = data.reasoning_effort;
   }
   return handle;
 }

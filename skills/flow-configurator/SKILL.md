@@ -55,8 +55,9 @@ Set concrete overrides:
 node "$SKILL_DIR/scripts/flow-env-configurator.mjs" set \
   --flow development-flow-v1 \
   --agents-env .agents.env \
-  --set DEVFLOW_ANALYST_BACKEND=opencode-server \
-  --set DEVFLOW_ANALYST_MODEL=opencode-go/deepseek-v4-pro
+  --set DEVFLOW_ANALYST_BACKEND=codex-thread \
+  --set DEVFLOW_ANALYST_MODEL=gpt-5.6-luna \
+  --set DEVFLOW_ANALYST_REASONING_EFFORT=max
 ```
 
 The helper validates that `--set` keys exist in the selected flow. Use
@@ -89,17 +90,20 @@ different variables.
 
 ## Opting Into Native Codex Subagents
 
-The bundled development/demo roles keep their current backend defaults. To opt
-one configurable role into the native bridge, set its backend to
-`codex-subagent` and set its model variable to an explicit empty value so the
-worker inherits the root model:
+Bundled roles default to Codex Luna Max, while existing explicit Codex choices
+remain intact. Roles with a reasoning default also expose a matching
+`*_REASONING_EFFORT` variable; discover the exact keys with the helper.
+To opt one configurable role into the native bridge, set its backend to
+`codex-subagent` and clear its model and reasoning-effort variables so the
+worker inherits the root settings:
 
 ```bash
 node "$SKILL_DIR/scripts/flow-env-configurator.mjs" set \
   --flow development-flow-v1 \
   --agents-env .agents.env \
   --set DEVFLOW_ANALYST_BACKEND=codex-subagent \
-  --set DEVFLOW_ANALYST_MODEL=
+  --set DEVFLOW_ANALYST_MODEL= \
+  --set DEVFLOW_ANALYST_REASONING_EFFORT=
 ```
 
 The bundled role then uses the safe native default `fork_turns: none`.

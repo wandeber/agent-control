@@ -1420,6 +1420,22 @@ describe("AgentController", () => {
     ]);
   });
 
+  it.each(["codex-thread", "opencode-server"])("dispatches %s flows with the selected adapter server and Codex effort", async (backend) => {
+    const worker = new FakeAdapter(backend);
+    registry.register(worker);
+    const run = controller.createRun({ title: "Backend defaults", repoDir: "/repo" });
+    const orchestrator = controller.registerAgent({ runId: run.run_id, backend: "fake", title: "Orchestrator", role: "orchestrator" });
+    const isCodex = backend === "codex-thread";
+    const started = controller.startFlow({ runId: run.run_id, config: {
+      id: "backend-defaults", initial_step: "work",
+      roles: { worker: { backend, model: isCodex ? "gpt-5.6-luna" : "provider/explicit-model", ...(isCodex ? { reasoning_effort: "max" } : {}) } },
+      steps: { work: { role: "worker", on: { reported: { finish: true } } } }
+    } });
+    await controller.dispatchActiveFlowStep({ flowInstanceId: started.instance.flow_instance_id, subscriberAgentId: orchestrator.agent_id });
+    expect(worker.starts[0]?.server).toBe(isCodex ? undefined : "http://localhost:53910");
+    expect(worker.starts[0]?.metadata?.reasoning_effort).toBe(isCodex ? "max" : undefined);
+  });
+
   it("pre-registers declarative flow agents and reuses their cards across clean step instances", async () => {
     process.env.AGENT_CONTROL_ADMIN_KEY = "ack_planned_flow_test";
     const login = controller.orchestratorLogin({
@@ -5594,7 +5610,7 @@ describe("AgentController", () => {
     expect(adapter.sent).toHaveLength(0);
   });
 
-  it("recovers OpenCode runtime handles before purge stop-first", async () => {
+  it.each(["provider/explicit-model", undefined])("recovers OpenCode runtime handles without inventing a model (%s)", async (model) => {
     const opencodeAdapter = new FakeAdapter("opencode-server");
     registry.register(opencodeAdapter);
     const run = controller.createRun({ title: "opencode run", repoDir: "/repo" });
@@ -5603,7 +5619,7 @@ describe("AgentController", () => {
       backend: "opencode-server",
       title: "implementation",
       repoDir: "/repo",
-      model: "opencode-go/deepseek-v4-pro",
+      model,
       status: "running"
     });
     const runtimePath = agentRuntimePath(run.run_id, agent.agent_id);
@@ -5616,7 +5632,7 @@ describe("AgentController", () => {
       metadataFile,
       JSON.stringify({
         server: "http://localhost:53910",
-        model: "opencode-go/deepseek-v4-pro",
+        model,
         title: "implementation",
         repoDir: "/repo",
         pidFile,
@@ -5629,10 +5645,16 @@ describe("AgentController", () => {
     const result = await controller.runPurge(run.run_id, { stopFirst: true });
 
     expect(opencodeAdapter.stopped).toHaveLength(1);
+    expect(opencodeAdapter.stopped[0]?.data.model).toBe(model ?? "");
     expect(opencodeAdapter.stopped[0]?.data.pidFile).toBe(pidFile);
     expect(result.purged_runs).toEqual([run.run_id]);
     expect(existsSync(runRuntimePath(run.run_id))).toBe(false);
     expect(() => controller.getRun(run.run_id)).toThrow(/Run not found/);
+  });
+
+  it("rejects OpenCode continuation without a known model before accessing the backend", async () => {
+    const opencodeAdapter = new OpenCodeServerAdapter();
+    await expect(opencodeAdapter.sendMessage({ backend: "opencode-server", id: "unknown-model", data: { model: "" } }, { message: "Continue." })).rejects.toThrow(/provider\/model format/);
   });
 
   it("requires explicit debug opt-in for MCP blocking waits", async () => {

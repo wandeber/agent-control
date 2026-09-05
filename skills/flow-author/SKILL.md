@@ -24,8 +24,10 @@ available.
   reference them from roles or steps with `prompt_ref`.
 - Use role `backend` and `model` when the flow should suggest a worker backend
   or model. Prefer environment placeholders with defaults for repo-authored
-  flows, for example `${DEVFLOW_ANALYST_BACKEND:-opencode-server}` and
-  `${DEVFLOW_ANALYST_MODEL:-opencode-go/deepseek-v4-pro}`.
+  flows, for example `${DEVFLOW_ANALYST_BACKEND:-codex-thread}` and
+  `${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}`. Set `reasoning_effort` to
+  `${DEVFLOW_ANALYST_REASONING_EFFORT-max}` for Codex Luna Max. Preserve explicit
+  Codex choices; use OpenCode only when requested with an explicit provider/model.
 - Prefer Markdown prompt files for stable instructions:
   - role prompts define stable worker behavior;
   - step prompts define the current phase/action;
@@ -64,8 +66,9 @@ prompts:
     path: prompts/steps/analysis.md
 roles:
   analyst:
-    backend: ${DEVFLOW_ANALYST_BACKEND:-opencode-server}
-    model: ${DEVFLOW_ANALYST_MODEL:-opencode-go/deepseek-v4-pro}
+    backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
+    model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
     prompt_ref: analyst_role
 artifacts:
   analysis:
