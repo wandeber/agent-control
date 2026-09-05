@@ -69,6 +69,65 @@ describe("McpConsoleNotificationStore", () => {
       console: { requested_run_id: "run-42", follow_latest: false }
     });
   });
+
+  it("replays a close command without treating it as a run selection", () => {
+    const host = {} as MessageEventSource;
+    const store = new McpConsoleNotificationStore();
+
+    expect(
+      store.consume(
+        {
+          source: host,
+          data: {
+            jsonrpc: "2.0",
+            method: "ui/notifications/tool-result",
+            params: {
+              structuredContent: {
+                console: {
+                  requested_run_id: null,
+                  follow_latest: false,
+                  action: "close",
+                  command_id: "console-command-7"
+                }
+              }
+            }
+          }
+        },
+        host
+      )
+    ).toBe(true);
+
+    expect(store.current()).toEqual({
+      snapshot: null,
+      console: {
+        requested_run_id: null,
+        follow_latest: false,
+        action: "close",
+        command_id: "console-command-7"
+      }
+    });
+  });
+
+  it("ignores app-only snapshot acknowledgements as selection input", () => {
+    const host = {} as MessageEventSource;
+    const store = new McpConsoleNotificationStore();
+
+    expect(
+      store.consume(
+        {
+          source: host,
+          data: {
+            jsonrpc: "2.0",
+            method: "ui/notifications/tool-input",
+            params: { arguments: { command_id: "console-command-8" } }
+          }
+        },
+        host
+      )
+    ).toBe(true);
+
+    expect(store.current()).toEqual({ snapshot: null, console: null });
+  });
 });
 
 function dashboardSnapshot(runId: string): DashboardSnapshot {

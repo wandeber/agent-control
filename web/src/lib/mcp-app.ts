@@ -32,9 +32,18 @@ interface PendingRequest<T> {
   timeout: ReturnType<typeof setTimeout>;
 }
 
+type McpUiDisplayMode = "inline" | "fullscreen" | "pip";
+
+interface McpHostContext {
+  availableDisplayModes?: McpUiDisplayMode[];
+  displayMode?: McpUiDisplayMode;
+}
+
 export interface ConsoleSelectionState {
   requested_run_id: string | null;
   follow_latest: boolean;
+  action?: "reuse" | "close";
+  command_id?: string;
 }
 
 export interface McpConsoleState {
@@ -89,10 +98,19 @@ export class McpConsoleNotificationStore {
     }
 
     const requestedRunId = nonEmptyString(args.run_id);
+    const action = args.action === "reuse" || args.action === "close" ? args.action : undefined;
+    // App-only snapshot acknowledgements can carry a command_id. They are
+    // transport bookkeeping, not a new run-selection request.
+    const commandId = nonEmptyString(args.command_id);
+    if (commandId && !action) {
+      return;
+    }
     this.publish({
       console: {
         requested_run_id: requestedRunId,
-        follow_latest: !requestedRunId
+        follow_latest: !requestedRunId,
+        ...(action ? { action } : {}),
+        ...(commandId ? { command_id: commandId } : {})
       }
     });
   }
@@ -141,6 +159,7 @@ class AgentControlMcpAppClient {
   private readonly pending = new Map<string | number, PendingRequest<unknown>>();
   private nextId = 1;
   private connected = false;
+  private hostContext: McpHostContext | null = null;
   private readonly onMessage = (event: MessageEvent) => {
     // Notification handling deliberately runs before response handling because
     // MCP App notifications have no JSON-RPC id. The old id-only parser
@@ -148,7 +167,26 @@ class AgentControlMcpAppClient {
     if (consoleNotifications.consume(event, window.parent)) {
       return;
     }
+
     if (event.source !== window.parent) {
+      return;
+    }
+
+    const notification = asRecord(event.data) as JsonRpcNotification | null;
+    if (notification?.method === "ui/notifications/host-context-changed") {
+      this.hostContext = parseHostContext(notification.params);
+      return;
+    }
+
+    // MCP Apps hosts may acknowledge an app-requested teardown by sending a
+    // resource-teardown request before unmounting the iframe. This console has
+    // no unsaved client state, so acknowledge it immediately instead of
+    // leaving the host waiting for a graceful-termination response.
+    if (notification?.method === "ui/resource-teardown") {
+      const requestId = asRecord(event.data)?.id;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        window.parent.postMessage({ jsonrpc: "2.0", id: requestId, result: {} }, "*");
+      }
       return;
     }
 
@@ -177,7 +215,7 @@ class AgentControlMcpAppClient {
     }
     window.addEventListener("message", this.onMessage);
     try {
-      await this.request(
+      const initializeResult = await this.request<{ hostContext?: unknown }>(
         "ui/initialize",
         {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
@@ -192,8 +230,14 @@ class AgentControlMcpAppClient {
         },
         900
       );
+      this.hostContext = parseHostContext(initializeResult?.hostContext);
       this.notify("ui/notifications/initialized", {});
       this.connected = true;
+      // Codex exposes fullscreen MCP Apps in its shared app/sidebar surface.
+      // Request it from the app bridge instead of relying on a visual click or
+      // Computer Use. Hosts that do not support the mode simply reject it and
+      // keep the widget inline.
+      void this.requestPreferredDisplayMode();
     } catch (error) {
       window.removeEventListener("message", this.onMessage);
       for (const request of this.pending.values()) {
@@ -227,6 +271,35 @@ class AgentControlMcpAppClient {
       return parsed;
     }
     return {} as T;
+  }
+
+  /** Ask the host to tear down this MCP App surface. The host may decline. */
+  requestTeardown(): void {
+    this.notify("ui/request-teardown", {});
+  }
+
+  private async requestPreferredDisplayMode(): Promise<void> {
+    if (this.hostContext?.displayMode === "fullscreen") {
+      return;
+    }
+    if (this.hostContext?.availableDisplayModes && !this.hostContext.availableDisplayModes.includes("fullscreen")) {
+      return;
+    }
+
+    try {
+      const result = await this.request<{ mode?: unknown }>(
+        "ui/request-display-mode",
+        { mode: "fullscreen" },
+        5000
+      );
+      const mode = displayMode(result?.mode);
+      if (mode) {
+        this.hostContext = { ...this.hostContext, displayMode: mode };
+      }
+    } catch {
+      // Display-mode changes are host-controlled. An unsupported or rejected
+      // request must not make the console unavailable in its inline fallback.
+    }
   }
 
   private request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
@@ -289,6 +362,21 @@ export function subscribeMcpConsoleState(listener: ConsoleStateListener): () => 
   return unsubscribe;
 }
 
+/** Apply a structured app-only snapshot result to the shared console bridge. */
+export function applyMcpConsoleToolResult(value: Record<string, unknown>): void {
+  consoleNotifications.applyToolResult({ structuredContent: value });
+}
+
+/** Request closure of the currently mounted native Agent Control surface. */
+export async function requestMcpAppTeardown(): Promise<boolean> {
+  const client = await getMcpAppClient();
+  if (!client) {
+    return false;
+  }
+  client.requestTeardown();
+  return true;
+}
+
 function unwrapCallToolResult(value: unknown): CallToolResult | null {
   const record = asRecord(value);
   if (!record) {
@@ -304,10 +392,34 @@ function parseConsoleSelection(value: unknown): ConsoleSelectionState | null {
     return null;
   }
   const requestedRunId = nonEmptyString(record.requested_run_id);
+  const action = record.action === "reuse" || record.action === "close" ? record.action : undefined;
+  const commandId = nonEmptyString(record.command_id);
   return {
     requested_run_id: requestedRunId,
-    follow_latest: typeof record.follow_latest === "boolean" ? record.follow_latest : !requestedRunId
+    follow_latest: typeof record.follow_latest === "boolean" ? record.follow_latest : !requestedRunId,
+    ...(action ? { action } : {}),
+    ...(commandId ? { command_id: commandId } : {})
   };
+}
+
+function parseHostContext(value: unknown): McpHostContext | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const availableDisplayModes = Array.isArray(record.availableDisplayModes)
+    ? record.availableDisplayModes.map(displayMode).filter((mode): mode is McpUiDisplayMode => Boolean(mode))
+    : undefined;
+  const mode = displayMode(record.displayMode);
+  return {
+    ...(availableDisplayModes ? { availableDisplayModes } : {}),
+    ...(mode ? { displayMode: mode } : {})
+  };
+}
+
+function displayMode(value: unknown): McpUiDisplayMode | null {
+  return value === "inline" || value === "fullscreen" || value === "pip" ? value : null;
 }
 
 function isDashboardSnapshot(value: unknown): value is DashboardSnapshot {

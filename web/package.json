@@ -20,10 +20,15 @@
     "@xyflow/react": "^12.9.3",
     "clsx": "^2.1.1",
     "elkjs": "^0.11.1",
+    "highlight.js": "^11.12.0",
     "lucide-react": "^0.468.0",
+    "mermaid": "^11.16.1",
     "next": "^15.5.7",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {

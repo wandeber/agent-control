@@ -4,7 +4,7 @@ import { Bot, Clock3, Info, PanelBottom, Workflow, X, type LucideIcon } from "lu
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useSnapshotStream } from "@/lib/api";
 import { latestAgentFlowStep } from "@/lib/flow-steps";
-import { subscribeMcpConsoleState } from "@/lib/mcp-app";
+import { useConsoleSelection } from "./console-selection";
 import type { DashboardSnapshot } from "@/lib/types";
 import {
   AGENT_MESSAGE_LOAD_STEP,
@@ -46,9 +46,7 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 };
 
 export function ConsoleShell() {
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(() => readRunIdFromLocation());
-  const [followLatestRun, setFollowLatestRun] = useState(() => !readRunIdFromLocation());
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const { selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [selectedStepInstanceId, setSelectedStepInstanceId] = useState<string | null>(null);
   const [selectedAgentMessageLimit, setSelectedAgentMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
@@ -59,7 +57,6 @@ export function ConsoleShell() {
   const [renderedBottomPanel, setRenderedBottomPanel] = useState<BottomPanel>("agent");
   const [resizing, setResizing] = useState<ResizeTarget | null>(null);
   const latestStepByAgentRef = useRef<Map<string, string | null>>(new Map());
-  const runSelectionPinnedRef = useRef(Boolean(selectedRunId));
   const { bottomPanel, runsOpen, threadOpen } = layout;
   const { agentLog, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
     selectedRunId,
@@ -76,62 +73,17 @@ export function ConsoleShell() {
   }, [selectedAgentId, selectedStepInstanceId]);
 
   useEffect(() => {
-    const syncRunFromHistory = () => {
-      const nextRunId = readRunIdFromLocation();
-      runSelectionPinnedRef.current = Boolean(nextRunId);
-      setSelectedRunId(nextRunId);
-      setFollowLatestRun(!nextRunId);
-      setSelectedAgentId(null);
-      setSelectedStepId(null);
-      setSelectedStepInstanceId(null);
-    };
-    // Static MCP App HTML is rendered without request-specific query state.
-    // Re-read the live iframe URL on mount so an explicit `run_id` is pinned
-    // even when the server render could not see it.
-    syncRunFromHistory();
-    window.addEventListener("popstate", syncRunFromHistory);
-    return () => window.removeEventListener("popstate", syncRunFromHistory);
-  }, []);
-
-  useEffect(() => {
-    return subscribeMcpConsoleState((state) => {
-      const selection = state.console;
-      if (!selection) {
-        return;
-      }
-
-      if (selection.requested_run_id) {
-        // A run passed to open_agent_control_console is just as explicit as a
-        // URL/sidebar selection. Pin it and keep future snapshots on that run.
-        runSelectionPinnedRef.current = true;
-        setSelectedRunId(selection.requested_run_id);
-        setFollowLatestRun(false);
-        setSelectedAgentId(null);
-        setSelectedStepId(null);
-        setSelectedStepInstanceId(null);
-        replaceRunIdInLocation(selection.requested_run_id);
-        return;
-      }
-
-      // A no-run opening request means "follow latest" only when no explicit
-      // URL/tool/click selection has already pinned the console.
-      if (selection.follow_latest && !runSelectionPinnedRef.current) {
-        setFollowLatestRun(true);
-      }
-    });
-  }, []);
-
-  useEffect(() => {
     if (!followLatestRun || !snapshot?.selected_run_id || selectedRunId === snapshot.selected_run_id) {
       return;
     }
     setSelectedRunId(snapshot.selected_run_id);
-    setSelectedAgentId(null);
+    if (selectedRunId) setSelectedAgentId(null);
     setSelectedStepId(null);
     setSelectedStepInstanceId(null);
   }, [followLatestRun, selectedRunId, snapshot?.selected_run_id]);
 
   useEffect(() => {
+    if (!snapshot || (!followLatestRun && selectedRunId && snapshot.selected_run_id !== selectedRunId)) return;
     if (!selectedAgentId && snapshot?.agents[0]) {
       const preferred =
         snapshot.agents.find((agent) => agent.status === "running") ??
@@ -143,7 +95,7 @@ export function ConsoleShell() {
     if (selectedAgentId && snapshot && !snapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
       setSelectedAgentId(snapshot.agents[0]?.agent_id ?? null);
     }
-  }, [selectedAgentId, snapshot]);
+  }, [selectedAgentId, snapshot, followLatestRun, selectedRunId]);
 
   const selectedSnapshot = useMemo(() => snapshot, [snapshot]);
   const flowGraphAvailable = Boolean(selectedSnapshot?.flows.length && selectedSnapshot.flow_instances.length);
@@ -249,7 +201,11 @@ export function ConsoleShell() {
     if (!layoutHydrated) {
       return;
     }
-    window.localStorage.setItem(CONSOLE_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+    try {
+      window.localStorage.setItem(CONSOLE_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+    } catch {
+      // Sandboxed MCP hosts can deny storage; layout still works in memory.
+    }
   }, [layout, layoutHydrated]);
 
   useEffect(() => {
@@ -404,13 +360,9 @@ export function ConsoleShell() {
           <div className="console-panel-body">
             <RunSidebar
               onSelectRun={(runId) => {
-                runSelectionPinnedRef.current = true;
-                setSelectedRunId(runId);
-                setFollowLatestRun(false);
-                setSelectedAgentId(null);
+                selectRun(runId);
                 setSelectedStepId(null);
                 setSelectedStepInstanceId(null);
-                pushRunIdToLocation(runId);
                 patchLayout({ runsOpen: false });
               }}
               selectedRunId={selectedRunId ?? selectedSnapshot.selected_run_id ?? null}
@@ -680,33 +632,6 @@ function keepSingleOpenPanel(layout: ConsoleLayoutState): ConsoleLayoutState {
     return { ...layout, threadOpen: false };
   }
   return layout;
-}
-
-function readRunIdFromLocation(): string | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  const value = new URLSearchParams(window.location.search).get("run_id")?.trim();
-  return value && value.length > 0 ? value : null;
-}
-
-function pushRunIdToLocation(runId: string): void {
-  updateRunIdInLocation(runId, "push");
-}
-
-function replaceRunIdInLocation(runId: string): void {
-  updateRunIdInLocation(runId, "replace");
-}
-
-function updateRunIdInLocation(runId: string, mode: "push" | "replace"): void {
-  const url = new URL(window.location.href);
-  url.searchParams.set("run_id", runId);
-  const next = `${url.pathname}${url.search}${url.hash}`;
-  if (mode === "replace") {
-    window.history.replaceState(window.history.state, "", next);
-    return;
-  }
-  window.history.pushState(window.history.state, "", next);
 }
 
 function boundedNumber(value: unknown, fallback: number, min: number, max: number): number {

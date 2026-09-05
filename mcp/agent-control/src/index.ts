@@ -12,6 +12,7 @@ import {
 import { createController } from "./core/factory.js";
 import { errorToPayload } from "./core/errors.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
+import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 
@@ -278,7 +279,10 @@ async function inlineWebRuntimeAssets(html: string): Promise<string> {
         return `<link${before} rel="stylesheet"${middle} href="${href}"${after}/>`;
       }
       const css = await readFile(assetPath, "utf8");
-      return `<style data-agent-control-inline-asset="${escapeHtml(String(href))}">\n${css}\n</style>`;
+      // React's resource hydration looks for the original stylesheet link.
+      // Keep a disabled marker to prevent it from fetching the already-inlined
+      // CSS from an asset server that does not exist in the MCP host.
+      return `<style data-agent-control-inline-asset="${escapeHtml(String(href))}">\n${css}\n</style><link${before} rel="stylesheet"${middle} href="${href}"${after} disabled/>`;
     }
   );
 
@@ -290,7 +294,7 @@ async function inlineWebRuntimeAssets(html: string): Promise<string> {
       if (!assetPath) {
         return `<script${before} src="${src}"${after}></script>`;
       }
-      const js = (await readFile(assetPath, "utf8")).replaceAll("</script", "<\\/script");
+      const js = escapeInlineScript(await readFile(assetPath, "utf8"));
       return `<script${stripAsyncAttribute(`${before}${after}`)} data-agent-control-inline-asset="${escapeHtml(
         String(src)
       )}">\n${js}\n</script>`;

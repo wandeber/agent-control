@@ -155,6 +155,18 @@ Inside Codex, open the native side-panel console with the MCP tool:
 open_agent_control_console
 ```
 
+The panel opens the simple **Subagents** screen by default: a worker list and
+its selected conversation. **Full console** opens a separate graph/flow screen;
+**Back to subagents** returns to the simple screen. The screens share run and
+worker selection, and only one is mounted at a time. The full console's Chat
+tab uses the same rich conversation view as Subagents while retaining its
+Events, Artifacts, and Logs tabs.
+
+Browser URLs can select `#/subagents` or `#/console`. Fragment navigation also
+works inside the single embedded Codex resource without reloading the app or
+requesting another panel. Client library imports are eagerly bundled so chat
+diagrams and graph layout do not require an external asset server.
+
 Pass `run_id` to pin a specific run. With no `run_id`, the panel follows the
 latest run. The tool result includes the initial snapshot and that selection
 mode so the panel can paint immediately; later app-only reads run through one

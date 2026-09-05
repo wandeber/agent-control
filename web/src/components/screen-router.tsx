@@ -1,0 +1,45 @@
+"use client";
+
+import { ArrowLeft, Workflow } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ConsoleSelectionProvider } from "./console-selection";
+import { ConsoleShell } from "./console-shell";
+import { SubagentsShell } from "./subagents-shell";
+
+export function ScreenRouter() {
+  const [screen, setScreen] = useState("subagents");
+  useEffect(() => {
+    const syncScreen = () => setScreen(window.location.hash === "#/console" ? "console" : "subagents");
+    syncScreen();
+    window.addEventListener("hashchange", syncScreen);
+    window.addEventListener("popstate", syncScreen);
+    return () => {
+      window.removeEventListener("hashchange", syncScreen);
+      window.removeEventListener("popstate", syncScreen);
+    };
+  }, []);
+
+  const fullConsole = screen === "console";
+  return (
+    <ConsoleSelectionProvider>
+      <div className="agent-control-app" data-screen={screen}>
+        <nav aria-label="Agent Control screens" className="screen-navigation">
+          <span>Agent Control <span aria-hidden="true">/</span> <strong>{fullConsole ? "Full console" : "Subagents"}</strong></span>
+          {/* Fragment routes keep the single embedded MCP resource loaded.
+              Both shells are eagerly bundled, and only the active one mounts. */}
+          <button className="screen-navigation-link" onClick={() => {
+            const next = fullConsole ? "subagents" : "console";
+            setScreen(next);
+            try { window.location.hash = `/${next}`; } catch { /* Opaque hosts can restrict history. */ }
+          }} type="button">
+            {fullConsole ? <ArrowLeft className="size-4" /> : <Workflow className="size-4" />}
+            {fullConsole ? "Back to subagents" : "Full console"}
+          </button>
+        </nav>
+        <div className="agent-control-screen">
+          {fullConsole ? <ConsoleShell /> : <SubagentsShell />}
+        </div>
+      </div>
+    </ConsoleSelectionProvider>
+  );
+}

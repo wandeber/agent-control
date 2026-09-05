@@ -1064,5 +1064,9 @@ function storePositions(key: string, nodes: AgentFlowNode[]): void {
   for (const node of nodes) {
     values[node.id] = node.position;
   }
-  window.localStorage.setItem(key, JSON.stringify(values));
+  try {
+    window.localStorage.setItem(key, JSON.stringify(values));
+  } catch {
+    // Sandboxed MCP hosts can deny storage; layout still works in memory.
+  }
 }

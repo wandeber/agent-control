@@ -2,7 +2,11 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
+import rehypeHighlight from "rehype-highlight";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
+  ArrowDown,
   Bot,
   Braces,
   Clock3,
@@ -16,7 +20,7 @@ import {
   TerminalSquare,
   Wrench
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { isValidElement, useEffect, useId, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { artifactImageUrl, fetchAgentLog, fetchAgentMessages } from "@/lib/api";
 import { compactId, formatDateTime, safeJson } from "@/lib/format";
 import { agentFlowSteps, artifactReferencesFlowStep, eventReferencesFlowStep, flowStepOrdinal } from "@/lib/flow-steps";
@@ -34,6 +38,7 @@ type Tab = "chat" | "events" | "artifacts" | "logs";
 const MAX_VISIBLE_MESSAGES = 42;
 
 export function WorkspacePanel({
+  compact = false,
   snapshot,
   selectedAgentId,
   selectedStepInstanceId,
@@ -41,6 +46,7 @@ export function WorkspacePanel({
   messageLimit,
   onRequestOlderMessages
 }: {
+  compact?: boolean;
   snapshot: DashboardSnapshot;
   selectedAgentId: string | null;
   selectedStepInstanceId: string | null;
@@ -82,42 +88,55 @@ export function WorkspacePanel({
     refetchInterval: refreshPolicy.logRefetchInterval
   });
   const activeLog = liveLog?.agent_id === agentId ? liveLog : log.data ?? null;
+  const messageError = messages.error instanceof Error ? messages.error : messages.error ? new Error(String(messages.error)) : null;
+  const logError = log.error instanceof Error ? log.error : log.error ? new Error(String(log.error)) : null;
+  const messageReady = messages.status === "success";
+  const logReady = !refreshPolicy.logEnabled || log.status === "success" || activeLog !== null;
+  const chatLoading = Boolean(agentId) && !messageError && !logError && (!messageReady || !logReady);
 
   return (
-    <section className="workspace-panel flex h-full min-h-0 flex-col bg-white">
-      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-black/8 bg-white/72 px-3 py-2">
-        <div className="min-w-0">
-          <div className="truncate text-xs font-semibold text-ink-900">{agent?.title ?? "Select an agent"}</div>
-          <div className="truncate text-[11px] text-ink-400">
-            {agent ? (
-              <>
-                {compactId(agent.agent_id)}
-                {selectedStep ? ` · instance #${flowStepOrdinal(snapshot, selectedStep)} · ${selectedStep.step_id}` : ""}
-              </>
-            ) : (
-              "No thread selected"
-            )}
+    <section className="workspace-panel flex h-full min-h-0 flex-col bg-white" data-compact={compact ? "true" : "false"}>
+      {!compact ? (
+        <div className="flex min-h-12 items-center justify-between gap-3 border-b border-black/8 bg-white/72 px-3 py-2">
+          <div className="min-w-0">
+            <div className="truncate text-xs font-semibold text-ink-900">{agent?.title ?? "Select an agent"}</div>
+            <div className="truncate text-[11px] text-ink-400">
+              {agent ? (
+                <>
+                  {compactId(agent.agent_id)}
+                  {selectedStep ? ` · instance #${flowStepOrdinal(snapshot, selectedStep)} · ${selectedStep.step_id}` : ""}
+                </>
+              ) : (
+                "No thread selected"
+              )}
+            </div>
+          </div>
+          <div className="workspace-tabs flex shrink-0 items-center gap-1">
+            <TabButton active={tab === "chat"} icon={MessageSquareText} label="Chat" onClick={() => setTab("chat")} />
+            <TabButton active={tab === "events"} icon={ListTree} label="Events" onClick={() => setTab("events")} />
+            <TabButton active={tab === "artifacts"} icon={Files} label="Artifacts" onClick={() => setTab("artifacts")} />
+            <TabButton active={tab === "logs"} icon={ScrollText} label="Logs" onClick={() => setTab("logs")} />
           </div>
         </div>
-        <div className="workspace-tabs flex shrink-0 items-center gap-1">
-          <TabButton active={tab === "chat"} icon={MessageSquareText} label="Chat" onClick={() => setTab("chat")} />
-          <TabButton active={tab === "events"} icon={ListTree} label="Events" onClick={() => setTab("events")} />
-          <TabButton active={tab === "artifacts"} icon={Files} label="Artifacts" onClick={() => setTab("artifacts")} />
-          <TabButton active={tab === "logs"} icon={ScrollText} label="Logs" onClick={() => setTab("logs")} />
-        </div>
-      </div>
+      ) : null}
       <div className="min-h-0 flex-1">
         {tab === "chat" ? (
-          <ChatView
-            agentId={agentId}
-            artifacts={scopedArtifacts}
-            events={scopedEvents}
-            log={activeLog}
-            selectedStep={selectedStep}
-            messages={messages.data ?? []}
-            onRequestOlder={onRequestOlderMessages}
-            requestedLimit={messageLimit}
-          />
+          <div className="agent-chat h-full min-h-0">
+            <ChatView
+              agentId={agentId}
+              artifacts={scopedArtifacts}
+              events={scopedEvents}
+              log={activeLog}
+              selectedStep={selectedStep}
+              messages={messages.data ?? []}
+              onRequestOlder={onRequestOlderMessages}
+              requestedLimit={messageLimit}
+              compact
+              error={messageError ?? logError}
+              loading={chatLoading}
+              showSidecar={false}
+            />
+          </div>
         ) : tab === "events" ? (
           <EventsTable events={scopedEvents} />
         ) : tab === "artifacts" ? (
@@ -217,7 +236,11 @@ function ChatView({
   selectedStep,
   messages,
   onRequestOlder,
-  requestedLimit
+  requestedLimit,
+  compact,
+  error,
+  loading,
+  showSidecar
 }: {
   agentId: string | null;
   artifacts: ArtifactRecord[];
@@ -227,11 +250,17 @@ function ChatView({
   messages: AgentMessage[];
   onRequestOlder: () => void;
   requestedLimit: number;
+  compact: boolean;
+  error: Error | null;
+  loading: boolean;
+  showSidecar: boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const previousAgentRef = useRef<string | null>(null);
   const previousBlockCountRef = useRef(0);
+  const isAtBottomRef = useRef(true);
   const [windowStart, setWindowStart] = useState(0);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const scopedMessages = scopeMessagesToStep(messages, selectedStep?.step_instance_id ?? null);
   const normalizedTurns = normalizeMessages(scopedMessages);
   const messagesAreLogFallback = scopedMessages.length > 0 && scopedMessages.every((message) => message.metadata?.source === "opencode-log-tail");
@@ -246,6 +275,23 @@ function ChatView({
   const visibleBlocks = blocks.slice(visibleStart, visibleStart + MAX_VISIBLE_MESSAGES);
   const hiddenBefore = visibleStart;
   const hiddenAfter = Math.max(0, blocks.length - visibleStart - visibleBlocks.length);
+  const todoItems = compact ? extractTodoItems(blocks) : [];
+
+  const scheduleScrollToBottom = (behavior: ScrollBehavior = "auto") => {
+    // The message list and the Todo overlay both change height after a new
+    // turn renders, so wait two frames before measuring the final scrollHeight.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const node = scrollRef.current;
+        if (!node) {
+          return;
+        }
+        node.scrollTo({ top: node.scrollHeight, behavior });
+        isAtBottomRef.current = true;
+        setShowScrollToBottom(false);
+      });
+    });
+  };
 
   useEffect(() => {
     const previousAgentId = previousAgentRef.current;
@@ -253,9 +299,16 @@ function ChatView({
     const agentChanged = previousAgentId !== agentId;
     const firstLoad = previousBlockCount === 0 && blocks.length > 0;
     const historyShrank = blocks.length < previousBlockCount;
+    const newBlocksArrived = blocks.length > previousBlockCount;
 
     if (agentChanged || firstLoad || historyShrank) {
       setWindowStart(maxWindowStart);
+      isAtBottomRef.current = true;
+      setShowScrollToBottom(false);
+      scheduleScrollToBottom();
+    } else if (newBlocksArrived && isAtBottomRef.current) {
+      setWindowStart(maxWindowStart);
+      scheduleScrollToBottom("smooth");
     } else if (windowStart > maxWindowStart) {
       setWindowStart(maxWindowStart);
     }
@@ -263,6 +316,14 @@ function ChatView({
     previousAgentRef.current = agentId;
     previousBlockCountRef.current = blocks.length;
   }, [agentId, blocks.length, maxWindowStart, windowStart]);
+
+  if (blocks.length === 0 && error) {
+    return <EmptyState detail={error.message} title="Could not load thread" />;
+  }
+
+  if (blocks.length === 0 && loading) {
+    return <EmptyState detail="Loading messages and runtime output." title="Loading thread" />;
+  }
 
   if (blocks.length === 0) {
     return <EmptyState detail="No messages or log tail are available for this agent yet." title="Quiet thread" />;
@@ -282,15 +343,25 @@ function ChatView({
     setWindowStart(Math.min(maxWindowStart, visibleStart + Math.floor(MAX_VISIBLE_MESSAGES * 0.75)));
   };
 
+  const jumpToLatest = () => {
+    setWindowStart(maxWindowStart);
+    isAtBottomRef.current = true;
+    setShowScrollToBottom(false);
+    scheduleScrollToBottom("smooth");
+  };
+
   return (
-    <div className="thread-grid h-full min-h-0">
+    <div className="thread-grid h-full min-h-0" data-has-todo={todoItems.length > 0 ? "true" : "false"}>
       <div
         className="agent-scroll min-h-0 overflow-auto border-r border-black/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.88),rgba(249,250,251,0.72))] p-4"
         onScroll={(event) => {
           const node = event.currentTarget;
+          const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 48;
+          isAtBottomRef.current = atBottom;
+          setShowScrollToBottom(!atBottom && node.scrollHeight > node.clientHeight + 48);
           if (node.scrollTop < 48) {
             showOlder();
-          } else if (node.scrollHeight - node.scrollTop - node.clientHeight < 48) {
+          } else if (atBottom) {
             showNewer();
           }
         }}
@@ -304,7 +375,7 @@ function ChatView({
             visible={hiddenBefore > 0 || hasMoreServerHistory}
           />
           {visibleBlocks.map((turn, index) => (
-            <TurnBlock artifacts={artifacts} key={`${turn.id}-${index}`} turn={turn} />
+            <TurnBlock artifacts={artifacts} compact={compact} key={`${turn.id}-${index}`} turn={turn} />
           ))}
           <HistoryWindowControl
             count={hiddenAfter}
@@ -314,16 +385,30 @@ function ChatView({
           />
         </div>
       </div>
-      <ThreadSidecar
-        artifacts={agentArtifacts}
-        events={agentEvents}
-        loadedCount={blocks.length}
-        log={log}
-        requestedLimit={requestedLimit}
-        selectedStep={selectedStep}
-        source={usingStructuredMessages ? "structured" : blocks.length > 0 ? "log" : "empty"}
-        visibleCount={visibleBlocks.length}
-      />
+      {showScrollToBottom ? (
+        <button
+          aria-label="Jump to latest message"
+          className="codex-scroll-to-bottom"
+          onClick={jumpToLatest}
+          title="Jump to latest message"
+          type="button"
+        >
+          <ArrowDown className="size-4" />
+        </button>
+      ) : null}
+      {showSidecar ? (
+        <ThreadSidecar
+          artifacts={agentArtifacts}
+          events={agentEvents}
+          loadedCount={blocks.length}
+          log={log}
+          requestedLimit={requestedLimit}
+          selectedStep={selectedStep}
+          source={usingStructuredMessages ? "structured" : blocks.length > 0 ? "log" : "empty"}
+          visibleCount={visibleBlocks.length}
+        />
+      ) : null}
+      {todoItems.length > 0 ? <TodoOverlay items={todoItems} /> : null}
     </div>
   );
 }
@@ -368,6 +453,122 @@ interface RenderMessagePart {
   created_at?: string;
   metadata?: Record<string, unknown>;
   kind?: "message" | "tool" | "reasoning" | "log";
+}
+
+interface TodoItem {
+  id: string;
+  label: string;
+  status: "completed" | "active" | "pending";
+}
+
+function extractTodoItems(blocks: RenderThreadTurn[]): TodoItem[] {
+  const items = new Map<string, TodoItem>();
+  for (const turn of blocks) {
+    for (const part of turn.parts) {
+      const text = part.text;
+      for (const record of todoRecordsFromText(text)) {
+        const id = record.id || record.label;
+        if (id) {
+          items.set(id, record);
+        }
+      }
+    }
+  }
+  return [...items.values()];
+}
+
+function todoRecordsFromText(text: string): TodoItem[] {
+  const records: TodoItem[] = [];
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = /^\s*(?:[-*]\s*)?(?:\[\s*([xX✓✔])\s*\]|\[\s*[-~]\s*\]|\[\s*\])\s+(.+?)\s*$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    records.push({
+      id: match[2],
+      label: match[2],
+      status: match[1] ? "completed" : "pending"
+    });
+  }
+
+  const inputStart = text.search(/\binput\s*:/i);
+  const jsonStart = inputStart >= 0 ? text.indexOf("{", inputStart) : text.indexOf("{");
+  const jsonEnd = text.lastIndexOf("}");
+  if (jsonStart >= 0 && jsonEnd > jsonStart) {
+    try {
+      collectTodoRecords(JSON.parse(text.slice(jsonStart, jsonEnd + 1)), records);
+    } catch {
+      // Tool output is best-effort; malformed or truncated JSON should not
+      // prevent the conversation from rendering.
+    }
+  }
+  return records;
+}
+
+function collectTodoRecords(value: unknown, records: TodoItem[], path = "todo"): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectTodoRecords(item, records, `${path}-${index}`));
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const label = firstString(record.content, record.label, record.title, record.text, record.description);
+  if (label) {
+    const id = firstString(record.id, record.todo_id, record.todoId) ?? label;
+    records.push({ id, label, status: normalizeTodoStatus(record.status, record.completed) });
+  }
+  for (const [key, nested] of Object.entries(record)) {
+    if (key.toLowerCase().includes("todo") || key === "items" || key === "tasks") {
+      collectTodoRecords(nested, records, `${path}-${key}`);
+    }
+  }
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function normalizeTodoStatus(status: unknown, completed: unknown): TodoItem["status"] {
+  if (completed === true || /^(?:complete|completed|done)$/i.test(String(status ?? ""))) {
+    return "completed";
+  }
+  if (/^(?:active|in[_ -]?progress|running|doing)$/i.test(String(status ?? ""))) {
+    return "active";
+  }
+  return "pending";
+}
+
+function TodoOverlay({ items }: { items: TodoItem[] }) {
+  const completed = items.filter((item) => item.status === "completed").length;
+  return (
+    <aside className="codex-todo-panel" aria-label="Todo list">
+      <div className="codex-todo-heading">
+        <span>TODO</span>
+        <span>
+          {completed}/{items.length}
+        </span>
+      </div>
+      <div className="codex-todo-items">
+        {items.map((item) => (
+          <div className={`codex-todo-item codex-todo-item-${item.status}`} key={item.id}>
+            <span aria-hidden="true" className="codex-todo-marker">
+              {item.status === "completed" ? "✓" : item.status === "active" ? "•" : "○"}
+            </span>
+            <span>{item.label}</span>
+          </div>
+        ))}
+      </div>
+    </aside>
+  );
 }
 
 function normalizeMessages(messages: AgentMessage[]): RenderThreadTurn[] {
@@ -479,7 +680,11 @@ function parseLogTail(tail: string): RenderThreadTurn[] {
   });
 }
 
-function TurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn: RenderThreadTurn }) {
+function TurnBlock({ artifacts, compact, turn }: { artifacts: ArtifactRecord[]; compact: boolean; turn: RenderThreadTurn }) {
+  if (compact) {
+    return <CodexTurnBlock artifacts={artifacts} turn={turn} />;
+  }
+
   if (turn.role === "user") {
     return <PromptTurnBlock artifacts={artifacts} turn={turn} />;
   }
@@ -502,6 +707,78 @@ function TurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn: Ren
       </div>
     </article>
   );
+}
+
+/**
+ * Keep the worker-only surface close to Codex's conversation grammar: prompts
+ * are bubbles, assistant prose has no repeated role label, and tools or
+ * reasoning are compact disclosure rows.
+ */
+function CodexTurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn: RenderThreadTurn }) {
+  if (turn.role === "user") {
+    return (
+      <article className="codex-user-turn">
+        <div className="codex-user-bubble">
+          {turn.parts.map((part, index) => (
+            <TurnPart artifacts={artifacts} inverted key={`${part.id ?? index}-${index}`} part={part} />
+          ))}
+        </div>
+      </article>
+    );
+  }
+
+  return (
+    <article className="codex-assistant-turn">
+      {turn.parts.map((part, index) => {
+        const isTool = part.kind === "tool";
+        const isReasoning = part.kind === "reasoning";
+        if (!isTool && !isReasoning) {
+          return <RichText artifacts={artifacts} key={`${part.id ?? index}-${index}`} text={part.text} />;
+        }
+
+        return (
+          <details className="codex-activity-row" key={`${part.id ?? index}-${index}`}>
+            <summary>
+              <span aria-hidden="true" className="codex-activity-chevron">
+                ›
+              </span>
+              <span className="codex-activity-label">{activityLabel(part, isReasoning)}</span>
+              <span className="codex-activity-preview">{activityPreview(part.text)}</span>
+            </summary>
+            <div className="codex-activity-content">
+              <RichText artifacts={artifacts} text={part.text} />
+            </div>
+          </details>
+        );
+      })}
+    </article>
+  );
+}
+
+function activityLabel(part: RenderMessagePart, isReasoning: boolean): string {
+  if (isReasoning) {
+    return "Razonamiento";
+  }
+  const text = part.text.toLowerCase();
+  if (text.includes("todo")) {
+    return "Lista Todo actualizada";
+  }
+  if (text.includes("command") || text.includes("exec")) {
+    return "Comandos ejecutados";
+  }
+  return "Herramienta";
+}
+
+function activityPreview(text: string): string {
+  const preview = text
+    .replace(/^\s*(tool|status|title|input|output|error):\s*/gim, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!preview) {
+    return "";
+  }
+  return preview.length > 110 ? `${preview.slice(0, 110)}…` : preview;
 }
 
 function PromptTurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn: RenderThreadTurn }) {
@@ -577,9 +854,11 @@ function promptPreview(text: string): string {
 
 function TurnPart({
   artifacts,
+  inverted = false,
   part
 }: {
   artifacts: ArtifactRecord[];
+  inverted?: boolean;
   part: RenderMessagePart;
 }) {
   const isTool = part.kind === "tool";
@@ -638,10 +917,10 @@ function TurnPart({
       {isAttachment ? (
         <details className={["border-l-2 py-1 pl-3", attachmentTone].join(" ")}>
           <summary className="cursor-pointer text-xs font-medium">{isReasoning ? "Reasoning" : "Tool call"}</summary>
-          <RichText artifacts={artifacts} text={part.text} />
+          <RichText artifacts={artifacts} inverted={inverted} text={part.text} />
         </details>
       ) : (
-        <RichText artifacts={artifacts} text={part.text} />
+        <RichText artifacts={artifacts} inverted={inverted} text={part.text} />
       )}
       {metadata && metadataOpen ? (
         <pre className="absolute right-0 top-6 z-30 max-h-64 w-[min(28rem,calc(100vw-2rem))] overflow-auto rounded-md border border-black/10 bg-ink-900 p-2 text-[10px] leading-4 text-white shadow-lg">
@@ -672,33 +951,213 @@ function RichText({ artifacts, inverted = false, text }: { artifacts: ArtifactRe
     .map((match) => match[1] ?? match[2])
     .filter(Boolean);
   const artifactByPath = new Map(artifacts.map((artifact) => [artifact.path, artifact]));
-  const codeFence = text.includes("```");
-  if (codeFence) {
-    return <CodeFence text={text} />;
-  }
+  const components = useMemo<Components>(() => createMarkdownComponents(artifactByPath), [artifactByPath]);
+  const markdown = normalizeMarkdownSource(text);
+
   return (
     <div className={["chat-prose text-xs leading-5", inverted ? "text-white/88" : "text-ink-700"].join(" ")}>
-      {text.split(/\n{2,}/).map((paragraph, index) => (
-        <p className="mb-2 whitespace-pre-wrap" key={`${paragraph.slice(0, 20)}-${index}`}>
-          {paragraph}
-        </p>
-      ))}
-      {imagePaths.length > 0 ? (
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          {imagePaths.slice(0, 4).map((path) => {
-            const artifact = artifactByPath.get(path);
-            const src = artifact ? artifactImageUrl(artifact.artifact_id) : path;
-            return (
-              <a className="group overflow-hidden rounded-lg border border-black/10 bg-white" href={src} key={path} target="_blank">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img alt={path} className="aspect-video w-full object-cover transition group-hover:scale-[1.02]" src={src} />
-              </a>
-            );
-          })}
-        </div>
-      ) : null}
+      <ReactMarkdown components={components} rehypePlugins={[rehypeHighlight]} remarkPlugins={[remarkGfm]}>
+        {markdown}
+      </ReactMarkdown>
     </div>
   );
+}
+
+function renderMarkdownBlocks(text: string): ReactNode[] {
+  return text.split(/\n{2,}/).map((block, index) => {
+    const lines = block.split(/\r?\n/).map((line) => line.trimEnd());
+    const firstLine = lines[0]?.trim() ?? "";
+    if (/^#{1,4}\s+/.test(firstLine)) {
+      const heading = firstLine.replace(/^#{1,4}\s+/, "");
+      return (
+        <h3 className="mb-2 text-[0.92rem] font-semibold leading-6" key={`heading-${index}`}>
+          {renderInlineMarkdown(heading)}
+        </h3>
+      );
+    }
+
+    if (lines.length > 0 && lines.every((line) => /^\s*[-*+]\s+/.test(line))) {
+      return (
+        <ul className="mb-2 list-disc space-y-1 pl-5" key={`list-${index}`}>
+          {lines.map((line, itemIndex) => (
+            <li key={`${itemIndex}-${line.slice(0, 20)}`}>{renderInlineMarkdown(line.replace(/^\s*[-*+]\s+/, ""))}</li>
+          ))}
+        </ul>
+      );
+    }
+
+    if (lines.length > 0 && lines.every((line) => /^\s*\d+[.)]\s+/.test(line))) {
+      return (
+        <ol className="mb-2 list-decimal space-y-1 pl-5" key={`ordered-list-${index}`}>
+          {lines.map((line, itemIndex) => (
+            <li key={`${itemIndex}-${line.slice(0, 20)}`}>{renderInlineMarkdown(line.replace(/^\s*\d+[.)]\s+/, ""))}</li>
+          ))}
+        </ol>
+      );
+    }
+
+    return (
+      <p className="mb-2 whitespace-pre-wrap" key={`paragraph-${index}`}>
+        {renderInlineMarkdown(block)}
+      </p>
+    );
+  });
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const pattern = /(\*\*[^*]+\*\*|__[^_]+__|`[^`]+`|\[[^\]]+\]\([^\s)]+\))/g;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const token = match[0];
+    const start = match.index ?? 0;
+    if (start > cursor) {
+      nodes.push(text.slice(cursor, start));
+    }
+    if (token.startsWith("**") || token.startsWith("__")) {
+      nodes.push(<strong key={`strong-${start}`}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("`")) {
+      nodes.push(<code key={`code-${start}`}>{token.slice(1, -1)}</code>);
+    } else {
+      const link = /^\[([^\]]+)\]\(([^\s)]+)\)$/.exec(token);
+      if (link) {
+        const href = safeMarkdownHref(link[2]);
+        nodes.push(
+          href ? (
+            <a href={href} key={`link-${start}`} rel="noreferrer" target="_blank">
+              {link[1]}
+            </a>
+          ) : (
+            link[1]
+          )
+        );
+      } else {
+        nodes.push(token);
+      }
+    }
+    cursor = start + token.length;
+  }
+  if (cursor < text.length) {
+    nodes.push(text.slice(cursor));
+  }
+  return nodes;
+}
+
+function normalizeMarkdownSource(text: string): string {
+  // OpenCode logs can contain ANSI cursor/color sequences. They are control
+  // data, not Markdown, and otherwise leak into the visible conversation.
+  return text
+    .replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function createMarkdownComponents(artifactByPath: Map<string, ArtifactRecord>): Components {
+  return {
+    a({ children, href }) {
+      const safeHref = typeof href === "string" ? safeMarkdownHref(href) : null;
+      return safeHref ? (
+        <a href={safeHref} rel="noreferrer" target="_blank">
+          {children}
+        </a>
+      ) : (
+        <span>{children}</span>
+      );
+    },
+    code({ children, className }) {
+      return <code className={className}>{children}</code>;
+    },
+    img({ alt, src }) {
+      const path = typeof src === "string" ? src : "";
+      const artifact = artifactByPath.get(path);
+      const resolvedSrc = artifact ? artifactImageUrl(artifact.artifact_id) : path;
+      if (!resolvedSrc) {
+        return null;
+      }
+      return (
+        <a className="chat-image-link" href={resolvedSrc} rel="noreferrer" target="_blank">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img alt={alt ?? path} className="chat-image" src={resolvedSrc} />
+        </a>
+      );
+    },
+    pre({ children }) {
+      const child = Array.isArray(children) ? children[0] : children;
+      if (isValidElement<{ children?: ReactNode; className?: string }>(child)) {
+        const className = child.props.className ?? "";
+        const language = /language-([\w+-]+)/.exec(className)?.[1]?.toLowerCase();
+        if (language === "mermaid") {
+          return <MermaidBlock chart={String(child.props.children ?? "").replace(/\n$/, "")} />;
+        }
+        return (
+          <div className="chat-code-shell">
+            {language ? <div className="chat-code-language">{language}</div> : null}
+            <pre>{children}</pre>
+          </div>
+        );
+      }
+      return <pre>{children}</pre>;
+    },
+    table({ children }) {
+      return (
+        <div className="chat-table-wrap">
+          <table>{children}</table>
+        </div>
+      );
+    }
+  };
+}
+
+function MermaidBlock({ chart }: { chart: string }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mermaidId = `mermaid-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    void import("mermaid")
+      .then(async ({ default: mermaid }) => {
+        mermaid.initialize({ securityLevel: "strict", startOnLoad: false, theme: "dark" });
+        const result = await mermaid.render(mermaidId, chart);
+        if (!cancelled && containerRef.current) {
+          containerRef.current.innerHTML = result.svg;
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : "Mermaid diagram could not be rendered.");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chart, mermaidId]);
+
+  if (error) {
+    return (
+      <div className="chat-code-shell chat-mermaid-error">
+        <div className="chat-code-language">mermaid · {error}</div>
+        <pre>
+          <code>{chart}</code>
+        </pre>
+      </div>
+    );
+  }
+
+  return <div aria-label="Mermaid diagram" className="chat-mermaid" ref={containerRef} />;
+}
+
+function safeMarkdownHref(value: string): string | null {
+  if (value.startsWith("/") || value.startsWith("#")) {
+    return value;
+  }
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function ThreadSidecar({

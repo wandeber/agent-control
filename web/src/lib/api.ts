@@ -3,6 +3,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  applyMcpConsoleToolResult,
   getCachedMcpConsoleState,
   getMcpAppClient,
   shouldTryMcpApp,
@@ -14,6 +15,11 @@ import type { AgentLogTail, AgentMessage, DashboardSnapshot, SocketPayload } fro
 import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
 
 export type ConnectionState = "connecting" | "live" | "offline";
+
+// Console lifecycle commands are delivered through the same serialized
+// snapshot path as live state. Keeping the last id here lets the next app-only
+// read acknowledge a command without requiring a second UI-capable tool call.
+let lastMcpConsoleCommandId: string | null = null;
 
 export function controlApiBase(): string {
   const configured = process.env.NEXT_PUBLIC_AGENT_CONTROL_API_BASE;
@@ -90,9 +96,21 @@ function normalizeBase(value: string | null): string | null {
 export async function fetchSnapshot(runId?: string | null): Promise<DashboardSnapshot> {
   const client = await getMcpAppClient();
   if (client) {
-    const result = await client.callTool<{ snapshot: DashboardSnapshot }>("agent_control_console_snapshot", {
-      ...(runId ? { run_id: runId } : {})
+    const acknowledgedCommandId = lastMcpConsoleCommandId;
+    const result = await client.callTool<{
+      snapshot: DashboardSnapshot;
+      console?: { action?: "reuse" | "close"; command_id?: string };
+    }>("agent_control_console_snapshot", {
+      ...(runId ? { run_id: runId } : {}),
+      ...(acknowledgedCommandId ? { command_id: acknowledgedCommandId } : {})
     });
+    if (acknowledgedCommandId && result.console?.command_id !== acknowledgedCommandId) {
+      lastMcpConsoleCommandId = null;
+    }
+    if (result.console?.action && result.console.command_id) {
+      lastMcpConsoleCommandId = result.console.command_id;
+      applyMcpConsoleToolResult(result as unknown as Record<string, unknown>);
+    }
     return result.snapshot;
   }
 

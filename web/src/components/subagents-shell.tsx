@@ -1,0 +1,219 @@
+"use client";
+
+import { ArrowLeft, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useSnapshotStream } from "@/lib/api";
+import { useConsoleSelection } from "./console-selection";
+import type { AgentRecord, AgentStatus } from "@/lib/types";
+import {
+  AGENT_MESSAGE_LOAD_STEP,
+  INITIAL_AGENT_MESSAGE_LIMIT,
+  MAX_AGENT_MESSAGE_LIMIT
+} from "@/lib/workspace-refresh-policy";
+import { EmptyState, StatusDot, StatusPill } from "./ui";
+import { WorkspacePanel } from "./workspace-panel";
+
+/** Worker list and conversation, shown as the default Agent Control screen. */
+export function SubagentsShell() {
+  const { selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
+  const [messageLimit, setMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
+  const [narrowViewport, setNarrowViewport] = useState<boolean | null>(null);
+  const { agentLog, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
+    selectedRunId,
+    selectedAgentId,
+    followLatestRun,
+    messageLimit
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 760px)");
+    const syncViewport = () => setNarrowViewport(media.matches);
+    syncViewport();
+    media.addEventListener("change", syncViewport);
+    return () => media.removeEventListener("change", syncViewport);
+  }, []);
+
+  useEffect(() => {
+    setMessageLimit(INITIAL_AGENT_MESSAGE_LIMIT);
+  }, [selectedAgentId]);
+
+  const subagents = useMemo(
+    () =>
+      [...(snapshot?.agents ?? [])]
+        .filter((agent) => agent.role !== "orchestrator")
+        .sort(compareAgents),
+    [snapshot?.agents]
+  );
+  const activeSubagents = useMemo(() => subagents.filter((agent) => !isTerminalStatus(agent.status)), [subagents]);
+  const finishedSubagents = useMemo(() => subagents.filter((agent) => isTerminalStatus(agent.status)), [subagents]);
+  const selectedAgent = selectedAgentId
+    ? subagents.find((agent) => agent.agent_id === selectedAgentId) ?? null
+    : null;
+
+  useEffect(() => {
+    if (!snapshot || (!followLatestRun && selectedRunId && snapshot.selected_run_id !== selectedRunId)) return;
+    if (narrowViewport === false && !selectedAgentId && subagents[0]) {
+      setSelectedAgentId(subagents[0].agent_id);
+      return;
+    }
+    if (selectedAgentId && !subagents.some((agent) => agent.agent_id === selectedAgentId)) {
+      setSelectedAgentId(subagents[0]?.agent_id ?? null);
+    }
+  }, [narrowViewport, selectedAgentId, subagents, snapshot, followLatestRun, selectedRunId]);
+
+  if (error) {
+    return (
+      <main className="subagents-shell">
+        <EmptyState detail={error.message} title="Agent Control unavailable" />
+      </main>
+    );
+  }
+
+  if (isLoading && !snapshot) {
+    return (
+      <main className="subagents-shell">
+        <EmptyState detail="Connecting to Agent Control." title="Loading subagents" />
+      </main>
+    );
+  }
+
+  if (!snapshot || subagents.length === 0) {
+    return (
+      <main className="subagents-shell">
+        <EmptyState detail="The selected run has no registered worker agents yet." title="No subagents" />
+      </main>
+    );
+  }
+
+  return (
+    <main className="subagents-shell" data-agent-selected={selectedAgent ? "true" : "false"}>
+      <div className="subagents-layout">
+        <aside className="subagents-list" data-mobile-hidden={selectedAgent ? "true" : "false"}>
+          <div className="subagents-list-heading">
+            <div className="min-w-0">
+              <h1>Subagents</h1>
+              <p title={selectedRun?.title ?? undefined}>{selectedRun?.title ?? "Current run"}</p>
+            </div>
+            <button aria-label="Refresh subagents" className="subagents-refresh" onClick={refresh} title="Refresh subagents" type="button">
+              <RefreshCw className="size-4" />
+            </button>
+          </div>
+          <div className="subagents-connection">
+            {connection === "live" ? <Wifi className="size-3.5" /> : <WifiOff className="size-3.5" />}
+            <span>{connection === "live" ? "Live" : connection === "connecting" ? "Connecting" : "Offline"}</span>
+          </div>
+          <div className="subagents-list-scroll">
+            {activeSubagents.length > 0 ? (
+              <AgentGroup agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />
+            ) : null}
+            {finishedSubagents.length > 0 ? (
+              <AgentGroup agents={finishedSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Finished" />
+            ) : null}
+          </div>
+        </aside>
+
+        <section className="subagents-chat" data-mobile-visible={selectedAgent ? "true" : "false"}>
+          {selectedAgent ? (
+            <>
+              <header className="subagents-chat-heading">
+                <button aria-label="Back to subagents" className="subagents-back" onClick={() => setSelectedAgentId(null)} type="button">
+                  <ArrowLeft className="size-4" />
+                </button>
+                <div className="min-w-0">
+                  <h2>{selectedAgent.title}</h2>
+                  <p>{selectedAgent.model ?? selectedAgent.backend}</p>
+                </div>
+                <StatusPill status={selectedAgent.status} />
+              </header>
+              <div className="subagents-chat-body">
+                <WorkspacePanel
+                  compact
+                  liveLog={agentLog}
+                  messageLimit={messageLimit}
+                  onRequestOlderMessages={() => setMessageLimit((value) => Math.min(MAX_AGENT_MESSAGE_LIMIT, value + AGENT_MESSAGE_LOAD_STEP))}
+                  selectedAgentId={selectedAgent.agent_id}
+                  selectedStepInstanceId={null}
+                  snapshot={snapshot}
+                />
+              </div>
+            </>
+          ) : (
+            <EmptyState detail="Select a subagent to read its conversation." title="Choose a subagent" />
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function AgentGroup({
+  agents,
+  onSelect,
+  selectedAgentId,
+  title
+}: {
+  agents: AgentRecord[];
+  onSelect: (agentId: string) => void;
+  selectedAgentId: string | null;
+  title: string;
+}) {
+  return (
+    <section className="subagents-group">
+      <h2>{title}</h2>
+      <div className="subagents-group-items">
+        {agents.map((agent) => (
+          <button
+            aria-current={agent.agent_id === selectedAgentId ? "true" : undefined}
+            className="subagent-list-item"
+            data-selected={agent.agent_id === selectedAgentId ? "true" : "false"}
+            key={agent.agent_id}
+            onClick={() => onSelect(agent.agent_id)}
+            type="button"
+          >
+            <StatusDot status={agent.status} />
+            <span className="subagent-list-copy">
+              <span className="subagent-list-title">{agent.title}</span>
+              <span className="subagent-list-detail">{agent.model ?? agent.backend}</span>
+            </span>
+            <StatusPill compact status={agent.status} />
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function compareAgents(left: AgentRecord, right: AgentRecord): number {
+  return agentStatusPriority(left.status) - agentStatusPriority(right.status) || Date.parse(right.updated_at) - Date.parse(left.updated_at);
+}
+
+function agentStatusPriority(status: AgentStatus): number {
+  switch (status) {
+    case "running":
+      return 0;
+    case "waiting_for_input":
+      return 1;
+    case "starting":
+      return 2;
+    case "queued":
+      return 3;
+    case "planned":
+      return 4;
+    case "stopping":
+      return 5;
+    case "completed":
+      return 6;
+    case "failed":
+      return 7;
+    case "blocked":
+      return 8;
+    case "stopped":
+      return 9;
+    default:
+      return 10;
+  }
+}
+
+function isTerminalStatus(status: AgentStatus): boolean {
+  return status === "completed" || status === "failed" || status === "blocked" || status === "stopped";
+}
