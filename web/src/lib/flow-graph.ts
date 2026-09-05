@@ -8,6 +8,7 @@ import type {
   FlowStepInstanceRecord,
   FlowTransitionConfigRecord
 } from "./types";
+import { compareFlowStepsNewestFirst } from "./flow-steps";
 
 export type FlowVisualNodeKind = "decision" | "finish" | "notify" | "step";
 export type FlowVisualStepStatus = FlowStepInstanceRecord["status"] | "planned";
@@ -52,8 +53,6 @@ type VirtualTargetKind = "finish" | "notify";
 const STEP_X_GAP = 332;
 const STEP_ROW_HEIGHT = 250;
 const STEPS_PER_ROW = 8;
-const DECISION_Y = 112;
-const DECISION_Y_GAP = 48;
 const VIRTUAL_X_GAP = 142;
 const VIRTUAL_Y_GAP = 62;
 
@@ -73,9 +72,8 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
   const stepRuntime = latestFlowStepsByStepId(snapshot, instance.flow_instance_id);
   const nodes = new Map<string, FlowVisualNode>();
   const edges: FlowVisualEdge[] = [];
-  const decisionIndexes = new Map<string, number>();
   const virtualIndexes = new Map<VirtualTargetKind, number>();
-  const takenTransitions = takenTransitionKeys(snapshot, instance.flow_instance_id);
+  const takenTransitions = takenTransitionKeys(snapshot, instance.flow_instance_id, stepRuntime);
 
   stepOrder.forEach((stepId, index) => {
     const step = stepsById.get(stepId);
@@ -108,7 +106,6 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
     for (const [eventName, action] of Object.entries(step.on ?? {})) {
       addActionEdges({
         action,
-        decisionIndexes,
         edges,
         eventName,
         nodes,
@@ -119,6 +116,37 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
         takenTransitions,
         virtualIndexes
       });
+    }
+  }
+
+  // Manual continuations are recorded by the runtime, not declared in the flow.
+  // Include them so an orchestrator handoff never leaves the next phase disconnected.
+  const runtimeById = new Map(snapshot.flow_steps.map((step) => [step.step_instance_id, step]));
+  for (const transition of snapshot.flow_transitions) {
+    if (transition.flow_instance_id !== instance.flow_instance_id || !transition.action_json.manual || !transition.target_step_id) continue;
+    const source = runtimeById.get(transition.from_step_instance_id);
+    if (!source || !nodes.has(stepNodeId(transition.target_step_id))) continue;
+    edges.push({
+      id: `manual:${transition.flow_transition_id}`,
+      source: stepNodeId(source.step_id),
+      target: stepNodeId(transition.target_step_id),
+      label: "Orchestrator continuation",
+      tone: takenTransitions.has(`${source.step_id}:${transition.transition_id}`) ? "taken" : "default",
+      transitionId: transition.transition_id,
+      sourceStepId: source.step_id
+    });
+  }
+
+  const lastTransition = [...snapshot.flow_transitions].reverse()
+    .filter((transition) => transition.flow_instance_id === instance.flow_instance_id)
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+  for (const node of nodes.values()) {
+    if (node.kind === "finish") {
+      node.status = instance.status === "completed" ? "completed" : "planned";
+    }
+    if (node.kind === "notify") {
+      node.isCurrent = instance.status === "waiting_for_orchestrator" && lastTransition?.action_json.notify === node.role;
+      node.status = node.isCurrent ? "active" : "planned";
     }
   }
 
@@ -144,18 +172,20 @@ function latestFlowStepsByStepId(
   for (const [stepId, steps] of grouped) {
     grouped.set(
       stepId,
-      [...steps].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      [...steps].sort((a, b) => compareFlowStepsNewestFirst(a, b) || Number(b.status === "active") - Number(a.status === "active"))
     );
   }
   return grouped;
 }
 
-function takenTransitionKeys(snapshot: DashboardSnapshot, flowInstanceId: string): Set<string> {
+function takenTransitionKeys(snapshot: DashboardSnapshot, flowInstanceId: string, stepRuntime: Map<string, FlowStepInstanceRecord[]>): Set<string> {
   const stepsByInstanceId = new Map(snapshot.flow_steps.map((step) => [step.step_instance_id, step]));
   const keys = new Set<string>();
   for (const transition of snapshot.flow_transitions.filter((item) => item.flow_instance_id === flowInstanceId)) {
     const step = stepsByInstanceId.get(transition.from_step_instance_id);
-    if (step) {
+    // Cards represent the latest attempt; highlighted exits must represent that
+    // same attempt instead of accumulating incompatible outcomes from retries.
+    if (step && stepRuntime.get(step.step_id)?.[0]?.step_instance_id === step.step_instance_id) {
       keys.add(`${step.step_id}:${transition.transition_id}`);
     }
   }
@@ -203,7 +233,6 @@ function collectActionTargets(action: FlowStepActionConfigRecord, targets: strin
 
 function addActionEdges(input: {
   action: FlowStepActionConfigRecord;
-  decisionIndexes: Map<string, number>;
   edges: FlowVisualEdge[];
   eventName: string;
   nodes: Map<string, FlowVisualNode>;
@@ -216,46 +245,13 @@ function addActionEdges(input: {
 }) {
   const transitions = input.action.transitions ?? [];
   if (transitions.length > 0) {
-    const decisionIndex = input.decisionIndexes.get(input.sourceNodeId) ?? 0;
-    input.decisionIndexes.set(input.sourceNodeId, decisionIndex + 1);
-    const decisionId = `${input.sourceNodeId}:decision:${input.eventName}:${decisionIndex}`;
-    input.nodes.set(decisionId, {
-      id: decisionId,
-      kind: "decision",
-      title: "Switch",
-      subtitle: input.eventName,
-      description: "Routes from the reported step result.",
-      isCurrent: false,
-      position: {
-        x: stepPosition(Math.max(0, input.stepIndex)).x + STEP_X_GAP * 0.46,
-        y: stepPosition(Math.max(0, input.stepIndex)).y + DECISION_Y + decisionIndex * DECISION_Y_GAP
-      },
-      role: null,
-      stepId: input.sourceStepId,
-      latestStep: null,
-      instanceCount: 0,
-      status: "planned",
-      reportValues: [],
-      inputCount: 0,
-      outputCount: 0
-    });
-    input.edges.push({
-      id: `${input.sourceNodeId}->${decisionId}`,
-      source: input.sourceNodeId,
-      target: decisionId,
-      label: input.eventName,
-      tone: "default",
-      transitionId: null,
-      sourceStepId: input.sourceStepId
-    });
-
     transitions.forEach((transition, index) => {
       addTransitionTargetEdges({
         ...input,
         action: transition,
         edgeIndex: index,
         label: transitionLabel(transition),
-        sourceNodeId: decisionId,
+        sourceNodeId: input.sourceNodeId,
         transitionId: transition.id
       });
     });
@@ -272,7 +268,6 @@ function addActionEdges(input: {
 
 function addTransitionTargetEdges(input: {
   action: FlowStepActionConfigRecord;
-  decisionIndexes: Map<string, number>;
   edgeIndex: number;
   edges: FlowVisualEdge[];
   eventName: string;
@@ -322,6 +317,30 @@ function targetForAction(
   if (action.to) {
     return { id: stepNodeId(action.to), tone: "default" };
   }
+  // Match runtime precedence: a finish can also send a notification.
+  if (action.finish) {
+    const id = virtualNodeId("finish", "done");
+    if (!input.nodes.has(id)) {
+      input.nodes.set(id, {
+        id,
+        kind: "finish",
+        title: "Done",
+        subtitle: "Flow terminal",
+        description: "The selected transition marks the flow as completed.",
+        isCurrent: false,
+        position: virtualPosition("finish", input.stepOrder.length, 0),
+        role: null,
+        stepId: null,
+        latestStep: null,
+        instanceCount: 0,
+        status: "planned",
+        reportValues: [],
+        inputCount: 0,
+        outputCount: 0
+      });
+    }
+    return { id, tone: "finish" };
+  }
   if (action.notify) {
     const id = virtualNodeId("notify", action.notify);
     if (!input.nodes.has(id)) {
@@ -346,29 +365,6 @@ function targetForAction(
       });
     }
     return { id, tone: "notify" };
-  }
-  if (action.finish) {
-    const id = virtualNodeId("finish", "done");
-    if (!input.nodes.has(id)) {
-      input.nodes.set(id, {
-        id,
-        kind: "finish",
-        title: "Done",
-        subtitle: "Flow terminal",
-        description: "The selected transition marks the flow as completed.",
-        isCurrent: false,
-        position: virtualPosition("finish", input.stepOrder.length, 0),
-        role: null,
-        stepId: null,
-        latestStep: null,
-        instanceCount: 0,
-        status: "planned",
-        reportValues: [],
-        inputCount: 0,
-        outputCount: 0
-      });
-    }
-    return { id, tone: "finish" };
   }
   return null;
 }
@@ -414,11 +410,11 @@ function actionLabel(action: FlowStepActionConfigRecord, fallback: string): stri
   if (action.to) {
     return fallback;
   }
+  if (action.finish) {
+    return action.notify ? `finish and notify ${action.notify}` : "finish";
+  }
   if (action.notify) {
     return `notify ${action.notify}`;
-  }
-  if (action.finish) {
-    return "finish";
   }
   return fallback;
 }

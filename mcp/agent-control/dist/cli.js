@@ -16,7 +16,7 @@ const program = new Command();
 program
     .name("agentctl")
     .description("Control local agent workers through the Agent Control core.")
-    .version("0.1.2")
+    .version("0.1.3")
     .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
     .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();
