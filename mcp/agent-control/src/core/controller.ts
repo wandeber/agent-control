@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, wr
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
+import { currentCodexThreadId } from "./caller-context.js";
 import { RunObservation, isPassiveObserver, type ObserveRunInput, type WaitRunInput, type AcknowledgeRunInput, type RequesterInput } from "./run-observation.js";
 import { parseActivity, activityText, type AgentActivity } from "./agent-activity.js";
 import {
@@ -468,7 +469,7 @@ export class AgentController {
             );
           }
           const ownerTaskIdentity = normalizeOptionalIdentity(
-            input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null
+            input.ownerTaskIdentity ?? currentCodexThreadId() ?? null
           );
           const ownerTaskPath = normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root");
           const originatingGrant = this.resolveNativeFlowBridgeGrant(
@@ -521,7 +522,7 @@ export class AgentController {
           runId: run.run_id,
           orchestratorAgentId: caller.agent_id,
           ownerTaskIdentity: normalizeOptionalIdentity(
-            input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null
+            input.ownerTaskIdentity ?? currentCodexThreadId() ?? null
           ),
           ownerTaskPath: normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root"),
           tokenHash: hashToken(rawBridgeToken)
@@ -604,10 +605,11 @@ export class AgentController {
     };
   }
 
-  /** Identity comes from the locally hosted tool process, never an agent id in a report payload. */
+  /** Identity comes from the local host's MCP request context or CLI environment,
+   * never an agent id in a model-generated report payload. */
   private flowCaller(agentToken?: string | null, expectedIds?: Array<string | null>): AgentRecord | null {
     if (agentToken) return this.requireAgentToken(agentToken);
-    const threadId = process.env.CODEX_THREAD_ID;
+    const threadId = currentCodexThreadId();
     if (!threadId) return null;
     const matches = this.store.listAgents().filter(agent => !agent.unregistered_at && (!expectedIds || expectedIds.includes(agent.agent_id)) &&
       (agent.backend_handle?.thread_id === threadId || (agent.backend === CODEX_SUBAGENT_BACKEND && agent.backend_handle?.native_agent_id === threadId)));

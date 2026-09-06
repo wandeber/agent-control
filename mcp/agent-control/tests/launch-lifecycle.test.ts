@@ -47,7 +47,7 @@ describe("launch and shutdown boundaries", () => {
     const client = new Client({ name: "lifecycle-test", version: "1" });
     try {
       await client.connect(transport);
-      const launch = await client.callTool({ name: "flow_launch", arguments: {
+      const launch = await client.callTool({ name: "flow_launch", _meta: { threadId: "conversation-lifecycle" }, arguments: {
         title: "One-call observation", repo_dir: path, requester_thread_id: "original-user",
         config: { id: "observed-native-flow", initial_step: "work", roles: { worker: { backend: "codex-subagent" } },
           steps: { work: { role: "worker", prompt: "Inspect only", on: { reported: { finish: true } } } } }
