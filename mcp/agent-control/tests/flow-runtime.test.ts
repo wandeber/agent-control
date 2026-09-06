@@ -162,6 +162,19 @@ describe("strict flow runtime", () => {
     expect(controller.getFlowSnapshot(started.instance.flow_instance_id).runtime!.evidence).toEqual({});
   });
 
+  it("reads historical receipts without republishing their provenance during plan corrections", async () => {
+    const cfg = config(); cfg.steps.work.evidence_operations = ["snapshot_artifact", "read_receipt"];
+    const { started } = await draft(cfg); const id = started.instance.flow_instance_id;
+    approve(id); await dispatch(id);
+    const receipt = await controller.executeFlowEvidence({ flowInstanceId: id, key: "original", request: { operation: "snapshot_artifact", path: join(root, "plan.md") } });
+    const before = controller.getFlowSnapshot(id).runtime!;
+    writeFileSync(join(root, "plan.md"), "Work in progress; not yet reported.");
+    const read = await controller.executeFlowEvidence({ flowInstanceId: id, key: "new-alias-must-not-be-written", request: { operation: "read_receipt", receipt_id: receipt.receipt_id } });
+    expect(read).toEqual(receipt);
+    expect(controller.getFlowSnapshot(id).runtime).toEqual(before);
+    await expect(controller.executeFlowEvidence({ flowInstanceId: id, key: "new", request: { operation: "snapshot_artifact", path: join(root, "plan.md") } })).rejects.toThrow(/outside its producing report/);
+  });
+
   it("lets a replacement planner perform a full review using real current complete validation", async () => {
     const repo = join(root, "repo"); mkdirSync(repo);
     execFileSync("git", ["init", "-q", repo]);

@@ -721,7 +721,7 @@ export class AgentController {
     return current;
   }
 
-  private evidenceContext(instance: FlowInstanceRecord, actorId: string, actorRole: string) {
+  private evidenceContext(instance: FlowInstanceRecord, actorId: string, actorRole: string, historicalRead = false) {
     const state = this.flowRuntime.get(instance.flow_instance_id)!;
     const run = this.getRun(instance.run_id);
     if (!run.repo_dir) throw new ControllerError("Evidence requires a repository directory.", "tool_error");
@@ -729,7 +729,7 @@ export class AgentController {
     const planKey = config.policy?.plan_artifact;
     const binding = planKey ? this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey) : null;
     return { runId: instance.run_id, flowInstanceId: instance.flow_instance_id, repoPath: run.repo_dir, actorId, actorRole,
-      acceptanceRevision: String(state.acceptance_revision), planRevision: binding ? this.boundFlowArtifactDigest(instance, planKey!) : "unplanned" };
+      acceptanceRevision: String(state.acceptance_revision), planRevision: binding && !historicalRead ? this.boundFlowArtifactDigest(instance, planKey!) : "unplanned" };
   }
 
   async executeFlowEvidence(input: { flowInstanceId: string; key: string; request: EvidenceRequest; stepInstanceId?: string; reportToken?: string; agentToken?: string | null; adminKey?: string | null }) {
@@ -766,7 +766,9 @@ export class AgentController {
       const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey);
       if (!binding || resolve(input.request.plan_path) !== resolve(binding.path)) throw new ControllerError("Evidence must use the flow's exact bound plan artifact, not a worker-selected substitute.", "tool_error");
     }
-    const context = this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator");
+    // Historical receipt reads verify their original revisions in the service.
+    // A working plan edit must not prevent reading the findings that caused it.
+    const context = this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator", input.request.operation === "read_receipt");
     const service = new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") });
     const receipt = await service.execute(context, input.request);
     if (input.request.operation === "read_receipt") return receipt;
