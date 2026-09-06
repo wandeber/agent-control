@@ -1904,7 +1904,7 @@ export class AgentController {
           return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
             activeStep: blockedStep,
             agent,
-            blockedReason: "terminal_agent_missing_flow_report"
+            blockedReason: this.workerCapabilityFailure(agent) ? "worker_capability_unavailable" : "terminal_agent_missing_flow_report"
           });
         }
       }
@@ -2201,11 +2201,38 @@ export class AgentController {
       : undefined;
   }
 
+  private workerCapabilityFailure(agent: AgentRecord): string | null {
+    const activity = this.readActivity(agent);
+    const prefix = "AGENT_CONTROL_BLOCKED:";
+    return activity?.kind === "message" && activity.text.startsWith(prefix)
+      ? activity.text.slice(prefix.length).trim() || "Required Agent Control tool was unavailable."
+      : null;
+  }
+
+  /** Backend completion is not a semantic report. Surface a missing handback
+   * from status polling too, so an event observer need not call flow_continue. */
+  private reconcileTerminalStrictFlowWorker(agent: AgentRecord): void {
+    if (!TERMINAL_STATUSES.has(agent.status)) return;
+    for (const instance of this.store.listFlowInstances({ runId: agent.run_id })) {
+      if (!this.getFlowOrThrow(instance.flow_record_id).config.policy?.strict) continue;
+      for (const step of this.store.listFlowStepInstances(instance.flow_instance_id)) {
+        if (step.status !== "active" || step.agent_id !== agent.agent_id) continue;
+        if (this.store.listFlowStepReports(instance.flow_instance_id).some(report => report.step_instance_id === step.step_instance_id)) continue;
+        this.blockFlowStepForMissingReport(step, agent);
+      }
+    }
+  }
+
   private blockFlowStepForMissingReport(
     step: FlowStepInstanceRecord,
     agent: AgentRecord
   ): FlowStepInstanceRecord {
-    const summary = `Worker ${agent.agent_id} reached terminal status ${agent.status} without reporting the flow step result.`;
+    const current = this.getFlowStepInstanceOrThrow(step.step_instance_id);
+    if (current.status !== "active") return current;
+    const capabilityFailure = this.workerCapabilityFailure(agent);
+    const summary = capabilityFailure
+      ? `Worker reported an unavailable Agent Control capability: ${capabilityFailure}`
+      : `Worker ${agent.agent_id} reached terminal status ${agent.status} without reporting the flow step result.`;
     const blocked = this.store.updateFlowStepInstance(step.step_instance_id, {
       status: "blocked",
       summary,
@@ -2223,7 +2250,9 @@ export class AgentController {
         flow_instance_id: step.flow_instance_id,
         step_instance_id: step.step_instance_id,
         step_id: step.step_id,
-        reason: "terminal_agent_missing_flow_report",
+        reason: capabilityFailure ? "worker_capability_unavailable" : "terminal_agent_missing_flow_report",
+        summary,
+        ...(capabilityFailure ? { failure_source: "worker_reported", capability_failure: capabilityFailure } : {}),
         agent_status: agent.status
       }
     });
@@ -3366,6 +3395,7 @@ export class AgentController {
         });
       }
       if (TERMINAL_STATUSES.has(updated.status)) {
+        this.reconcileTerminalStrictFlowWorker(updated);
         this.finalizeStoppingRunIfTerminal(updated.run_id, queueEvent);
       }
       const reconciled = preserveStopIntent
@@ -6455,6 +6485,7 @@ export class AgentController {
             payload
           })
         );
+        this.reconcileTerminalStrictFlowWorker(failed);
         this.finalizeStoppingRunIfTerminal(failed.run_id, (event) => {
           pendingEvents.push(this.store.createEvent(event));
         });
@@ -6569,6 +6600,7 @@ export class AgentController {
       }
       const projectedTerminal = TERMINAL_STATUSES.has(updated.status);
       if (projectedTerminal) {
+        this.reconcileTerminalStrictFlowWorker(updated);
         this.finalizeStoppingRunIfTerminal(updated.run_id, (event) => {
           pendingEvents.push(this.store.createEvent(event));
         });
@@ -7970,6 +8002,7 @@ export class AgentController {
       outputArtifacts
     });
     const reportingContract = this.buildFlowStepReportingContract({
+      strict: Boolean(config.policy?.strict),
       stepId,
       stepInstanceId,
       stepConfig,
@@ -8110,7 +8143,7 @@ export class AgentController {
       "Use the generated runtime and reporting contracts as the source of truth.",
       "Write the required artifact paths before reporting.",
       "Keep any in-process status terse.",
-      "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
+      currentFlow.config.policy?.strict ? "Use only the assigned Agent Control MCP tools for evidence and reporting." : "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
     ];
     const runtimeContractRecord =
       input.runtime_contract && typeof input.runtime_contract === "object" && !Array.isArray(input.runtime_contract)
@@ -8131,7 +8164,7 @@ export class AgentController {
     );
     const instance = this.getFlowInstanceOrThrow(step.flow_instance_id);
     const config = this.getFlowOrThrow(instance.flow_record_id).config;
-    if (config.policy?.strict) sections.push(section("Report identity", "Report from this assigned Codex thread. Agent Control derives the worker identity from the local tool process; if MCP cannot identify this thread, use the shown local CLI command. Never copy credentials into prompts, artifacts or reports."));
+    if (config.policy?.strict) sections.push(section("Report identity", "Report from this assigned Codex thread. Agent Control derives the worker identity from the local tool process. Never copy credentials into prompts, artifacts or reports. " + STRICT_FLOW_CAPABILITY_FAILURE));
     if (input.correction) sections.push(section("Transition cause", JSON.stringify(input.correction)));
     const state = this.flowRuntime.get(step.flow_instance_id);
     if (state?.recovery?.agent_id === step.agent_id && state.recovery.full_review_required) sections.push(section("Explicit owner recovery", "You are the new owner after a visible recovery. Perform a full review with a fresh checkpoint and no prior-owner source receipts. Do not inherit or carry earlier approval merely because the role name is unchanged."));
@@ -8195,13 +8228,15 @@ export class AgentController {
       },
       input_artifacts: input.inputArtifacts,
       output_artifacts: input.outputArtifacts,
+      ...(strict ? { capability_failure_contract: { handback_prefix: "AGENT_CONTROL_BLOCKED:", behavior: STRICT_FLOW_CAPABILITY_FAILURE } } : {}),
       instructions: [
         input.coordinatorContext
           ? "Use `objective` as the source of truth. Its coordinator context supersedes the original run title wherever it adds, clarifies, or conflicts."
           : "Use `objective` and the repository directory from this runtime contract as the source of truth.",
         "Read only the input artifacts that are present and relevant to this step.",
         "Write every required output artifact to its assigned path before reporting.",
-        "Do not invent artifact paths, filenames, or additional handoff files unless the task itself requires separate repo changes."
+        "Do not invent artifact paths, filenames, or additional handoff files unless the task itself requires separate repo changes.",
+        ...(strict ? [STRICT_FLOW_CAPABILITY_FAILURE] : [])
       ],
       markdown: buildFlowRuntimeMarkdown({
         flowId: input.flowId,
@@ -8216,11 +8251,12 @@ export class AgentController {
         objectiveSource,
         inputArtifacts: input.inputArtifacts,
         outputArtifacts: input.outputArtifacts
-      })
+      }) + (strict ? `\n\n### Required tool capability\n\n${STRICT_FLOW_CAPABILITY_FAILURE}` : "")
     };
   }
 
   private buildFlowStepReportingContract(input: {
+    strict: boolean;
     stepId: string;
     stepInstanceId: string;
     stepConfig: FlowConfig["steps"][string];
@@ -8237,7 +8273,7 @@ export class AgentController {
       artifacts: artifactExample,
       summary: `Compact ${input.stepId} result.`
     };
-    const cliCommand = buildFlowReportCliCommand(input.stepInstanceId, resultExample, artifactExample, mcpInput.summary);
+    const cliCommand = input.strict ? undefined : buildFlowReportCliCommand(input.stepInstanceId, resultExample, artifactExample, mcpInput.summary);
 
     return {
       step_id: input.stepId,
@@ -8247,17 +8283,15 @@ export class AgentController {
         name: toolName,
         input: mcpInput
       },
-      cli: {
-        command: cliCommand
-      },
+      ...(cliCommand ? { cli: { command: cliCommand } } : {}),
       result_schema: resultSchema,
       result_example: resultExample,
       artifact_example: artifactExample,
       instructions: [
         `Use the Agent Control MCP tool \`${toolName}\` when it is available.`,
-        "If MCP tools are not available, use the CLI command shown below.",
+        input.strict ? STRICT_FLOW_CAPABILITY_FAILURE : "If MCP tools are not available, use the CLI command shown below.",
         "Report only fields allowed by the result schema. Do not invent result labels.",
-        "Use status `completed` when the required artifact was written, even if the structured conclusion represents a blocker.",
+        input.strict ? "Use status `completed` only for valid step work with the required evidence and artifacts. A required-tool capability failure is a blocked handback, never a semantic completion." : "Use status `completed` when the required artifact was written, even if the structured conclusion represents a blocker.",
         "Use a non-completed status only when you could not write the required artifact or could not produce a valid report."
       ],
       markdown: buildFlowReportingMarkdown({
@@ -9992,17 +10026,19 @@ function agentctlExecutable(): string {
   return existsSync(bundled) ? bundled : "agentctl";
 }
 
+const STRICT_FLOW_CAPABILITY_FAILURE = "If a required Agent Control tool is unavailable, requires approval, is denied by host policy, or returns auth_required, stop this step immediately. Do not retry repeatedly, switch to CLI or shell reporting, write controller files or the database, search for step IDs or credentials, change tool approval settings, or claim completion. Return exactly one concise final line: AGENT_CONTROL_BLOCKED: <tool name> | <brief observed reason>. Report the observed limitation without guessing whether the host or controller caused it; the coordinator will handle recovery.";
+
 function buildFlowReportingMarkdown(input: {
   toolName: string;
   mcpInput: Record<string, unknown>;
-  cliCommand: string;
+  cliCommand?: string;
   resultSchema: unknown;
   outputArtifacts: Record<string, Record<string, unknown>>;
 }): string {
   return [
     "## Agent Control Reporting Contract",
     "",
-    `When this step is complete, report the result through Agent Control. Prefer the MCP tool \`${input.toolName}\` when available. If MCP tools are unavailable, use the CLI command shown below exactly as rendered.`,
+    `When this step is complete, report the result through Agent Control using the MCP tool \`${input.toolName}\`. ${input.cliCommand ? "If MCP tools are unavailable, use the CLI command shown below exactly as rendered." : STRICT_FLOW_CAPABILITY_FAILURE}`,
     "",
     "Do not invent routing labels. The allowed structured result is defined by this schema:",
     "",
@@ -10022,13 +10058,8 @@ function buildFlowReportingMarkdown(input: {
     JSON.stringify(input.mcpInput, null, 2),
     "```",
     "",
-    "CLI fallback example:",
-    "",
-    "```bash",
-    input.cliCommand,
-    "```",
-    "",
-    "Use `status: \"completed\"` when the required artifact was written, including conclusions that route to blockers or corrections. Use a non-completed status only when you could not write the required artifact or could not produce a valid report.",
+    ...(input.cliCommand ? ["CLI fallback example:", "", "```bash", input.cliCommand, "```", ""] : []),
+    input.cliCommand ? "Use `status: \"completed\"` when the required artifact was written, including conclusions that route to blockers or corrections. Use a non-completed status only when you could not write the required artifact or could not produce a valid report." : "Use `status: \"completed\"` only for valid step work with required evidence and artifacts. A required-tool capability failure is a blocked handback, never a semantic completion.",
     "After reporting, stop. Agent Control may dispatch the next configured step automatically; do not manually route or start another worker from inside this step."
   ].join("\n");
 }

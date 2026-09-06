@@ -78,6 +78,40 @@ describe("strict flow runtime", () => {
     await expect(handleTool(controller, "flow_step_report", { step_instance_id: started.active_step!.step_instance_id, status: "completed", auto_continue: false })).resolves.toBeTruthy();
     expect(adapter.starts[0]!.prompt).not.toMatch(/report_token=|acb_|aca_/);
   });
+  it("gives strict read-only workers an MCP-only blocked handback contract", async () => {
+    const cfg = config(); cfg.steps.draft.sandbox = "read_only"; cfg.steps.draft.outputs = {};
+    const started = start(cfg); await dispatch(started.instance.flow_instance_id);
+    const contract = started.active_step!.input_json.reporting_contract as Record<string, any>;
+    expect(contract.cli).toBeUndefined();
+    expect(contract.markdown).toContain("AGENT_CONTROL_BLOCKED:");
+    expect(contract.markdown).not.toContain("CLI fallback example");
+    expect(adapter.starts[0]!.prompt).toContain("Do not retry repeatedly, switch to CLI or shell reporting");
+    expect(adapter.starts[0]!.prompt).not.toContain("use the shown local CLI command");
+    expect((started.active_step!.input_json.runtime_contract as Record<string, any>).capability_failure_contract.handback_prefix).toBe("AGENT_CONTROL_BLOCKED:");
+  });
+  it.each(["AGENT_CONTROL_BLOCKED: flow_evidence | Host requires approval.", "Worker stopped without a report."])("notifies run_wait of terminal missing reports without flow_continue: %s", async finalText => {
+    const started = start(); await dispatch(started.instance.flow_instance_id);
+    const observer = controller.observeRun({ runId: owner.run.run_id, threadId: "waiting-user", eventTypes: ["flow.step_blocked"], agentToken: owner.agent_token });
+    vi.spyOn(adapter, "getStatus").mockResolvedValue({ status: "completed", data: { activity: { kind: "message", text: finalText } } } as any);
+    const observed = await controller.waitForRun({ runId: owner.run.run_id, observerAgentId: observer.observer_agent_id, cursor: observer.cursor, timeoutMs: 1000, intervalMs: 1 });
+    expect(observed.events.some(event => event.type === "flow.step_blocked")).toBe(true);
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.instance.status).toBe("blocked"); expect(snapshot.reports).toHaveLength(0);
+    const events = controller.listEvents({ runId: owner.run.run_id, type: "flow.step_blocked" });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.payload.reason).toBe(finalText.startsWith("AGENT_CONTROL_BLOCKED:") ? "worker_capability_unavailable" : "terminal_agent_missing_flow_report");
+    if (finalText.startsWith("AGENT_CONTROL_BLOCKED:")) expect(events[0]!.payload.failure_source).toBe("worker_reported");
+    await controller.pollActiveAgents(owner.run.run_id);
+    expect(controller.listEvents({ runId: owner.run.run_id, type: "flow.step_blocked" })).toHaveLength(1);
+  });
+  it("does not reinterpret a valid reported phase as a terminal capability failure", async () => {
+    const { started } = await draft();
+    vi.spyOn(adapter, "getStatus").mockResolvedValue({ status: "completed", data: { activity: { kind: "message", text: "AGENT_CONTROL_BLOCKED: unrelated later message" } } } as any);
+    await controller.pollActiveAgents(owner.run.run_id);
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id).instance.status).toBe("waiting_for_orchestrator");
+    expect(controller.listEvents({ runId: owner.run.run_id, type: "flow.step_blocked" })).toHaveLength(0);
+  });
+
   it("requires human approval of immutable exact plan bytes", async () => {
     const { started, reported } = await draft(); const id = started.instance.flow_instance_id;
     expect(reported.instance.status).toBe("waiting_for_orchestrator");
