@@ -481,7 +481,6 @@ flow
   .option("--result-json <json>", "Structured result JSON object.")
   .option("--artifact <key=path>", "Output artifact path by output name or artifact key.", collect, [] as string[])
   .option("--summary <summary>", "Compact step summary.")
-  .option("--report-token <token>", "Scoped step reporting credential; defaults to AGENT_CONTROL_REPORT_TOKEN.")
   .option("--server <url>", "Optional backend server URL when auto-continuing.")
   .option("--no-auto-continue", "Do not dispatch the next active step after reporting.")
   .action(
@@ -491,7 +490,6 @@ flow
       resultJson?: string;
       artifact: string[];
       summary?: string;
-      reportToken?: string;
       server?: string;
       autoContinue?: boolean;
     }) =>
@@ -503,7 +501,7 @@ flow
             result: options.resultJson ? parseJsonObjectOption(options.resultJson) : undefined,
             artifacts: parseKeyValueList(options.artifact),
             summary: options.summary,
-            ...{ reportToken: options.reportToken ?? process.env.AGENT_CONTROL_REPORT_TOKEN, agentToken: authOptions().agentToken },
+            ...{ agentToken: authOptions().agentToken },
             server: options.server,
             autoContinue: options.autoContinue
           })

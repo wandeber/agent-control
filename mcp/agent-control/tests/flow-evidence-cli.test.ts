@@ -30,14 +30,13 @@ describe("flow evidence and observer CLI commands", () => {
     expect(controller.recordFlowDecision).toHaveBeenCalledWith({ flowInstanceId: "flow-1", key: "plan_approved", value: true,
       reason: "Approved exact plan", expectedRevision: 2, artifactKey: "plan", artifactDigest: "digest", adminKey: "test-admin" });
   });
-  it("loads evidence request files and resolves a scoped report credential from its environment", async () => {
+  it("loads evidence request files and forwards configured caller authentication", async () => {
     const { controller, parse } = fixture();
     const directory = mkdtempSync(join(tmpdir(), "flow-evidence-cli-")); directories.push(directory);
     const path = join(directory, "request.json"); writeFileSync(path, JSON.stringify({ operation: "prepare_plan", plan_path: "plan.md" }));
-    vi.stubEnv("AGENT_CONTROL_REPORT_TOKEN", "scoped-test-credential");
     await parse(["flow", "evidence", "--flow", "flow-1", "--key", "plan-review", "--step", "step-1", "--request-file", path]);
     expect(controller.executeFlowEvidence).toHaveBeenCalledWith({ flowInstanceId: "flow-1", key: "plan-review", stepInstanceId: "step-1",
-      reportToken: "scoped-test-credential", request: { operation: "prepare_plan", plan_path: "plan.md" }, adminKey: "test-admin" });
+      request: { operation: "prepare_plan", plan_path: "plan.md" }, adminKey: "test-admin" });
   });
   it("does not invoke a mutation for ambiguous input or a malformed revision", async () => {
     const { controller, parse } = fixture();

@@ -5,7 +5,7 @@ import { parseJsonObjectOption, type CliDeps } from "./shared.js";
 interface FlowRuntimeCommands {
   updateFlowContext(input: { flowInstanceId: string; context: Record<string, unknown>; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
   recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; agentToken?: string; adminKey?: string }): unknown;
-  executeFlowEvidence(input: { flowInstanceId: string; key: string; request: Record<string, unknown>; stepInstanceId?: string; reportToken?: string; agentToken?: string; adminKey?: string }): Promise<unknown>;
+  executeFlowEvidence(input: { flowInstanceId: string; key: string; request: Record<string, unknown>; stepInstanceId?: string; agentToken?: string; adminKey?: string }): Promise<unknown>;
 }
 
 function revision(value: string): number {
@@ -51,10 +51,9 @@ export function registerFlowEvidenceCommands(flow: Command, deps: CliDeps): void
     .option("--request-file <path>", "Read the evidence operation JSON from a file (recommended).")
     .option("--request-json <json>", "Evidence operation JSON object.")
     .option("--step <id>", "Authoring step instance id.")
-    .option("--report-token <token>", "Scoped step reporting credential; use AGENT_CONTROL_REPORT_TOKEN when available.")
-    .action(async (options: { flow: string; key: string; requestFile?: string; requestJson?: string; step?: string; reportToken?: string }) => {
+    .action(async (options: { flow: string; key: string; requestFile?: string; requestJson?: string; step?: string }) => {
       deps.output(await controller.executeFlowEvidence({ flowInstanceId: options.flow, key: options.key,
         request: jsonSource(options.requestFile, options.requestJson, "request"), stepInstanceId: options.step,
-        reportToken: options.reportToken ?? process.env.AGENT_CONTROL_REPORT_TOKEN, ...deps.authOptions({ allowStoredAdminKey: true }) }));
+        ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
 }
