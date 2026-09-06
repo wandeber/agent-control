@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { EvidenceService, type EvidenceContext, type EvidenceReceipt, type EvidenceRequest } from '../src/core/evidence/service.js';
 import { validationCheckSchema, evidenceRequestJsonSchema } from '../src/core/evidence/schema.js';
 import { executeCheckGraph, prepareCheck, readOnlySandboxAvailable } from '../src/core/evidence/commands.js';
-import { fingerprint } from '../src/core/evidence/provider.js';
+import { fingerprint, sha256 } from '../src/core/evidence/provider.js';
 
 let root: string; let repo: string; let context: EvidenceContext; let service: EvidenceService;
 function write(path: string, content: string) { writeFileSync(join(repo, path), content); }
@@ -40,7 +40,7 @@ beforeEach(() => {
   write('value.txt', 'before\n'); write('unrelated.txt', 'unrelated\n');
   execFileSync('git', ['-C', repo, 'add', '.']); execFileSync('git', ['-C', repo, 'commit', '-qm', 'base']);
   write('value.txt', 'after\n');
-  context = { runId: 'run-test', flowInstanceId: 'flow-test', repoPath: repo, actorId: 'expert-1', actorRole: 'expert', acceptanceRevision: 'accepted-1', planRevision: 'plan-revision-1' };
+  context = { runId: 'run-test', flowInstanceId: 'flow-test', repoPath: repo, actorId: 'expert-1', actorRole: 'expert', acceptanceRevision: 'accepted-1', planRevision: sha256(readFileSync(join(repo, 'plan.md'))) };
   service = new EvidenceService({ rootDir: join(root, 'run', 'evidence') });
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -99,7 +99,7 @@ describe('run-owned canonical evidence', () => {
     const records = Object.fromEntries(Object.keys(payload(first).sections).map(id => [id, { disposition: 'reviewed', status: 'validated', depends_on: [], invariants: [`Reviewed ${id}.`] }]));
     const review = await service.execute(context, { operation: 'record_plan_review', checkpoint_id: 'plan-1', draft: { verdict: 'approved', coverage_ledger: { mode: 'full', sections: records, deleted_section_ids_reviewed: [], limitations: [] } } });
     write('plan.md', readFileSync(join(repo, 'plan.md'), 'utf8').replace('Original.', 'Corrected.'));
-    context = { ...context, planRevision: 'plan-revision-2' };
+    context = { ...context, planRevision: sha256(readFileSync(join(repo, 'plan.md'))) };
     await service.execute(context, { operation: 'prepare_plan', checkpoint_id: 'plan-2', plan_path: 'plan.md', previous: 'plan-1' });
     const delta = await service.execute(context, { operation: 'diff_plan', from_checkpoint_id: 'plan-1', to_checkpoint_id: 'plan-2' });
     const direct = Object.fromEntries(payload(delta).required_review_section_ids.map((id: string) => [id, records[id]]));
@@ -117,6 +117,21 @@ describe('run-owned canonical evidence', () => {
     await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'expert', draft: draft() });
     write('value.txt', 'correction\n'); await result('result-2', 'result-1');
     await expect(service.execute({ ...context, actorId: 'replacement' }, { operation: 'record_review', checkpoint_id: 'result-2', gate: 'expert', draft: draft() })).rejects.toThrow(/same authenticated/);
+  });
+
+  it('rejects plan B under the controller-bound digest of plan A before creating evidence', async () => {
+    write('different-plan.md', '# Different approved behavior\n');
+    await expect(service.execute(context, { operation: 'prepare_plan', checkpoint_id: 'wrong-plan', plan_path: 'different-plan.md' })).rejects.toThrow(/controller-bound plan revision/);
+    await expect(service.execute(context, { operation: 'prepare_result', checkpoint_id: 'wrong-result', plan_path: 'different-plan.md', paths: ['value.txt'] })).rejects.toThrow(/controller-bound plan revision/);
+    expect(existsSync(join(root, 'run/evidence/run-test/flow-test/provider/flow/plan/checkpoints/wrong-plan.json'))).toBe(false);
+    const plan = await service.execute(context, { operation: 'prepare_plan', checkpoint_id: 'right-plan', plan_path: 'plan.md' });
+    // A relabelled receipt with an otherwise correct digest still cannot turn
+    // the provider's immutable plan A into a checkpoint for plan B.
+    const forged = { ...plan, plan_revision: sha256(readFileSync(join(repo, 'different-plan.md'))) };
+    const { record_sha256: _oldDigest, ...body } = forged;
+    forged.record_sha256 = fingerprint(body);
+    writeFileSync(join(root, 'run/evidence/run-test/flow-test/receipts', `${plan.receipt_id}.json`), JSON.stringify(forged));
+    expect(() => service.verifyReceiptSync({ ...context, planRevision: forged.plan_revision }, plan.receipt_id)).toThrow(/controller-bound plan revision/);
   });
 
   it('reruns volatile or incomplete contexts and preserves actionable redacted failures', async () => {

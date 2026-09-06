@@ -99,7 +99,8 @@ export class EvidenceService {
     }
     if (request.operation === 'prepare_plan' || request.operation === 'prepare_result') {
       const plan = request.operation === 'prepare_plan';
-      this.ensureArtifactInput(context, request.plan_path);
+      const planPath = this.ensureArtifactInput(context, request.plan_path);
+      this.assertPlanIdentity(context, sha256(readRegular(planPath)));
       // Revision changes require a new full-review lineage. The helper itself
       // handles content deltas within a lineage, including deletions/restores.
       if (request.previous) {
@@ -116,6 +117,7 @@ export class EvidenceService {
         request.paths?.forEach(path => args.push('--path', path));
       }
       const payload = provider.invoke(context, plan ? 'create-plan' : 'create', args);
+      this.assertPlanIdentity(context, payload.plan.sha256);
       payload.draft_contracts = provider.draftContracts(plan);
       this.checkpointBinding(context, request.checkpoint_id, plan, true);
       return this.makeReceipt(context, provider, plan ? 'plan_checkpoint' : 'result_checkpoint', 'prepared', payload,
@@ -143,6 +145,7 @@ export class EvidenceService {
       this.checkpointBinding(context, request.checkpoint_id, plan);
       const sources = [...request.source_receipt_ids];
       const manifest = provider.manifestFor(context, request.checkpoint_id, plan);
+      this.assertPlanIdentity(context, manifest.plan.sha256);
       const previousId = plan ? manifest.previous_checkpoint : manifest.scope?.previous_checkpoint;
       const kind = plan ? 'plan_review' : request.operation === 'record_review' && request.gate === 'planner' ? 'planner_review' : 'expert_review';
       if (previousId) {
@@ -167,6 +170,7 @@ export class EvidenceService {
       this.checkpointBinding(context, request.checkpoint_id, true);
       const args = ['--checkpoint-id', request.checkpoint_id]; request.sections.forEach(section => args.push('--section', section));
       const payload = provider.invoke(context, 'plan-projection', args);
+      this.assertPlanIdentity(context, payload.plan_sha256);
       return this.makeReceipt(context, provider, 'plan_projection', 'verified', payload, { checkpointId: request.checkpoint_id });
     }
     if (request.operation === 'validation_run') return this.runValidation(context, provider, request);
@@ -235,6 +239,7 @@ export class EvidenceService {
         const verifyArgs = receipt.status === 'rejected' ? ['--checkpoint-id', receipt.checkpoint_id] : args;
         const required = verifyArgs.includes('--require-review') ? [plan ? 'plan' : receipt.kind === 'expert_review' ? 'expert' : 'planner'] : [];
         const verified = provider.verifyStored(context, receipt.checkpoint_id, plan, required);
+        this.assertPlanIdentity(context, verified.plan_sha256);
         if (receipt.snapshot_sha256 && verified.snapshot_sha256 && verified.snapshot_sha256 !== receipt.snapshot_sha256) throw new Error('Provider checkpoint identity changed.');
         if (expected.requireCurrent) provider.invoke(context, plan ? 'matches-plan' : 'matches', ['--checkpoint-id', receipt.checkpoint_id]);
       }
@@ -255,6 +260,12 @@ export class EvidenceService {
       }
       return receipt;
     } finally { visiting.delete(receiptId); }
+  }
+
+  private assertPlanIdentity(context: EvidenceContext, planSha256: unknown): void {
+    if (!/^[a-f0-9]{64}$/.test(context.planRevision) || planSha256 !== context.planRevision) {
+      throw new Error('Checkpoint plan bytes do not match the controller-bound plan revision.');
+    }
   }
 
   private verifyReviewSource(context: EvidenceContext, id: string, previousId: string | null | undefined, kind: EvidenceReceiptKind, visiting = new Set<string>()): EvidenceReceipt {
@@ -308,6 +319,7 @@ export class EvidenceService {
     this.checkpointBinding(context, request.checkpoint_id, false);
     provider.invoke(context, 'matches', ['--checkpoint-id', request.checkpoint_id]);
     const manifest = provider.manifestFor(context, request.checkpoint_id);
+    this.assertPlanIdentity(context, manifest.plan.sha256);
     const snapshot = manifest.snapshot_sha256 as string;
     const sources: EvidenceReceipt[] = [];
     // A corrupt candidate is never a hit. Validation still makes progress by

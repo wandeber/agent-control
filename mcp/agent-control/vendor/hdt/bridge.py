@@ -39,6 +39,7 @@ try:
             state = result["review_state"] if args.plan else result["review_states"][gate]
             if state != "strict-approved":
                 raise provider.CheckpointError("Stored review is not strictly approved.")
+        result["plan_sha256"] = manifest["plan"]["sha256"]
         print(json.dumps(result))
         raise SystemExit(0)
     if not args.report:

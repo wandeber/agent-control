@@ -9,6 +9,10 @@ The controller constructs `EvidenceContext` from the authenticated run, flow
 instance, step owner, acceptance revision, and current plan revision. Workers
 cannot supply that context. Runtime step capabilities restrict operations and
 review gates; review transitions additionally specify the expected owner.
+`planRevision` is the SHA-256 of the controller-bound plan bytes. Preparation
+checks the requested plan before capturing it, and every receipt gate compares
+the provider manifest's plan digest with that trusted revision. An arbitrary
+revision label or another plan path cannot confer approval on different bytes.
 
 ## API
 
