@@ -29,7 +29,7 @@ export function registerObservationCommands(run, deps) {
         .description("Wait for subscribed events with a durable cursor. Keep the turn open while work remains; answer user messages and resume this wait. Omit timeout for indefinite waiting, or use 1h.")
         .requiredOption("--run <id>", "Observed run.")
         .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
-        .requiredOption("--cursor <cursor>", "Cursor returned by run observe or the previous run wait.")
+        .option("--cursor <cursor>", "Explicit replay cursor; omit to resume the durable processed position. Fetching never acknowledges processing.")
         .option("--timeout <duration>", "Optional timeout such as 1h.")
         .action(async (options) => {
         const cancellation = new AbortController();
@@ -44,5 +44,15 @@ export function registerObservationCommands(run, deps) {
             process.removeListener("SIGINT", abort);
             process.removeListener("SIGTERM", abort);
         }
+    });
+    run.command("ack")
+        .description("Commit successful handling of all delivered events through a cursor. ACK is explicit, monotonic and recoverable after restart.")
+        .requiredOption("--run <id>", "Observed run.")
+        .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
+        .requiredOption("--cursor <cursor>", "Observer-bound cursor returned by run wait after handling the events.")
+        .action((options) => {
+        const controller = deps.controller;
+        deps.output(controller.acknowledgeRunEvents({ runId: options.run, observerAgentId: options.observerAgentId,
+            cursor: options.cursor, ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
 }

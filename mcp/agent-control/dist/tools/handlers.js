@@ -3,6 +3,11 @@ import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
 export async function handleTool(controller, name, input, signal) {
     switch (name) {
+        case "flow_owner_recover": return controller.recoverFlowOwner({ flowInstanceId: String(input.flow_instance_id), role: String(input.role), restartStepId: String(input.restart_step_id), reason: String(input.reason), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "flow_context_update": return controller.updateFlowContext({ flowInstanceId: String(input.flow_instance_id), context: String(input.context), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "flow_decision": return controller.recordFlowDecision({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), value: input.value, reason: String(input.reason), expectedRevision: Number(input.expected_revision), artifactKey: maybeString(input.artifact_key), artifactDigest: maybeString(input.artifact_digest), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "flow_evidence": return controller.executeFlowEvidence({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), request: input.request, stepInstanceId: maybeString(input.step_instance_id), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "run_ack": return controller.acknowledgeRunEvents({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id), cursor: String(input.cursor), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
         case "worker_launch": return launchWorkerTool(controller, input);
         case "flow_launch": return launchFlowTool(controller, input);
         case "run_observe":
@@ -11,7 +16,7 @@ export async function handleTool(controller, name, input, signal) {
                 delivery: input.delivery, adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
         case "run_wait":
             return controller.waitForRun({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id),
-                cursor: String(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit), signal });
+                cursor: maybeString(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit), signal });
         case "backend_list":
             return controller.listBackends();
         case "flow_validate_config":
@@ -29,6 +34,7 @@ export async function handleTool(controller, name, input, signal) {
                 config: maybeObject(input.config) ?? {},
                 runId: maybeString(input.run_id),
                 runTitle: maybeString(input.run_title),
+                acceptanceContext: maybeString(input.acceptance_context),
                 repoDir: maybeString(input.repo_dir),
                 adminKey: maybeString(input.admin_key),
                 agentToken: maybeString(input.agent_token),
@@ -85,7 +91,7 @@ export async function handleTool(controller, name, input, signal) {
                 stepId: String(input.step_id),
                 fromStepInstanceId: maybeString(input.from_step_instance_id),
                 transitionId: maybeString(input.transition_id),
-                reason: maybeString(input.reason)
+                reason: maybeString(input.reason), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key)
             });
         case "flow_step_report":
             return compactReportAndContinueResult(await controller.reportFlowStepAndContinue({
@@ -95,6 +101,7 @@ export async function handleTool(controller, name, input, signal) {
                 artifacts: maybeStringRecord(input.artifacts),
                 summary: maybeString(input.summary),
                 server: maybeString(input.server),
+                agentToken: maybeString(input.agent_token),
                 autoContinue: input.auto_continue === false ? false : true
             }));
         case "orchestrator_login":

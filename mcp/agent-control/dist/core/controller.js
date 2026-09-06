@@ -1,10 +1,12 @@
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
+import { EvidenceService } from "./evidence/service.js";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
 import { RunObservation, isPassiveObserver } from "./run-observation.js";
 import { parseActivity, activityText } from "./agent-activity.js";
-import { parseFlowConfig, resolveFlowAgentLifecycle, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
+import { evaluateCondition, parseFlowConfig, resolveFlowAgentLifecycle, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
 import { getFlowFromCatalog, listFlowCatalog } from "./flow-catalog.js";
 import { generateActionToken, generateAgentToken, generateBridgeToken, hashToken, verifyAdminKey } from "./identity.js";
 import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "./ids.js";
@@ -30,6 +32,7 @@ export class AgentController {
     credentialStore;
     controllerInstanceId = newId("controller");
     observations;
+    flowRuntime;
     disposing = false;
     disposeTask = null;
     backgroundTasks = new Set();
@@ -46,6 +49,7 @@ export class AgentController {
         this.adapters = adapters;
         this.credentialStore = credentialStore;
         this.observations = new RunObservation(store, this, adapters);
+        this.flowRuntime = new FlowRuntime(store);
         const configuredDelays = options.nativeActionDeliveryRetryDelaysMs ??
             DEFAULT_NATIVE_ACTION_DELIVERY_RETRY_DELAYS_MS;
         this.nativeActionDeliveryRetryDelaysMs = configuredDelays
@@ -186,6 +190,7 @@ export class AgentController {
     ensureRequester(runId, input = {}) {
         return this.observations.ensure(runId, input);
     }
+    acknowledgeRunEvents(input) { return this.observations.acknowledge(input); }
     waitForRun(input) {
         return this.observations.wait(input);
     }
@@ -285,7 +290,7 @@ export class AgentController {
         return run;
     }
     startFlow(input) {
-        const config = parseFlowConfig(input.config);
+        const config = pinFlowConfig(parseFlowConfig(input.config));
         const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : null;
         const requiresNativeBridge = flowUsesCodexSubagents(config);
         const persistBridgeCredentialLocally = input.bridgeCredentialDelivery === "local";
@@ -371,13 +376,19 @@ export class AgentController {
                 originatingBridgeGrantId,
                 currentStepId: config.initial_step
             });
-            this.ensureDeclaredFlowAgents({
+            this.flowRuntime.initialize(instance.flow_instance_id, config, input.acceptanceContext ?? run.title);
+            const declaredOwners = this.ensureDeclaredFlowAgents({
                 config,
+                instanceId: instance.flow_instance_id,
                 flowId: flow.flow_id,
                 run,
                 caller,
                 agentToken: input.agentToken ?? null
             });
+            const runtimeState = this.flowRuntime.get(instance.flow_instance_id);
+            runtimeState.decision_owners = { requester: observer?.observer_agent_id ?? null, orchestrator: caller?.agent_id ?? null };
+            runtimeState.owners = Object.fromEntries([...declaredOwners].map(([role, agent]) => [role, agent.agent_id]));
+            this.flowRuntime.save(instance.flow_instance_id, runtimeState);
             if (caller) {
                 this.ensureFlowOwnerSubscriptions(run.run_id, caller.agent_id);
             }
@@ -426,16 +437,253 @@ export class AgentController {
             bridge_credential: initialized.bridgeCredential
         };
     }
+    /** Identity comes from the locally hosted tool process, never an agent id in a report payload. */
+    flowCaller(agentToken, expectedIds) {
+        if (agentToken)
+            return this.requireAgentToken(agentToken);
+        const threadId = process.env.CODEX_THREAD_ID;
+        if (!threadId)
+            return null;
+        const matches = this.store.listAgents().filter(agent => !agent.unregistered_at && (!expectedIds || expectedIds.includes(agent.agent_id)) &&
+            (agent.backend_handle?.thread_id === threadId || (agent.backend === CODEX_SUBAGENT_BACKEND && agent.backend_handle?.native_agent_id === threadId)));
+        return matches.length === 1 ? matches[0] : null;
+    }
+    requireFlowCoordinator(instance, input) {
+        if (input.adminKey && verifyAdminKey(input.adminKey))
+            return instance.orchestrator_agent_id ?? "local-admin";
+        const caller = this.flowCaller(input.agentToken, [instance.orchestrator_agent_id]);
+        if (!caller || caller.agent_id !== instance.orchestrator_agent_id || caller.unregistered_at)
+            throw new ControllerError("This flow decision requires its authenticated coordinator.", "auth_required");
+        return caller.agent_id;
+    }
+    updateFlowContext(input) {
+        return this.store.immediateTransaction(() => {
+            const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+            const actorId = this.requireFlowDecisionActor(instance, { owner: this.flowRuntime.get(instance.flow_instance_id)?.decision_owners?.requester ? "requester" : "orchestrator" }, input);
+            if (!input.context.trim())
+                throw new ControllerError("Acceptance context must not be empty.", "tool_error");
+            const runtime = this.flowRuntime.changeContext(instance.flow_instance_id, input.context, actorId, input.expectedRevision);
+            this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "acceptance_updated", acceptance_revision: runtime.acceptance_revision } });
+            return { flow_instance_id: instance.flow_instance_id, runtime };
+        });
+    }
+    recoverFlowOwner(input) {
+        return this.store.immediateTransaction(() => {
+            const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+            this.requireFlowCoordinator(instance, input);
+            const flow = this.getFlowOrThrow(instance.flow_record_id);
+            if (!flow.config.policy?.strict)
+                throw new ControllerError("Explicit owner recovery requires a strict flow with pinned role ownership.", "tool_error");
+            const state = this.flowRuntime.get(instance.flow_instance_id);
+            const requestDigest = digest({ role: input.role, restart_step: input.restartStepId, reason: input.reason, expected_revision: input.expectedRevision });
+            if (state.recovery?.request_digest === requestDigest)
+                return this.getFlowSnapshot(instance.flow_instance_id);
+            if (state.revision !== input.expectedRevision)
+                throw new ControllerError("Flow state changed before owner recovery; read the current state before retrying.", "tool_error");
+            const roleConfig = flow.config.roles?.[input.role];
+            const stepConfig = flow.config.steps[input.restartStepId];
+            const previousId = state.owners[input.role];
+            if (!previousId || !roleConfig?.backend || !stepConfig || stepConfig.role !== input.role || !input.reason.trim())
+                throw new ControllerError("Recovery must select the pinned role and one of its configured steps with an explicit reason.", "tool_error");
+            const previous = this.getAgent(previousId);
+            if (!previous.unregistered_at && !TERMINAL_STATUSES.has(previous.status))
+                throw new ControllerError("Stop or detach the previous role owner before replacing it; recovery does not interrupt active work implicitly.", "tool_error");
+            const activeSteps = this.store.listFlowStepInstances(instance.flow_instance_id).filter(step => step.status === "active");
+            if (activeSteps.some(step => step.agent_id && step.agent_id !== previousId))
+                throw new ControllerError("Another worker owns the active phase; recover the missing owner after that work reaches a handoff.", "tool_error");
+            const { agent_token: _privateToken, ...replacement } = this.registerAgent({ runId: instance.run_id, backend: roleConfig.backend,
+                title: declaredFlowAgentTitle(`${flow.flow_id}/${instance.flow_instance_id}/recovery-${state.revision + 1}`, input.role),
+                role: input.role, objective: state.context ?? this.getRun(instance.run_id).title, repoDir: this.getRun(instance.run_id).repo_dir,
+                model: roleConfig.model, status: "planned", ...(input.agentToken ? { agentToken: input.agentToken } : { adminKey: input.adminKey ?? undefined }) });
+            for (const active of activeSteps)
+                this.store.updateFlowStepInstance(active.step_instance_id, { status: "cancelled", summary: `Explicit owner recovery: ${input.reason}`, completedAt: nowIso() });
+            state.owners[input.role] = replacement.agent_id;
+            state.revision += 1;
+            state.recovery = { request_digest: requestDigest, role: input.role, previous_agent_id: previousId, agent_id: replacement.agent_id,
+                reason: input.reason, restart_step_id: input.restartStepId, full_review_required: true };
+            state.correction = { from_step_id: instance.current_step_id, summary: input.reason, reason: "explicit_owner_recovery", role: input.role, full_review_required: true };
+            this.flowRuntime.save(instance.flow_instance_id, state);
+            const next = this.activateFlowStep(flow.config, instance, input.restartStepId);
+            this.emit({ runId: instance.run_id, agentId: replacement.agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, step_instance_id: next.step_instance_id, reason: "owner_recovered", role: input.role, previous_agent_id: previousId, full_review_required: true, summary: input.reason } });
+            return this.getFlowSnapshot(instance.flow_instance_id);
+        });
+    }
+    requireFlowDecisionActor(instance, declaration, input) {
+        const ownerKind = declaration.owner ?? "orchestrator";
+        const ownerId = this.flowRuntime.get(instance.flow_instance_id)?.decision_owners?.[ownerKind] ?? (ownerKind === "orchestrator" ? instance.orchestrator_agent_id : null);
+        if (!ownerId)
+            throw new ControllerError("This decision requires the original requesting conversation to be identified at launch.", "auth_required");
+        const caller = this.flowCaller(input.agentToken, [ownerId]);
+        if (!caller || caller.agent_id !== ownerId)
+            throw new ControllerError("This decision belongs to a different conversation; its configured owner must record it.", "auth_required");
+        return caller.agent_id;
+    }
+    recordFlowDecision(input) {
+        return this.store.immediateTransaction(() => {
+            const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+            const flow = this.getFlowOrThrow(instance.flow_record_id);
+            const state = this.flowRuntime.get(instance.flow_instance_id);
+            if (state.revision !== input.expectedRevision)
+                throw new ControllerError("The flow revision changed before this decision; read the current gate first.", "tool_error");
+            const step = this.store.listFlowStepInstances(instance.flow_instance_id).find(item => item.status === "active" && flow.config.steps[item.step_id].decision?.key === input.key);
+            const declaration = step ? flow.config.steps[step.step_id].decision : flow.config.preferences?.[input.key];
+            if (!declaration || !input.reason.trim())
+                throw new ControllerError("This decision is not a configured active gate or preference, or has no human decision record.", "tool_error");
+            if ("values" in declaration && declaration.values && !declaration.values.includes(input.value))
+                throw new ControllerError("Decision is outside configured preference values.", "tool_error");
+            const actorId = this.requireFlowDecisionActor(instance, declaration, input);
+            const authority = "authority" in declaration ? declaration.authority ?? "user" : "user";
+            const artifactKey = declaration.artifact_key;
+            if (input.artifactKey && input.artifactKey !== artifactKey)
+                throw new ControllerError("Decision artifact differs from its configured gate.", "tool_error");
+            const binding = artifactKey ? this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === artifactKey) : null;
+            const boundDigest = binding ? this.boundFlowArtifactDigest(instance, artifactKey) : undefined;
+            if (artifactKey && (!binding || !input.artifactDigest || input.artifactDigest !== boundDigest))
+                throw new ControllerError("The human decision must name the exact current artifact digest.", "tool_error");
+            state.decisions[input.key] = { value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
+            state.revision += 1;
+            this.flowRuntime.save(instance.flow_instance_id, state);
+            this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "human_decision_recorded", decision_key: input.key, decision: input.value } });
+            return step ? this.reportFlowStep({ stepInstanceId: step.step_instance_id, status: "completed", result: { decision: input.value }, summary: input.reason, reportToken: this.flowRuntime.capability(step.step_instance_id) }) : { flow_instance_id: instance.flow_instance_id, runtime: state };
+        });
+    }
+    flowConditionContext(instance) {
+        const state = this.flowRuntime.get(instance.flow_instance_id);
+        if (!state)
+            return {};
+        const bindings = this.store.listFlowArtifactBindings(instance.flow_instance_id);
+        const decisions = Object.fromEntries(Object.entries(state.decisions).filter(([, decision]) => {
+            if (decision.acceptance_revision !== state.acceptance_revision)
+                return false;
+            if (!decision.artifact_key)
+                return true;
+            const binding = bindings.find(item => item.artifact_key === decision.artifact_key);
+            try {
+                return Boolean(binding && this.boundFlowArtifactDigest(instance, decision.artifact_key) === decision.artifact_digest);
+            }
+            catch {
+                return false;
+            }
+        }));
+        return { state: state.state, decisions, evidence: state.evidence, acceptance_revision: state.acceptance_revision };
+    }
+    boundFlowArtifactDigest(instance, key) {
+        const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === key);
+        if (!binding)
+            throw new ControllerError("Required bound artifact is missing.", "missing_artifact", { artifact: key });
+        const current = artifactDigest(binding.path);
+        const recorded = this.flowRuntime.get(instance.flow_instance_id)?.artifacts?.[key];
+        if (this.getFlowOrThrow(instance.flow_record_id).config.policy?.strict && (!recorded || recorded.path !== binding.path || recorded.sha256 !== current || artifactDigest(recorded.snapshot_path) !== recorded.sha256))
+            throw new ControllerError("A bound artifact changed outside its producing report; restore or explicitly report the new revision before proceeding.", "tool_error", { artifact: key });
+        return current;
+    }
+    evidenceContext(instance, actorId, actorRole, historicalRead = false) {
+        const state = this.flowRuntime.get(instance.flow_instance_id);
+        const run = this.getRun(instance.run_id);
+        if (!run.repo_dir)
+            throw new ControllerError("Evidence requires a repository directory.", "tool_error");
+        const config = this.getFlowOrThrow(instance.flow_record_id).config;
+        const planKey = config.policy?.plan_artifact;
+        const binding = planKey ? this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey) : null;
+        return { runId: instance.run_id, flowInstanceId: instance.flow_instance_id, repoPath: run.repo_dir, actorId, actorRole,
+            acceptanceRevision: String(state.acceptance_revision), planRevision: binding && !historicalRead ? this.boundFlowArtifactDigest(instance, planKey) : "unplanned" };
+    }
+    async executeFlowEvidence(input) {
+        const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+        const config = this.getFlowOrThrow(instance.flow_record_id).config;
+        const step = input.stepInstanceId ? this.getFlowStepInstanceOrThrow(input.stepInstanceId) : this.store.listFlowStepInstances(instance.flow_instance_id).find(item => item.status === "active");
+        if (!step || step.flow_instance_id !== instance.flow_instance_id || step.status !== "active")
+            throw new ControllerError("Evidence requires a current step generation in this flow.", "tool_error");
+        const stepConfig = config.steps[step.step_id];
+        if (input.request.operation !== "read_receipt" && step.input_json.acceptance_revision !== this.flowRuntime.get(instance.flow_instance_id)?.acceptance_revision)
+            throw new ControllerError("The acceptance changed after this step started; evidence cannot be authored for the new contract by an obsolete attempt.", "tool_error");
+        let actorId;
+        if (stepConfig.execution === "coordinator")
+            actorId = this.requireFlowCoordinator(instance, input);
+        else {
+            const caller = this.flowCaller(input.agentToken, [step.agent_id]);
+            if (!caller || caller.agent_id !== step.agent_id)
+                this.flowRuntime.verifyCapability(step.step_instance_id, input.reportToken);
+            if (!step.agent_id)
+                throw new ControllerError("Evidence requires the pinned assigned worker.", "auth_required");
+            actorId = step.agent_id;
+        }
+        if (config.policy?.strict && !stepConfig.evidence_operations?.includes(input.request.operation))
+            throw new ControllerError("This evidence operation is not authorized for the current step.", "auth_required");
+        if (input.request.operation === "record_review" && !stepConfig.evidence_gates?.includes(input.request.gate))
+            throw new ControllerError("This step cannot author this review gate.", "auth_required");
+        const recovery = this.flowRuntime.get(instance.flow_instance_id)?.recovery;
+        if (recovery?.full_review_required && recovery.agent_id === actorId) {
+            if ((input.request.operation === "prepare_result" || input.request.operation === "prepare_plan") && input.request.previous)
+                throw new ControllerError("A replacement review owner must start a full checkpoint without inheriting another owner's evidence.", "tool_error");
+            if (input.request.operation === "record_review" || input.request.operation === "record_plan_review") {
+                if (input.request.draft.coverage_ledger?.mode !== "full")
+                    throw new ControllerError("The replacement owner must complete a full review before incremental reuse is enabled.", "tool_error");
+                // Mechanical proof remains usable; only semantic approval from the
+                // previous owner is forbidden as a replacement review's carry source.
+                for (const sourceId of input.request.source_receipt_ids ?? [])
+                    new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") }).verifyReceiptSync(this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator"), sourceId, { kind: "validation", requireCurrent: true, requireApproved: true, validationMode: "complete_gate" });
+            }
+        }
+        if (input.request.operation === "prepare_plan" || input.request.operation === "prepare_result") {
+            const planKey = config.policy?.plan_artifact;
+            const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey);
+            if (!binding || resolve(input.request.plan_path) !== resolve(binding.path))
+                throw new ControllerError("Evidence must use the flow's exact bound plan artifact, not a worker-selected substitute.", "tool_error");
+        }
+        // Historical receipt reads verify their original revisions in the service.
+        // A working plan edit must not prevent reading the findings that caused it.
+        const context = this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator", input.request.operation === "read_receipt");
+        const service = new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") });
+        const receipt = await service.execute(context, input.request);
+        if (input.request.operation === "read_receipt")
+            return receipt;
+        return this.store.immediateTransaction(() => {
+            const current = this.getFlowStepInstanceOrThrow(step.step_instance_id);
+            const state = this.flowRuntime.get(instance.flow_instance_id);
+            if ((current.agent_id && (current.agent_id !== actorId || this.getAgent(current.agent_id).unregistered_at)) || current.status !== "active" || String(state.acceptance_revision) !== context.acceptanceRevision || this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator").planRevision !== context.planRevision)
+                throw new ControllerError("Work changed while evidence was being prepared; its receipt cannot advance this flow.", "tool_error");
+            if (state.recovery?.agent_id === actorId && ["plan_review", "planner_review", "expert_review"].includes(receipt.kind))
+                state.recovery.full_review_required = false;
+            state.evidence[input.key] = receipt.receipt_id;
+            state.evidence_summaries ??= {};
+            state.evidence_summaries[input.key] = { receipt_id: receipt.receipt_id, kind: receipt.kind, status: receipt.status, step_instance_id: step.step_instance_id, acceptance_revision: state.acceptance_revision, summary: receipt.summary };
+            state.revision += 1;
+            this.flowRuntime.save(instance.flow_instance_id, state);
+            this.emit({ runId: instance.run_id, agentId: step.agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, step_instance_id: step.step_instance_id, reason: "evidence_recorded", evidence: state.evidence_summaries[input.key] } });
+            return receipt;
+        });
+    }
+    assertFlowRequirements(instance, requirements, extra = {}) {
+        const context = { ...this.flowConditionContext(instance), ...extra };
+        if (requirements.requires && !evaluateCondition(requirements.requires, context))
+            throw new ControllerError("This phase is waiting for its configured decision or milestone.", "tool_error");
+        for (const requirement of requirements.requires_evidence ?? []) {
+            const receiptId = requirement.receipt.split(".").reduce((value, key) => value && typeof value === "object" ? value[key] : undefined, context);
+            if (typeof receiptId !== "string")
+                throw new ControllerError("Required verified evidence is missing.", "tool_error", { receipt: requirement.receipt });
+            const ownerId = requirement.owner_role ? this.flowRuntime.get(instance.flow_instance_id)?.owners[requirement.owner_role] : undefined;
+            if (requirement.owner_role && !ownerId)
+                throw new ControllerError("Evidence has no pinned review owner.", "tool_error");
+            const receipt = new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") }).verifyReceiptSync(this.evidenceContext(instance, instance.orchestrator_agent_id ?? "coordinator", "coordinator"), receiptId, { kind: requirement.kind, requireCurrent: requirement.require_current ?? true, requireApproved: requirement.require_approved ?? true, actorId: ownerId, validationMode: requirement.validation_mode });
+            if (requirement.validation_mode) {
+                const mechanical = receipt.payload.mechanical_report;
+                if (receipt.kind !== "validation" || mechanical?.validation_mode !== requirement.validation_mode)
+                    throw new ControllerError("The validation receipt does not cover the required mechanical gate.", "tool_error");
+            }
+        }
+    }
     getFlowSnapshot(flowInstanceId) {
         const instance = this.getFlowInstanceOrThrow(flowInstanceId);
         const flow = this.getFlowOrThrow(instance.flow_record_id);
         return {
             flow,
             instance,
+            runtime: this.flowRuntime.get(flowInstanceId),
             steps: this.store.listFlowStepInstances(flowInstanceId),
             reports: this.store.listFlowStepReports(flowInstanceId),
             transitions: this.store.listFlowTransitions(flowInstanceId),
-            artifact_bindings: this.store.listFlowArtifactBindings(flowInstanceId)
+            artifact_bindings: this.store.listFlowArtifactBindings(flowInstanceId).map(binding => ({ ...binding, ...(this.flowRuntime.get(flowInstanceId)?.artifacts?.[binding.artifact_key] ?? {}) }))
         };
     }
     async startFlowStep(input) {
@@ -446,6 +694,8 @@ export class AgentController {
             };
             const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
             const flow = this.getFlowOrThrow(instance.flow_record_id);
+            if (flow.config.policy?.strict)
+                this.requireFlowCoordinator(instance, input);
             if (flowUsesCodexSubagents(flow.config)) {
                 // Manual routing can cancel workers and enqueue cleanup, so it must
                 // prove the flow's immutable native owner before its first write too.
@@ -566,6 +816,8 @@ export class AgentController {
         if (resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) !== "reuse") {
             return null;
         }
+        if (flow.config.policy?.strict)
+            return this.flowRuntime.get(instance.flow_instance_id)?.owners[stepConfig.role ?? stepId] ?? null;
         return (this.findDeclaredFlowAgent(instance.run_id, flow.flow_id, stepConfig.role, roleConfig?.backend)?.agent_id ?? null);
     }
     /** Do not stop a reusable worker that another concurrently active flow owns. */
@@ -616,6 +868,8 @@ export class AgentController {
             ? this.resolveNativeFlowBridgeGrant(snapshot.instance)
             : null;
         const activeStep = this.activeFlowStepOrThrow(snapshot, input.flowInstanceId);
+        if (snapshot.flow.config.steps[activeStep.step_id].execution === "coordinator")
+            throw new ControllerError("This phase is waiting for the coordinator; it does not launch a worker.", "tool_error");
         const stepConfig = snapshot.flow.config.steps[activeStep.step_id];
         const roleConfig = stepConfig.role ? snapshot.flow.config.roles?.[stepConfig.role] : undefined;
         const backend = roleConfig?.backend;
@@ -729,7 +983,7 @@ export class AgentController {
     }
     async reportFlowStepAndContinue(input) {
         const report = this.reportFlowStep(input);
-        if (input.autoContinue === false || !report.active_step) {
+        if (input.autoContinue === false || report.replayed || !report.active_step) {
             return { report, continuation: null };
         }
         const continuation = await this.continueFlowInternal({
@@ -866,6 +1120,8 @@ export class AgentController {
                 role: stepConfig.role
             });
         }
+        if (stepConfig.sandbox === "read_only" && backend !== "codex-thread")
+            throw new ControllerError("This backend cannot enforce the configured read-only step sandbox.", "unsupported_operation");
         this.adapters.get(backend);
         const run = this.getRun(snapshot.instance.run_id);
         const expectedArtifacts = expectedArtifactsFromStep(activeStep);
@@ -996,6 +1252,7 @@ export class AgentController {
                     flow_instance_id: snapshot.instance.flow_instance_id,
                     step_instance_id: activeStep.step_instance_id,
                     step_id: activeStep.step_id,
+                    ...(stepConfig.sandbox ? { sandbox: stepConfig.sandbox, flow_writable_root: runRuntimeDir(snapshot.instance.run_id) } : {}),
                     ...(roleConfig?.reasoning_effort ? { reasoning_effort: roleConfig.reasoning_effort } : {})
                 },
                 agentToken: input.agentToken,
@@ -1066,6 +1323,48 @@ export class AgentController {
                     : null
         };
     }
+    /** Repair only the old report/activation gap; never replay a worker or upgrade a legacy approval. */
+    recoverLegacyCompletedFlowStep(flowInstanceId) {
+        return this.store.immediateTransaction(() => {
+            const snapshot = this.getFlowSnapshot(flowInstanceId);
+            if (snapshot.flow.config.policy?.strict || snapshot.instance.status !== "active" || snapshot.steps.some(step => step.status === "active"))
+                return false;
+            const step = snapshot.steps.at(-1);
+            if (!step || step.status !== "completed")
+                return false;
+            const report = snapshot.reports.filter(item => item.step_instance_id === step.step_instance_id).at(-1);
+            if (!report || report.status !== "completed" || !stableJsonEquals(report.result_json, step.result_json))
+                return false;
+            const action = resolveStepEventAction(snapshot.flow.config.steps[step.step_id], "completed");
+            if (!action)
+                return false;
+            const context = { ...this.flowConditionContext(snapshot.instance), status: "completed", result: step.result_json, step: { id: step.step_id, instance_id: step.step_instance_id } };
+            const selected = action.transitions ? selectTransition(action, context) : null;
+            if (action.transitions && !selected)
+                return false;
+            const selectedAction = selected ?? action;
+            const prior = snapshot.transitions.filter(item => item.from_step_instance_id === step.step_instance_id).at(-1);
+            if (prior) {
+                // A persisted transition is authority only when it exactly matches the
+                // original flow config and the committed report; a manual route is not
+                // guessed or replayed as an automatic transition after interruption.
+                if (prior.action_json.manual || !stableJsonEquals(prior.action_json, selectedAction) || !selectedAction.to || prior.target_step_id !== selectedAction.to)
+                    return false;
+                if (snapshot.steps.some(item => item.created_at > step.created_at))
+                    return false;
+                const state = this.flowRuntime.get(flowInstanceId) ?? this.flowRuntime.initialize(flowInstanceId, snapshot.flow.config);
+                state.correction = { from_step_id: step.step_id, from_step_instance_id: step.step_instance_id, status: step.status, result: step.result_json, summary: report.summary, artifacts: step.output_json, transition_id: prior.transition_id };
+                state.revision += 1;
+                this.flowRuntime.save(flowInstanceId, state);
+                this.activateFlowStep(snapshot.flow.config, snapshot.instance, selectedAction.to);
+            }
+            else {
+                this.advanceFlowAfterStep(snapshot.flow.config, snapshot.instance, step, step.result_json);
+            }
+            this.emit({ runId: snapshot.instance.run_id, type: "flow.notification", payload: { flow_instance_id: flowInstanceId, from_step_instance_id: step.step_instance_id, reason: "interrupted_transition_recovered", target_step_id: selectedAction.to ?? null, summary: "Recovered the committed step handoff without repeating its worker." } });
+            return true;
+        });
+    }
     async continueFlowInternal(input) {
         const snapshot = this.getFlowSnapshot(input.flowInstanceId);
         const instance = snapshot.instance;
@@ -1114,12 +1413,16 @@ export class AgentController {
         }
         const activeStep = snapshot.steps.find((step) => step.status === "active") ?? null;
         if (!activeStep) {
+            if (this.recoverLegacyCompletedFlowStep(instance.flow_instance_id))
+                return this.continueFlowInternal(input);
             return this.flowContinuationResult(snapshot, "no_active_step", {
                 blockedReason: "no_active_step"
             });
         }
         const run = this.getRun(instance.run_id);
         const activeStepConfig = snapshot.flow.config.steps[activeStep.step_id];
+        if (activeStepConfig.execution === "coordinator")
+            return this.flowContinuationResult(snapshot, "waiting_for_orchestrator", { activeStep, notification: "coordinator_gate" });
         const activeStepBackend = activeStepConfig?.role
             ? snapshot.flow.config.roles?.[activeStepConfig.role]?.backend
             : null;
@@ -1240,7 +1543,7 @@ export class AgentController {
                     return this.flowContinuationResult(this.getFlowSnapshot(input.flowInstanceId), "blocked", {
                         activeStep: blockedStep,
                         agent,
-                        blockedReason: "terminal_agent_missing_flow_report"
+                        blockedReason: this.workerCapabilityFailure(agent) ? "worker_capability_unavailable" : "terminal_agent_missing_flow_report"
                     });
                 }
             }
@@ -1466,8 +1769,38 @@ export class AgentController {
             ? this.openOrchestratorActionRef(action.action_id) ?? undefined
             : undefined;
     }
+    workerCapabilityFailure(agent) {
+        const activity = this.readActivity(agent);
+        const prefix = "AGENT_CONTROL_BLOCKED:";
+        return activity?.kind === "message" && activity.text.startsWith(prefix)
+            ? activity.text.slice(prefix.length).trim() || "Required Agent Control tool was unavailable."
+            : null;
+    }
+    /** Backend completion is not a semantic report. Surface a missing handback
+     * from status polling too, so an event observer need not call flow_continue. */
+    reconcileTerminalStrictFlowWorker(agent) {
+        if (!TERMINAL_STATUSES.has(agent.status))
+            return;
+        for (const instance of this.store.listFlowInstances({ runId: agent.run_id })) {
+            if (!this.getFlowOrThrow(instance.flow_record_id).config.policy?.strict)
+                continue;
+            for (const step of this.store.listFlowStepInstances(instance.flow_instance_id)) {
+                if (step.status !== "active" || step.agent_id !== agent.agent_id)
+                    continue;
+                if (this.store.listFlowStepReports(instance.flow_instance_id).some(report => report.step_instance_id === step.step_instance_id))
+                    continue;
+                this.blockFlowStepForMissingReport(step, agent);
+            }
+        }
+    }
     blockFlowStepForMissingReport(step, agent) {
-        const summary = `Worker ${agent.agent_id} reached terminal status ${agent.status} without reporting the flow step result.`;
+        const current = this.getFlowStepInstanceOrThrow(step.step_instance_id);
+        if (current.status !== "active")
+            return current;
+        const capabilityFailure = this.workerCapabilityFailure(agent);
+        const summary = capabilityFailure
+            ? `Worker reported an unavailable Agent Control capability: ${capabilityFailure}`
+            : `Worker ${agent.agent_id} reached terminal status ${agent.status} without reporting the flow step result.`;
         const blocked = this.store.updateFlowStepInstance(step.step_instance_id, {
             status: "blocked",
             summary,
@@ -1485,7 +1818,9 @@ export class AgentController {
                 flow_instance_id: step.flow_instance_id,
                 step_instance_id: step.step_instance_id,
                 step_id: step.step_id,
-                reason: "terminal_agent_missing_flow_report",
+                reason: capabilityFailure ? "worker_capability_unavailable" : "terminal_agent_missing_flow_report",
+                summary,
+                ...(capabilityFailure ? { failure_source: "worker_reported", capability_failure: capabilityFailure } : {}),
                 agent_status: agent.status
             }
         });
@@ -1724,6 +2059,33 @@ export class AgentController {
         });
     }
     reportFlowStep(input) {
+        return this.store.immediateTransaction(() => {
+            const step = this.getFlowStepInstanceOrThrow(input.stepInstanceId);
+            const instance = this.getFlowInstanceOrThrow(step.flow_instance_id);
+            const flow = this.getFlowOrThrow(instance.flow_record_id);
+            if (flow.config.policy?.strict) {
+                const caller = this.flowCaller(input.agentToken, [step.agent_id, ...(flow.config.steps[step.step_id].execution === "coordinator" ? [instance.orchestrator_agent_id] : [])]);
+                if (!caller || (caller.agent_id !== step.agent_id && !(flow.config.steps[step.step_id].execution === "coordinator" && caller.agent_id === instance.orchestrator_agent_id)))
+                    this.flowRuntime.verifyCapability(step.step_instance_id, input.reportToken);
+                const state = this.flowRuntime.get(instance.flow_instance_id);
+                const decision = flow.config.steps[step.step_id].decision;
+                if (decision && !Object.is(state.decisions[decision.key]?.value, input.result?.decision))
+                    throw new ControllerError("Record the configured decision before reporting this gate.", "tool_error");
+                if (step.input_json.acceptance_revision !== state.acceptance_revision)
+                    throw new ControllerError("The acceptance changed after this step started; route the revised work before reporting.", "tool_error");
+                if (step.agent_id && this.getAgent(step.agent_id).unregistered_at)
+                    throw new ControllerError("The assigned flow owner is detached.", "tool_error");
+            }
+            const requestDigest = digest({ status: input.status, result: input.result ?? {}, artifacts: input.artifacts ?? {}, summary: input.summary ?? null });
+            const replay = this.flowRuntime.replay(input.stepInstanceId, requestDigest);
+            if (replay)
+                return { ...replay, replayed: true };
+            const response = this.reportFlowStepInTransaction(input);
+            this.flowRuntime.recordResponse(input.stepInstanceId, requestDigest, response);
+            return response;
+        });
+    }
+    reportFlowStepInTransaction(input) {
         const existingStep = this.getFlowStepInstanceOrThrow(input.stepInstanceId);
         if (existingStep.status !== "active") {
             throw new ControllerError("Flow step report requires an active step instance.", "tool_error", {
@@ -1736,6 +2098,10 @@ export class AgentController {
         const stepConfig = flow.config.steps[existingStep.step_id];
         const result = input.result ?? {};
         const artifacts = input.artifacts ?? {};
+        if (flow.config.policy?.strict && input.status === "completed") {
+            validateStepResult(stepConfig.report?.schema, result);
+            this.assertFlowRequirements(instance, stepConfig, { result, step: existingStep });
+        }
         this.store.createFlowStepReport({
             stepInstanceId: existingStep.step_instance_id,
             status: input.status,
@@ -1791,6 +2157,8 @@ export class AgentController {
             return this.advanceFlowAfterStep(flow.config, instance, completedStep, result);
         }
         catch (error) {
+            if (flow.config.policy?.strict)
+                throw error;
             const payload = errorToPayload(error);
             const blocked = this.finishFlowStep(existingStep, "blocked", result, {}, null, input.summary ?? null);
             this.store.updateFlowInstance(instance.flow_instance_id, {
@@ -2331,6 +2699,7 @@ export class AgentController {
                 });
             }
             if (TERMINAL_STATUSES.has(updated.status)) {
+                this.reconcileTerminalStrictFlowWorker(updated);
                 this.finalizeStoppingRunIfTerminal(updated.run_id, queueEvent);
             }
             const reconciled = preserveStopIntent
@@ -3400,7 +3769,7 @@ export class AgentController {
             }
             if (step.agent_id) {
                 const assigned = this.getAgent(step.agent_id);
-                if (assigned.run_id !== input.run.run_id || assigned.backend !== input.backend) {
+                if (assigned.unregistered_at || assigned.run_id !== input.run.run_id || assigned.backend !== input.backend) {
                     throw new ControllerError("Assigned flow worker does not match the active step backend or run.", "tool_error", {
                         step_instance_id: step.step_instance_id,
                         agent_id: assigned.agent_id,
@@ -3443,6 +3812,14 @@ export class AgentController {
                     });
                     agent = created;
                 }
+            }
+            else if (input.snapshot.flow.config.policy?.strict) {
+                const ownerId = this.flowRuntime.get(input.snapshot.instance.flow_instance_id)?.owners[role ?? step.step_id];
+                if (!ownerId)
+                    throw new ControllerError("The flow role has no pinned owner; explicit recovery is required.", "tool_error");
+                agent = this.getAgent(ownerId);
+                if (agent.unregistered_at || agent.backend !== input.backend || agent.run_id !== input.run.run_id)
+                    throw new ControllerError("The pinned role owner is unavailable; silent replacement is forbidden.", "tool_error");
             }
             else {
                 agent =
@@ -3556,7 +3933,7 @@ export class AgentController {
             if (!roleConfig?.backend) {
                 continue;
             }
-            const existing = this.findDeclaredFlowAgent(input.run.run_id, input.flowId, role, roleConfig.backend);
+            const existing = input.config.policy?.strict ? null : this.findDeclaredFlowAgent(input.run.run_id, input.flowId, role, roleConfig.backend);
             if (existing) {
                 roleAgents.set(role, existing);
                 continue;
@@ -3564,7 +3941,7 @@ export class AgentController {
             const planned = this.registerAgent({
                 runId: input.run.run_id,
                 backend: roleConfig.backend,
-                title: declaredFlowAgentTitle(input.flowId, role),
+                title: declaredFlowAgentTitle(input.config.policy?.strict ? `${input.flowId}/${input.instanceId}` : input.flowId, role),
                 role,
                 objective: input.run.title,
                 repoDir: input.run.repo_dir,
@@ -4636,6 +5013,7 @@ export class AgentController {
                     type: "agent.failed",
                     payload
                 }));
+                this.reconcileTerminalStrictFlowWorker(failed);
                 this.finalizeStoppingRunIfTerminal(failed.run_id, (event) => {
                     pendingEvents.push(this.store.createEvent(event));
                 });
@@ -4735,6 +5113,7 @@ export class AgentController {
             }
             const projectedTerminal = TERMINAL_STATUSES.has(updated.status);
             if (projectedTerminal) {
+                this.reconcileTerminalStrictFlowWorker(updated);
                 this.finalizeStoppingRunIfTerminal(updated.run_id, (event) => {
                     pendingEvents.push(this.store.createEvent(event));
                 });
@@ -5791,7 +6170,7 @@ export class AgentController {
             agents,
             agent_links: agentLinks,
             flows: [...flowRecordsById.values()],
-            flow_instances: flowInstances,
+            flow_instances: flowInstances.map(instance => ({ ...instance, runtime: this.flowRuntime.get(instance.flow_instance_id) })),
             flow_steps: flowSteps,
             flow_reports: flowReports,
             flow_transitions: flowTransitions,
@@ -5818,14 +6197,32 @@ export class AgentController {
                 step_id: stepId
             });
         }
+        if (!this.flowRuntime.get(instance.flow_instance_id))
+            this.flowRuntime.initialize(instance.flow_instance_id, config);
+        if (activation.coordinatorContext?.trim()) {
+            if (config.policy?.strict) {
+                const state = this.flowRuntime.get(instance.flow_instance_id);
+                state.correction = { from_step_id: instance.current_step_id, summary: activation.coordinatorContext.trim(), manual: true };
+                state.revision += 1;
+                this.flowRuntime.save(instance.flow_instance_id, state);
+            }
+            else
+                this.flowRuntime.changeContext(instance.flow_instance_id, activation.coordinatorContext.trim(), instance.orchestrator_agent_id);
+        }
+        const runtimeState = this.flowRuntime.get(instance.flow_instance_id);
+        this.assertFlowRequirements(instance, stepConfig);
         const bindings = this.store.listFlowArtifactBindings(instance.flow_instance_id);
         const inputArtifacts = resolveInputArtifacts(stepConfig.inputs, bindings);
+        if (config.policy?.strict)
+            for (const ref of Object.values(stepConfig.inputs ?? {}))
+                if (bindings.some(binding => binding.artifact_key === ref.artifact))
+                    this.boundFlowArtifactDigest(instance, ref.artifact);
         const promptSources = resolveStepPromptSources(config, stepId);
         const stepInstanceId = newId("flowstep");
         const run = this.getRun(instance.run_id);
         const describedInputs = this.describeStepInputArtifacts(config, stepConfig, inputArtifacts);
         const outputArtifacts = this.resolveStepOutputArtifacts(config, instance, stepConfig);
-        const coordinatorContext = activation.coordinatorContext?.trim() || null;
+        const coordinatorContext = runtimeState.context;
         const runtimeContract = this.buildFlowStepRuntimeContract({
             flowId: config.id,
             stepId,
@@ -5838,6 +6235,7 @@ export class AgentController {
             outputArtifacts
         });
         const reportingContract = this.buildFlowStepReportingContract({
+            strict: Boolean(config.policy?.strict),
             stepId,
             stepInstanceId,
             stepConfig,
@@ -5845,6 +6243,9 @@ export class AgentController {
         });
         const inputJson = {
             ...inputArtifacts,
+            acceptance_revision: runtimeState.acceptance_revision,
+            config_digest: runtimeState.config_digest,
+            correction: runtimeState.correction,
             runtime_contract: runtimeContract,
             input_artifacts: describedInputs,
             output_artifacts: outputArtifacts,
@@ -5890,9 +6291,11 @@ export class AgentController {
             return blocked;
         }
         this.store.updateFlowInstance(instance.flow_instance_id, {
-            status: "active",
+            status: stepConfig.execution === "coordinator" ? "waiting_for_orchestrator" : "active",
             currentStepId: stepId
         });
+        if (stepConfig.execution === "coordinator")
+            emitEvent({ runId: instance.run_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, step_instance_id: step.step_instance_id, step_id: stepId, reason: "coordinator_gate", decision: stepConfig.decision ?? null } });
         emitEvent({
             runId: instance.run_id,
             agentId: stepConfig.agent_id,
@@ -5929,11 +6332,15 @@ export class AgentController {
         const input = step.input_json;
         const sections = [];
         const promptSources = Array.isArray(input.prompt_sources) ? input.prompt_sources : [];
+        const currentFlow = this.getFlowOrThrow(this.getFlowInstanceOrThrow(step.flow_instance_id).flow_record_id);
+        const priorOwnedStep = currentFlow.config.policy?.strict && step.agent_id ? this.store.listFlowStepInstances(step.flow_instance_id).find(prior => prior.step_instance_id !== step.step_instance_id && prior.agent_id === step.agent_id && prior.status === "completed" && prior.input_json.config_digest === step.input_json.config_digest) : null;
         for (const source of promptSources) {
             if (!source || typeof source !== "object") {
                 continue;
             }
             const record = source;
+            if (priorOwnedStep && record.scope === "role")
+                continue;
             const label = [record.scope, record.owner_id, record.prompt_ref].filter(Boolean).join(":");
             if (typeof record.text === "string") {
                 sections.push(section(`Prompt ${label || sections.length + 1}`, record.text));
@@ -5962,7 +6369,7 @@ export class AgentController {
             "Use the generated runtime and reporting contracts as the source of truth.",
             "Write the required artifact paths before reporting.",
             "Keep any in-process status terse.",
-            "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
+            currentFlow.config.policy?.strict ? "Use only the assigned Agent Control MCP tools for evidence and reporting." : "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
         ];
         const runtimeContractRecord = input.runtime_contract && typeof input.runtime_contract === "object" && !Array.isArray(input.runtime_contract)
             ? input.runtime_contract
@@ -5972,6 +6379,17 @@ export class AgentController {
             backendConstraints.push("Do not call native collaboration/subagent tools and do not spawn sibling agents.", "Perform only this assigned step, write its required artifacts, call `flow_step_report`, and then end.");
         }
         sections.push(section("Backend Constraints", backendConstraints.join("\n")));
+        const instance = this.getFlowInstanceOrThrow(step.flow_instance_id);
+        const config = this.getFlowOrThrow(instance.flow_record_id).config;
+        if (config.policy?.strict)
+            sections.push(section("Report identity", "Report from this assigned Codex thread. Agent Control derives the worker identity from the local tool process. Never copy credentials into prompts, artifacts or reports. " + STRICT_FLOW_CAPABILITY_FAILURE));
+        if (input.correction)
+            sections.push(section("Transition cause", JSON.stringify(input.correction)));
+        const state = this.flowRuntime.get(step.flow_instance_id);
+        if (state?.recovery?.agent_id === step.agent_id && state.recovery.full_review_required)
+            sections.push(section("Explicit owner recovery", "You are the new owner after a visible recovery. Perform a full review with a fresh checkpoint and no prior-owner source receipts. Do not inherit or carry earlier approval merely because the role name is unchanged."));
+        if (state && Object.keys(state.evidence).length)
+            sections.push(section("Evidence references", JSON.stringify({ evidence: state.evidence, summaries: state.evidence_summaries })));
         return sections.join("\n\n");
     }
     resolveStepOutputArtifacts(config, instance, stepConfig) {
@@ -5989,7 +6407,8 @@ export class AgentController {
         return outputArtifacts;
     }
     buildFlowStepRuntimeContract(input) {
-        const objective = buildEffectiveFlowObjective(input.run.title, input.coordinatorContext);
+        const strict = this.getFlowOrThrow(input.instance.flow_record_id).config.policy?.strict;
+        const objective = strict ? input.coordinatorContext ?? input.run.title : buildEffectiveFlowObjective(input.run.title, input.coordinatorContext);
         const objectiveSource = input.coordinatorContext ? "coordinator_context_over_run_title" : "run_title";
         return {
             flow_id: input.flowId,
@@ -5999,6 +6418,8 @@ export class AgentController {
             objective,
             objective_source: objectiveSource,
             coordinator_context: input.coordinatorContext,
+            evidence: this.flowRuntime.get(input.instance.flow_instance_id)?.evidence ?? {},
+            evidence_summaries: this.flowRuntime.get(input.instance.flow_instance_id)?.evidence_summaries ?? {},
             run: {
                 run_id: input.run.run_id,
                 title: input.run.title,
@@ -6012,13 +6433,15 @@ export class AgentController {
             },
             input_artifacts: input.inputArtifacts,
             output_artifacts: input.outputArtifacts,
+            ...(strict ? { capability_failure_contract: { handback_prefix: "AGENT_CONTROL_BLOCKED:", behavior: STRICT_FLOW_CAPABILITY_FAILURE } } : {}),
             instructions: [
                 input.coordinatorContext
                     ? "Use `objective` as the source of truth. Its coordinator context supersedes the original run title wherever it adds, clarifies, or conflicts."
                     : "Use `objective` and the repository directory from this runtime contract as the source of truth.",
                 "Read only the input artifacts that are present and relevant to this step.",
                 "Write every required output artifact to its assigned path before reporting.",
-                "Do not invent artifact paths, filenames, or additional handoff files unless the task itself requires separate repo changes."
+                "Do not invent artifact paths, filenames, or additional handoff files unless the task itself requires separate repo changes.",
+                ...(strict ? [STRICT_FLOW_CAPABILITY_FAILURE] : [])
             ],
             markdown: buildFlowRuntimeMarkdown({
                 flowId: input.flowId,
@@ -6033,7 +6456,7 @@ export class AgentController {
                 objectiveSource,
                 inputArtifacts: input.inputArtifacts,
                 outputArtifacts: input.outputArtifacts
-            })
+            }) + (strict ? `\n\n### Required tool capability\n\n${STRICT_FLOW_CAPABILITY_FAILURE}` : "")
         };
     }
     buildFlowStepReportingContract(input) {
@@ -6048,7 +6471,7 @@ export class AgentController {
             artifacts: artifactExample,
             summary: `Compact ${input.stepId} result.`
         };
-        const cliCommand = buildFlowReportCliCommand(input.stepInstanceId, resultExample, artifactExample, mcpInput.summary);
+        const cliCommand = input.strict ? undefined : buildFlowReportCliCommand(input.stepInstanceId, resultExample, artifactExample, mcpInput.summary);
         return {
             step_id: input.stepId,
             step_instance_id: input.stepInstanceId,
@@ -6057,17 +6480,15 @@ export class AgentController {
                 name: toolName,
                 input: mcpInput
             },
-            cli: {
-                command: cliCommand
-            },
+            ...(cliCommand ? { cli: { command: cliCommand } } : {}),
             result_schema: resultSchema,
             result_example: resultExample,
             artifact_example: artifactExample,
             instructions: [
                 `Use the Agent Control MCP tool \`${toolName}\` when it is available.`,
-                "If MCP tools are not available, use the CLI command shown below.",
+                input.strict ? STRICT_FLOW_CAPABILITY_FAILURE : "If MCP tools are not available, use the CLI command shown below.",
                 "Report only fields allowed by the result schema. Do not invent result labels.",
-                "Use status `completed` when the required artifact was written, even if the structured conclusion represents a blocker.",
+                input.strict ? "Use status `completed` only for valid step work with the required evidence and artifacts. A required-tool capability failure is a blocked handback, never a semantic completion." : "Use status `completed` when the required artifact was written, even if the structured conclusion represents a blocker.",
                 "Use a non-completed status only when you could not write the required artifact or could not produce a valid report."
             ],
             markdown: buildFlowReportingMarkdown({
@@ -6082,6 +6503,8 @@ export class AgentController {
     advanceFlowAfterStep(config, instance, step, result) {
         const action = resolveStepEventAction(config.steps[step.step_id], step.status);
         if (!action) {
+            if (config.policy?.strict)
+                throw new ControllerError("Strict flows require an explicit terminal transition and verified guards.", "tool_error");
             this.store.updateFlowInstance(instance.flow_instance_id, {
                 status: "completed",
                 currentStepId: null
@@ -6104,6 +6527,7 @@ export class AgentController {
             };
         }
         const context = {
+            ...this.flowConditionContext(instance),
             status: step.status,
             result,
             step: {
@@ -6113,6 +6537,15 @@ export class AgentController {
         };
         const selected = action.transitions ? selectTransition(action, context) : null;
         const selectedAction = selected ?? action;
+        if (action.transitions && !selected && config.policy?.strict)
+            throw new ControllerError("No declared transition matches this report.", "tool_error");
+        this.assertFlowRequirements(instance, selectedAction, context);
+        const runtimeState = this.flowRuntime.get(instance.flow_instance_id);
+        if (selectedAction.set)
+            Object.assign(runtimeState.state, selectedAction.set);
+        runtimeState.revision += 1;
+        runtimeState.correction = { from_step_id: step.step_id, from_step_instance_id: step.step_instance_id, status: step.status, result, summary: step.summary, artifacts: step.output_json, transition_id: selected?.id ?? null };
+        this.flowRuntime.save(instance.flow_instance_id, runtimeState);
         const transitionId = selected?.id ?? (selectedAction.to ? `${step.step_id}-to-${selectedAction.to}` : "notify");
         let transitionRecord = null;
         if (selectedAction.to) {
@@ -6256,7 +6689,7 @@ export class AgentController {
                     runDir: runRuntimeDir(instance.run_id)
                 })
                 : undefined;
-            const path = reportedArtifacts[outputName] ?? reportedArtifacts[ref.artifact] ?? configuredPath;
+            let path = reportedArtifacts[outputName] ?? reportedArtifacts[ref.artifact] ?? configuredPath;
             if (!path) {
                 if (ref.required) {
                     throw new ControllerError("Flow step report is missing a required output artifact path.", "missing_artifact", {
@@ -6275,11 +6708,31 @@ export class AgentController {
                     path
                 });
             }
+            if (config.policy?.strict && existsSync(path)) {
+                const priorBinding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(binding => binding.artifact_key === ref.artifact);
+                if ((configuredPath && resolve(path) !== resolve(configuredPath)) || (priorBinding && resolve(path) !== resolve(priorBinding.path)))
+                    throw new ControllerError("A strict artifact must keep its configured canonical path across revisions.", "tool_error");
+                if (!statSync(path).isFile())
+                    throw new ControllerError("Flow artifacts must be regular files.", "missing_artifact");
+                const content = readFileSync(path);
+                const contentDigest = artifactDigest(path);
+                const directory = join(runRuntimeDir(instance.run_id), "flow-artifacts", instance.flow_instance_id, digest(ref.artifact));
+                mkdirSync(directory, { recursive: true });
+                const immutablePath = join(directory, `${contentDigest}${extname(path)}`);
+                if (!existsSync(immutablePath))
+                    writeFileSync(immutablePath, content, { flag: "wx", mode: 0o444 });
+                if (artifactDigest(immutablePath) !== contentDigest)
+                    throw new ControllerError("The immutable artifact store contains conflicting content.", "tool_error");
+                const state = this.flowRuntime.get(instance.flow_instance_id);
+                state.artifacts ??= {};
+                state.artifacts[ref.artifact] = { path, sha256: contentDigest, snapshot_path: immutablePath, produced_by_step_instance_id: step.step_instance_id };
+                this.flowRuntime.save(instance.flow_instance_id, state);
+            }
             const artifact = this.store.createArtifact({
                 runId: instance.run_id,
                 agentId: step.agent_id,
                 label: ref.artifact,
-                path,
+                path: this.flowRuntime.get(instance.flow_instance_id)?.artifacts?.[ref.artifact]?.snapshot_path ?? path,
                 expected: false
             });
             this.store.upsertFlowArtifactBinding({
@@ -6362,6 +6815,8 @@ export class AgentController {
             if ((flow.version ?? null) !== (config.version ?? null)) {
                 continue;
             }
+            if ((config.policy?.strict || flow.config.policy?.strict) && digest(flow.config) !== digest(config))
+                throw new ControllerError("The active flow is pinned to different configuration or prompt bytes; explicit migration is required.", "tool_error");
             return { flow, instance };
         }
         return null;
@@ -7517,11 +7972,12 @@ function agentctlExecutable() {
     const bundled = resolve(packageRoot, "bin/agentctl");
     return existsSync(bundled) ? bundled : "agentctl";
 }
+const STRICT_FLOW_CAPABILITY_FAILURE = "If a required Agent Control tool is unavailable, requires approval, is denied by host policy, or returns auth_required, stop this step immediately. Do not retry repeatedly, switch to CLI or shell reporting, write controller files or the database, search for step IDs or credentials, change tool approval settings, or claim completion. Return exactly one concise final line: AGENT_CONTROL_BLOCKED: <tool name> | <brief observed reason>. Report the observed limitation without guessing whether the host or controller caused it; the coordinator will handle recovery.";
 function buildFlowReportingMarkdown(input) {
     return [
         "## Agent Control Reporting Contract",
         "",
-        `When this step is complete, report the result through Agent Control. Prefer the MCP tool \`${input.toolName}\` when available. If MCP tools are unavailable, use the CLI command shown below exactly as rendered.`,
+        `When this step is complete, report the result through Agent Control using the MCP tool \`${input.toolName}\`. ${input.cliCommand ? "If MCP tools are unavailable, use the CLI command shown below exactly as rendered." : STRICT_FLOW_CAPABILITY_FAILURE}`,
         "",
         "Do not invent routing labels. The allowed structured result is defined by this schema:",
         "",
@@ -7541,13 +7997,8 @@ function buildFlowReportingMarkdown(input) {
         JSON.stringify(input.mcpInput, null, 2),
         "```",
         "",
-        "CLI fallback example:",
-        "",
-        "```bash",
-        input.cliCommand,
-        "```",
-        "",
-        "Use `status: \"completed\"` when the required artifact was written, including conclusions that route to blockers or corrections. Use a non-completed status only when you could not write the required artifact or could not produce a valid report.",
+        ...(input.cliCommand ? ["CLI fallback example:", "", "```bash", input.cliCommand, "```", ""] : []),
+        input.cliCommand ? "Use `status: \"completed\"` when the required artifact was written, including conclusions that route to blockers or corrections. Use a non-completed status only when you could not write the required artifact or could not produce a valid report." : "Use `status: \"completed\"` only for valid step work with required evidence and artifacts. A required-tool capability failure is a blocked handback, never a semantic completion.",
         "After reporting, stop. Agent Control may dispatch the next configured step automatically; do not manually route or start another worker from inside this step."
     ].join("\n");
 }

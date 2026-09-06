@@ -1,3 +1,4 @@
+import { initializeObserverCursorSchema } from "./observer-cursors.js";
 /** Keep observation order independent of timestamps and SQLite's mutable rowids. */
 export function initializeObservationSchema(db) {
     db.transaction(() => {
@@ -47,5 +48,6 @@ export function initializeObservationSchema(db) {
         if (!exists) {
             db.exec("insert or ignore into event_order(event_id) select event_id from events order by created_at, rowid");
         }
+        initializeObserverCursorSchema(db);
     }).immediate();
 }

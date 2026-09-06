@@ -1,4 +1,6 @@
 import { conversationWaitContract } from "./conversation-wait.js";
+import { compactFlowEvent } from "./flow-event-summary.js";
+import { ObserverCursors } from "../storage/observer-cursors.js";
 import { ControllerError } from "./errors.js";
 import { resolveAdminKey, verifyAdminKey } from "./identity.js";
 import { EVENT_TYPES } from "./types.js";
@@ -22,10 +24,12 @@ export class RunObservation {
     store;
     controller;
     adapters;
+    cursors;
     constructor(store, controller, adapters) {
         this.store = store;
         this.controller = controller;
         this.adapters = adapters;
+        this.cursors = new ObserverCursors(store.db);
     }
     /** The first requester remains stable when a worker launches nested work. */
     requesterThread(runId, visited = new Set()) {
@@ -146,21 +150,50 @@ export class RunObservation {
                 const sub = this.store.createSubscription({ runId: run.run_id, subscriberAgentId: agent.agent_id, eventType });
                 this.store.db.prepare("insert into observer_subscriptions values (?, ?)").run(sub.subscription_id, agent.agent_id);
             }
-            const cursor = encodeCursor(run.run_id, start);
+            const state = this.cursors.state(agent.agent_id, start);
+            const cursor = this.cursors.encode(run.run_id, agent.agent_id, state.processed_sequence, state);
             return { run_id: run.run_id, observer_agent_id: agent.agent_id, thread_id: threadId, event_types: events,
-                delivery, cursor, reused: Boolean(previous), wait_contract: conversationWaitContract(run.run_id, agent.agent_id, cursor) };
+                delivery, cursor, processed_cursor: cursor,
+                delivered_cursor: this.cursors.encode(run.run_id, agent.agent_id, state.delivered_sequence, state),
+                reused: Boolean(previous), wait_contract: conversationWaitContract(run.run_id, agent.agent_id) };
+        });
+    }
+    acknowledge(input) {
+        return this.store.immediateTransaction(() => {
+            const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
+                .get(input.observerAgentId, input.runId);
+            const agent = this.store.getAgent(input.observerAgentId);
+            if (!observer || !agent || agent.unregistered_at)
+                throw new ControllerError("The observing participant is not attached to this run.", "tool_error");
+            const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
+            const authorized = caller
+                ? this.controller.canAgentAccessRun(caller, input.runId) && (caller.agent_id === agent.agent_id || this.observationOwners(agent, input.runId).includes(caller.agent_id))
+                : input.adminKey ? verifyAdminKey(input.adminKey)
+                    // The local MCP/CLI host supplies this identity; explicit credentials never fall back to it.
+                    : process.env.CODEX_THREAD_ID === observer.thread_id;
+            if (!authorized)
+                throw new ControllerError("Acknowledgement requires the observing identity or an authorized administrator.", "auth_required");
+            const state = this.cursors.state(agent.agent_id, observer.start_sequence);
+            const sequence = this.cursors.decode(input.cursor, input.runId, agent.agent_id, state);
+            if (sequence < observer.start_sequence)
+                throw new ControllerError("Observation cursor precedes this subscription.", "tool_error");
+            const advanced = this.cursors.acknowledge(agent.agent_id, sequence, state);
+            const cursor = this.cursors.encode(input.runId, agent.agent_id, Math.max(sequence, state.processed_sequence), state);
+            return { run_id: input.runId, observer_agent_id: agent.agent_id, cursor, processed_cursor: cursor, advanced,
+                wait_contract: conversationWaitContract(input.runId, agent.agent_id) };
         });
     }
     async wait(input) {
-        const sequence = decodeCursor(input.cursor, input.runId);
+        let sequence;
+        let requestedCursor = input.cursor ?? "";
         if (input.timeoutMs !== undefined && (!Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0)) {
             throw new ControllerError("Observation timeout must be a positive duration.", "tool_error");
         }
         const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 20)));
         const started = Date.now();
         const empty = (timedOut, closed) => ({ run_id: input.runId, observer_agent_id: input.observerAgentId,
-            events: [], cursor: input.cursor, timed_out: timedOut, closed,
-            wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId, input.cursor) });
+            events: [], cursor: requestedCursor, timed_out: timedOut, closed,
+            wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId) });
         while (true) {
             input.signal?.throwIfAborted();
             const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
@@ -169,6 +202,11 @@ export class RunObservation {
             const agent = this.store.getAgent(input.observerAgentId);
             if (!observer || !run || !agent || agent.unregistered_at)
                 return empty(false, true);
+            const state = this.cursors.state(agent.agent_id, observer.start_sequence);
+            if (sequence === undefined) {
+                requestedCursor = input.cursor ?? this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state);
+                sequence = this.cursors.decode(requestedCursor, input.runId, agent.agent_id, state, true);
+            }
             if (sequence < observer.start_sequence || sequence > this.currentSequence()) {
                 throw new ControllerError("Observation cursor is outside this subscription's history.", "tool_error");
             }
@@ -180,12 +218,17 @@ export class RunObservation {
         where e.run_id = ? and o.sequence > ? and ${MATCHING_OBSERVER_SUBSCRIPTION}
         order by o.sequence limit ?`).all(input.runId, sequence, agent.agent_id, JSON.stringify(owners), owners.length ? 1 : 0, limit);
             if (rows.length) {
-                const cursor = encodeCursor(input.runId, Number(rows.at(-1).sequence));
+                const deliveredSequence = Number(rows.at(-1).sequence);
+                this.cursors.delivered(agent.agent_id, sequence, deliveredSequence);
+                const cursor = this.cursors.encode(input.runId, agent.agent_id, deliveredSequence, state);
                 return { run_id: input.runId, observer_agent_id: input.observerAgentId,
                     events: rows.map((row) => publicEvent({ event_id: String(row.event_id), run_id: input.runId,
                         agent_id: row.agent_id === null ? null : String(row.agent_id), type: String(row.type),
                         created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) }, owners, this.notificationStatus(agent.agent_id, String(row.event_id)))),
-                    cursor, timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId, cursor) };
+                    cursor, processed_cursor: this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state),
+                    ack_contract: { tool: "run_ack", arguments: { run_id: input.runId, observer_agent_id: agent.agent_id, cursor },
+                        instruction: "After successfully handling all events through this cursor, acknowledge them explicitly. Fetching or receiving a notification does not acknowledge processing." },
+                    timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId) };
             }
             if (run.status === "stopped")
                 return empty(false, true);
@@ -254,18 +297,6 @@ export class RunObservation {
         return row?.seq ?? 0;
     }
 }
-function encodeCursor(runId, sequence) {
-    return Buffer.from(JSON.stringify([1, runId, sequence])).toString("base64url");
-}
-function decodeCursor(cursor, runId) {
-    try {
-        const [version, run, sequence] = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-        if (version === 1 && run === runId && Number.isSafeInteger(sequence) && sequence >= 0)
-            return sequence;
-    }
-    catch { /* Reject malformed and cross-run cursors uniformly. */ }
-    throw new ControllerError("Invalid observation cursor for this run.", "tool_error");
-}
 function publicEvent(event, owners = [], notificationStatus) {
     const action = event.payload.orchestrator_action;
     const ownerAction = typeof action?.orchestrator_agent_id === "string" && owners.includes(action.orchestrator_agent_id)
@@ -274,6 +305,7 @@ function publicEvent(event, owners = [], notificationStatus) {
     const phase = typeof event.payload.step_id === "string" ? event.payload.step_id : typeof event.payload.target_step_id === "string" ? event.payload.target_step_id : undefined;
     const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
     return { event_id: event.event_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
+        ...compactFlowEvent(event),
         summary: `${event.type.replace(/[._]/g, " ")}${phase ? `: ${phase}` : ""}`,
         ...(flow ? { flow_instance_id: flow } : {}), ...(phase ? { step_id: phase } : {}),
         ...(ownerAction ? { orchestrator_action: ownerAction } : {}), ...(notificationStatus ? { notification_status: notificationStatus } : {}) };

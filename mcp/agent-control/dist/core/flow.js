@@ -17,6 +17,7 @@ const artifactReferenceSchema = z.object({
     required: z.boolean().optional()
 });
 const resultPropertySchema = z.object({
+    type: z.enum(["string", "number", "boolean", "object", "array", "null"]).optional(),
     enum: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional()
 });
 const resultSchema = z.object({
@@ -54,7 +55,11 @@ const conditionSchema = z.lazy(() => z.union([
         any: z.array(conditionSchema).min(1)
     })
 ]));
+const evidenceRequirementSchema = z.object({ receipt: z.string().min(1), kind: z.string().optional(), require_current: z.boolean().optional(), require_approved: z.boolean().optional(), owner_role: z.string().optional(), validation_mode: z.enum(["focused", "complete_gate"]).optional() });
 const actionShape = {
+    requires: conditionSchema.optional(),
+    requires_evidence: z.array(evidenceRequirementSchema).optional(),
+    set: z.record(z.unknown()).optional(),
     notify: z.string().min(1).optional(),
     to: z.string().min(1).optional(),
     finish: z.boolean().optional()
@@ -70,6 +75,13 @@ const transitionSchema = z.lazy(() => z.object({
     transitions: z.array(transitionSchema).optional()
 }));
 const stepSchema = z.object({
+    execution: z.enum(["worker", "coordinator"]).optional(),
+    sandbox: z.enum(["read_only", "workspace"]).optional(),
+    evidence_operations: z.array(z.string().min(1)).optional(),
+    evidence_gates: z.array(z.enum(["planner", "expert"])).optional(),
+    decision: z.object({ key: z.string().min(1), artifact_key: z.string().min(1).optional(), authority: z.enum(["user", "coordinator"]).optional(), owner: z.enum(["requester", "orchestrator"]).optional() }).optional(),
+    requires: conditionSchema.optional(),
+    requires_evidence: z.array(evidenceRequirementSchema).optional(),
     role: z.string().min(1).optional(),
     agent_id: z.string().min(1).optional(),
     prompt: z.string().min(1).optional(),
@@ -109,6 +121,9 @@ export const flowConfigSchema = z.object({
     version: z.string().min(1).optional(),
     description: z.string().min(1).optional(),
     initial_step: z.string().min(1),
+    policy: z.object({ strict: z.boolean().optional(), plan_artifact: z.string().optional() }).optional(),
+    preferences: z.record(z.object({ values: z.array(z.string()).min(1), artifact_key: z.string().optional(), owner: z.enum(["requester", "orchestrator"]).optional() })).optional(),
+    state: z.record(z.unknown()).optional(),
     prompts: z.record(promptSourceSchema).optional(),
     artifacts: z
         .record(z.object({
@@ -278,9 +293,13 @@ export function validateStepResult(schema, result) {
         }
     }
     for (const [key, property] of Object.entries(schema.properties ?? {})) {
-        if (!(key in result) || !property.enum) {
+        if (!(key in result))
             continue;
-        }
+        const value = result[key];
+        if (property.type && (property.type === "array" ? !Array.isArray(value) : property.type === "null" ? value !== null : property.type === "object" ? !value || typeof value !== "object" || Array.isArray(value) : typeof value !== property.type))
+            throw new ControllerError("Flow result field has the wrong type.", "tool_error", { field: key, expected_type: property.type });
+        if (!property.enum)
+            continue;
         if (!property.enum.some((candidate) => Object.is(candidate, result[key]))) {
             throw new ControllerError("Flow step report result field is outside the configured enum.", "tool_error", {
                 field: key,

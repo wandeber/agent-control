@@ -1,3 +1,4 @@
+import { evidenceRequestSchema } from "../core/evidence/service.js";
 import { z } from "zod";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
@@ -17,7 +18,7 @@ export const workerLaunchSchema = z.object({
     admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
 }).refine(v => Boolean(v.prompt) !== Boolean(v.prompt_file), "Provide exactly one of prompt or prompt_file.");
 export const flowLaunchSchema = z.object({
-    ...requesterFields, title: z.string().min(1), config: z.record(z.unknown()).optional(), flow_id: z.string().min(1).optional(),
+    ...requesterFields, title: z.string().min(1), acceptance_context: z.string().min(1).optional(), config: z.record(z.unknown()).optional(), flow_id: z.string().min(1).optional(),
     repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), server: z.string().min(1).optional(),
     admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional(),
     owner_task_identity: z.string().min(1).optional(), owner_task_path: z.string().min(1).optional()
@@ -28,7 +29,7 @@ export const runObserveSchema = z.object({
     admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
 });
 export const runWaitSchema = z.object({
-    run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1),
+    run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1).optional(),
     timeout_ms: z.number().int().positive().optional(), limit: z.number().int().positive().max(100).optional()
 });
 export const emptySchema = z.object({});
@@ -180,6 +181,7 @@ export const orchestratorLoginSchema = z.object({
     admin_key: z.string().min(1),
     title: z.string().min(1),
     run_title: z.string().min(1).optional(),
+    acceptance_context: z.string().min(1).optional(),
     repo_dir: z.string().min(1).optional(),
     run_id: z.string().min(1).optional(),
     backend: z.string().min(1).optional(),
@@ -225,6 +227,7 @@ export const flowCatalogGetSchema = z.object({
     flow_id: z.string().min(1)
 });
 export const flowStartSchema = z.object({
+    acceptance_context: z.string().min(1).optional(),
     ...requesterFields,
     config: z.record(z.unknown()),
     run_id: z.string().min(1).optional(),
@@ -253,6 +256,8 @@ export const flowContinueSchema = z.object({
     bridge_token: z.string().min(1).optional()
 });
 export const flowStepStartSchema = z.object({
+    agent_token: z.string().min(1).optional(),
+    admin_key: z.string().min(1).optional(),
     flow_instance_id: z.string().min(1),
     step_id: z.string().min(1),
     from_step_instance_id: z.string().min(1).optional(),
@@ -260,6 +265,7 @@ export const flowStepStartSchema = z.object({
     reason: z.string().min(1).optional()
 });
 export const flowStepReportSchema = z.object({
+    agent_token: z.string().min(1).optional(),
     step_instance_id: z.string().min(1),
     status: z.enum(FLOW_STEP_INSTANCE_STATUSES),
     result: z.record(z.unknown()).optional(),
@@ -301,3 +307,9 @@ export const agentExternalSyncSchema = z.object({
     confirmed_absent: z.boolean().optional()
 });
 export const agentStatusEnum = z.enum(AGENT_STATUSES);
+const flowCoordinatorFields = { flow_instance_id: z.string().min(1), agent_token: z.string().min(1).optional(), admin_key: z.string().min(1).optional() };
+export const flowContextUpdateSchema = z.object({ ...flowCoordinatorFields, context: z.string().min(1), expected_revision: z.number().int().nonnegative() });
+export const flowDecisionSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), value: z.unknown(), reason: z.string().min(1), expected_revision: z.number().int().nonnegative(), artifact_key: z.string().optional(), artifact_digest: z.string().regex(/^[a-f0-9]{64}$/).optional() });
+export const flowEvidenceSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), request: evidenceRequestSchema, step_instance_id: z.string().optional() });
+export const runAckSchema = z.object({ run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1), agent_token: z.string().optional(), admin_key: z.string().optional() });
+export const flowOwnerRecoverSchema = z.object({ ...flowCoordinatorFields, role: z.string().min(1), restart_step_id: z.string().min(1), reason: z.string().min(1), expected_revision: z.number().int().nonnegative() });
