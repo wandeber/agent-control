@@ -101,6 +101,49 @@ After a Git marketplace refresh or a local plugin version/cachebuster change,
 rerun `codex plugin add agent-control@agent-control` and start a new Codex task
 so the updated MCP server and skills are loaded together.
 
+## Development Flow Evidence
+
+The bundled `development-flow-v1` version 1.2.0 records the current accepted
+contract before dispatch, preserves Context and Analysis with the same analyst,
+checks intent with the clarification owner, and requires approval of the exact
+plan after the analyst's review. Integration is conditional; mechanical
+validation, the planner's first result approval, optional user testing, expert
+review, and verified closure have separate transition requirements.
+
+Use `flow_launch` with `acceptance_context` (CLI: `flow launch
+--acceptance-context`) to initialize the complete accepted contract atomically.
+`flow_context_update` replaces that contract while retaining prior revisions.
+`flow_decision` records decisions against the current revision and, where
+configured, the exact artifact digest. Workers cannot advance a guarded phase
+with an unsupported approval claim.
+
+`flow_evidence` prepares immutable checkpoints, computes review scope, composes
+eligible prior reviews, projects approved plan sections, executes affected
+checks, and verifies closure. The packaged HDT provider is pinned by version and
+hash; verify it with `node scripts/sync-hdt-evidence.mjs --check`. Agent Settings
+owns its canonical review contracts. Agent Control owns run storage, authenticated
+roles, command execution, and transition enforcement. Do not wrap this flow in
+a second HDT review cycle.
+
+Independent checks can run concurrently when their declared dependencies and
+resources allow it; the batch joins all required results. Reuse verifies actual
+execution receipts and their origins. Selective reuse additionally needs an
+enforced input boundary; unsupported or changed identities conservatively miss
+the cache. This does not claim generic reuse across worktrees or native parallel
+flow branches. See [the evidence contract](mcp/agent-control/src/core/evidence/README.md).
+
+Requester event delivery and processing are distinct. After handling a complete
+`run_wait` batch, call its returned `run_ack` contract. A subsequent wait without
+an explicit cursor resumes from acknowledged progress. Fetching events never
+acknowledges them. Keep the conversational turn open and reattach the long wait
+after answering the user while required flow work remains active.
+
+Older runs remain inspectable without acquiring strict approval retrospectively.
+Use the new configuration for new runs; recover existing owners explicitly when
+continuity is unavailable. Phase details show retained and reopened review scope,
+executed and reused checks, and pending decisions without adding counters to
+agent cards.
+
 ## Identity
 
 Root orchestrators authenticate with the local Agent Control admin key and

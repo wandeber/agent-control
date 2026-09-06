@@ -1,4 +1,5 @@
 import { conversationWaitContract } from "./conversation-wait.js";
+import { compactFlowEvent } from "./flow-event-summary.js";
 import type { AgentController } from "./controller.js";
 import type { SqliteStore } from "../storage/sqlite-store.js";
 import { ObserverCursors } from "../storage/observer-cursors.js";
@@ -337,6 +338,7 @@ function publicEvent(event: EventRecord, owners: string[] = [], notificationStat
   const phase = typeof event.payload.step_id === "string" ? event.payload.step_id : typeof event.payload.target_step_id === "string" ? event.payload.target_step_id : undefined;
   const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
   return { event_id: event.event_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
+    ...compactFlowEvent(event),
     summary: `${event.type.replace(/[._]/g, " ")}${phase ? `: ${phase}` : ""}`,
     ...(flow ? { flow_instance_id: flow } : {}), ...(phase ? { step_id: phase } : {}),
     ...(ownerAction ? { orchestrator_action: ownerAction } : {}), ...(notificationStatus ? { notification_status: notificationStatus } : {}) };
