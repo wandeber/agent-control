@@ -752,8 +752,14 @@ export class AgentController {
     const recovery = this.flowRuntime.get(instance.flow_instance_id)?.recovery;
     if (recovery?.full_review_required && recovery.agent_id === actorId) {
       if ((input.request.operation === "prepare_result" || input.request.operation === "prepare_plan") && input.request.previous) throw new ControllerError("A replacement review owner must start a full checkpoint without inheriting another owner's evidence.", "tool_error");
-      if ((input.request.operation === "record_review" || input.request.operation === "record_plan_review") &&
-        ((input.request.draft.coverage_ledger as Record<string, unknown> | undefined)?.mode !== "full" || (input.request.source_receipt_ids?.length ?? 0) > 0)) throw new ControllerError("The replacement owner must complete a full review before incremental reuse is enabled.", "tool_error");
+      if (input.request.operation === "record_review" || input.request.operation === "record_plan_review") {
+        if ((input.request.draft.coverage_ledger as Record<string, unknown> | undefined)?.mode !== "full") throw new ControllerError("The replacement owner must complete a full review before incremental reuse is enabled.", "tool_error");
+        // Mechanical proof remains usable; only semantic approval from the
+        // previous owner is forbidden as a replacement review's carry source.
+        for (const sourceId of input.request.source_receipt_ids ?? []) new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") }).verifyReceiptSync(
+          this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator"), sourceId,
+          { kind: "validation", requireCurrent: true, requireApproved: true, validationMode: "complete_gate" });
+      }
     }
     if (input.request.operation === "prepare_plan" || input.request.operation === "prepare_result") {
       const planKey = config.policy?.plan_artifact;
@@ -1624,6 +1630,41 @@ export class AgentController {
     };
   }
 
+  /** Repair only the old report/activation gap; never replay a worker or upgrade a legacy approval. */
+  private recoverLegacyCompletedFlowStep(flowInstanceId: string): boolean {
+    return this.store.immediateTransaction(() => {
+      const snapshot = this.getFlowSnapshot(flowInstanceId);
+      if (snapshot.flow.config.policy?.strict || snapshot.instance.status !== "active" || snapshot.steps.some(step => step.status === "active")) return false;
+      const step = snapshot.steps.at(-1);
+      if (!step || step.status !== "completed") return false;
+      const report = snapshot.reports.filter(item => item.step_instance_id === step.step_instance_id).at(-1);
+      if (!report || report.status !== "completed" || !stableJsonEquals(report.result_json, step.result_json)) return false;
+      const action = resolveStepEventAction(snapshot.flow.config.steps[step.step_id], "completed");
+      if (!action) return false;
+      const context = { ...this.flowConditionContext(snapshot.instance), status: "completed", result: step.result_json, step: { id: step.step_id, instance_id: step.step_instance_id } };
+      const selected = action.transitions ? selectTransition(action, context) : null;
+      if (action.transitions && !selected) return false;
+      const selectedAction = selected ?? action;
+      const prior = snapshot.transitions.filter(item => item.from_step_instance_id === step.step_instance_id).at(-1);
+      if (prior) {
+        // A persisted transition is authority only when it exactly matches the
+        // original flow config and the committed report; a manual route is not
+        // guessed or replayed as an automatic transition after interruption.
+        if (prior.action_json.manual || !stableJsonEquals(prior.action_json, selectedAction) || !selectedAction.to || prior.target_step_id !== selectedAction.to) return false;
+        if (snapshot.steps.some(item => item.created_at > step.created_at)) return false;
+        const state = this.flowRuntime.get(flowInstanceId) ?? this.flowRuntime.initialize(flowInstanceId, snapshot.flow.config);
+        state.correction = { from_step_id: step.step_id, from_step_instance_id: step.step_instance_id, status: step.status, result: step.result_json, summary: report.summary, artifacts: step.output_json, transition_id: prior.transition_id };
+        state.revision += 1;
+        this.flowRuntime.save(flowInstanceId, state);
+        this.activateFlowStep(snapshot.flow.config, snapshot.instance, selectedAction.to);
+      } else {
+        this.advanceFlowAfterStep(snapshot.flow.config, snapshot.instance, step, step.result_json);
+      }
+      this.emit({ runId: snapshot.instance.run_id, type: "flow.notification", payload: { flow_instance_id: flowInstanceId, from_step_instance_id: step.step_instance_id, reason: "interrupted_transition_recovered", target_step_id: selectedAction.to ?? null, summary: "Recovered the committed step handoff without repeating its worker." } });
+      return true;
+    });
+  }
+
   private async continueFlowInternal(input: {
     flowInstanceId: string;
     subscriberAgentId?: string | null;
@@ -1690,6 +1731,7 @@ export class AgentController {
 
     const activeStep = snapshot.steps.find((step) => step.status === "active") ?? null;
     if (!activeStep) {
+      if (this.recoverLegacyCompletedFlowStep(instance.flow_instance_id)) return this.continueFlowInternal(input);
       return this.flowContinuationResult(snapshot, "no_active_step", {
         blockedReason: "no_active_step"
       });

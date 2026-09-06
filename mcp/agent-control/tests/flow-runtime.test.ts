@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -159,6 +160,55 @@ describe("strict flow runtime", () => {
     const substitute = join(root, "substitute.md"); writeFileSync(substitute, "Unapproved substitute");
     await expect(controller.executeFlowEvidence({ flowInstanceId: started.instance.flow_instance_id, key: "wrong", request: { operation: "prepare_plan", checkpoint_id: "wrong", plan_path: substitute } })).rejects.toThrow(/worker-selected substitute/);
     expect(controller.getFlowSnapshot(started.instance.flow_instance_id).runtime!.evidence).toEqual({});
+  });
+
+  it("lets a replacement planner perform a full review using real current complete validation", async () => {
+    const repo = join(root, "repo"); mkdirSync(repo);
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "fixture@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Fixture"]);
+    writeFileSync(join(repo, "plan.md"), "# Plan\n\n<!-- hdt-section: work -->\n## Work\n\nUpdate value.\n");
+    writeFileSync(join(repo, "value.txt"), "before\n");
+    execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "base"]);
+    writeFileSync(join(repo, "value.txt"), "after\n");
+    owner = controller.orchestratorLogin({ adminKey: resolveAdminKey(), title: "Evidence coordinator", runTitle: "Implement value", repoDir: repo, backend: "codex-thread", backendHandle: { thread_id: "evidence-coordinator" } });
+    const cfg = config(); cfg.artifacts!.plan.path = join(repo, "plan.md");
+    cfg.steps.work.evidence_operations = ["prepare_result", "validation_run", "record_review"]; cfg.steps.work.evidence_gates = ["planner"];
+    const started = start(cfg); const id = started.instance.flow_instance_id;
+    await dispatch(id); controller.reportFlowStep({ stepInstanceId: started.active_step!.step_instance_id, status: "completed" }); approve(id); await dispatch(id);
+    const before = controller.getFlowSnapshot(id); store.updateAgent(before.runtime!.owners.author!, { unregisteredAt: new Date().toISOString() });
+    controller.recoverFlowOwner({ flowInstanceId: id, role: "author", restartStepId: "work", reason: "Recover planner with full review", expectedRevision: before.runtime!.revision, agentToken: owner.agent_token });
+    await dispatch(id);
+    await controller.executeFlowEvidence({ flowInstanceId: id, key: "result", request: { operation: "prepare_result", checkpoint_id: "new-planner", plan_path: join(repo, "plan.md"), paths: ["value.txt"] } });
+    const checks = await controller.executeFlowEvidence({ flowInstanceId: id, key: "validation", request: { operation: "validation_run", checkpoint_id: "new-planner",
+      checks: [{ check_id: "unit", argv: [process.execPath, "-e", "process.stdout.write('passed')"], sandbox: "workspace", context_complete: true, volatile: false }],
+      coverage: { validation_mode: "complete_gate", path_packages: { "value.txt": "package" }, surfaces: [{ surface_id: "package", kind: "package", check_ids: ["unit"], no_applicable_checks_reason: null }] } } });
+    const review = await controller.executeFlowEvidence({ flowInstanceId: id, key: "planner", request: { operation: "record_review", checkpoint_id: "new-planner", gate: "planner", source_receipt_ids: [checks.receipt_id], draft: {
+      verdict: "approved", summary: "Reviewed the complete affected result.", blocking_findings: [], non_blocking_findings: [], required_corrections: [], prior_finding_results: [],
+      recommended_next_phase: "post_planner_choice", recommended_rollback_phase: null, impact_analysis: null,
+      coverage_ledger: { mode: "full", surfaces: { package: { paths: ["value.txt"], disposition: "reviewed", status: "validated", depends_on: [], invariants: ["The result implements the plan."], finding_ids: [] } }, surface_transitions: [], limitations: [] }
+    } } });
+    expect(review.kind).toBe("planner_review"); expect(review.status).toBe("approved");
+    expect(controller.getFlowSnapshot(id).runtime!.recovery?.full_review_required).toBe(false);
+  }, 30_000);
+
+  it.each([false, true])("recovers a legacy report/activation gap without replaying its worker (transition persisted=%s)", async (transitionPersisted) => {
+    const cfg: FlowConfig = { id: "legacy-recovery", initial_step: "one", roles: { author: { backend: "codex-thread" } }, steps: {
+      one: { role: "author", prompt: "First worker phase", on: { completed: { to: "two" } } },
+      two: { role: "author", prompt: "Second worker phase", on: { completed: { finish: true } } }
+    } };
+    const started = start(cfg); await dispatch(started.instance.flow_instance_id); const step = started.active_step!;
+    // Represent the published runtime's durable cut after a successful report
+    // and before activation. This is state injection, not a process-kill test.
+    store.createFlowStepReport({ stepInstanceId: step.step_instance_id, status: "completed", resultJson: {}, artifactsJson: {}, summary: "First phase done" });
+    store.updateFlowStepInstance(step.step_instance_id, { status: "completed", resultJson: {}, summary: "First phase done", completedAt: new Date().toISOString() });
+    if (transitionPersisted) store.createFlowTransition({ flowInstanceId: started.instance.flow_instance_id, fromStepInstanceId: step.step_instance_id, transitionId: "one-to-two", targetStepId: "two", actionJson: { to: "two" } });
+    const recovered = await controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id, agentToken: owner.agent_token });
+    expect(recovered.action).toBe("dispatched"); expect(adapter.starts).toHaveLength(2);
+    expect(adapter.starts.at(-1)!.prompt).toContain("Second worker phase");
+    expect(adapter.starts.at(-1)!.prompt).not.toContain("First worker phase");
+    await controller.continueFlow({ flowInstanceId: started.instance.flow_instance_id, agentToken: owner.agent_token });
+    expect(adapter.starts).toHaveLength(2); expect(controller.getFlowSnapshot(started.instance.flow_instance_id).transitions).toHaveLength(1);
   });
 
 });
