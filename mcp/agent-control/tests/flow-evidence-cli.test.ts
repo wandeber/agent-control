@@ -12,7 +12,7 @@ describe("flow evidence and observer CLI commands", () => {
   afterEach(() => { vi.unstubAllEnvs(); directories.forEach(path => rmSync(path, { recursive: true, force: true })); directories.length = 0; });
   function fixture() {
     const controller = { updateFlowContext: vi.fn(() => ({ revision: 2 })), recordFlowDecision: vi.fn(() => ({ recorded: true })),
-      executeFlowEvidence: vi.fn(async () => ({ receipt_id: "receipt" })), acknowledgeRunEvents: vi.fn(() => ({ advanced: true })),
+      executeFlowPackages: vi.fn(async () => ({ branches: {} })), executeFlowEvidence: vi.fn(async () => ({ receipt_id: "receipt" })), acknowledgeRunEvents: vi.fn(() => ({ advanced: true })),
       waitForRun: vi.fn(async () => ({ events: [] })), recoverFlowOwner: vi.fn(() => ({ runtime: { recovery: { full_review_required: true } } })) };
     const program = new Command(); program.exitOverride();
     const deps = { controller, output: vi.fn(), authOptions: vi.fn(() => ({ adminKey: "test-admin" })) } as unknown as CliDeps;
@@ -54,6 +54,13 @@ describe("flow evidence and observer CLI commands", () => {
     const empty = fixture();
     await expect(empty.parse(["flow", "context-update", "--flow", "f", "--expected-revision", "0", "--context", "  "])).rejects.toThrow(/must not be empty/);
     expect(empty.controller.updateFlowContext).not.toHaveBeenCalled();
+  });
+  it("forwards compact package requests and the manifest digest in the existing plan approval", async () => {
+    const { controller, parse } = fixture();
+    await parse(["flow", "packages", "--flow-instance-id", "flow-1", "--request-json", '{"operation":"launch"}']);
+    expect(controller.executeFlowPackages).toHaveBeenCalledWith({ flowInstanceId: "flow-1", request: { operation: "launch" }, adminKey: "test-admin" });
+    await parse(["flow", "decision", "--flow", "flow-1", "--key", "plan", "--value-json", '"approved"', "--reason", "Approved plan and packages", "--expected-revision", "2", "--artifact-digest", "plan-hash", "--package-manifest-digest", "package-hash"]);
+    expect(controller.recordFlowDecision).toHaveBeenCalledWith(expect.objectContaining({ packageManifestDigest: "package-hash", artifactDigest: "plan-hash" }));
   });
   it("loads evidence request files and forwards configured caller authentication", async () => {
     const { controller, parse } = fixture();

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,7 +28,7 @@ describe("durable work package fork and join", () => {
   function actor(agentId:string) { vi.stubEnv("CODEX_THREAD_ID",`thread-${agentId}`); }
   async function dispatch() { const result = await controller.dispatchActiveFlowStep({flowInstanceId:id,agentToken:owner.agent_token}); actor(result.agent!.agent_id); return result; }
   function report() { const step=controller.getFlowSnapshot(id).steps.find(s=>s.status==="active")!; return controller.reportFlowStep({stepInstanceId:step.step_instance_id,status:"completed"}); }
-  function config():FlowConfig { return {id:"packages",policy:{strict:true,plan_artifact:"plan",work_packages:{approval_decision:"plan",manifest_step:"review",execution_step:"implementation",integration_step:"integration"}},initial_step:"draft",roles:{planner:{backend:"codex-thread"},implementer:{backend:"codex-thread"}},artifacts:{plan:{path:join(repo,"plan.md")}},steps:{
+  function config():FlowConfig { return {id:"packages",policy:{strict:true,plan_artifact:"plan",work_packages:{approval_decision:"plan",manifest_step:"review",execution_step:"implementation",integration_step:"integration"}},initial_step:"draft",roles:{planner:{backend:"codex-thread"},implementer:{backend:"codex-thread",model:"gpt-5.6-luna",reasoning_effort:"max"}},artifacts:{plan:{path:join(repo,"plan.md")}},steps:{
     draft:{role:"planner",outputs:{plan:{artifact:"plan",required:true}},on:{completed:{to:"review"}}},
     review:{role:"planner",on:{completed:{to:"approval"}}},
     approval:{execution:"coordinator",decision:{key:"plan",artifact_key:"plan"},on:{completed:{to:"implementation"}}},
@@ -68,6 +68,8 @@ describe("durable work package fork and join", () => {
     await approve();let release!:()=>void;adapter.gate=new Promise<void>(r=>release=r);const pending=request({operation:"launch"});
     await vi.waitFor(()=>expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2));
     await request({operation:"launch"});expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);release();await pending;adapter.gate=undefined;
+    for (const branch of Object.values(group().branches)) { expect(branch.step_id).toBe("implementation"); expect(branch.parent_agent_id).toBe(parentId); expect(controller.listAgentLinks({runId:owner.run.run_id}).some(link=>link.source_agent_id===parentId && link.target_agent_id===branch.agent_id && link.type==="parent_child")).toBe(true); }
+    expect(controller.ensureRequester(owner.run.run_id).observer_agent_id).toBe(controller.getFlowSnapshot(id).runtime!.decision_owners!.requester);
     actor(parentId);expect(()=>report()).toThrow(/join/);
     await expect(controller.startFlowStep({flowInstanceId:id,stepId:"integration",agentToken:owner.agent_token})).rejects.toThrow(/decision or milestone/);
     const a=await deliver("a");await expect(request({operation:"accept",deliveries:[{package_id:"a",delivery_id:a.delivery_id}],reason:"yes"})).rejects.toThrow(/inactive/);
@@ -80,6 +82,14 @@ describe("durable work package fork and join", () => {
     receipt=await controller.executeFlowEvidence({flowInstanceId:id,key:"integration",request:{operation:"prepare_result",checkpoint_id:"consolidated",plan_path:join(repo,"plan.md"),paths:["a.txt","b.txt"]}});
     const integrated=await request({operation:"integrate",result_receipt_id:receipt.receipt_id});expect(integrated.integration!.delivery_ids).toHaveLength(2);expect(report().instance.status).toBe("completed");
   },30000);
+  it("does not treat cancellation of an in-flight start as proof that it is inactive",async()=>{
+    await approve([entries()[0]!]);let release!:()=>void;adapter.gate=new Promise<void>(r=>release=r);const pending=request({operation:"launch"});
+    await vi.waitFor(()=>expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(1));
+    await request({operation:"cancel",package_id:"a",attempt:1,reason:"Stop this branch"});
+    await expect(request({operation:"retry",package_id:"a",attempt:1,reason:"Start again"})).rejects.toThrow(/settle/);
+    release();await pending;adapter.gate=undefined;expect(group().branches.a!.state).toBe("cancelled");
+    expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(1);
+  });
   it("releases dependency successors in the batch acceptance call",async()=>{
     await approve(entries(true));await request({operation:"launch"});expect(group().branches.b!.agent_id).toBeUndefined();await deliver("a");await accept(["a"]);expect(group().branches.b!.state).toBe("running");
     expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);
@@ -102,6 +112,43 @@ describe("durable work package fork and join", () => {
     const previous=group();await controller.dispose();store.close();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
     expect(group().manifest_digest).toBe(previous.manifest_digest);await request({operation:"launch"});expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);
     writeFileSync(join(repo,"plan.md"),"Changed unreported plan");actor(parentId);expect(()=>report()).toThrow(/outside its producing report/);
+  });
+  it("recovers an accepted backend launch after restart without issuing another start",async()=>{
+    await approve();await request({operation:"launch"});const state=controller.getFlowSnapshot(id).runtime!;
+    const branch=state.packages!.branches.a!;branch.state="invoking";branch.work_generation=0;branch.prior_start_event_id=null;branch.launch_lease_expires_at=new Date(0).toISOString();
+    store.db.prepare("update flow_runtime set state_json=? where flow_instance_id=?").run(JSON.stringify(state),id);
+    await controller.dispose();store.close();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
+    const count=adapter.starts.length;await request({operation:"launch"});expect(group().branches.a!.state).toBe("running");expect(adapter.starts).toHaveLength(count);
+  });
+  it("keeps an expired launch without backend acceptance uncertain instead of replaying it",async()=>{
+    await approve();const state=controller.getFlowSnapshot(id).runtime!;const branch=state.packages!.branches.a!;
+    const child=controller.registerAgent({runId:owner.run.run_id,backend:"codex-thread",title:"Interrupted package a",repoDir:join(root,"a"),agentToken:owner.agent_token});
+    branch.state="invoking";branch.agent_id=child.agent_id;branch.work_generation=0;branch.launch_lease_expires_at=new Date(0).toISOString();
+    store.db.prepare("update flow_runtime set state_json=? where flow_instance_id=?").run(JSON.stringify(state),id);
+    await request({operation:"launch"});expect(group().branches.a!.state).toBe("uncertain");expect(adapter.starts.filter(s=>s.agent.agent_id===child.agent_id)).toHaveLength(0);
+    actor(parentId);expect(()=>report()).toThrow(/join/);
+  });
+  it("represents deletion-only delivery and rejects dangling symlinks",async()=>{
+    await approve([entries()[0]!]);await request({operation:"launch"});const branch=group().branches.a!;actor(branch.agent_id!);
+    rmSync(join(root,"a","a.txt"));symlinkSync("missing-target",join(root,"a","a.txt"));
+    await expect(request({operation:"deliver",package_id:"a",attempt:1,summary:"Delete a"},true)).rejects.toThrow(/symbolic links/);
+    rmSync(join(root,"a","a.txt"));const deleted=await request({operation:"deliver",package_id:"a",attempt:1,summary:"Delete a"},true);
+    expect(deleted.branches.a!.delivery!.files).toEqual([{path:"a.txt",sha256:null,mode:null}]);
+    await accept(["a"]);actor(parentId);report();await dispatch();rmSync(join(repo,"a.txt"));
+    const receipt=await controller.executeFlowEvidence({flowInstanceId:id,key:"deletion",request:{operation:"prepare_result",checkpoint_id:"deletion",plan_path:join(repo,"plan.md"),paths:["a.txt"],base:group().base_commit}});
+    await request({operation:"integrate",result_receipt_id:receipt.receipt_id});expect(report().instance.status).toBe("completed");
+  },30000);
+  it("invalidates dependent acceptances and requeues their generations after cancellation",async()=>{
+    const definitions=entries(true);await approve([{...definitions[0]!,required:false},definitions[1]!]);await request({operation:"launch"});await deliver("a");await accept(["a"]);await deliver("b");await accept(["b"]);
+    await request({operation:"cancel",package_id:"a",attempt:1,reason:"Correct upstream assumption"});expect(group().branches.b!.state).toBe("cancelled");actor(parentId);expect(()=>report()).toThrow(/join/);
+    await request({operation:"retry",package_id:"a",attempt:1,reason:"Fix the upstream behavior"});expect(group().branches.a!.attempt).toBe(2);expect(group().branches.b!.attempt).toBe(2);expect(group().branches.b!.state).toBe("pending");
+    const start=adapter.starts.filter(s=>s.metadata?.package_id==="a").at(-1)!;expect(start.metadata?.reasoning_effort).toBe("max");expect(start.prompt).toContain("Fix the upstream behavior");
+    await deliver("a","a corrected\n");await accept(["a"]);expect(group().branches.b!.state).toBe("running");expect(group().branches.b!.dependency_delivery_ids).toEqual([group().branches.a!.delivery!.delivery_id]);
+  });
+  it("rejects altered manifest fields even when the stored approval hash was retained",async()=>{
+    await approve();const state=controller.getFlowSnapshot(id).runtime!;state.packages!.manifest[0]!.required=false;
+    store.db.prepare("update flow_runtime set state_json=? where flow_instance_id=?").run(JSON.stringify(state),id);
+    await expect(request({operation:"launch"})).rejects.toThrow(/manifest integrity/);
   });
   it("rejects overlapping writes, shared worktrees and postapproval manifest rewrites",async()=>{
     await expect(request({operation:"define",packages:[entries()[0]!,{...entries()[1]!,paths:["a.txt"],deliverables:["a.txt"]}]})).rejects.toThrow(/disjoint/);

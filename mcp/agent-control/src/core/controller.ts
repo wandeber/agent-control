@@ -629,7 +629,7 @@ export class AgentController {
     if (!run.repo_dir || !binding) throw new ControllerError("Work packages require the bound plan and consolidated repository.", "tool_error");
     return { flowId, runId: run.run_id, repo: realpathSync(run.repo_dir), root: join(runRuntimeDir(run.run_id), "packages", flowId), planPath: binding.path,
       planRevision: verifyPlan ? this.boundFlowArtifactDigest(instance, flow.config.policy.plan_artifact) : state.artifacts?.[flow.config.policy.plan_artifact]?.sha256 ?? "unplanned",
-      acceptanceRevision: state.acceptance_revision, stepId: instance.current_step_id, policy, config: flow.config, approval: state.decisions[policy.approval_decision] };
+      acceptanceRevision: state.acceptance_revision, stepId: instance.current_step_id, parentAgentId: state.owners[flow.config.steps[policy.execution_step].role ?? ""] ?? instance.orchestrator_agent_id!, policy, config: flow.config, approval: state.decisions[policy.approval_decision] };
   }
 
   private packageRuntime(auth: { agentToken?: string | null; adminKey?: string | null } = {}): FlowPackages {
@@ -645,23 +645,25 @@ export class AgentController {
         if (caller.agent_id !== instance.orchestrator_agent_id && purpose !== "deliver" && active?.input_json.acceptance_revision !== context.acceptanceRevision) throw new ControllerError("The package coordinator attempt belongs to obsolete acceptance.", "tool_error");
         return caller.agent_id;
       },
-      register: (context, entry) => { const role = context.config.roles![entry.role]!; const { agent_token: _secret, ...agent } = this.registerAgent({ runId: context.runId, backend: role.backend!, title: `${entry.title} (${entry.id})`, role: entry.role, objective: entry.title, repoDir: entry.worktree, model: role.model }); return agent; },
+      register: (context, entry) => { const role = context.config.roles![entry.role]!; const { agent_token: _secret, ...agent } = this.registerAgent({ runId: context.runId, backend: role.backend!, title: `${entry.title} (${entry.id})`, role: entry.role, objective: entry.title, repoDir: entry.worktree, model: role.model }); this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: agent.agent_id, type: "parent_child", label: entry.id }); return agent; },
       start: async (context, entry, branch) => {
         const state = this.flowRuntime.get(context.flowId)!; const role = context.config.roles![entry.role]!;
         const rolePrompt = role.prompt ?? (role.prompt_ref ? context.config.prompts?.[role.prompt_ref]?.text : "") ?? "";
         const dependencies = entry.depends_on.map(id => ({ package_id: id, delivery: state.packages?.branches[id]?.delivery }));
         const prompt = [rolePrompt, "You own one approved work package, not the parent flow phase. Do not call flow_step_report, route phases, approve packages, or spawn workers. Use the assigned worktree and write only its declared paths. Read the bound plan and dependency delivery snapshots before working. Do not alter the source dependency worktrees or integration checkout.",
-          JSON.stringify({ objective: state.context, flow_instance_id: context.flowId, package: entry, attempt: branch.attempt, plan_path: context.planPath, plan_revision: context.planRevision, dependencies }),
+          JSON.stringify({ objective: state.context, flow_instance_id: context.flowId, package: entry, attempt: branch.attempt, plan_path: context.planPath, plan_revision: context.planRevision, dependencies, correction: state.correction, retry_reason: branch.reason, previous_delivery: branch.prior_attempts?.at(-1)?.delivery }),
           "When the expected files are ready, call flow_packages with the exact contract below. The tool snapshots the actual delivered files; after success, stop and return a concise final message. Do not continue editing after delivery.",
           JSON.stringify({ flow_instance_id: context.flowId, request: { operation: "deliver", package_id: entry.id, attempt: branch.attempt, summary: "Brief delivery result." } }), STRICT_FLOW_CAPABILITY_FAILURE].join("\n\n");
-        return this.startAgent({ agentId: branch.agent_id!, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
+        this.ensureRequester(context.runId);
+        this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: branch.agent_id!, type: "parent_child", label: entry.id });
+        return this.startAgent({ agentId: branch.agent_id!, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", ...(role.reasoning_effort ? { reasoning_effort: role.reasoning_effort } : {}), phase: context.policy.execution_step, parent_agent_id: context.parentAgentId, package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
       },
       agent: id => this.getAgent(id), refresh: id => this.refreshAgentStatus(id), stop: id => this.stopAgent(id),
-      verifyResult: (context, id) => new EvidenceService({ rootDir: join(runRuntimeDir(context.runId), "evidence") }).verifyReceiptSync(this.evidenceContext(this.getFlowInstanceOrThrow(context.flowId), "package-integration", "integration"), id, { kind: "result_checkpoint", requireCurrent: true }),
+      verifyResult: (context, id) => new EvidenceService({ rootDir: join(runRuntimeDir(context.runId), "evidence") }).verifyResultManifestSync(this.evidenceContext(this.getFlowInstanceOrThrow(context.flowId), "package-integration", "integration"), id),
       emit: (context, reason, detail) => {
         const group = this.flowRuntime.get(context.flowId)?.packages; const packageId = typeof detail.package_id === "string" ? detail.package_id : undefined;
         const branch = packageId ? group?.branches[packageId] : undefined;
-        const packageProgress = { ...(packageId ? { package_id: packageId, label: group?.manifest.find(item => item.id === packageId)?.title, status: branch?.state, generation: branch?.attempt } : {}), required_count: group?.manifest.filter(item => item.required).length ?? 0, accepted_count: Object.values(group?.branches ?? {}).filter(item => item.state === "accepted").length, ...(typeof detail.reason === "string" ? { reason: detail.reason } : {}) };
+        const packageProgress = { ...(packageId ? { package_id: packageId, label: group?.manifest.find(item => item.id === packageId)?.title, status: branch?.state, generation: branch?.attempt } : {}), required_count: group?.manifest.filter(item => item.required).length ?? 0, accepted_count: group?.manifest.filter(item => item.required && group.branches[item.id]?.state === "accepted").length ?? 0, ...(typeof detail.reason === "string" ? { reason: detail.reason } : {}) };
         this.emit({ runId: context.runId, agentId: branch?.agent_id, type: "flow.notification", payload: { flow_instance_id: context.flowId, step_id: context.stepId, reason, ...detail, package_progress: packageProgress } });
         if (reason === "package_blocked") this.emit({ runId: context.runId, agentId: branch?.agent_id, type: "flow.step_blocked", payload: { flow_instance_id: context.flowId, step_id: context.policy.execution_step, reason, package_progress: packageProgress } });
       }
