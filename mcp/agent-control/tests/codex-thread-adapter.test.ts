@@ -198,6 +198,7 @@ describe("CodexThreadAdapter", () => {
       agent: { repo_dir: "/repo", model: "gpt-5.6-luna", backend_handle: null } as StartAgentInput["agent"],
       prompt: "Review without edits", server: appServerUrl, metadata: { sandbox: "read_only" }
     });
+    expect(handle.data.cwd).toBe("/repo");
     expect(requests.find(request => request.method === "turn/start")?.params).toMatchObject({ sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" });
     requests.length = 0;
     await adapter.start({ agent: { repo_dir: "/repo", backend_handle: handle.data } as StartAgentInput["agent"],

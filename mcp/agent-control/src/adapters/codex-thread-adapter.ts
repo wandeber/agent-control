@@ -139,7 +139,7 @@ export class CodexThreadAdapter implements AgentAdapter {
         app_server_url: appServerUrl,
         auth_token: stringValue(input.metadata?.auth_token) ?? stringValue(input.metadata?.authToken),
         auth_token_file: resolveAuthTokenFile(input.metadata, handleData),
-        cwd: readCwdFromResponse(startResponse) ?? undefined
+        cwd: readCwdFromResponse(startResponse) ?? input.agent.repo_dir ?? undefined
       };
       if (input.prompt) {
         const turnResponse = await startTurnOnLoadedThread(client, data, input.prompt, input.model, data.cwd);
