@@ -121,7 +121,7 @@ export const flowConfigSchema = z.object({
     version: z.string().min(1).optional(),
     description: z.string().min(1).optional(),
     initial_step: z.string().min(1),
-    policy: z.object({ strict: z.boolean().optional(), plan_artifact: z.string().optional() }).optional(),
+    policy: z.object({ strict: z.boolean().optional(), plan_artifact: z.string().optional(), work_packages: z.object({ approval_decision: z.string().min(1), approval_value: z.string().optional(), success_condition: conditionSchema.optional(), manifest_step: z.string().min(1), execution_step: z.string().min(1), integration_step: z.string().min(1) }).strict().optional() }).optional(),
     preferences: z.record(z.object({ values: z.array(z.string()).min(1), artifact_key: z.string().optional(), owner: z.enum(["requester", "orchestrator"]).optional() })).optional(),
     state: z.record(z.unknown()).optional(),
     prompts: z.record(promptSourceSchema).optional(),
@@ -144,6 +144,11 @@ export function parseFlowConfig(value) {
     }
     const normalized = normalizeCodexSubagentConfig(parsed.data);
     validateFlowConfigReferences(normalized);
+    if (normalized.policy?.work_packages) {
+        const policy = normalized.policy.work_packages;
+        if (!normalized.policy.strict || !normalized.policy.plan_artifact || !normalized.artifacts?.[normalized.policy.plan_artifact] || [policy.manifest_step, policy.execution_step, policy.integration_step].some(id => !normalized.steps[id]) || !Object.values(normalized.steps).some(step => step.decision?.key === policy.approval_decision && step.decision.artifact_key === normalized.policy.plan_artifact))
+            throw new ControllerError("Work packages require strict plan approval and configured manifest, execution and integration phases.", "tool_error");
+    }
     return normalized;
 }
 /**

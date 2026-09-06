@@ -6,12 +6,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createController } from "./core/factory.js";
 import { errorToPayload } from "./core/errors.js";
+import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
 import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 const { controller, store } = createController();
-const MCP_APP_VERSION = "0.1.9";
+const MCP_APP_VERSION = AGENT_CONTROL_VERSION;
 const CONSOLE_RESOURCE_URI = `ui://agent-control/${MCP_APP_VERSION}/console.html`;
 const CONSOLE_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -84,7 +85,7 @@ const OPEN_CONSOLE_TOOL = {
 };
 const server = new Server({
     name: "agent_control",
-    version: "0.1.0"
+    version: AGENT_CONTROL_VERSION
 }, {
     capabilities: {
         tools: {},

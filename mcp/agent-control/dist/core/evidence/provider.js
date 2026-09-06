@@ -86,14 +86,15 @@ export class HdtProvider {
         }
     }
     manifestFor(context, checkpointId, plan = false) {
-        this.verifyStored(context, checkpointId, plan);
-        return JSON.parse(readRegular(resolve(this.store, 'flow', ...(plan ? ['plan'] : []), 'checkpoints', `${checkpointId}.json`)).toString());
+        // Return the same in-memory document verified by the canonical provider,
+        // rather than rereading a mutable pathname after that verification.
+        return this.verifyStored(context, checkpointId, plan, [], true).manifest;
     }
-    verifyStored(context, checkpointId, plan = false, required = []) {
+    verifyStored(context, checkpointId, plan = false, required = [], includeManifest = false) {
         this.verifyPin();
         const result = spawnSync(this.pythonCommand, [resolve(dirname(this.helperPath), 'bridge.py'), '--operation', 'verify-stored',
             '--repo', context.repoPath, '--store', this.store, '--workflow-id', 'flow', '--checkpoint-id', checkpointId,
-            ...(plan ? ['--plan'] : []), ...required.flatMap(gate => ['--require-review', gate])], {
+            ...(plan ? ['--plan'] : []), ...(includeManifest ? ['--include-manifest'] : []), ...required.flatMap(gate => ['--require-review', gate])], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: 12 * 1024 * 1024, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
         });
         if (result.error || result.status !== 0)

@@ -1,6 +1,7 @@
+import { FlowPackages, flowPackagesRequestSchema } from "./flow-packages.js";
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
 import { EvidenceService } from "./evidence/service.js";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
@@ -8,10 +9,10 @@ import { RunObservation, isPassiveObserver } from "./run-observation.js";
 import { parseActivity, activityText } from "./agent-activity.js";
 import { evaluateCondition, parseFlowConfig, resolveFlowAgentLifecycle, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
 import { getFlowFromCatalog, listFlowCatalog } from "./flow-catalog.js";
-import { generateActionToken, generateAgentToken, generateBridgeToken, hashToken, verifyAdminKey } from "./identity.js";
+import { generateActionToken, generateAgentToken, generateBridgeToken, hashToken, verifyAdminKey, resolveAdminKey } from "./identity.js";
 import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "./ids.js";
 import { agentRuntimePath, isInsideRunsRuntimeRoot, runRuntimeDir, runRuntimePath } from "./paths.js";
-import { AGENT_STATUSES } from "./types.js";
+import { AGENT_STATUSES, EVENT_TYPES } from "./types.js";
 const TERMINAL_STATUSES = new Set(["completed", "failed", "blocked", "stopped"]);
 const PURGE_SAFE_STATUSES = new Set(["planned", "completed", "failed", "blocked", "stopped"]);
 const STOP_INTENT_AGENT_STATUSES = new Set(["stopping", "stopped"]);
@@ -456,6 +457,99 @@ export class AgentController {
             throw new ControllerError("This flow decision requires its authenticated coordinator.", "auth_required");
         return caller.agent_id;
     }
+    packageContext(flowId, verifyPlan = true) {
+        const instance = this.getFlowInstanceOrThrow(flowId);
+        const flow = this.getFlowOrThrow(instance.flow_record_id);
+        const policy = flow.config.policy?.work_packages;
+        if (!policy || !flow.config.policy?.strict || !flow.config.policy.plan_artifact)
+            throw new ControllerError("This flow does not declare strict work packages.", "tool_error");
+        const state = this.flowRuntime.get(flowId);
+        const run = this.getRun(instance.run_id);
+        const binding = this.store.listFlowArtifactBindings(flowId).find(item => item.artifact_key === flow.config.policy.plan_artifact);
+        if (!run.repo_dir || !binding)
+            throw new ControllerError("Work packages require the bound plan and consolidated repository.", "tool_error");
+        return { flowId, runId: run.run_id, repo: realpathSync(run.repo_dir), root: join(runRuntimeDir(run.run_id), "packages", flowId), planPath: binding.path,
+            planRevision: verifyPlan ? this.boundFlowArtifactDigest(instance, flow.config.policy.plan_artifact) : state.artifacts?.[flow.config.policy.plan_artifact]?.sha256 ?? "unplanned",
+            acceptanceRevision: state.acceptance_revision, stepId: instance.current_step_id, parentAgentId: state.owners[flow.config.steps[policy.execution_step].role ?? ""] ?? instance.orchestrator_agent_id, policy, config: flow.config, approval: state.decisions[policy.approval_decision] };
+    }
+    packageRuntime(auth = {}) {
+        return new FlowPackages({ store: this.store, runtime: this.flowRuntime,
+            context: (id, verify) => this.packageContext(id, verify),
+            authorize: (id, purpose, assignedId) => {
+                const instance = this.getFlowInstanceOrThrow(id);
+                const context = this.packageContext(id, false);
+                const active = this.store.listFlowStepInstances(id).find(step => step.status === "active");
+                const expected = purpose === "deliver" ? [assignedId ?? null] : [instance.orchestrator_agent_id, active?.agent_id ?? null];
+                const caller = this.flowCaller(auth.agentToken, expected);
+                if (purpose !== "deliver" && auth.adminKey && verifyAdminKey(auth.adminKey))
+                    return instance.orchestrator_agent_id ?? "local-admin";
+                if (!caller || !expected.includes(caller.agent_id) || purpose === "deliver" && caller.agent_id !== assignedId)
+                    throw new ControllerError("This package operation requires its assigned worker or authenticated coordinator.", "auth_required");
+                if (caller.agent_id !== instance.orchestrator_agent_id && purpose !== "deliver" && active?.input_json.acceptance_revision !== context.acceptanceRevision)
+                    throw new ControllerError("The package coordinator attempt belongs to obsolete acceptance.", "tool_error");
+                return caller.agent_id;
+            },
+            register: (context, entry) => { const role = context.config.roles[entry.role]; const { agent_token: _secret, ...agent } = this.registerAgent({ runId: context.runId, backend: role.backend, title: `${entry.title} (${entry.id})`, role: entry.role, objective: entry.title, repoDir: entry.worktree, model: role.model }); this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: agent.agent_id, type: "parent_child", label: entry.id }); return agent; },
+            start: async (context, entry, branch) => {
+                const state = this.flowRuntime.get(context.flowId);
+                const role = context.config.roles[entry.role];
+                const rolePrompt = role.prompt ?? (role.prompt_ref ? context.config.prompts?.[role.prompt_ref]?.text : "") ?? "";
+                const dependencies = entry.depends_on.map(id => ({ package_id: id, delivery: state.packages?.branches[id]?.delivery }));
+                const prompt = [rolePrompt, "You own one approved work package, not the parent flow phase. Do not call flow_step_report, route phases, approve packages, or spawn workers. Use the assigned worktree and write only its declared paths. Read the bound plan and dependency delivery snapshots before working. Do not alter the source dependency worktrees or integration checkout.",
+                    JSON.stringify({ objective: state.context, flow_instance_id: context.flowId, package: entry, attempt: branch.attempt, plan_path: context.planPath, plan_revision: context.planRevision, dependencies, correction: state.correction, retry_reason: branch.reason, previous_delivery: branch.prior_attempts?.at(-1)?.delivery }),
+                    "When the expected files are ready, call flow_packages with the exact contract below. The tool snapshots the actual delivered files; after success, stop and return a concise final message. Do not continue editing after delivery.",
+                    JSON.stringify({ flow_instance_id: context.flowId, request: { operation: "deliver", package_id: entry.id, attempt: branch.attempt, summary: "Brief delivery result." } }), STRICT_FLOW_CAPABILITY_FAILURE].join("\n\n");
+                this.ensureRequester(context.runId);
+                this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: branch.agent_id, type: "parent_child", label: entry.id });
+                return this.startAgent({ agentId: branch.agent_id, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", ...(role.reasoning_effort ? { reasoning_effort: role.reasoning_effort } : {}), phase: context.policy.execution_step, parent_agent_id: context.parentAgentId, package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
+            },
+            agent: id => this.getAgent(id), refresh: async (id) => { const agent = await this.refreshAgentStatus(id); this.packageRuntime().reconcile(agent); return agent; }, stop: id => this.stopAgent(id),
+            verifyResult: (context, id) => new EvidenceService({ rootDir: join(runRuntimeDir(context.runId), "evidence") }).verifyResultManifestSync(this.evidenceContext(this.getFlowInstanceOrThrow(context.flowId), "package-integration", "integration"), id),
+            emit: (context, reason, detail) => {
+                const group = this.flowRuntime.get(context.flowId)?.packages;
+                const packageId = typeof detail.package_id === "string" ? detail.package_id : undefined;
+                const branch = packageId ? group?.branches[packageId] : undefined;
+                const packageProgress = { ...(packageId ? { package_id: packageId, label: group?.manifest.find(item => item.id === packageId)?.title, status: branch?.state, generation: branch?.attempt } : {}), required_count: group?.manifest.filter(item => item.required).length ?? 0, accepted_count: group?.manifest.filter(item => item.required && group.branches[item.id]?.state === "accepted").length ?? 0, ...(typeof detail.reason === "string" ? { reason: detail.reason } : {}) };
+                this.emit({ runId: context.runId, agentId: branch?.agent_id, type: "flow.notification", payload: { flow_instance_id: context.flowId, step_id: context.stepId, reason, ...detail, package_progress: packageProgress } });
+                if (reason === "package_blocked")
+                    this.emit({ runId: context.runId, agentId: branch?.agent_id, type: "flow.step_blocked", payload: { flow_instance_id: context.flowId, step_id: context.policy.execution_step, reason, package_progress: packageProgress } });
+            } });
+    }
+    packageObserver(flowId, auth) {
+        const instance = this.getFlowInstanceOrThrow(flowId);
+        const context = this.packageContext(flowId, false);
+        const requesterId = this.flowRuntime.get(flowId)?.decision_owners?.requester ?? null;
+        const expected = [instance.orchestrator_agent_id, context.parentAgentId, requesterId];
+        const caller = this.flowCaller(auth.agentToken, expected);
+        const threadId = caller?.backend === "codex-thread" ? caller.backend_handle?.thread_id : null;
+        if (!caller || !expected.includes(caller.agent_id) || typeof threadId !== "string" || !threadId)
+            throw new ControllerError("Package supervision requires the actual launching Codex conversation identity.", "auth_required");
+        // Register before dispatch so even a fast first delivery is in this
+        // observer's history. This never replaces the original requester binding.
+        this.ensureRequester(context.runId);
+        for (const branch of Object.values(this.flowRuntime.get(flowId)?.packages?.branches ?? {}))
+            if (branch.agent_id)
+                this.packageRuntime().reconcile(this.getAgent(branch.agent_id));
+        return { ...this.observeRun({ runId: context.runId, threadId, title: `Package coordinator: ${caller.title}`, eventTypes: [...EVENT_TYPES], delivery: "wait", adminKey: resolveAdminKey() }), wait_contract: packageWaitContract(flowId) };
+    }
+    async executeFlowPackages(input) {
+        const request = flowPackagesRequestSchema.parse(input.request);
+        const observer = ["launch", "accept", "retry", "wait", "ack"].includes(request.operation) ? this.packageObserver(input.flowInstanceId, input) : undefined;
+        const waitContract = packageWaitContract(input.flowInstanceId);
+        if (request.operation === "wait") {
+            const result = await this.waitForRun({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor: request.cursor, timeoutMs: request.timeout_ms ?? 3_600_000, signal: input.signal });
+            return { ...result, coordinator_observer: observer, wait_contract: result.closed ? null : waitContract,
+                ...("ack_contract" in result && result.ack_contract ? { ack_contract: { tool: "flow_packages", arguments: { flow_instance_id: input.flowInstanceId, request: { operation: "ack", cursor: result.cursor } }, instruction: "Acknowledge this cursor only after handling every event in this batch, then wait again." } } : {}) };
+        }
+        if (request.operation === "ack") {
+            // The cursor is signed and checked by the existing observer protocol;
+            // its observer is derived from the authenticated thread, never submitted.
+            const result = this.acknowledgeRunEvents({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor: request.cursor, adminKey: resolveAdminKey() });
+            return { ...result, coordinator_observer: observer, wait_contract: waitContract };
+        }
+        const group = await this.packageRuntime(input).execute(input.flowInstanceId, request);
+        return { ...group, ...(observer ? { coordinator_observer: observer, wait_contract: waitContract } : {}) };
+    }
     updateFlowContext(input) {
         return this.store.immediateTransaction(() => {
             const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
@@ -540,7 +634,8 @@ export class AgentController {
             const boundDigest = binding ? this.boundFlowArtifactDigest(instance, artifactKey) : undefined;
             if (artifactKey && (!binding || !input.artifactDigest || input.artifactDigest !== boundDigest))
                 throw new ControllerError("The human decision must name the exact current artifact digest.", "tool_error");
-            state.decisions[input.key] = { value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
+            const packageManifestDigest = flow.config.policy?.work_packages?.approval_decision === input.key && input.value === (flow.config.policy.work_packages.approval_value ?? "approved") ? this.packageRuntime(input).approval(this.packageContext(instance.flow_instance_id), input.packageManifestDigest) : undefined;
+            state.decisions[input.key] = { ...(packageManifestDigest ? { package_manifest_digest: packageManifestDigest } : {}), value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
             state.revision += 1;
             this.flowRuntime.save(instance.flow_instance_id, state);
             this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "human_decision_recorded", decision_key: input.key, decision: input.value } });
@@ -565,7 +660,7 @@ export class AgentController {
                 return false;
             }
         }));
-        return { state: state.state, decisions, evidence: state.evidence, acceptance_revision: state.acceptance_revision };
+        return { state: state.state, decisions, evidence: state.evidence, acceptance_revision: state.acceptance_revision, ...(this.getFlowOrThrow(instance.flow_record_id).config.policy?.work_packages ? { packages: this.packageRuntime().condition(instance.flow_instance_id) } : {}) };
     }
     boundFlowArtifactDigest(instance, key) {
         const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === key);
@@ -1781,6 +1876,7 @@ export class AgentController {
     reconcileTerminalStrictFlowWorker(agent) {
         if (!TERMINAL_STATUSES.has(agent.status))
             return;
+        this.packageRuntime().reconcile(agent);
         for (const instance of this.store.listFlowInstances({ runId: agent.run_id })) {
             if (!this.getFlowOrThrow(instance.flow_record_id).config.policy?.strict)
                 continue;
@@ -2100,6 +2196,10 @@ export class AgentController {
         const artifacts = input.artifacts ?? {};
         if (flow.config.policy?.strict && input.status === "completed") {
             validateStepResult(stepConfig.report?.schema, result);
+            if (flow.config.policy.work_packages?.execution_step === existingStep.step_id && (!flow.config.policy.work_packages.success_condition || evaluateCondition(flow.config.policy.work_packages.success_condition, { result, status: input.status })))
+                this.packageRuntime().assertJoin(this.packageContext(instance.flow_instance_id));
+            if (flow.config.policy.work_packages?.integration_step === existingStep.step_id && (!flow.config.policy.work_packages.success_condition || evaluateCondition(flow.config.policy.work_packages.success_condition, { result, status: input.status })))
+                this.packageRuntime().assertIntegrated(this.packageContext(instance.flow_instance_id));
             this.assertFlowRequirements(instance, stepConfig, { result, step: existingStep });
         }
         this.store.createFlowStepReport({
@@ -5616,7 +5716,9 @@ export class AgentController {
                 runId: updated.run_id,
                 agentId: updated.agent_id,
                 type: this.statusEventType(updated.status),
-                payload
+                // Bind stop evidence to the actual generation/handle, including a
+                // late start whose compensating stop precedes package reconciliation.
+                payload: { ...payload, work_generation: updated.work_generation, backend_handle_sha256: digest(updated.backend_handle) }
             }));
             if (TERMINAL_STATUSES.has(updated.status)) {
                 this.finalizeStoppingRunIfTerminal(updated.run_id, (event) => {
@@ -7971,6 +8073,10 @@ function agentctlExecutable() {
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
     const bundled = resolve(packageRoot, "bin/agentctl");
     return existsSync(bundled) ? bundled : "agentctl";
+}
+function packageWaitContract(flowInstanceId) {
+    return { turn_policy: "keep_open_while_work_pending", tool: "flow_packages", arguments: { flow_instance_id: flowInstanceId, request: { operation: "wait", timeout_ms: 3_600_000 } },
+        instruction: "Keep this Codex turn open while supervised packages remain pending. Use this wait contract after launch, after a timeout, and after answering a user message in commentary. Handle the returned events, explicitly call the returned flow_packages ack contract, then wait again. Fetching never acknowledges processing. Omit cursor to resume the durable processed position; the original requesting conversation remains separately subscribed. A timeout or unrelated user message does not cancel the work. End only when supervision is resolved or explicitly paused or cancelled." };
 }
 const STRICT_FLOW_CAPABILITY_FAILURE = "If a required Agent Control tool is unavailable, requires approval, is denied by host policy, or returns auth_required, stop this step immediately. Do not retry repeatedly, switch to CLI or shell reporting, write controller files or the database, search for step IDs or credentials, change tool approval settings, or claim completion. Return exactly one concise final line: AGENT_CONTROL_BLOCKED: <tool name> | <brief observed reason>. Report the observed limitation without guessing whether the host or controller caused it; the coordinator will handle recovery.";
 function buildFlowReportingMarkdown(input) {

@@ -258,6 +258,26 @@ export class EvidenceService {
     verifyReceiptSync(rawContext, receiptId, expected = {}) {
         return this.verifyInternal(evidenceContextSchema.parse(rawContext), receiptId, expected, new Set());
     }
+    verifyResultManifestSync(rawContext, receiptId) {
+        const context = evidenceContextSchema.parse(rawContext);
+        const receipt = this.verifyReceiptSync(context, receiptId, { kind: 'result_checkpoint' });
+        const provider = this.provider(context);
+        const manifest = provider.manifestFor(context, receipt.checkpoint_id);
+        this.assertPlanIdentity(context, manifest.plan.sha256);
+        if (manifest.snapshot_sha256 !== receipt.snapshot_sha256 || manifest.checkpoint_id !== receipt.checkpoint_id) {
+            throw new Error('Result receipt does not identify the verified provider manifest.');
+        }
+        // Package consolidation consumes provider truth, not a projection asserted
+        // by the receipt. Rehashing an edited receipt cannot expand reviewed scope,
+        // alter deletion/file identities, or relabel the task's original base.
+        for (const [key, value] of Object.entries(manifest)) {
+            if (!(key in receipt.payload) || fingerprint(receipt.payload[key]) !== fingerprint(value)) {
+                throw new Error(`Result receipt payload contradicts the verified provider manifest: ${key}.`);
+            }
+        }
+        provider.invoke(context, 'matches', ['--checkpoint-id', receipt.checkpoint_id]);
+        return { receipt, manifest };
+    }
     async verifyReceipt(context, receiptId, expected = {}) {
         return this.verifyReceiptSync(context, receiptId, expected);
     }

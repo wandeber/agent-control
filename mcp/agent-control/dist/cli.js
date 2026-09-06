@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { registerMarketplaceCommands } from "./cli/marketplace.js";
 import { registerFlowEvidenceCommands } from "./cli/flow-evidence.js";
 import { registerSmokeCommands } from "./cli/smoke.js";
@@ -19,7 +20,7 @@ const program = new Command();
 program
     .name("agentctl")
     .description("Control local agent workers through the Agent Control core.")
-    .version("0.1.9")
+    .version(AGENT_CONTROL_VERSION)
     .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
     .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();

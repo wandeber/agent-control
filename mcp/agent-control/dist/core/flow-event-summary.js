@@ -43,11 +43,31 @@ export function compactFlowEvent(event) {
         if (Object.keys(detail).length)
             compactEvidence.summary = detail;
     }
+    // Package notifications must explain the join without exposing worker reports
+    // or requiring the requester to fetch the full manifest after every event.
+    const packageProgress = object(event.payload.package_progress);
+    const compactPackage = {};
+    if (packageProgress) {
+        for (const key of ["package_id", "label", "status", "reason"]) {
+            const value = short(packageProgress[key]);
+            if (value !== undefined)
+                compactPackage[key] = value;
+        }
+        for (const key of ["generation", "required_count", "accepted_count"]) {
+            const value = packageProgress[key];
+            if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+                compactPackage[key] = value;
+        }
+        if (typeof compactPackage.accepted_count === "number" && typeof compactPackage.required_count === "number"
+            && compactPackage.accepted_count > compactPackage.required_count)
+            delete compactPackage.accepted_count;
+    }
     return {
         ...(short(event.payload.reason) ? { reason: short(event.payload.reason) } : {}),
         ...(short(event.payload.summary) ? { detail: short(event.payload.summary) } : {}),
         ...(event.payload.failure_source === "worker_reported" ? { failure_source: "worker_reported" } : {}),
         ...(Object.keys(compactResult).length ? { result: compactResult } : {}),
+        ...(Object.keys(compactPackage).length ? { package_progress: compactPackage } : {}),
         ...(typeof compactEvidence.receipt_id === "string" ? { evidence: compactEvidence } : {})
     };
 }

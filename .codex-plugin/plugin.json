@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "Agent Control",
     "shortDescription": "Declarative flows, native Codex subagents, CLI, and live console",
-    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering subscriptions without asking an orchestrator model to wait and poll.",
+    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering durable event subscriptions with renewable waits and explicit acknowledgement.",
     "developerName": "wandeber",
     "category": "Developer Tools",
     "capabilities": [
