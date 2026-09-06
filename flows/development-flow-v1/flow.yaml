@@ -14,10 +14,12 @@ preferences:
     values:
       - loop
       - single_review
+    owner: requester
   uat_preference:
     values:
       - prepare
       - skip
+    owner: requester
 state:
   planner_approved: false
   uat_completed: false
@@ -195,6 +197,7 @@ steps:
       key: analysis_intent
       artifact_key: analysis
       authority: coordinator
+      owner: requester
     report:
       schema:
         type: object
@@ -371,6 +374,7 @@ steps:
       key: plan_approval
       artifact_key: plan
       authority: user
+      owner: requester
     report:
       schema:
         type: object
@@ -867,6 +871,7 @@ steps:
     decision:
       key: uat_preference
       authority: user
+      owner: requester
     report:
       schema:
         type: object
@@ -976,6 +981,7 @@ steps:
     decision:
       key: uat_result
       authority: user
+      owner: requester
     report:
       schema:
         type: object

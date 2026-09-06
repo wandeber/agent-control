@@ -24,7 +24,9 @@ technical decisions already delegated to the team need no approval question.
 Group related required questions and wait for answers before dependent work.
 Do not manufacture a requirement to ask about every imaginable interpretation.
 
-Capture the normalized acceptance context at launch. Later material clarification
+Pass the complete normalized contract as `acceptance_context` at launch; use
+`title` only as a concise run label. Launch persists this context before the
+first worker is dispatched. Later material clarification
 uses `flow_context_update` with the current revision; a transient transition
 reason or run title is not its durable replacement. Preserve prior decisions
 and attach the concrete correction cause when resuming. Changed intent or plan
@@ -40,8 +42,8 @@ invalidates the dependent approvals; unchanged valid approval is reusable.
    tool is required; if unavailable or failed, report that exact blocker before
    dispatch. Do not replace it with a browser or web-console fallback. Never
    reopen it on notifications, retries, or resumption.
-3. Call `flow_launch` once with the discovered flow and complete acceptance
-   context. Launch automatically registers the original conversation and its
+3. Call `flow_launch` once with the discovered flow and complete
+   `acceptance_context`. Launch automatically registers the original conversation and its
    all-event subscription. Forward its original requester identity through
    delegation; do not add routine login, worker registration, or subscription
    calls. Preserve returned run, flow, observer, cursor, and completion condition.
@@ -59,7 +61,11 @@ flow is still running; I am continuing to wait."
 
 ## Coordinator Decisions
 
-Use `flow_decision` for configured decision steps. Consume the generated gate
+Use `flow_decision` for configured decision steps. Their `owner: requester`
+binds the original conversational thread, even when another coordinator executes
+the run. `authority: coordinator` marks its narrow analysis-intent judgment;
+`authority: user` records actual user choices. Neither permits an executing
+coordinator to impersonate the original conversation. Consume the generated gate
 contract and current revision; never infer approval from a timeout, a worker's
 `approved` label, or the absence of an objection.
 

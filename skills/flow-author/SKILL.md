@@ -38,10 +38,11 @@ available.
   relative prompt paths resolvable from the flow config file's directory.
 - Use structured `report.schema` fields only for routing decisions that the
   flow actually needs.
-- Use `execution: coordinator` with `decision: { key, authority, artifact_key? }` for
+- Use `execution: coordinator` with `decision: { key, authority, owner, artifact_key? }` for
   explicit human/coordinator gates. These steps notify without dispatching a
   worker. Use `authority: user` for human decisions and `authority: coordinator` for
-  coordinator judgment. Bind content approvals to their artifact revision. A plain `notify`
+  coordinator judgment. Use `owner: requester` when the original conversation
+  owns the decision and `owner: orchestrator` when the executor owns it. Bind content approvals to their artifact revision. A plain `notify`
   remains useful for a blocker or ambiguous route.
 - Use `to: "<step-id>"` only for deterministic transitions that the config can
   express safely.

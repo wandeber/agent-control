@@ -27,7 +27,7 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     expect(route("analysis", { conclusion: "ready" })?.to).toBe("analysis_intent");
     expect(record.steps.analysis_intent).toMatchObject({
       execution: "coordinator",
-      decision: { key: "analysis_intent", artifact_key: "analysis", authority: "coordinator" }
+      decision: { key: "analysis_intent", artifact_key: "analysis", authority: "coordinator", owner: "requester" }
     });
     expect(route("analysis_intent", { decision: "changes_required" })?.to).toBe("analysis");
     expect(record.steps.plan_review.role).toBe(record.steps.analysis.role);
@@ -38,7 +38,7 @@ describe("development-flow-v1 responsibility and routing parity", () => {
       to: "plan_approval",
       requires_evidence: [{ kind: "plan_review", owner_role: "analyst" }]
     });
-    expect(record.steps.plan_approval.decision).toEqual({ key: "plan_approval", artifact_key: "plan", authority: "user" });
+    expect(record.steps.plan_approval.decision).toEqual({ key: "plan_approval", artifact_key: "plan", authority: "user", owner: "requester" });
     const guard = record.steps.implementation.requires as FlowConditionConfig;
     expect(evaluateCondition(guard, { decisions: {} })).toBe(false);
     expect(evaluateCondition(guard, { decisions: { plan_approval: { value: "approved" } } })).toBe(true);

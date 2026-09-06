@@ -1,8 +1,13 @@
 # Mechanical Validation
 
 Remain no-edit. Consume the current result checkpoint and supplied affected
-closure; every changed path must belong to a plan package. Use `complete_gate`
-for the initial pre-planner gate and for final closure freshness. A
+closure. Resolve its receipt with `read_receipt`; reuse that checkpoint when the
+result is unchanged between focused and complete validation. Create a new
+checkpoint ID only for a new snapshot, with the previous ID when lineage is
+valid. Checkpoints are immutable: do not call preparation again using an
+existing checkpoint ID. Every changed path must belong to a plan package.
+Use the current snapshot rather than assuming a historical receipt is fresh.
+Use `complete_gate` for the initial pre-planner gate and final closure freshness. A
 `focused_recheck` covers a known correction bundle and cannot stand in for the
 complete gate at closure.
 

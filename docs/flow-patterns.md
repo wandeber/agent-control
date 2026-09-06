@@ -207,8 +207,9 @@ its exact snapshot, actor/gate, provenance, and required evidence. Do not trust
 nested `approved` or `evidence_valid` values supplied by the worker.
 
 Use `execution: coordinator` and `decision: { key: plan_approval,
-authority: user, artifact_key: plan }` for an explicit plan decision. No worker is dispatched. A coordinator-only intention check
-uses `authority: coordinator` so it does not ask the user for a redundant
+authority: user, owner: requester, artifact_key: plan }` for an explicit plan decision. No worker is dispatched. A coordinator-only intention check
+uses `authority: coordinator` with the appropriate original `owner: requester`
+so it does not ask the user for a redundant
 decision. `flow_decision` records the authorized value and current revision, then routes
 its generated `result.decision`. Current decisions are filtered by acceptance
 and bound artifact revision; a changed plan cannot inherit its old approval.

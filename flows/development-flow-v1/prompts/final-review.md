@@ -5,8 +5,10 @@ mechanical evidence, and relevant constraints. Start independently with clean
 context; consume your own earlier findings and current correction evidence only
 on subsequent iterations. Do not use authoring history as proof.
 
-Prepare the current checkpoint and inspect the result delta through the
-evidence tool; determine current expert scope from semantic impact. The
+Read the current validation/checkpoint receipts and inspect the result delta
+through the evidence tool. Reuse an unchanged existing checkpoint; prepare a
+new ID only for a new snapshot and preserve its valid predecessor. Never
+recreate an immutable checkpoint using an existing ID; determine current expert scope from semantic impact. The
 planner-only scope operation is not an expert scope authority. Review all
 required surfaces initially. Later, decide current semantic impact, inspect
 changed/dependent surfaces and prior findings, and return direct review records.

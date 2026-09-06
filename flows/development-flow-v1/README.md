@@ -78,6 +78,10 @@ shared provider is the authority for complete draft structure. Typical operation
 | Mechanical checks | `validation_run` | Declare complete affected checks, execution context, and safe independence |
 | Final binding | `verify_closure` | Supply current expert and complete validation receipt references |
 
+Checkpoint IDs identify immutable captures. Reuse the current unchanged
+checkpoint by reading its receipt when a later phase needs it; do not recreate
+the same ID. New content gets a new ID with a valid `previous` lineage.
+
 Use explicit paths unless the entire worktree is truly isolated. Never declare
 `all_changes` and isolation over unrelated dirty work. Keep secrets out of
 artifacts, invocation descriptors, and reports; the evidence provider validates
@@ -113,8 +117,9 @@ build outputs sequential.
 ## Coordinator Operation
 
 Use `development-flow` for launch and decision policy, and `flow-runner` for
-transport. `flow_context_update` persists clarified acceptance before dependent
-work. `flow_decision` records current configured choices and follows declarative
+transport. `flow_launch` persists the complete initial `acceptance_context` before
+dispatch; its short title is a label. `flow_context_update` appends subsequent
+clarified acceptance revisions before dependent work. `flow_decision` records current configured choices and follows declarative
 routes. Manual routing cannot bypass plan approval or evidence guards.
 
 Keep the initiating conversation registered and subscribed to all run events.
@@ -124,7 +129,29 @@ run's last processed cursor and never rely on a notification to awaken an ended
 Codex turn. Original requester and executing coordinator retain distinct roles
 when they are different threads.
 
+Decision `owner: requester` preserves the original conversation separately
+from the executing coordinator. `authority` distinguishes coordinator judgment
+from an actual user decision; ownership determines which thread may record it.
+
 Configured model defaults remain Codex Luna Max for ordinary workers and the
 existing explicit final-reviewer model. Changing instruction contracts does not
 migrate model routes. Effective config/prompts are pinned for each run; override
 changes apply to future launches unless an explicit revision is accepted.
+
+## Current Parallelism And Reuse Boundaries
+
+Controlled validation has a native dependency graph and joins every required
+check outcome. Agent work packages still use explicit ownership, isolated
+worktrees, and the Integration phase; this version does not provide native
+agent fork/join scheduling. Do not present a set of separately launched workers
+as an engine-enforced package join.
+
+Selective declared-input reuse is eligible only where read restrictions and
+complete input identity can be enforced. Otherwise the evidence service falls
+back to exact-result reuse. Cross-worktree portability is not a guaranteed
+optimization; use the returned effective reuse mode and provenance.
+
+Planner `record_review` supplies its current passed complete validation receipt
+in `source_receipt_ids`. The service derives the mechanical-report fingerprint;
+the semantic draft must not invent it. A readable historical receipt provides
+lineage and findings, not authority to satisfy a current gate.
