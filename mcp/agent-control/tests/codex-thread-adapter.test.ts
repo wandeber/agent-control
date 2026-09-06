@@ -273,6 +273,8 @@ describe("CodexThreadAdapter", () => {
     const socketPath = join(tmp, "codex-app-server.sock");
     const unixRequests: Array<{ method: string; params: Record<string, unknown> }> = [];
     const httpServer: Server = createServer();
+    const compressionOffers: Array<string | undefined> = [];
+    httpServer.on("upgrade", request => compressionOffers.push(request.headers["sec-websocket-extensions"]));
     const unixServer = new WebSocketServer({ server: httpServer, perMessageDeflate: false });
     wireMockServer(unixServer, unixRequests);
     await new Promise<void>((resolve) => httpServer.listen(socketPath, resolve));
@@ -289,6 +291,7 @@ describe("CodexThreadAdapter", () => {
       };
 
       await adapter.sendMessage(handle, { message: "Worker completed; continue orchestration." });
+      expect(compressionOffers).toEqual([undefined]);
 
       expect(unixRequests.map((request) => request.method)).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
     } finally {

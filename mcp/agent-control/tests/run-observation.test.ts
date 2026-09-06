@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 import { AgentController } from "../src/core/controller.js";
 import { AdapterRegistry } from "../src/adapters/registry.js";
+import { EVENT_TYPES } from "../src/core/types.js";
 import type { AgentAdapter, AgentStatusSnapshot, EventRecord, EventType } from "../src/core/types.js";
 import { handleTool } from "../src/tools/handlers.js";
 import { launchWorker, type WorkerLaunchOptions } from "../src/cli/worker.js";
@@ -31,7 +32,7 @@ describe("run observation", () => {
     sent = vi.fn(async () => {});
     stopped = vi.fn(async () => ({ status: "stopped" as const }));
     status = { status: "running" };
-    for (const kind of ["codex-thread", "fake"]) {
+    for (const kind of ["codex-thread", "fake", "manual"]) {
       adapters.register({ kind, capabilities: () => ({ canStart: true, canSendMessage: true, canReadLatest: true,
         canStopGracefully: true, canForceStop: false, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: true }),
         start: async ({ agent }) => ({ backend: kind, id: agent.agent_id, data: { thread_id: agent.agent_id } }),
@@ -42,7 +43,7 @@ describe("run observation", () => {
   });
 
   afterEach(async () => {
-    await controller.drainDeliveries();
+    await controller.dispose();
     store.close();
     vi.unstubAllEnvs();
     rmSync(directory, { recursive: true, force: true });
@@ -377,9 +378,94 @@ describe("run observation", () => {
       promptFile: resolve("../../flows/development-flow-v0/prompts/analysis.md"), repoDir: directory,
       outputArtifact: join(directory, "output.md"), startTimeoutMs: 1000, inputArtifact: [], constraint: [],
       expectArtifact: [], file: [], subscribeEvent: [], subscriberAgentId: [], watchIntervalMs: 1000,
-      requesterThreadId: "user-thread", requesterEvent: ["agent.completed"] };
+      watch: false, requesterThreadId: "user-thread", requesterEvent: ["agent.completed"] };
     const result = await launchWorker(options, { controller, output: () => {}, authOptions: () => ({ adminKey: "observer-test-admin" }) });
     expect(registeredBeforeStart).toBe(true);
     expect(result.observer).toMatchObject({ thread_id: "user-thread", event_types: ["agent.completed"] });
   });
+  it("launches a reportless MCP worker in one call with all events and one user participant", async () => {
+    let beforeStart = false;
+    const adapter = adapters.get("codex-thread");
+    adapter.start = async ({ agent }) => {
+      const subscriptions = controller.listSubscriptions({ runId: agent.run_id });
+      beforeStart = subscriptions.length === EVENT_TYPES.length;
+      return { backend: "codex-thread", id: agent.agent_id, data: { thread_id: agent.agent_id } };
+    };
+    const launched = await handleTool(controller, "worker_launch", { title: "Quick review", prompt: "Review only", repo_dir: directory, watch: false }) as any;
+    expect(beforeStart).toBe(true);
+    expect(launched.observer).toMatchObject({ thread_id: "user-thread", event_types: [...EVENT_TYPES], delivery: "wait" });
+    expect(controller.listAgents({ runId: launched.run_id }).filter(a => a.backend_handle?.thread_id === "user-thread")).toHaveLength(1);
+    expect(controller.getAgent(launched.observer.observer_agent_id).role).toBe("orchestrator");
+    expect(launched).not.toHaveProperty("agent_token");
+    const batch = await wait(launched.observer);
+    expect(batch.events.some(e => e.type === "agent.started")).toBe(true);
+    expect(batch.events.some(e => e.type === "agent.status_changed")).toBe(true);
+  });
+
+  it("automatically attaches direct MCP starts before the backend runs", async () => {
+    const id = run().run_id;
+    const worker = controller.registerAgent({ runId: id, backend: "fake", title: "Worker" });
+    let attached = false;
+    adapters.get("fake").start = async ({ agent }) => {
+      attached = controller.listSubscriptions({ runId: id }).length === EVENT_TYPES.length;
+      return { backend: "fake", id: agent.agent_id, data: { id: agent.agent_id } };
+    };
+    const started = await handleTool(controller, "agent_start", { agent_id: worker.agent_id, prompt: "Review" }) as any;
+    expect(attached).toBe(true);
+    expect(started.observer.event_types).toEqual([...EVENT_TYPES]);
+  });
+
+  it("inherits the original requester into child runs before the nested worker thread", async () => {
+    const parent = run();
+    const original = observe(parent.run_id, { eventTypes: ["agent.completed"] });
+    const worker = controller.registerAgent({ runId: parent.run_id, backend: "fake", title: "Nested launcher", adminKey: "observer-test-admin" });
+    const child = controller.createRun({ title: "Child", agentToken: worker.agent_token });
+    vi.stubEnv("CODEX_THREAD_ID", "nested-thread");
+    const first = controller.ensureRequester(child.run_id, { agentToken: worker.agent_token })!;
+    expect(first.thread_id).toBe(original.thread_id);
+    expect(first.event_types).toEqual([...EVENT_TYPES]);
+    expect(controller.ensureRequester(parent.run_id)?.event_types).toEqual(["agent.completed"]);
+    const again = controller.ensureRequester(child.run_id)!;
+    expect(again.observer_agent_id).toBe(first.observer_agent_id);
+    expect(controller.listSubscriptions({ runId: child.run_id })).toHaveLength(EVENT_TYPES.length);
+  });
+
+  it("returns an observer for direct flow starts before initial events", async () => {
+    const started = await handleTool(controller, "flow_start", { admin_key: "observer-test-admin", config: {
+      id: "observed-flow", initial_step: "work", roles: { worker: { backend: "fake" } },
+      steps: { work: { role: "worker", prompt: "Review", on: { reported: { finish: true } } } }
+    } }) as any;
+    expect(started.observer.thread_id).toBe("user-thread");
+    const batch = await wait(started.observer);
+    expect(batch.events.map(e => e.type)).toEqual(expect.arrayContaining(["flow.started", "flow.step_started"]));
+  });
+
+  it("recovers a nested Codex caller without redundant tokens or run arguments", async () => {
+    const parent = run();
+    const original = observe(parent.run_id);
+    const nested = controller.registerAgent({ runId: parent.run_id, backend: "codex-thread", title: "Nested executor", role: "reviewer",
+      backendHandle: { thread_id: "nested-conversation" }, adminKey: "observer-test-admin" });
+    vi.stubEnv("CODEX_THREAD_ID", "nested-conversation");
+    const launched = await handleTool(controller, "worker_launch", { title: "Nested work", prompt: "Review", repo_dir: directory,
+      backend: "fake", watch: false }) as any;
+    expect(launched.run_id).toBe(parent.run_id);
+    expect(launched.observer.thread_id).toBe(original.thread_id);
+    expect(controller.getAgent(nested.agent_id).role).toBe("reviewer");
+    expect(controller.listAgentLinks({ runId: parent.run_id })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source_agent_id: nested.agent_id, target_agent_id: launched.agent_id, type: "parent_child" })
+    ]));
+    expect(JSON.stringify(launched)).not.toMatch(/agent_token|act_/);
+  });
+
+  it("keeps a supplied requester passive when the executing host has no Codex identity", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", "");
+    const launched = await handleTool(controller, "worker_launch", { title: "Headless launch", prompt: "Review", repo_dir: directory,
+      backend: "fake", requester_thread_id: "original-user", watch: false }) as any;
+    const agents = controller.listAgents({ runId: launched.run_id });
+    expect(agents.find(a => a.role === "orchestrator")?.backend).toBe("manual");
+    const observer = controller.getAgent(launched.observer.observer_agent_id);
+    expect(observer).toMatchObject({ role: "observer", backend_handle: { thread_id: "original-user" } });
+    expect(store.db.prepare("select count(*) n from agent_tokens where agent_id = ?").get(observer.agent_id)).toEqual({ n: 0 });
+  });
+
 });

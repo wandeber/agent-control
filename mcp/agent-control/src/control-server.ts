@@ -21,7 +21,15 @@ type Controller = ReturnType<typeof createController>["controller"];
 
 export async function startControlServer(options: ControlServerOptions): Promise<{ server: Server; close: () => Promise<void> }> {
   const { controller, store } = createController();
-  const server = createServer(async (request, response) => {
+  let closing = false;
+  const activeRequests = new Set<Promise<void>>();
+  const socketTimers = new Set<ReturnType<typeof setInterval>>();
+  const server = createServer((request, response) => {
+    const work = handleRequest(request, response).finally(() => activeRequests.delete(work));
+    activeRequests.add(work);
+  });
+  const handleRequest = async (request: IncomingMessage, response: ServerResponse) => {
+    if (closing) { response.writeHead(503); response.end(); return; }
     setCorsHeaders(response);
     if (request.method === "OPTIONS") {
       response.statusCode = 204;
@@ -63,7 +71,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
         error: error instanceof Error ? error.message : String(error)
       });
     }
-  });
+  };
 
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", (request, socket, head) => {
@@ -109,33 +117,41 @@ export async function startControlServer(options: ControlServerOptions): Promise
     });
 
     const timer = setInterval(() => {
-      void tickSocket(controller, client, state);
+      controller.runBackground(() => tickSocket(controller, client, state));
     }, 1000);
     timer.unref();
-    client.once("close", () => clearInterval(timer));
+    socketTimers.add(timer);
+    client.once("close", () => { clearInterval(timer); socketTimers.delete(timer); });
   });
 
-  server.once("close", () => {
+  let cleanupTask: Promise<void> | undefined;
+  const cleanup = () => cleanupTask ??= (async () => {
+    closing = true;
+    for (const timer of socketTimers) clearInterval(timer);
+    for (const client of wss.clients) client.terminate();
     wss.close();
+    await Promise.allSettled([...activeRequests]);
+    await controller.dispose();
     store.close();
-  });
+  })();
+  server.once("close", () => { void cleanup(); });
 
   await new Promise<void>((resolveListen) => {
     server.listen(options.port, options.host, resolveListen);
   });
 
+  let closeTask: Promise<void> | undefined;
   return {
     server,
-    close: () =>
-      new Promise<void>((resolveClose, rejectClose) => {
-        server.close((error) => {
-          if (error) {
-            rejectClose(error);
-            return;
-          }
-          resolveClose();
-        });
-      })
+    close: () => closeTask ??= (async () => {
+      // Stop accepting work first; upgraded sockets otherwise keep close pending.
+      closing = true;
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => error ? rejectClose(error) : resolveClose());
+      });
+      await cleanup();
+    })()
   };
 }
 

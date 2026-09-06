@@ -2,7 +2,7 @@ import type { AgentController } from "./controller.js";
 import type { SqliteStore } from "../storage/sqlite-store.js";
 import type { AdapterRegistry } from "../adapters/registry.js";
 import { ControllerError } from "./errors.js";
-import { verifyAdminKey } from "./identity.js";
+import { resolveAdminKey, verifyAdminKey } from "./identity.js";
 import { EVENT_TYPES, type AgentRecord, type EventRecord, type EventType } from "./types.js";
 
 // Match the complete subscription before applying the event batch limit. Owner subscriptions may be source-scoped.
@@ -18,11 +18,7 @@ const MATCHING_OBSERVER_SUBSCRIPTION = `exists (
     and (s.source_agent_id is null or s.source_agent_id = e.agent_id)
 )`;
 
-export const DEFAULT_OBSERVER_EVENTS: EventType[] = [
-  "flow.step_started", "flow.step_blocked", "flow.completed", "flow.notification",
-  "agent.completed", "agent.failed", "agent.blocked", "agent.stopped",
-  "goal.completed", "goal.blocked"
-];
+export const DEFAULT_OBSERVER_EVENTS: EventType[] = [...EVENT_TYPES];
 
 export interface ObserveRunInput {
   runId: string;
@@ -32,6 +28,12 @@ export interface ObserveRunInput {
   delivery?: "wait" | "notify";
   adminKey?: string | null;
   agentToken?: string | null;
+}
+
+export interface RequesterInput {
+  requesterThreadId?: string;
+  requesterEventTypes?: EventType[];
+  requesterDelivery?: "wait" | "notify";
 }
 
 export interface WaitRunInput {
@@ -59,6 +61,31 @@ export function isPassiveObserver(agent: AgentRecord): boolean {
 
 export class RunObservation {
   constructor(private store: SqliteStore, private controller: AgentController, private adapters: AdapterRegistry) {}
+
+  /** The first requester remains stable when a worker launches nested work. */
+  requesterThread(runId: string, visited = new Set<string>()): string | undefined {
+    if (visited.has(runId)) return undefined;
+    visited.add(runId);
+    const binding = this.store.db.prepare("select thread_id from run_requesters where run_id = ?").get(runId) as { thread_id: string } | undefined;
+    if (binding) return binding.thread_id;
+    // Existing runs predate the explicit requester binding.
+    const first = this.store.db.prepare("select thread_id from run_observers where run_id = ? order by created_at, rowid limit 1").get(runId) as { thread_id: string } | undefined;
+    if (first) return first.thread_id;
+    const parent = this.store.getRun(runId)?.parent_run_id;
+    return parent ? this.requesterThread(parent, visited) : undefined;
+  }
+
+  ensure(runId: string, input: RequesterInput & { agentToken?: string | null; adminKey?: string | null } = {}) {
+    const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
+    const threadId = input.requesterThreadId ?? this.requesterThread(runId) ??
+      (caller ? this.requesterThread(caller.run_id) : undefined) ??
+      process.env.AGENT_CONTROL_REQUESTER_THREAD_ID ?? process.env.CODEX_THREAD_ID;
+    // Headless/non-Codex callers have no conversation to fabricate.
+    if (!threadId) return null;
+    return this.observe({ runId, threadId, eventTypes: input.requesterEventTypes,
+      delivery: input.requesterDelivery, agentToken: input.agentToken,
+      adminKey: input.adminKey ?? (caller ? undefined : resolveAdminKey()) });
+  }
 
   listPublic(runId: string) {
     return (this.store.db.prepare("select o.* from run_observers o join agents a on a.agent_id = o.observer_agent_id where o.run_id = ? and a.unregistered_at is null").all(runId) as ObserverRow[])
@@ -111,6 +138,7 @@ export class RunObservation {
           role: "observer", status: "waiting_for_input", repoDir: run.repo_dir,
           backendHandle: { thread_id: threadId, agent_control_role: "observer", cwd: run.repo_dir } });
       }
+      this.store.db.prepare("insert or ignore into run_requesters(run_id, thread_id) values (?, ?)").run(run.run_id, threadId);
       const start = previous?.start_sequence ?? this.currentSequence();
       this.store.db.prepare(`insert into run_observers(observer_agent_id, run_id, thread_id, events_json, delivery, start_sequence, created_at)
         values (?, ?, ?, ?, ?, ?, ?) on conflict(observer_agent_id) do update set events_json = excluded.events_json, delivery = excluded.delivery`)

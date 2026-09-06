@@ -2,6 +2,28 @@ import { z } from "zod";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 
+const requesterFields = {
+  requester_thread_id: z.string().min(1).optional(),
+  requester_event_types: z.array(z.enum(EVENT_TYPES)).min(1).optional(),
+  requester_delivery: z.enum(["wait", "notify"]).optional()
+};
+export const workerLaunchSchema = z.object({
+  ...requesterFields, title: z.string().min(1), prompt: z.string().min(1).optional(), prompt_file: z.string().min(1).optional(),
+  repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), backend: z.string().min(1).optional(),
+  model: z.string().min(1).optional(), reasoning_effort: z.string().min(1).optional(), server: z.string().min(1).optional(),
+  phase: z.string().min(1).optional(), role: z.string().min(1).optional(), objective: z.string().min(1).optional(),
+  output_artifact: z.string().min(1).optional(), input_handoffs: z.array(z.unknown()).optional(),
+  input_artifacts: z.array(z.string()).optional(), constraints: z.array(z.string()).optional(),
+  expected_artifacts: z.array(z.string()).optional(), attachments: z.array(z.string()).optional(), watch: z.boolean().optional(),
+  admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
+}).refine(v => Boolean(v.prompt) !== Boolean(v.prompt_file), "Provide exactly one of prompt or prompt_file.");
+export const flowLaunchSchema = z.object({
+  ...requesterFields, title: z.string().min(1), config: z.record(z.unknown()).optional(), flow_id: z.string().min(1).optional(),
+  repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), server: z.string().min(1).optional(),
+  admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional(),
+  owner_task_identity: z.string().min(1).optional(), owner_task_path: z.string().min(1).optional()
+}).refine(v => Boolean(v.config) !== Boolean(v.flow_id), "Provide exactly one of config or flow_id.");
+
 export const runObserveSchema = z.object({
   run_id: z.string().min(1), thread_id: z.string().min(1).optional(), title: z.string().min(1).optional(),
   event_types: z.array(z.enum(EVENT_TYPES)).min(1).optional(), delivery: z.enum(["wait", "notify"]).optional(),
@@ -55,6 +77,7 @@ export const agentListSchema = z.object({
 });
 
 export const agentStartSchema = z.object({
+  ...requesterFields,
   agent_id: z.string().min(1),
   prompt: z.string().min(1).optional(),
   server: z.string().min(1).optional(),
@@ -241,6 +264,7 @@ export const flowCatalogGetSchema = z.object({
 });
 
 export const flowStartSchema = z.object({
+  ...requesterFields,
   config: z.record(z.unknown()),
   run_id: z.string().min(1).optional(),
   run_title: z.string().min(1).optional(),

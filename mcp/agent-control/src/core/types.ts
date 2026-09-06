@@ -436,7 +436,7 @@ export type AgentStartResult = (
   | AgentWithToken
   | AgentWithOrchestratorAction
   | (AgentRecord & { agent_token?: never; orchestrator_action?: never })
-) & { start_state?: AgentStartState };
+) & { start_state?: AgentStartState; observer?: RunObserverResult | null };
 
 export type AgentSendResult =
   | { agent: AgentRecord; delivered: true }
@@ -632,7 +632,10 @@ export type FlowConditionConfig =
   | { all: FlowConditionConfig[] }
   | { any: FlowConditionConfig[] };
 
+export type RunObserverResult = ReturnType<import("./run-observation.js").RunObservation["observe"]>;
+
 export interface FlowStartResult {
+  observer?: RunObserverResult | null;
   flow: FlowRecord;
   instance: FlowInstanceRecord;
   active_step: FlowStepInstanceRecord | null;

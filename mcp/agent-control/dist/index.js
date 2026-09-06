@@ -11,7 +11,7 @@ import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 const { controller, store } = createController();
-const MCP_APP_VERSION = "0.1.6";
+const MCP_APP_VERSION = "0.1.7";
 const CONSOLE_RESOURCE_URI = `ui://agent-control/${MCP_APP_VERSION}/console.html`;
 const CONSOLE_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -128,39 +128,46 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         ]
     };
 });
-server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === request.params.name);
-    try {
-        const appResult = await handleConsoleTool(request.params.name, request.params.arguments ?? {});
-        if (appResult) {
-            return appResult;
+const activeCalls = new Set();
+const shutdownCancellation = new AbortController();
+let shutdownTask;
+server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
+    const call = (async () => {
+        if (shutdownCancellation.signal.aborted)
+            return jsonResult({ error: "Agent Control is shutting down." }, true);
+        const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === request.params.name);
+        try {
+            const appResult = await handleConsoleTool(request.params.name, request.params.arguments ?? {});
+            if (appResult) {
+                return appResult;
+            }
         }
-    }
-    catch (error) {
-        await controller.drainDeliveries();
-        return jsonResult(errorToPayload(error), true);
-    }
-    if (!tool) {
-        return jsonResult({ error: `Unknown tool: ${request.params.name}` }, true);
-    }
-    try {
-        const input = tool.schema.parse(request.params.arguments ?? {});
-        const result = await handleTool(controller, tool.name, input, extra.signal);
-        await controller.drainDeliveries();
-        return jsonResult(result);
-    }
-    catch (error) {
-        await controller.drainDeliveries();
-        return jsonResult(errorToPayload(error), true);
-    }
+        catch (error) {
+            await controller.drainDeliveries();
+            return jsonResult(errorToPayload(error), true);
+        }
+        if (!tool) {
+            return jsonResult({ error: `Unknown tool: ${request.params.name}` }, true);
+        }
+        try {
+            const input = tool.schema.parse(request.params.arguments ?? {});
+            const result = await handleTool(controller, tool.name, input, AbortSignal.any([extra.signal, shutdownCancellation.signal]));
+            await controller.drainDeliveries();
+            return jsonResult(result);
+        }
+        catch (error) {
+            await controller.drainDeliveries();
+            return jsonResult(errorToPayload(error), true);
+        }
+    })().finally(() => activeCalls.delete(call));
+    activeCalls.add(call);
+    return call;
 });
 const pollIntervalMs = Number(process.env.AGENT_CONTROL_POLL_INTERVAL_MS ?? "0");
+let pollTimer;
 if (Number.isFinite(pollIntervalMs) && pollIntervalMs > 0) {
-    setInterval(() => {
-        void controller.pollActiveAgents().catch(() => {
-            // Background polling is best-effort. Explicit MCP calls surface errors.
-        });
-    }, pollIntervalMs).unref();
+    pollTimer = setInterval(() => controller.runBackground(() => controller.pollActiveAgents()), pollIntervalMs);
+    pollTimer.unref();
 }
 process.once("SIGINT", () => {
     void shutdown(0);
@@ -299,8 +306,15 @@ function numberField(input, key, fallback) {
     const value = input[key];
     return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
-async function shutdown(code) {
-    await controller.drainDeliveries();
-    store.close();
-    process.exit(code);
+function shutdown(code) {
+    return shutdownTask ??= (async () => {
+        shutdownCancellation.abort();
+        if (pollTimer)
+            clearInterval(pollTimer);
+        await Promise.allSettled([...activeCalls]);
+        await controller.dispose();
+        await server.close();
+        store.close();
+        process.exit(code);
+    })();
 }

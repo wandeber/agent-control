@@ -1,3 +1,4 @@
+import { launchFlowTool, launchWorkerTool, requesterOptions } from "./launch.js";
 import type { AgentController } from "../core/controller.js";
 import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
@@ -10,6 +11,8 @@ export async function handleTool(
   signal?: AbortSignal
 ): Promise<unknown> {
   switch (name) {
+    case "worker_launch": return launchWorkerTool(controller, input);
+    case "flow_launch": return launchFlowTool(controller, input);
     case "run_observe":
       return controller.observeRun({ runId: String(input.run_id), threadId: maybeString(input.thread_id),
         title: maybeString(input.title), eventTypes: maybeStringArray(input.event_types) as EventType[] | undefined,
@@ -30,6 +33,7 @@ export async function handleTool(
         throw new ControllerError("flow_start requires admin_key or agent_token.", "auth_required");
       }
       return controller.startFlow({
+        ...requesterOptions(input),
         config: maybeObject(input.config) ?? {},
         runId: maybeString(input.run_id),
         runTitle: maybeString(input.run_title),
@@ -157,6 +161,7 @@ export async function handleTool(
       });
     case "agent_start":
       return controller.startAgent({
+        ...requesterOptions(input),
         agentId: String(input.agent_id),
         prompt: maybeString(input.prompt),
         server: maybeString(input.server),

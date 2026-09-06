@@ -17,7 +17,7 @@ import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
 
 const { controller, store } = createController();
-const MCP_APP_VERSION = "0.1.6";
+const MCP_APP_VERSION = "0.1.7";
 const CONSOLE_RESOURCE_URI = `ui://agent-control/${MCP_APP_VERSION}/console.html`;
 const CONSOLE_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -147,7 +147,12 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+const activeCalls = new Set<Promise<unknown>>();
+const shutdownCancellation = new AbortController();
+let shutdownTask: Promise<void> | undefined;
+server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
+  const call = (async () => {
+    if (shutdownCancellation.signal.aborted) return jsonResult({ error: "Agent Control is shutting down." }, true);
   const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === request.params.name);
 
   try {
@@ -166,22 +171,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   try {
     const input = tool.schema.parse(request.params.arguments ?? {});
-    const result = await handleTool(controller, tool.name, input as Record<string, unknown>, extra.signal);
+    const result = await handleTool(controller, tool.name, input as Record<string, unknown>, AbortSignal.any([extra.signal, shutdownCancellation.signal]));
     await controller.drainDeliveries();
     return jsonResult(result);
   } catch (error) {
     await controller.drainDeliveries();
     return jsonResult(errorToPayload(error), true);
   }
+  })().finally(() => activeCalls.delete(call));
+  activeCalls.add(call);
+  return call;
 });
 
 const pollIntervalMs = Number(process.env.AGENT_CONTROL_POLL_INTERVAL_MS ?? "0");
+let pollTimer: ReturnType<typeof setInterval> | undefined;
 if (Number.isFinite(pollIntervalMs) && pollIntervalMs > 0) {
-  setInterval(() => {
-    void controller.pollActiveAgents().catch(() => {
-      // Background polling is best-effort. Explicit MCP calls surface errors.
-    });
-  }, pollIntervalMs).unref();
+  pollTimer = setInterval(() => controller.runBackground(() => controller.pollActiveAgents()), pollIntervalMs);
+  pollTimer.unref();
 }
 
 process.once("SIGINT", () => {
@@ -366,8 +372,14 @@ function numberField(input: unknown, key: string, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-async function shutdown(code: number): Promise<never> {
-  await controller.drainDeliveries();
-  store.close();
-  process.exit(code);
+function shutdown(code: number): Promise<void> {
+  return shutdownTask ??= (async () => {
+    shutdownCancellation.abort();
+    if (pollTimer) clearInterval(pollTimer);
+    await Promise.allSettled([...activeCalls]);
+    await controller.dispose();
+    await server.close();
+    store.close();
+    process.exit(code);
+  })();
 }

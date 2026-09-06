@@ -7,16 +7,10 @@ export function addRequesterOptions(command) {
         .option("--requester-delivery <mode>", "wait (default) or notify using safe in-turn injection.");
 }
 export function attachRequester(runId, options, deps, agentToken) {
-    const threadId = options.requesterThreadId ?? process.env.CODEX_THREAD_ID;
-    if (!threadId) {
-        if (options.requesterEvent?.length)
-            throw new Error("Requester subscriptions require the actual requester thread id.");
-        return null;
-    }
     const auth = deps.authOptions({ allowStoredAdminKey: true });
-    return deps.controller.observeRun({ runId, threadId, agentToken: agentToken ?? auth.agentToken,
-        adminKey: auth.adminKey, delivery: options.requesterDelivery,
-        eventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined });
+    return deps.controller.ensureRequester(runId, { requesterThreadId: options.requesterThreadId,
+        requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined,
+        requesterDelivery: options.requesterDelivery, agentToken: agentToken ?? auth.agentToken, adminKey: auth.adminKey });
 }
 export function registerObservationCommands(run, deps) {
     run.command("observe")

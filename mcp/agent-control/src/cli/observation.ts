@@ -17,15 +17,10 @@ export function addRequesterOptions(command: Command): Command {
 }
 
 export function attachRequester(runId: string, options: RequesterOptions, deps: CliDeps, agentToken?: string) {
-  const threadId = options.requesterThreadId ?? process.env.CODEX_THREAD_ID;
-  if (!threadId) {
-    if (options.requesterEvent?.length) throw new Error("Requester subscriptions require the actual requester thread id.");
-    return null;
-  }
   const auth = deps.authOptions({ allowStoredAdminKey: true });
-  return deps.controller.observeRun({ runId, threadId, agentToken: agentToken ?? auth.agentToken,
-    adminKey: auth.adminKey, delivery: options.requesterDelivery,
-    eventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined });
+  return deps.controller.ensureRequester(runId, { requesterThreadId: options.requesterThreadId,
+    requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined,
+    requesterDelivery: options.requesterDelivery, agentToken: agentToken ?? auth.agentToken, adminKey: auth.adminKey });
 }
 
 export function registerObservationCommands(run: Command, deps: CliDeps): void {

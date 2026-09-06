@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import type { CliDeps } from "../src/cli/shared.js";
 import { launchWorker, registerWorkerCommands, type WorkerLaunchOptions } from "../src/cli/worker.js";
 import type { AgentRecord } from "../src/core/types.js";
@@ -13,6 +13,8 @@ const CANONICAL_PROMPT_FILE = resolve(REPOSITORY_ROOT, "flows/development-flow-v
 const OUTPUT_ARTIFACT = resolve(tmpdir(), "agent-control-worker-input-handoffs-report.md");
 
 describe("worker launch input handoffs", () => {
+  beforeEach(() => { vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "test-admin-key"); vi.stubEnv("CODEX_THREAD_ID", ""); });
+  afterEach(() => vi.unstubAllEnvs());
   it("defaults CLI workers to Codex Luna Max without an OpenCode server", async () => {
     const harness = createCliHarness();
     const program = new Command().name("agentctl").exitOverride();
@@ -20,7 +22,7 @@ describe("worker launch input handoffs", () => {
     await program.parseAsync([
       "worker", "launch", "--repo", REPOSITORY_ROOT, "--title", "Default worker",
       "--prompt-file", CANONICAL_PROMPT_FILE, "--phase", "analysis",
-      "--output-artifact", OUTPUT_ARTIFACT
+      "--output-artifact", OUTPUT_ARTIFACT, "--no-watch"
     ], { from: "user" });
     expect(harness.registerAgent).toHaveBeenCalledWith(expect.objectContaining({ backend: "codex-thread", model: "gpt-5.6-luna" }));
     expect(harness.startAgent).toHaveBeenCalledWith(expect.objectContaining({
@@ -371,7 +373,8 @@ function createCliHarness(): {
   const registerAgent = vi.fn(() => agent);
   const startAgent = vi.fn(async () => ({ ...agent, status: "running" as const }));
   const controller = {
-    observeRun: vi.fn(() => ({ observer_agent_id: "observer_handoff_test", run_id: agent.run_id })),
+    orchestratorLogin: vi.fn(() => ({ run: { run_id: agent.run_id }, agent: { ...agent, agent_id: "owner" }, agent_token: "owner-token" })),
+    ensureRequester: vi.fn(() => ({ observer_agent_id: "observer_handoff_test", run_id: agent.run_id })),
     createRun: vi.fn(() => ({ run_id: agent.run_id })),
     registerAgent,
     createArtifact: vi.fn(() => ({

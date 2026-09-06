@@ -2,7 +2,7 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
-import { RunObservation, isPassiveObserver, type ObserveRunInput, type WaitRunInput } from "./run-observation.js";
+import { RunObservation, isPassiveObserver, type ObserveRunInput, type WaitRunInput, type RequesterInput } from "./run-observation.js";
 import { parseActivity, activityText, type AgentActivity } from "./agent-activity.js";
 import {
   parseFlowConfig,
@@ -119,6 +119,10 @@ interface AgentControllerOptions {
 export class AgentController {
   private readonly controllerInstanceId = newId("controller");
   private readonly observations: RunObservation;
+  private disposing = false;
+  private disposeTask: Promise<void> | null = null;
+  private readonly backgroundTasks = new Set<Promise<void>>();
+  private readonly backgroundAbort = new AbortController();
   private readonly statusWatchers = new Map<string, () => void>();
   private readonly pendingDeliveries = new Set<Promise<void>>();
   private readonly inFlightSubscriberDeliveries = new Set<string>();
@@ -283,6 +287,10 @@ export class AgentController {
     return this.observations.observe(input);
   }
 
+  ensureRequester(runId: string, input: RequesterInput & { agentToken?: string | null; adminKey?: string | null } = {}) {
+    return this.observations.ensure(runId, input);
+  }
+
   waitForRun(input: WaitRunInput) {
     return this.observations.wait(input);
   }
@@ -332,6 +340,42 @@ export class AgentController {
     return getFlowFromCatalog({ flowId: input.flowId });
   }
 
+  /** Stop local supervision without stopping durable workers or detaching observers. */
+  dispose(): Promise<void> {
+    if (this.disposeTask) return this.disposeTask;
+    this.disposing = true;
+    this.backgroundAbort.abort();
+    for (const agentId of this.statusWatchers.keys()) this.disarmStatusWatcher(agentId);
+    this.disposeTask = (async () => {
+      while (this.backgroundTasks.size || this.pendingDeliveries.size) {
+        await Promise.allSettled([...this.backgroundTasks, ...this.pendingDeliveries]);
+      }
+    })();
+    return this.disposeTask;
+  }
+
+  runBackground(task: () => Promise<unknown>): void {
+    if (this.disposing) return;
+    const pending = Promise.resolve().then(task).then(() => undefined).catch(() => {
+      // Background refresh is best-effort; explicit operations report errors.
+    }).finally(() => this.backgroundTasks.delete(pending));
+    this.backgroundTasks.add(pending);
+  }
+
+  private async backgroundDelay(ms: number): Promise<boolean> {
+    if (this.disposing) return false;
+    return new Promise((resolveDelay) => {
+      const finish = (elapsed: boolean) => {
+        clearTimeout(timer);
+        this.backgroundAbort.signal.removeEventListener("abort", abort);
+        resolveDelay(elapsed);
+      };
+      const abort = () => finish(false);
+      const timer = setTimeout(() => finish(true), ms);
+      this.backgroundAbort.signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
   async drainDeliveries(): Promise<void> {
     while (this.pendingDeliveries.size > 0) {
       await Promise.allSettled([...this.pendingDeliveries]);
@@ -358,7 +402,7 @@ export class AgentController {
     return run;
   }
 
-  startFlow(input: {
+  startFlow(input: RequesterInput & {
     config: unknown;
     runId?: string | null;
     runTitle?: string | null;
@@ -400,6 +444,7 @@ export class AgentController {
           adminKey: input.adminKey,
           agentToken: input.agentToken
         });
+    const observer = this.ensureRequester(run.run_id, input);
     if (input.runId) {
       const reusable = this.findReusableFlowInstance(run.run_id, config);
       if (reusable) {
@@ -444,6 +489,7 @@ export class AgentController {
           .listFlowStepInstances(reusable.instance.flow_instance_id)
           .find((step) => step.status === "active") ?? null;
         return {
+          observer,
           flow: reusable.flow,
           instance: reusable.instance,
           active_step: activeStep,
@@ -528,6 +574,7 @@ export class AgentController {
       this.scheduleEventDelivery(event);
     }
     return {
+      observer,
       flow: initialized.flow,
       instance: this.getFlowInstanceOrThrow(initialized.instance.flow_instance_id),
       active_step: initialized.activeStep.status === "active" ? initialized.activeStep : null,
@@ -5119,7 +5166,14 @@ export class AgentController {
     });
   }
 
-  async startAgent(input: {
+  async startAgent(input: Parameters<AgentController["startAgentExecution"]>[0] & RequesterInput): Promise<AgentStartResult> {
+    const agent = this.getAgent(input.agentId);
+    const observer = this.ensureRequester(agent.run_id, input);
+    const result = await this.startAgentExecution(input);
+    return { ...result, observer };
+  }
+
+  private async startAgentExecution(input: {
     agentId: string;
     prompt?: string;
     server?: string;
@@ -6244,6 +6298,18 @@ export class AgentController {
     }
     await this.checkHeartbeats();
     return refreshed;
+  }
+
+  async waitForFlowTerminal(flowInstanceId: string, input: { intervalMs?: number; timeoutMs?: number } = {}) {
+    const started = Date.now();
+    while (true) {
+      const snapshot = this.getFlowSnapshot(flowInstanceId);
+      await this.pollActiveAgents(snapshot.instance.run_id);
+      const current = this.getFlowSnapshot(flowInstanceId);
+      if (["completed", "cancelled"].includes(current.instance.status) || this.getRun(current.instance.run_id).status === "stopped") return { flow: current, timed_out: false };
+      if (input.timeoutMs !== undefined && Date.now() - started >= input.timeoutMs) return { flow: current, timed_out: true };
+      await sleep(input.intervalMs ?? 5000);
+    }
   }
 
   async waitForAgentTerminal(
@@ -8277,7 +8343,7 @@ export class AgentController {
     deliveryKey: string
   ): void {
     if (
-      this.nativeActionDeliveryRetryDelaysMs.length === 0 ||
+      this.disposing || this.nativeActionDeliveryRetryDelaysMs.length === 0 ||
       this.nativeActionDeliveryRetryTasks.has(deliveryKey)
     ) {
       return;
@@ -8286,7 +8352,7 @@ export class AgentController {
     let retryTask!: Promise<void>;
     retryTask = (async () => {
       for (const delayMs of this.nativeActionDeliveryRetryDelaysMs) {
-        await sleep(delayMs);
+        if (!await this.backgroundDelay(delayMs)) return;
         if (
           this.nativeActionWakeWasDelivered(event.event_id, subscriberAgentId) ||
           !this.nativeActionWakeIsStillRequired(event)
@@ -8757,6 +8823,7 @@ export class AgentController {
   }
 
   private armStatusWatcher(agent: AgentRecord): void {
+    if (this.disposing) return;
     this.disarmStatusWatcher(agent.agent_id);
     const adapter = this.adapters.get(agent.backend);
     if (!adapter.watchStatus || !agent.backend_handle) {
@@ -8766,7 +8833,7 @@ export class AgentController {
       ) {
         const timers = [3000, 10000, 30000].map((delayMs) =>
           setTimeout(() => {
-            void this.refreshAgentStatus(agent.agent_id);
+            this.runBackground(() => this.refreshAgentStatus(agent.agent_id));
           }, delayMs)
         );
         this.statusWatchers.set(agent.agent_id, () => {
@@ -8778,7 +8845,7 @@ export class AgentController {
       return;
     }
     const unwatch = adapter.watchStatus(this.requireHandle(agent), () => {
-      void this.refreshAgentStatus(agent.agent_id);
+      this.runBackground(() => this.refreshAgentStatus(agent.agent_id));
     });
     this.statusWatchers.set(agent.agent_id, unwatch);
   }

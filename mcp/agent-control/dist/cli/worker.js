@@ -1,3 +1,4 @@
+import { prepareLaunchOwner } from "../core/launch-context.js";
 import { addRequesterOptions, attachRequester } from "./observation.js";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -22,9 +23,10 @@ export function registerWorkerCommands(program, deps) {
         .option("--model <model>", "Backend model.")
         .option("--reasoning-effort <effort>", "Codex-thread reasoning effort (for example max).")
         .requiredOption("--title <title>", "Worker title.")
-        .requiredOption("--prompt-file <path>", "Canonical prompt file. Do not use per-run temporary prompt files.")
+        .option("--prompt <text>", "Task text for an ad hoc worker; use --prompt-file for a skill-owned canonical prompt.")
+        .option("--prompt-file <path>", "Canonical prompt file. Do not use per-run temporary prompt files.")
         .requiredOption("--phase <name>", "Phase or operation name.")
-        .requiredOption("--output-artifact <path>", "Primary expected output artifact path.")
+        .option("--output-artifact <path>", "Primary expected output artifact path.")
         .option("--agent <agentId>", "Existing agent id to start.")
         .option("--agent-id <agentId>", "Existing agent id to start.")
         .option("--run <runId>", "Existing run id.")
@@ -46,7 +48,8 @@ export function registerWorkerCommands(program, deps) {
         .option("--file <path>", "Attachment path.", collect, [])
         .option("--subscribe-event <eventType>", "Additional subscription event type.", collect, [])
         .option("--no-default-terminal-subscriptions", "Do not add default terminal lifecycle subscription events.")
-        .option("--watch", "Arm a detached deterministic watcher for the launched worker.")
+        .option("--watch", "Arm detached supervision (enabled by default).")
+        .option("--no-watch", "Use an existing supervisor for an explicit manual or test launch.")
         .option("--watch-timeout <duration>", "Detached watcher timeout such as 30m or 8h.")
         .option("--watch-timeout-ms <ms>", "Detached watcher timeout in milliseconds.", parseIntOption)
         .option("--watch-interval-ms <ms>", "Detached watcher refresh interval.", parseIntOption, DEFAULT_WORKER_WATCH_INTERVAL_MS)
@@ -72,8 +75,9 @@ export function registerWatchCommands(program, deps) {
     watch
         .command("run", { hidden: true })
         .requiredOption("--watcher-id <watcherId>", "Watcher id.")
-        .requiredOption("--target-kind <kind>", "agent, subscription, or goal.")
+        .requiredOption("--target-kind <kind>", "agent, flow, subscription, or goal.")
         .option("--agent <agentId>", "Agent id.")
+        .option("--flow <flowInstanceId>", "Supervise all phases of a flow.")
         .option("--subscription <subscriptionId>", "Subscription id.")
         .option("--goal <goalId>", "Goal id.")
         .option("--then-goal-id <goalId>", "Goal id to confirm after a non-goal wait.")
@@ -91,22 +95,28 @@ export async function launchWorker(options, deps) {
     if (options.reasoningEffort && options.backend !== "codex-thread") {
         throw new Error("--reasoning-effort is only supported by codex-thread.");
     }
-    const auth = deps.authOptions();
-    const agentToken = options.agentToken ?? auth.agentToken;
-    const caller = agentToken ? deps.controller.requireAgentToken(agentToken) : null;
-    const promptFile = assertCanonicalPromptFile(options.promptFile);
+    const auth = deps.authOptions({ allowStoredAdminKey: true });
+    if (Boolean(options.promptFile) === Boolean(options.prompt))
+        throw new Error("Use exactly one of --prompt-file or --prompt.");
+    const promptFile = options.promptFile ? assertCanonicalPromptFile(options.promptFile) : undefined;
     const repoDir = resolveWorkerRepoDir(options);
-    const outputArtifact = resolve(options.outputArtifact);
+    const outputArtifact = options.outputArtifact ? resolve(options.outputArtifact) : undefined;
     const additionalExpectedArtifacts = options.expectArtifact.map((path) => resolve(path));
-    const expectedArtifacts = uniqueStrings([outputArtifact, ...additionalExpectedArtifacts]);
+    const expectedArtifacts = uniqueStrings([...(outputArtifact ? [outputArtifact] : []), ...additionalExpectedArtifacts]);
     const inputArtifacts = parseWorkerInputArtifacts(options.inputArtifact);
     const attachments = options.file.map((path) => resolve(path));
-    mkdirSync(dirname(outputArtifact), { recursive: true });
+    if (outputArtifact)
+        mkdirSync(dirname(outputArtifact), { recursive: true });
     assertReadableFiles([...inputArtifacts.map((artifact) => artifact.path), ...attachments]);
     const agentId = options.agentId ?? options.agent;
     const model = options.model ?? (!agentId && options.backend === "codex-thread" ? "gpt-5.6-luna" : undefined);
     const reasoningEffort = options.reasoningEffort ?? (model === "gpt-5.6-luna" ? "max" : undefined);
-    const runId = options.runId ?? options.run ?? caller?.run_id;
+    const owner = prepareLaunchOwner(deps.controller, { title: options.runTitle ?? options.title, repoDir,
+        runId: options.runId ?? options.run ?? (agentId ? deps.controller.getAgent(agentId).run_id : undefined),
+        agentToken: options.agentToken ?? auth.agentToken, adminKey: auth.adminKey, requesterThreadId: options.requesterThreadId });
+    const agentToken = owner.agentToken;
+    const caller = owner.agent;
+    const runId = owner.runId;
     let workerAgent;
     let createdAgent = false;
     if (agentId) {
@@ -149,13 +159,13 @@ export async function launchWorker(options, deps) {
         }, deps);
     }
     const observer = attachRequester(workerAgent.run_id, options, deps, agentToken);
-    const artifact = deps.controller.createArtifact({
+    const artifact = outputArtifact ? deps.controller.createArtifact({
         runId: workerAgent.run_id,
         agentId: workerAgent.agent_id,
         label: `${options.phase}-output`,
         path: outputArtifact,
         expected: true
-    });
+    }) : null;
     for (const path of additionalExpectedArtifacts) {
         deps.controller.createArtifact({
             runId: workerAgent.run_id,
@@ -208,7 +218,7 @@ export async function launchWorker(options, deps) {
         constraints: options.constraint,
         attachments,
         promptFile,
-        canonicalPrompt: readFileSync(promptFile, "utf8")
+        canonicalPrompt: promptFile ? readFileSync(promptFile, "utf8") : options.prompt
     });
     let started;
     try {
@@ -235,7 +245,7 @@ export async function launchWorker(options, deps) {
         }
         throw new Error(`Worker ${workerAgent.agent_id} did not enter running state. Current status: ${started.status}.`);
     }
-    const watchResult = options.watch
+    const watchResult = options.watch !== false
         ? startDetachedWatch({
             target: { kind: "agent", agentId: workerAgent.agent_id },
             timeoutMs: options.watchTimeoutMs ??
@@ -301,6 +311,9 @@ export function startDetachedWatch(options) {
     if (options.target.kind === "agent") {
         args.push("--agent", options.target.agentId);
     }
+    else if (options.target.kind === "flow") {
+        args.push("--flow", options.target.flowInstanceId);
+    }
     else if (options.target.kind === "subscription") {
         args.push("--subscription", options.target.subscriptionId);
     }
@@ -333,9 +346,11 @@ async function runDetachedWatch(options, deps) {
         const waitOptions = { intervalMs: options.intervalMs, timeoutMs: options.timeoutMs };
         const result = options.targetKind === "agent"
             ? await deps.controller.waitForAgentTerminal(requireOption(options.agent, "--agent"), waitOptions)
-            : options.targetKind === "subscription"
-                ? await deps.controller.waitForSubscriptionEvent(requireOption(options.subscription, "--subscription"), waitOptions)
-                : await deps.controller.waitForGoalConfirmation(requireOption(options.goal, "--goal"), waitOptions);
+            : options.targetKind === "flow"
+                ? await deps.controller.waitForFlowTerminal(requireOption(options.flow, "--flow"), waitOptions)
+                : options.targetKind === "subscription"
+                    ? await deps.controller.waitForSubscriptionEvent(requireOption(options.subscription, "--subscription"), waitOptions)
+                    : await deps.controller.waitForGoalConfirmation(requireOption(options.goal, "--goal"), waitOptions);
         mkdirSync(dirname(options.resultFile), { recursive: true });
         writeFileSync(options.resultFile, JSON.stringify(result, null, 2));
         let goalResult = null;
@@ -377,12 +392,13 @@ function normalizeWatchStartOptions(options) {
     const subscriptionId = options.subscriptionId ?? options.subscription;
     const goalId = options.goalId ?? options.goal;
     const targets = [
+        ...(options.flow ? [{ kind: "flow", flowInstanceId: options.flow }] : []),
         ...(agentId ? [{ kind: "agent", agentId }] : []),
         ...(subscriptionId ? [{ kind: "subscription", subscriptionId }] : []),
         ...(goalId ? [{ kind: "goal", goalId }] : [])
     ];
     if (targets.length !== 1) {
-        throw new Error("watch start requires exactly one of --agent, --subscription, or --goal.");
+        throw new Error("watch start requires exactly one of --agent, --flow, --subscription, or --goal.");
     }
     if (options.thenGoalId && targets[0]?.kind === "goal") {
         throw new Error("--then-goal-id cannot be used with --goal.");
@@ -550,7 +566,7 @@ function buildWorkerDispatchPrompt(input) {
         `Phase: ${input.phase}`,
         `Objective: ${input.objective ?? "Use the canonical prompt and provided artifacts."}`,
         `Repository: ${input.repoDir}`,
-        `Output artifact: ${input.outputArtifact}`,
+        ...(input.outputArtifact ? [`Output artifact: ${input.outputArtifact}`] : []),
         "",
         "Input artifacts:",
         ...(input.inputArtifacts.length > 0
@@ -568,11 +584,11 @@ function buildWorkerDispatchPrompt(input) {
         "",
         "Rules:",
         "- Follow the canonical prompt exactly.",
-        "- Write the required output artifact before reporting completion.",
+        ...(input.outputArtifact ? ["- Write the required output artifact before reporting completion."] : ["- Return your result in the final response."]),
         "- Keep in-process status terse.",
         "- Do not assume the coordinator is Codex unless the backend-specific prompt says so.",
         "",
-        `Canonical prompt file: ${input.promptFile}`,
+        ...(input.promptFile ? [`Canonical prompt file: ${input.promptFile}`] : []),
         "",
         "# Canonical Prompt Content",
         "",

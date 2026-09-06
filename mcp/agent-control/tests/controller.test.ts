@@ -236,7 +236,8 @@ describe("AgentController", () => {
     controller = new AgentController(store, registry);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await controller.dispose();
     vi.restoreAllMocks();
     store.close();
     if (oldControlHome === undefined) {

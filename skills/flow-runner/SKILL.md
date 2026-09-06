@@ -36,7 +36,8 @@ Use Agent Control MCP tools when available:
 - `flow_catalog_list`
 - `flow_catalog_get`
 - `flow_validate_config`
-- `flow_start`
+- `flow_launch` (preferred initial launch)
+- `flow_start` (lower-level start)
 - `flow_get`
 - `flow_continue`
 - `flow_dispatch_active`
@@ -200,8 +201,8 @@ path, resolve it through Agent Control before launching:
    catalogs are Agent Control's bundled `flows/` directory and the user flow
    catalog at `${AGENT_CONTROL_USER_DIR:-$HOME/.agent-control}/flows`.
 2. Use `flow_catalog_get` with the selected flow id or directory name.
-3. Launch with the returned `config_path`, or use the returned `config` when
-   you must call MCP-only `flow_start`.
+3. Call `flow_launch` with the selected `flow_id` and objective, or pass the
+   returned `config_path` to `agentctl flow launch`.
 
 For CLI fallback, use:
 
@@ -220,8 +221,17 @@ catalog with `AGENT_CONTROL_USER_FLOW_CATALOG_DIR`, or set
 
 ## Preferred One-Shot Launch
 
-When the user provides or selects a flow config path and a run objective for a
-new flow, prefer the deterministic one-shot CLI path:
+For a new flow, prefer one MCP `flow_launch` call with `title`, `repo_dir`, and
+exactly one of `flow_id` or `config`. The tool validates the flow, resolves local
+authorization, registers the executing coordinator and original conversation,
+subscribes the conversation to all supported run events before dispatch, and
+starts detached supervision. Do not precede it with login, agent registration,
+`run_observe`, socket probes, or manual subscriptions. It returns `run_id`,
+`flow_instance_id`, `observer`, `start`, `continuation`, and `watch`.
+
+When MCP tools are unavailable, the caller supplies a config file, or the native
+CLI bridge requires private local credential storage, use the equivalent CLI
+operation:
 
 ```bash
 agentctl flow launch \
@@ -232,7 +242,7 @@ agentctl flow launch \
 
 This command authenticates/registers the local coordinator, starts or reuses the
 flow instance, attaches the initiating conversational thread as a run observer
-before dispatch, preserves the coordinator's flow notifications and blockers,
+before dispatch, subscribes to all supported run events unless explicitly filtered,
 asks Agent Control to continue the flow, dispatches the currently
 active worker when one is ready, and returns immediately. The response is a
 compact control contract: read `next`, `run_id`, `flow_instance_id`,
@@ -280,17 +290,23 @@ The initiating conversational thread must also be identified in the run. When
 a separate thread executes the launch, pass the original requester as
 `--requester-thread-id "$REQUESTER_THREAD_ID"`. Preserve this identity in the
 delegation metadata: the executor's `CODEX_THREAD_ID` remains its own identity,
-while `source_thread_id` identifies the requester. Never substitute one for
-the other. If both identities are the same, Agent Control reuses one agent.
+while the original requester stays in control metadata across every delegation.
+Use `requester_thread_id` with MCP or `--requester-thread-id` with the CLI only
+when the executor cannot inherit it. Resolution prefers an explicit requester,
+the persisted run/parent requester, the authenticated caller's run requester,
+`AGENT_CONTROL_REQUESTER_THREAD_ID`, then `CODEX_THREAD_ID`. Never replace the
+original with an intermediate worker's thread or put thread identity in task
+text. A host without a Codex conversation must supply a real requester id to
+attach one; Agent Control does not invent an observer identity. If both identities are the same, Agent Control reuses one agent.
 An attached observer has no worker lifecycle or native execution grant.
 
 Do not inspect the full flow config, prompt files, implementation files, CLI
 help, or backend logs before using this path. Agent Control owns config
 validation, prompt composition, worker registration, subscription creation, and
-detached supervision. If `agentctl flow launch` is unavailable or fails because
-the installed Agent Control version is too old, fall back to the explicit
-`auth login` + `flow start --compact` + `flow continue` sequence below;
-do not replace it with manual polling or hand-written worker prompts.
+detached supervision. If the installed Agent Control version lacks the launch operation,
+report the missing capability and use the installation/update workflow. Do not
+replace it with a manual login/register/observe sequence, polling, or
+hand-written worker prompts.
 
 After launch, report the selected run URL compactly, for example
 the returned `ui_url`. Never run `agentctl web start`, health probes, Browser
@@ -319,9 +335,12 @@ commands as a substitute for `agentctl`.
 
 A run has an executing coordinator and an initiating conversational observer;
 they may be the same Codex thread. Register both identities before dispatch.
-The one-shot launch does this automatically. For separate MCP operations,
-call `run_observe` after coordinator login and before `flow_start` or the first
-worker launch. Attaching again is idempotent and preserves the observation.
+The one-shot launch does this automatically. Lower-level `flow_start` and
+`agent_start` also ensure requester observation before execution. Reserve
+`run_observe` for attaching an additional conversation, an older existing run,
+or intentionally changing filters/delivery. Reattachment preserves the current
+filters and does not duplicate the agent. Retain the last acknowledged cursor;
+an idempotent launch response must not reset a cursor already being consumed.
 
 The default observer delivery mode is `wait`. Retain the returned observer id
 and cursor and consume events in the conversational thread:
@@ -341,8 +360,8 @@ If the host interrupts or caps a tool call, resume from the last acknowledged
 cursor rather than polling worker status or replaying earlier events. Stop on
 user cancellation, `closed`, or the selected completion condition.
 
-Default observation covers phases, blockers, notifications, and completion,
-including workers registered later. Select specific events with repeated
+Default observation covers every supported event type for the entire run,
+including workers registered later. Narrow filters only when explicitly requested. Select specific events with repeated
 `--requester-event` options on launch or `--event` on `agentctl run observe`.
 For a completion-only flow observation, select `flow.completed`. Independent
 worker terminal events do not mean the entire run has completed.
@@ -415,30 +434,19 @@ result schema, allowed routing values, report artifact payload, and examples.
 
 ## Execution Model
 
-1. Validate the flow config before starting.
-2. For the initial launch, authenticate the coordinator with
-   `orchestrator_login`/`agentctl auth login`, or prefer the one-shot
-   `agentctl flow launch` command when available. This creates or attaches the
-   Agent Control run, registers or reuses the coordinator/orchestrator agent,
-   and returns the `agent_token` for that launch turn. Attach the initiating
-   thread with `run_observe` before starting flow steps when using the separate
-   MCP path; retain its event cursor in the initiating conversation.
-   - Prefer `agentctl auth login` for local Codex coordinators. It may use the
-     controller's local stored admin key without printing it.
-   - Do not print admin keys, agent tokens, or raw auth files in chat or logs.
-3. Use the returned `agent_token` only for the current launch turn's flow,
-   agent, subscription, and link operations. Do not perform another login on
-   later Agent Control wakeups just to obtain a token. Wakeup messages identify
-   the subscriber/orchestrator agent for the run.
-4. Start the flow with `flow_start`. For CLI usage, prefer
-   `agentctl flow start --compact` so the coordinator receives only ids and the
-   active step summary instead of a full config/contract snapshot.
-   - If this turn was triggered by an Agent Control notification for an
-     existing flow, do not start a new flow and do not log in again. Use the
-     `flow_instance_id` and subscriber/orchestrator agent id from the
-     notification.
-   - When `agentctl flow start --compact` returns `reused: true`, treat it as a
-     resume of the existing flow instance, not a new flow.
+1. For a new flow, use `flow_launch` or `agentctl flow launch`. This single
+   operation validates, authenticates locally, registers/reuses the coordinator,
+   attaches the original conversation with its event subscription, and dispatches
+   the first ready worker. Keep the returned run, flow, observer, and cursor.
+2. Do not print admin keys, agent tokens, or raw auth files in chat or logs.
+   The launcher resolves local authorization internally. Preserve any scoped
+   native bridge credential only through the existing private bridge contract.
+3. On an existing-flow notification, do not start a new flow or log in again.
+   Use the notification's flow and subscriber/orchestrator identities to resume
+   through `flow_continue`, unless it asks for a manual routing decision.
+4. Treat a reused launch as a resume. Keep the original conversational requester
+   and its acknowledged cursor. Never replace it with the current worker's
+   thread just because execution moved to another agent.
 5. Do not register a second coordinator agent after login. If an existing-flow
    notification requires more work, call `flow_continue` directly with the
    notification's `flow_instance_id` unless the notification explicitly asks

@@ -9,11 +9,12 @@ import {
   parseIntOption,
   parseJsonObjectOption
 } from "./cli/shared.js";
-import { registerWatchCommands, registerWorkerCommands } from "./cli/worker.js";
+import { registerWatchCommands, registerWorkerCommands, startDetachedWatch } from "./cli/worker.js";
 import { addRequesterOptions, attachRequester, registerObservationCommands, type RequesterOptions } from "./cli/observation.js";
 import { registerWebCommands } from "./cli/web.js";
 import { startControlServer } from "./control-server.js";
 import { parseDurationMs } from "./core/duration.js";
+import { prepareLaunchOwner } from "./core/launch-context.js";
 import { createController } from "./core/factory.js";
 import { flowConfigJsonSchema } from "./core/flow-config-schema.js";
 import { loadFlowConfigFile, parseFlowConfigText } from "./core/flow-config-loader.js";
@@ -38,7 +39,7 @@ const program = new Command();
 program
   .name("agentctl")
   .description("Control local agent workers through the Agent Control core.")
-  .version("0.1.6")
+  .version("0.1.7")
   .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
   .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();
@@ -207,8 +208,8 @@ flow
   .description("Print the Agent Control flow config JSON Schema.")
   .action(() => output(flowConfigJsonSchema));
 
-flow
-  .command("start")
+addRequesterOptions(flow
+  .command("start"))
   .description("Create a flow instance and activate its initial step.")
   .option("--config-file <path>", "Read flow config JSON/YAML from this file.")
   .option("--config-json <json>", "Flow config JSON object.")
@@ -232,14 +233,15 @@ flow
       ownerTaskPath?: string;
       configYaml?: string;
       compact?: boolean;
-    }) => {
-      const auth = authOptions();
+    } & RequesterOptions) => {
+      const auth = authOptions({ allowStoredAdminKey: true });
       if (!auth.adminKey && !auth.agentToken) {
         throw new Error("flow start requires --admin-key, --token, AGENT_CONTROL_ADMIN_KEY, or AGENT_CONTROL_TOKEN.");
       }
       credentialStore.assertReady();
       const result = controller.startFlow({
         config: await readConfigOption(options),
+        requesterThreadId: options.requesterThreadId, requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined, requesterDelivery: options.requesterDelivery,
         runId: options.run,
         runTitle: options.runTitle,
         repoDir: options.repoDir,
@@ -292,14 +294,20 @@ addRequesterOptions(flow
       uiPort: number;
       uiApiPort: number;
     } & RequesterOptions) => {
-      const adminKey = authOptions({ allowStoredAdminKey: true }).adminKey;
+      const launchAuth = authOptions({ allowStoredAdminKey: true });
+      const adminKey = launchAuth.adminKey;
       if (!adminKey) {
         throw new Error("flow launch requires --admin-key, AGENT_CONTROL_ADMIN_KEY, or a local stored admin key.");
       }
       credentialStore.assertReady();
       const repoDir = options.repoDir ?? process.cwd();
       const backendHandle = resolveLaunchOrchestratorBackendHandle({ ...options, repoDir });
-      const login = controller.orchestratorLogin({
+      const config = await readConfigOption({ configFile: options.configFile });
+      controller.validateFlowConfig(config);
+      const explicitCoordinator = options.orchestratorThreadId || options.orchestratorBackendHandleJson || options.orchestratorBackend !== "codex-thread";
+      const automatic = explicitCoordinator ? null : prepareLaunchOwner(controller, { title: options.title, repoDir,
+        runId: options.run, agentToken: launchAuth.agentToken, adminKey, requesterThreadId: options.requesterThreadId });
+      const login = automatic ? { agent: automatic.agent, agent_token: automatic.agentToken, run: controller.getRun(automatic.runId) } : controller.orchestratorLogin({
         adminKey,
         title: options.orchestratorTitle ?? `${options.title} orchestrator`,
         runTitle: options.title,
@@ -311,7 +319,7 @@ addRequesterOptions(flow
       });
       const observer = attachRequester(login.run.run_id, options, cliDeps, login.agent_token);
       const start = controller.startFlow({
-        config: await readConfigOption({ configFile: options.configFile }),
+        config,
         runId: login.run.run_id,
         agentToken: login.agent_token,
         ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),
@@ -337,8 +345,11 @@ addRequesterOptions(flow
             bridgeToken: bridgeToken ?? undefined
           })
         : null;
+      const worker = continuation?.agent;
+      const watch = worker && continuation?.action === "dispatched" && worker.backend !== "codex-subagent"
+        ? { detached_watcher: true, ...startDetachedWatch({ target: { kind: "flow", flowInstanceId: start.instance.flow_instance_id }, timeoutMs: 3_600_000, intervalMs: 5000 }) } : null;
       output(
-        compactFlowLaunchResult({
+        { ...compactFlowLaunchResult({
           runId: login.run.run_id,
           runTitle: login.run.title,
           orchestratorAgentId: login.agent.agent_id,
@@ -349,7 +360,7 @@ addRequesterOptions(flow
           uiHost: options.uiHost,
           uiPort: options.uiPort,
           uiApiPort: options.uiApiPort
-        })
+        }), watch }
       );
     }
   );
@@ -608,8 +619,8 @@ agent
     }
   );
 
-agent
-  .command("start")
+addRequesterOptions(agent
+  .command("start"))
   .requiredOption("--agent <agentId>", "Agent id.")
   .option("--prompt <prompt>", "Prompt text.")
   .option("--prompt-file <path>", "Read prompt text from this file.")
@@ -628,7 +639,7 @@ agent
       model?: string;
       expectedArtifact: string[];
       attachment: string[];
-    }) => {
+    } & RequesterOptions) => {
       if ([options.prompt, options.promptFile, options.promptStdin].filter(Boolean).length > 1) {
         throw new Error("Use only one prompt source: --prompt, --prompt-file, or --prompt-stdin.");
       }
@@ -640,6 +651,7 @@ agent
       output(
         await controller.startAgent({
           agentId: options.agent,
+          requesterThreadId: options.requesterThreadId, requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined, requesterDelivery: options.requesterDelivery,
           prompt,
           server: options.server,
           model: options.model,
@@ -1168,13 +1180,13 @@ maintenance
   );
 
 program.hook("postAction", async () => {
-  await controller.drainDeliveries();
+  await controller.dispose();
   store.close();
 });
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const commanderExit = commanderExitInfo(error);
-  void controller.drainDeliveries().finally(() => {
+  void controller.dispose().finally(() => {
     store.close();
     if (commanderExit?.code === "commander.helpDisplayed" || commanderExit?.code === "commander.version") {
       process.exit(commanderExit.exitCode);
@@ -1207,6 +1219,7 @@ function compactFlowStartResult(
   bridgeGrant: PublicBridgeGrantRef | null
 ): Record<string, unknown> {
   return {
+    observer: result.observer ?? null,
     flow_record_id: result.flow.flow_record_id,
     flow_id: result.flow.flow_id,
     flow_instance_id: result.instance.flow_instance_id,

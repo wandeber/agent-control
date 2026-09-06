@@ -120,7 +120,9 @@ CLI calls read `--token` first, then `AGENT_CONTROL_TOKEN`. MCP tools accept
 workers launched by Agent Control receive their token through
 `AGENT_CONTROL_TOKEN`; the token is not placed in the worker prompt.
 
-Create or attach a visible Codex-thread coordinator with:
+Normal `worker_launch` / `flow_launch` MCP calls and CLI launches resolve local
+authorization and coordinator identity automatically. For advanced manual
+identity management, create or attach a visible Codex-thread coordinator with:
 
 ```bash
 agentctl --admin-key "$AGENT_CONTROL_ADMIN_KEY" auth login \
@@ -254,10 +256,11 @@ While a blocking wait is open, the model is not polling or reading worker
 transcripts; Agent Control refreshes status in normal code and returns compact
 terminal state. For non-Codex or external orchestrators, prefer detached
 watchers so the orchestrator process can end. For normal Codex Desktop
-orchestration, prefer app-server delivery plus detached watchers; use blocking
-wait only when the caller explicitly selects `mcp-wait` for a short/manual
-foreground wait. Omit `--timeout` only when the caller has a separate
-cancellation path such as stop, purge, subscription delete, or run shutdown.
+orchestration, keep detached supervision and consume the automatic conversation
+subscription with `run_wait`, indefinitely or with a one-hour timeout. Legacy
+`agent_wait` / `subscription_wait` remain explicit diagnostic operations. The
+flow watcher refreshes the whole run through later phases and coordinator gates,
+until completion, cancellation, run shutdown, or its configured timeout.
 
 Delivered subscription messages are compact human-readable notifications. They
 include the event type, event id, run id, source agent, subscriber, status,
@@ -587,9 +590,29 @@ The first backend adapters are:
   This keeps Desktop-visible orchestration native while retaining durable flow,
   artifact, and transition state in Agent Control.
 
+For `codex-thread`, the default `unix://` connection starts the local Codex
+app-server daemon automatically if its socket is missing or refused. Explicit
+custom sockets, WebSocket URLs, and stdio transports keep their selected
+configuration. Unix control sockets disable WebSocket compression because
+Codex rejects the compression extension during the handshake.
+
 ## Standalone Workers
 
-Use native `agentctl` commands for worker-style tasks outside a declared flow:
+Use the MCP `worker_launch` tool for a worker outside a declared flow:
+
+```json
+{"title":"Review changes","prompt":"Review the current diff without editing files.","repo_dir":"/path/to/repo"}
+```
+
+One call registers the coordinator and initiating conversation, subscribes it
+to all run events before dispatch, starts a Codex Luna Max worker, and arms
+detached supervision. Keep the returned `observer` and use `run_wait` with its
+cursor. A report file is optional for ad hoc work. Declared flows have the
+corresponding `flow_launch` tool, accepting `title`, `repo_dir`, and either
+`flow_id` or `config`.
+
+The equivalent CLI supports `--prompt` for inline task text or `--prompt-file`
+for an existing canonical prompt. Workflow callers can still require a report:
 
 ```bash
 agentctl worker launch \
@@ -627,8 +650,9 @@ once in the worker's in-memory dispatch prompt; Agent Control does not create a
 prompt file or expose them as artifacts. Use `--input-artifact` for larger
 persisted input.
 
-`agentctl worker launch --watch` starts the worker and arms a detached
-deterministic watcher in the same operation. Use `agentctl watch start` only for
+`agentctl worker launch` starts the worker and arms a detached
+deterministic watcher by default. `--watch` remains accepted for compatibility;
+use `--no-watch` only when an existing supervisor already owns status refresh. Use `agentctl watch start` only for
 already-existing agents, subscriptions, or goals:
 
 ```bash
@@ -689,9 +713,12 @@ Agent Control is available under the [MIT License](LICENSE).
 
 ## Conversational run observation
 
-Flow and worker launches attach the initiating Codex conversation to the run
-before dispatch. Pass `--requester-thread-id` when a different thread executes
-the launch. `agentctl run observe` attaches to an existing run; `agentctl run
+MCP and CLI flow/worker launches attach the initiating Codex conversation to
+the run before dispatch and subscribe it to all supported events by default.
+Lower-level `flow_start` and `agent_start` share this behavior. The original
+requester persists across nested runs; pass `requester_thread_id` (MCP) or
+`--requester-thread-id` (CLI) when a separate executor cannot inherit it.
+Explicit filters and delivery choices survive repeated launches. `agentctl run observe` attaches to an existing run; `agentctl run
 wait` consumes its subscribed events with a durable cursor, indefinitely or
 with `--timeout 1h`. The conversational observer stays available when the run
 stops and does not acquire worker or native bridge ownership. See

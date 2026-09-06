@@ -1,11 +1,42 @@
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
-import { agentLinkCreateSchema, agentLinkDeleteSchema, agentLinkListSchema, agentIdSchema, agentListSchema, agentReadLatestSchema, agentRegisterSchema, agentPurgeSchema, agentSendSchema, agentStartSchema, agentStopSchema, agentWaitSchema, agentExternalSyncSchema, artifactReadHeaderSchema, artifactRegisterSchema, emptySchema, eventListSchema, flowCatalogGetSchema, flowCatalogListSchema, flowContinueSchema, flowDispatchActiveSchema, flowGetSchema, flowStartSchema, flowStepReportSchema, flowStepStartSchema, flowValidateConfigSchema, goalGetSchema, goalRegisterSchema, goalUpdateSchema, goalWaitConfirmationSchema, heartbeatCreateSchema, heartbeatDeleteSchema, heartbeatListSchema, maintenancePurgeOldSchema, orchestratorLoginSchema, orchestratorActionAckSchema, orchestratorActionClaimSchema, runObserveSchema, runWaitSchema, runCreateSchema, runIdSchema, runListSchema, runPurgeSchema, subscriptionCreateSchema, subscriptionDeleteSchema, subscriptionListSchema, subscriptionWaitSchema } from "./schemas.js";
+import { workerLaunchSchema, flowLaunchSchema, agentLinkCreateSchema, agentLinkDeleteSchema, agentLinkListSchema, agentIdSchema, agentListSchema, agentReadLatestSchema, agentRegisterSchema, agentPurgeSchema, agentSendSchema, agentStartSchema, agentStopSchema, agentWaitSchema, agentExternalSyncSchema, artifactReadHeaderSchema, artifactRegisterSchema, emptySchema, eventListSchema, flowCatalogGetSchema, flowCatalogListSchema, flowContinueSchema, flowDispatchActiveSchema, flowGetSchema, flowStartSchema, flowStepReportSchema, flowStepStartSchema, flowValidateConfigSchema, goalGetSchema, goalRegisterSchema, goalUpdateSchema, goalWaitConfirmationSchema, heartbeatCreateSchema, heartbeatDeleteSchema, heartbeatListSchema, maintenancePurgeOldSchema, orchestratorLoginSchema, orchestratorActionAckSchema, orchestratorActionClaimSchema, runObserveSchema, runWaitSchema, runCreateSchema, runIdSchema, runListSchema, runPurgeSchema, subscriptionCreateSchema, subscriptionDeleteSchema, subscriptionListSchema, subscriptionWaitSchema } from "./schemas.js";
 import { booleanProperty, enumProperty, numberProperty, objectSchema, stringArrayProperty, stringProperty } from "./json-schema.js";
+const requesterProperties = {
+    requester_thread_id: stringProperty("Original user conversation; resolved from the run/parent or CODEX_THREAD_ID when omitted."),
+    requester_event_types: { type: "array", items: { type: "string", enum: [...EVENT_TYPES] }, description: "Optional explicit filter; new observers subscribe to all supported events." },
+    requester_delivery: enumProperty(["wait", "notify"], "Default wait; consume the returned observer cursor through run_wait.")
+};
 export const TOOL_DEFINITIONS = [
     {
+        name: "worker_launch",
+        description: "Launch a Codex Luna Max worker in one call. Automatically creates local coordinator/run identity, registers the original user conversation, subscribes it to all events and starts detached supervision. Return observer contains the cursor for run_wait. No separate login, registration or observe call is needed.",
+        inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Worker title."),
+            prompt: stringProperty("Ad hoc task text; choose prompt or prompt_file."), prompt_file: stringProperty("Existing canonical skill prompt file."),
+            repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."),
+            backend: stringProperty("Default codex-thread."), model: stringProperty("Default gpt-5.6-luna."), reasoning_effort: stringProperty("Default max for Luna."),
+            server: stringProperty("Optional explicit backend endpoint."), phase: stringProperty("Task phase."), role: stringProperty("Worker role."),
+            objective: stringProperty("Bounded objective."), output_artifact: stringProperty("Optional report destination."),
+            input_handoffs: { type: "array", items: { type: "object" }, description: "Compact structured handoffs." },
+            input_artifacts: stringArrayProperty("Label=path inputs."), constraints: stringArrayProperty("Task constraints."),
+            expected_artifacts: stringArrayProperty("Expected output files."), attachments: stringArrayProperty("File attachments."),
+            watch: booleanProperty("Detached supervision is enabled by default. Disable only with an existing supervisor."),
+            admin_key: stringProperty("Optional explicit admin authorization."), agent_token: stringProperty("Optional existing caller identity.")
+        }, ["title"]), schema: workerLaunchSchema
+    },
+    {
+        name: "flow_launch",
+        description: "Launch and dispatch a flow in one call using config or a catalog flow_id. Automatically establishes local owner identity, registers/subscribes the original user conversation to all events before dispatch and returns its run_wait cursor. Keeps native bridge authority with the coordinator.",
+        inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Run objective/title."),
+            config: { type: "object", description: "Flow config; choose config or flow_id." }, flow_id: stringProperty("Bundled/user catalog flow id."),
+            repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."), server: stringProperty("Optional explicit backend endpoint."),
+            admin_key: stringProperty("Optional explicit admin authorization."), agent_token: stringProperty("Optional existing caller identity."),
+            owner_task_identity: stringProperty("Native bridge owner identity."), owner_task_path: stringProperty("Native bridge owner task path.")
+        }, ["title"]), schema: flowLaunchSchema
+    },
+    {
         name: "run_observe",
-        description: "Identify the user conversation in a run and subscribe to selected events without transferring workflow or native bridge ownership. Default delivery is through run_wait; notify uses safe in-turn injection only.",
+        description: "Identify the user conversation in a run and subscribe to all supported events by default or an explicit filter without transferring workflow or native bridge ownership. Default delivery is through run_wait; notify uses safe in-turn injection only.",
         inputSchema: objectSchema({ run_id: stringProperty("Run to observe."), thread_id: stringProperty("Actual Codex thread id; defaults to current CODEX_THREAD_ID."),
             title: stringProperty("Participant title."), event_types: { type: "array", items: { type: "string", enum: [...EVENT_TYPES] } },
             delivery: enumProperty(["wait", "notify"], "wait or notify; default wait."), admin_key: stringProperty("Admin authorization."), agent_token: stringProperty("Authorized caller identity.") }, ["run_id"]),
@@ -50,6 +81,7 @@ export const TOOL_DEFINITIONS = [
         name: "flow_start",
         description: "Create a flow instance, bind it to a run, and activate the initial step. Native codex-subagent flows return one scoped bridge credential at creation time.",
         inputSchema: objectSchema({
+            ...requesterProperties,
             config: { type: "object", description: "Flow config object." },
             run_id: stringProperty("Existing run id. If omitted, a new run is created."),
             run_title: stringProperty("Title for a newly created run."),
@@ -231,8 +263,9 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "agent_start",
-        description: "Start a registered agent through its backend.",
+        description: "Start a registered agent and automatically attach its run requester before dispatch. Returns observer for run_wait.",
         inputSchema: objectSchema({
+            ...requesterProperties,
             agent_id: stringProperty("Agent id."),
             prompt: stringProperty("Worker prompt. Required for OpenCode starts."),
             server: stringProperty("Backend server URL, required for OpenCode."),

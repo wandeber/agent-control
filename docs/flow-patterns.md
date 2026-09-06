@@ -245,7 +245,7 @@ Agent Control run event stream.
 
 Identify the conversational requester in the run before dispatching either
 free workers or a declared flow. The coordinator registers its own thread;
-`run_observe` attaches the requester separately when those identities differ.
+the launch operation attaches the requester separately when those identities differ.
 One thread serving both purposes reuses its existing agent record. Observation
 does not grant native bridge ownership and does not make the conversation a
 worker that run shutdown should interrupt.
@@ -255,14 +255,26 @@ worker that run shutdown should interrupt.
 `--requester-delivery wait|notify`. They attach observation before dispatch and
 return its control record. Forward the original requester identity through
 nested delegation instead of replacing it with the executor's current thread.
-For separate MCP calls, use `run_observe` after run creation and before the
-first `flow_start` or worker dispatch.
+The MCP `worker_launch` and `flow_launch` tools do the same in one call,
+including local authorization and detached supervision. Lower-level
+`agent_start` and `flow_start` also ensure observation before execution.
+`run_observe` remains useful for an additional observer or explicit filter
+changes; it is not a launch prerequisite.
+
+The original requester is persisted in the run and inherited from parent runs
+or the authenticated caller's run before consulting the executor environment.
+An explicit requester overrides automatic resolution. Otherwise
+`AGENT_CONTROL_REQUESTER_THREAD_ID` precedes `CODEX_THREAD_ID` as the final
+fallback. Hosts without a conversation must supply a real requester identity;
+headless operations never fabricate one. Reusing a run preserves its observer
+filters and does not replace the original requester with a nested executor.
 
 The default `wait` mode uses `run_wait` with the returned durable cursor,
 without a timeout or with `timeout_ms: 3600000` (`--timeout 1h` in the CLI).
 Consume the batch, retain its new cursor, and resume the long wait. Timeout is
-not completion. Filters cover present and future agents in the run, including
-phase changes, blockers, and completion. A completion-only flow observer uses
+not completion. Preserve the last acknowledged cursor when reusing a launch.
+By default every supported event type is selected, covering present and future
+agents in the run, including phase changes, blockers, and completion. A completion-only flow observer uses
 `flow.completed`; a free-worker observer chooses its agent terminal events.
 
 Explicit `notify` delivers a compact informational injection to the requester.

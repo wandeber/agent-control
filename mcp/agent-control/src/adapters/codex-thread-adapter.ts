@@ -619,9 +619,22 @@ class CodexAppServerClient {
   }
 
   private async connectUnixSocket(): Promise<void> {
+    try {
+      await this.openUnixSocket();
+    } catch (error) {
+      // Only the managed default may be started automatically. Explicit custom
+      // sockets and remote servers retain their configured lifecycle.
+      if (this.url !== "unix://" || !(error instanceof Error) || !/ENOENT|ECONNREFUSED/.test(error.message)) throw error;
+      await startDefaultDaemon();
+      await this.openUnixSocket();
+    }
+  }
+
+  private async openUnixSocket(): Promise<void> {
     const socketPath = resolveUnixSocketPath(this.url);
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(`ws+unix://${socketPath}:/`, {
+        // Codex control sockets reject a WebSocket compression extension offer.
         perMessageDeflate: false
       });
       const timeout = setTimeout(() => {
@@ -919,4 +932,21 @@ function timestampFromSeconds(value?: number | null): string {
     return new Date().toISOString();
   }
   return new Date(value * 1000).toISOString();
+}
+
+let daemonStart: Promise<void> | undefined;
+function startDefaultDaemon(): Promise<void> {
+  return daemonStart ??= new Promise<void>((resolveStart, rejectStart) => {
+    const child = spawn("codex", ["app-server", "daemon", "start"], { stdio: "ignore" });
+    const timer = setTimeout(() => {
+      child.kill();
+      rejectStart(new ControllerError("Timed out starting the local Codex app-server daemon.", "backend_unavailable"));
+    }, 15_000);
+    child.once("error", (error) => { clearTimeout(timer); rejectStart(error); });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolveStart();
+      else rejectStart(new ControllerError("Could not start the local Codex app-server daemon. Check codex app-server daemon start.", "backend_unavailable"));
+    });
+  }).finally(() => { daemonStart = undefined; });
 }

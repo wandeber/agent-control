@@ -50,7 +50,8 @@ Open questions: none
 
 This normalized objective is coordinator-owned launch context, not a flow-step
 artifact. Preserve the same conversational thread as the clarification owner
-and attach it to the run as an observer. If another thread executes the flow,
+and let the launch tool attach it to the run with all-event observation.
+Do not add separate login or subscription calls. If another thread executes the flow,
 forward the original requester identity on launch and keep the two roles
 distinct. The clarification owner still performs the analysis-intent gate;
 the executing coordinator waits for its decision before advancing.
@@ -90,7 +91,7 @@ on the analyst's behalf.
    creates it.
    - This native MCP App tool is a required pre-dispatch gate. If the tool is
      unavailable or its call fails, stop and report the problem before
-     `flow_start`, `flow_continue`, `agentctl flow launch`, or any worker
+     `flow_launch`, `flow_start`, `flow_continue`, `agentctl flow launch`, or any worker
      dispatch.
    - Do not replace it with Codex Browser, `agentctl web start`, an HTTP URL,
      or any other web-console fallback.
@@ -98,14 +99,17 @@ on the analyst's behalf.
      Agent Control notification, wakeup, resume, retry, or manual transition.
 4. Use `flow-runner` behavior for execution, starting with the launch itself;
    its normal no-reopen rule applies to every subsequent turn.
-5. Launch with the returned `config_path` and the normalized clarified
-   objective, not the raw request, as the run title or objective.
+5. Use one `flow_launch` call with the discovered flow id, or pass the returned
+   `config_path` to `agentctl flow launch`. Supply the normalized clarified
+   objective as the run title. Launch owns automatic requester registration
+   and subscription; forward the original identity when executing elsewhere.
 6. Handle the configured analysis notification with the analysis-intent gate
    above before starting `planning`.
 7. Keep updates concise. The initiating conversational thread retains the
    observer record returned by launch and uses `run_wait` with its cursor,
    indefinitely or with a one-hour timeout. It can report phase changes,
-   blockers, or just completion according to its filters. A separate executing
+   blockers, and completion. It subscribes to all supported events by default;
+   narrow filters only on an explicit request. A separate executing
    coordinator may end its turn after dispatch. If both roles share the same
    thread, waiting does not transfer or duplicate orchestration ownership.
 
