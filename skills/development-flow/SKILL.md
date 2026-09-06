@@ -51,8 +51,11 @@ invalidates the dependent approvals; unchanged valid approval is reusable.
    coordinator decisions. Do not write worker artifacts or reconstruct reports.
 
 Keep the launching turn open while any supervised work remains. Use `run_wait`
-with the last processed cursor, indefinitely or with a one-hour timeout (30
-minutes when required by the host). Answer new user messages in commentary,
+with the last processed cursor and renewable one-hour MCP waits below the
+client deadline. The bundled Codex server allows 3,700 seconds for a one-hour
+wait. Use indefinite waits only in the CLI/internal runtime or on a host whose
+support is explicitly verified; an internal timeout cannot extend a client
+deadline. Answer new user messages in commentary,
 including other topics, then resume the wait. Preserve every active run and
 independent cursor. Notification delivery cannot reliably awaken an ended Codex
 turn. The same rule applies to a separate coordinator with pending supervision.
@@ -133,12 +136,19 @@ The plan-review owner defines it, or the authorized coordinator completes that
 setup at the existing plan-approval gate. Definitions include the required
 packages, literal owned paths, deliverables, dependencies, a configured
 `codex-thread` role, and
-Codex-managed worktree paths. All worktrees must exist and share the approved
-repository/base; do not manufacture them with shell Git commands or reuse dirty
-unrelated checkouts. Preserve the original requester identity.
+Codex-managed worktree paths. A nonempty manifest requires a clean consolidated
+checkout and clean worktrees sharing the approved repository/base. Preserve
+uncommitted work and use inline execution when no authorized clean baseline is
+available; do not manufacture worktrees with shell Git commands or discard
+changes to make registration pass. Preserve the original requester identity.
 
 After exact approval, the implementation owner launches all ready packages in
 one operation, consumes run events, and accepts ready deliveries in a batch.
+`launch`, `accept`, and `retry` return a `coordinator_observer` for that caller
+and a `wait_contract`; preserve the separate original requester. Invoke the
+returned `flow_packages` wait contract, process each batch, invoke its explicit
+`ack_contract`, and resume the one-hour wait. Updates and unrelated user steering
+do not end supervision while packages remain pending. Launch stays non-blocking.
 The runtime retains each owner and attempt generation, checks required delivery
 coverage, and refuses to advance while a required package is incomplete or a
 launched branch remains active. A package child receives a delivery contract,

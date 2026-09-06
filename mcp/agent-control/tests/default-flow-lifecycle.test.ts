@@ -7,11 +7,13 @@ import { AdapterRegistry } from "../src/adapters/registry.js";
 import { AgentController } from "../src/core/controller.js";
 import { loadFlowConfigFile } from "../src/core/flow-config-loader.js";
 import { artifactDigest } from "../src/core/flow-runtime.js";
+import type { FlowPackagesRequest } from "../src/core/flow-packages.js";
 import { resolveAdminKey } from "../src/core/identity.js";
 import { runRuntimeDir } from "../src/core/paths.js";
 import type { EvidenceReceipt, EvidenceRequest } from "../src/core/evidence/service.js";
 import { EVENT_TYPES, type AgentAdapter, type AgentHandle, type AgentStatus, type StartAgentInput } from "../src/core/types.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
+import { handleTool } from "../src/tools/handlers.js";
 
 // Only model execution is replaced. The actual bundled YAML, controller,
 // SQLite transitions, canonical HDT provider, and command executor run normally.
@@ -173,7 +175,7 @@ function packageFixture(packageIds = ["alpha", "beta"], acceptedContext?: string
   });
 }
 const packagePlan = "# Plan\n\nTwo disjoint packages.\n\n<!-- hdt-section: alpha -->\n## Alpha\n\nSet alpha.txt to after.\n\n<!-- hdt-section: beta -->\n## Beta\n\nSet beta.txt to after.\n\n<!-- hdt-section: notes -->\n## Notes\n\nJoin both accepted deliveries and consolidate their exact contents before validation. Preserve value.txt and unrelated.txt.\n";
-function packages(request: Parameters<AgentController["executeFlowPackages"]>[0]["request"]) {
+function packages(request: FlowPackagesRequest) {
   return controller.executeFlowPackages({ flowInstanceId: id, request });
 }
 function asAgent(agentId: string) {
@@ -187,6 +189,22 @@ async function toPackageIntegration() {
   const step = await enter("implementation");
   const ownerThread = process.env.CODEX_THREAD_ID!;
   const launched = await packages({ operation: "launch" });
+  expect(launched.coordinator_observer).toMatchObject({ thread_id: ownerThread });
+  expect(new Set(launched.coordinator_observer!.event_types)).toEqual(new Set(EVENT_TYPES));
+  expect(launched.coordinator_observer!.observer_agent_id).not.toBe(snapshot().runtime!.decision_owners!.requester);
+  expect(controller.getAgent(step.agent_id!).role).toBe("implementer");
+  expect(launched.wait_contract).toMatchObject({ tool: "flow_packages", arguments: { flow_instance_id: id, request: { operation: "wait", timeout_ms: 3_600_000 } } });
+  // Exercise the returned tool contracts with a short fixture deadline. Launch
+  // events must already be observable, and fetching them must not acknowledge.
+  const waitArguments = { ...launched.wait_contract!.arguments, request: { ...launched.wait_contract!.arguments.request, timeout_ms: 1 } };
+  const batch = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
+  expect(batch.events.length).toBeGreaterThan(0);
+  expect(batch.processed_cursor).not.toBe(batch.cursor);
+  expect(batch.ack_contract).toMatchObject({ tool: "flow_packages", arguments: { flow_instance_id: id, request: { operation: "ack", cursor: batch.cursor } } });
+  const ack = await handleTool(controller, batch.ack_contract.tool, batch.ack_contract.arguments) as any;
+  expect(ack.advanced).toBe(true);
+  const next = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
+  expect(next.events.map((event: any) => event.event_id).filter((eventId: string) => batch.events.some((event: any) => event.event_id === eventId))).toEqual([]);
   expect(Object.values(launched.branches).map(branch => branch.state)).toEqual(["running", "running"]);
   expect(new Set(Object.values(launched.branches).map(branch => branch.agent_id)).size).toBe(2);
   expect(snapshot().runtime!.packages!.manifest_digest).toBe(approvedManifest);

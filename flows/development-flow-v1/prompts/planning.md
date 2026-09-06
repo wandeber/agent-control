@@ -23,8 +23,10 @@ and explicit user approval of the resulting plan before implementation resumes.
 
 Use external packages only when parallel work materially helps. Identify each
 package's configured `codex-thread` role, required deliverables, and needed
-Codex-managed worktree; keep concurrent writers disjoint. A single inline owner
-uses an empty external package manifest;
+Codex-managed worktree; keep concurrent writers disjoint. External groups need
+a clean consolidated baseline and clean worktrees at registration. Preserve
+uncommitted changes and choose inline work when that baseline is unavailable.
+A single inline owner uses an empty external package manifest;
 do not create workers or worktrees merely to populate a group. One external
 worktree still requires consolidation. The existing exact-plan decision also
 approves the registered package-manifest digest; there is no additional human

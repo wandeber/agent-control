@@ -16,8 +16,13 @@ For inline work, make the scoped changes and report normally. For a registered
 external package group, call `flow_packages` operation `launch` to dispatch all
 ready branches in a batch. Keep their pinned owners, worktrees, dependencies,
 and attempt generations. The runtime supplies package-specific delivery
-contracts; children must not report the parent's flow step. Wait through the
-run event stream and retain the original conversational requester.
+contracts; children must not report the parent's flow step. Use the returned
+`coordinator_observer` and `wait_contract` for your own thread; the original
+conversational requester remains subscribed separately. Launch does not itself
+wait. Invoke the returned `flow_packages` wait contract with its one-hour
+timeout, handle each event batch, explicitly invoke its returned `ack_contract`,
+and wait again. Answer useful updates or user steering, then reattach to the
+wait. Do not poll or end your turn while package work remains pending.
 
 Read completed delivery snapshots and accept the ready batch with operation
 `accept`; the runtime starts newly ready dependent packages in that operation. Do not poll one

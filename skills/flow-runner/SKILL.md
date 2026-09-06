@@ -384,8 +384,9 @@ the launch tool itself stays non-blocking. Use your newer processed cursor if a
 reused launch returns an older initial cursor. `closed: true` returns no next
 wait for that observation; check the remaining supervised runs before ending.
 
-The default delivery mode is `wait`. Use one-hour waits (30 minutes if required
-by the host), or omit the timeout for indefinite waiting:
+The default delivery mode is `wait`. Use renewable one-hour MCP waits below the
+effective client deadline. The bundled Codex server declares
+`tool_timeout_sec: 3700`, leaving headroom for `timeout_ms: 3600000`:
 
 ```bash
 agentctl run wait \
@@ -395,9 +396,13 @@ agentctl run wait \
   --timeout 1h
 ```
 
-The MCP equivalent is `run_wait` with `timeout_ms: 3600000`. Omit the timeout
-for an indefinite wait. Process each returned batch, retain its new cursor,
-and renew the long wait after a timeout. A timeout does not imply completion.
+The MCP equivalent is `run_wait` with `timeout_ms: 3600000`. Indefinite waits
+are limited to the CLI/internal runtime or a host whose support was explicitly
+verified. A server-side timeout cannot override a shorter client deadline;
+verify the effective client configuration when changing hosts. A shorter wide
+wait, such as 30 minutes, is valid only when it fits that verified deadline.
+Process each returned batch, acknowledge it explicitly, and renew the long wait
+after a timeout. A timeout does not imply completion.
 If the host interrupts or caps a tool call, resume from the last acknowledged
 cursor rather than polling worker status or replaying earlier events. Stop on
 user cancellation, `closed`, or the selected completion condition.
@@ -589,7 +594,12 @@ An empty manifest keeps ordinary inline execution unchanged.
 Use batch `launch` for all ready branches and batch `accept` for inspected
 current deliveries. The parent retains its flow-step authority; package children
 receive their own delivery contract and cannot complete the parent's step.
-Consume the same run event stream and preserve the original requester. Respect
+Consume the returned `wait_contract` through `flow_packages` using the launching
+owner's `coordinator_observer`; preserve the separate original requester. After
+processing a complete batch, invoke its returned `ack_contract` and wait again
+with the one-hour timeout. Do not substitute polling, implicit ACK, or ending
+the turn while packages remain pending. Respond to steering and reattach to the
+wait. Respect
 pinned owners, attempt generations, dependencies, and disjoint worktrees. The
 runtime joins all required accepted deliveries and checks no launched branch
 is still active before allowing implementation to finish.
@@ -604,7 +614,10 @@ name the current attempt and a concrete reason.
 
 Managed package workers currently require an explicitly configured
 `codex-thread` role. Resolve an incompatible role override before defining a
-group; do not silently change an explicitly requested backend. Native bridge
+group; do not silently change an explicitly requested backend. A nonempty
+manifest also requires a clean consolidated checkout and clean worktrees at the
+shared base. Preserve uncommitted work and use inline execution when a clean
+baseline is unavailable. Native bridge
 workers must not directly spawn siblings. The authorized coordinator provisions
 Codex worktrees before registration. Do not bypass this contract with ad hoc
 launches, manual worktree creation, or parent step reports submitted by children.

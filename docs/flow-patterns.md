@@ -252,11 +252,18 @@ Use an empty manifest when one inline owner is sufficient.
 
 `flow_packages` launches the ready set in a batch and gives each child a scoped
 delivery contract. Package roles currently require the `codex-thread` backend.
-Codex-managed worktrees must already exist, share the
+The consolidated checkout and Codex-managed worktrees must be clean when a
+nonempty manifest is registered. Worktrees must already exist, share the
 repository/base, and have disjoint declared paths. Delivery capture rejects
 changes outside those paths. Preserve each worker's
 owner and attempt generation. The original conversational requester stays
-attached to the run and the implementation owner consumes the event stream.
+attached to the run. Launch, accept, and retry also bind the invoking owner
+to its own `coordinator_observer` and return a `wait_contract`; launching itself
+does not wait for completion.
+Use that `flow_packages` wait, explicitly apply the batch's returned
+`ack_contract` after processing, and resume the one-hour wait. The launcher
+keeps its turn open and reattaches after updates while package work is pending;
+notification delivery cannot reliably wake an ended turn.
 
 The owner inspects immutable deliveries and accepts a batch. No implementation
 exit is valid while a required package is missing an accepted current delivery
@@ -393,8 +400,12 @@ fallback. Hosts without a conversation must supply a real requester identity;
 headless operations never fabricate one. Reusing a run preserves its observer
 filters and does not replace the original requester with a nested executor.
 
-The default `wait` mode uses `run_wait` with the returned durable cursor,
-without a timeout or with `timeout_ms: 3600000` (`--timeout 1h` in the CLI).
+The default MCP `wait` mode uses `run_wait` with renewable
+`timeout_ms: 3600000` waits (`--timeout 1h` in the CLI). The bundled Codex MCP
+configuration sets `tool_timeout_sec: 3700`; verify the effective client
+deadline on other hosts. Omitting an internal timeout cannot override a client
+cap. Indefinite waiting is supported only through the CLI/internal runtime or
+a host whose unlimited wait support has been explicitly verified.
 Consume the batch, retain its new cursor, and resume the long wait. Timeout is
 not completion. Preserve the last processed cursor when reusing a launch.
 When the user asks something else, answer in commentary and resume event waiting
@@ -406,9 +417,11 @@ pauses or cancels supervision. A short localized update may mention that the
 flow is still running and the conversation is returning to the wait.
 
 `observer.wait_contract` on launch and `wait_contract` on open event/timeout
-responses provide `run_wait` arguments with a one-hour timeout. A host that
-requires a shorter wide timeout may use 30 minutes. The contract includes the
-current response cursor; acknowledge it only after processing that batch. After
+responses provide `run_wait` arguments with a one-hour timeout. A shorter wide
+timeout such as 30 minutes must still fit the verified client deadline. Reusable
+wait contracts omit the cursor so the next call uses the durable processed
+position; the event batch provides a cursor and explicit ACK contract.
+Acknowledge only after processing that batch. After
 interruption, resume from the last processed cursor. A closed observation returns
 `wait_contract: null`; check the remaining active runs before ending the turn.
 By default every supported event type is selected, covering present and future

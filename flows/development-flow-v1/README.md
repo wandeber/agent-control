@@ -124,7 +124,10 @@ routes. Manual routing cannot bypass plan approval or evidence guards.
 
 Keep the initiating conversation registered and subscribed to all run events.
 Respond to new messages in commentary and re-enter `run_wait` while work remains.
-Use long waits (one hour or indefinite); timeout is not completion. Keep each
+Use renewable one-hour MCP waits below the verified client deadline. The bundled
+Codex server allows 3,700 seconds; an internal timeout cannot extend a client
+cap. Indefinite waits are reserved for CLI/internal runtime or an explicitly
+verified host. Timeout is not completion. Keep each
 run's last processed cursor and never rely on a notification to awaken an ended
 Codex turn. Original requester and executing coordinator retain distinct roles
 when they are different threads.
