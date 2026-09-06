@@ -219,6 +219,7 @@ addRequesterOptions(flow
   .option("--config-stdin", "Read flow config JSON/YAML from stdin.")
   .option("--run <runId>", "Existing run id. If omitted, a new run is created.")
   .option("--run-title <title>", "Title for a newly created run.")
+  .option("--acceptance-context <text>", "Complete accepted task contract, persisted before the first step is activated.")
   .option("--repo-dir <dir>", "Repository directory for a newly created run.")
   .option("--owner-task-identity <id>", "Optional root CODEX_THREAD_ID binding for a native bridge grant.")
   .option("--owner-task-path <path>", "Canonical root task path for native subagent actions.", "/root")
@@ -230,6 +231,7 @@ addRequesterOptions(flow
       configStdin?: boolean;
       run?: string;
       runTitle?: string;
+      acceptanceContext?: string;
       repoDir?: string;
       ownerTaskIdentity?: string;
       ownerTaskPath?: string;
@@ -246,6 +248,7 @@ addRequesterOptions(flow
         requesterThreadId: options.requesterThreadId, requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined, requesterDelivery: options.requesterDelivery,
         runId: options.run,
         runTitle: options.runTitle,
+        ...{ acceptanceContext: options.acceptanceContext },
         repoDir: options.repoDir,
         adminKey: auth.adminKey,
         agentToken: auth.agentToken,
@@ -267,6 +270,7 @@ addRequesterOptions(flow
   .description("Authenticate a local orchestrator, start or resume a flow, dispatch the active step, and return.")
   .requiredOption("--config-file <path>", "Read flow config JSON/YAML from this file.")
   .requiredOption("--title <title>", "Run title/objective. This is passed to workers through the runtime contract.")
+  .option("--acceptance-context <text>", "Complete accepted task contract, persisted before the first step is activated or dispatched.")
   .option("--run <runId>", "Existing run id to resume.")
   .option("--repo-dir <dir>", "Repository directory for the run.", process.cwd())
   .option("--orchestrator-title <title>", "Registered orchestrator title.")
@@ -283,6 +287,7 @@ addRequesterOptions(flow
     async (options: {
       configFile: string;
       title: string;
+      acceptanceContext?: string;
       run?: string;
       repoDir?: string;
       orchestratorTitle?: string;
@@ -323,6 +328,7 @@ addRequesterOptions(flow
       const coordinatorObserver = observeLaunchCoordinator(controller, { agent: login.agent, agentToken: login.agent_token }, login.run.run_id, observer);
       const start = controller.startFlow({
         config,
+        ...{ acceptanceContext: options.acceptanceContext },
         runId: login.run.run_id,
         agentToken: login.agent_token,
         ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),

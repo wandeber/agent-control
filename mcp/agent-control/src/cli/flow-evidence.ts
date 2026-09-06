@@ -3,7 +3,7 @@ import type { Command } from "commander";
 import { parseJsonObjectOption, type CliDeps } from "./shared.js";
 
 interface FlowRuntimeCommands {
-  updateFlowContext(input: { flowInstanceId: string; context: Record<string, unknown>; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
+  updateFlowContext(input: { flowInstanceId: string; context: string; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
   recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; agentToken?: string; adminKey?: string }): unknown;
   executeFlowEvidence(input: { flowInstanceId: string; key: string; request: Record<string, unknown>; stepInstanceId?: string; agentToken?: string; adminKey?: string }): Promise<unknown>;
 }
@@ -18,17 +18,31 @@ function jsonSource(file: string | undefined, inline: string | undefined, label:
   return parseJsonObjectOption(file === undefined ? inline! : readFileSync(file, "utf8"));
 }
 
+function acceptedContext(options: { context?: string; contextFile?: string; contextJson?: string }): string {
+  if ([options.context, options.contextFile, options.contextJson].filter(value => value !== undefined).length !== 1) {
+    throw new Error("Provide exactly one --context, --context-file or --context-json.");
+  }
+  const context = options.contextFile !== undefined ? readFileSync(options.contextFile, "utf8")
+    : options.contextJson !== undefined ? (() => {
+      const value: unknown = JSON.parse(options.contextJson!);
+      return typeof value === "string" ? value : JSON.stringify(value);
+    })() : options.context!;
+  if (!context.trim()) throw new Error("The complete accepted task contract must not be empty.");
+  return context;
+}
+
 export function registerFlowEvidenceCommands(flow: Command, deps: CliDeps): void {
   const controller = deps.controller as typeof deps.controller & FlowRuntimeCommands;
   flow.command("context-update")
-    .description("Persist revised task context with compare-and-swap protection against stale updates.")
+    .description("Replace the complete current accepted task contract with compare-and-swap protection; previous revisions remain in history.")
     .requiredOption("--flow <id>", "Flow instance id.")
     .requiredOption("--expected-revision <n>", "Current context revision.", revision)
-    .option("--context-file <path>", "Read the context JSON object from a file.")
-    .option("--context-json <json>", "Context JSON object; prefer a file for larger records.")
-    .action((options: { flow: string; expectedRevision: number; contextFile?: string; contextJson?: string }) => {
+    .option("--context <text>", "Complete accepted task contract, including requirements that remain unchanged.")
+    .option("--context-file <path>", "Read the complete accepted task contract as UTF-8 text.")
+    .option("--context-json <json>", "Complete contract encoded as JSON; converted to text for the runtime.")
+    .action((options: { flow: string; expectedRevision: number; context?: string; contextFile?: string; contextJson?: string }) => {
       deps.output(controller.updateFlowContext({ flowInstanceId: options.flow, expectedRevision: options.expectedRevision,
-        context: jsonSource(options.contextFile, options.contextJson, "context"), ...deps.authOptions({ allowStoredAdminKey: true }) }));
+        context: acceptedContext(options), ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
   flow.command("decision")
     .description("Record a user decision against the current revision and, when required, the exact artifact digest.")

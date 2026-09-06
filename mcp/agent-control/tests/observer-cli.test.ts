@@ -12,6 +12,29 @@ describe("observer launch CLI", () => {
   const directories: string[] = [];
   afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
+  it.each(["start", "launch"] as const)("persists the complete acceptance contract before %s activates its first step", (command) => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-control-accepted-context-cli-"));
+    directories.push(directory);
+    const contract = "Preserve all existing requirements.\nImplement only the accepted behavior.\nKeep the recorded acceptance criteria.";
+    const result = JSON.parse(execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "flow", command,
+      "--config-file", "tests/fixtures/codex-subagent-flow.yaml", command === "start" ? "--run-title" : "--title", "Short display title",
+      "--acceptance-context", contract, "--repo-dir", directory
+    ], { cwd: resolve("."), encoding: "utf8", env: { ...process.env, AGENT_CONTROL_HOME: directory,
+      AGENT_CONTROL_DB: join(directory, "state.sqlite"), AGENT_CONTROL_ADMIN_KEY: "accepted-context-test-admin",
+      AGENT_CONTROL_TOKEN: "", CODEX_THREAD_ID: "owner-thread" } }));
+    const store = new SqliteStore(join(directory, "state.sqlite"));
+    try {
+      const instanceId = result.flow_instance_id ?? result.instance.flow_instance_id;
+      const step = store.db.prepare("select input_json from flow_step_instances where flow_instance_id = ? order by rowid limit 1")
+        .get(instanceId) as { input_json: string };
+      const input = JSON.parse(step.input_json);
+      expect(input.coordinator_context).toBe(contract);
+      expect(input.acceptance_revision).toBe(0);
+      expect(JSON.stringify(input.runtime_contract)).toContain("Keep the recorded acceptance criteria.");
+      if (command === "launch") expect(result.orchestrator_action).toMatchObject({ operation: "spawn_agent", status: "pending" });
+    } finally { store.close(); }
+  });
+
   it("registers the original conversation before the first native phase without launching native work", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-control-observer-cli-"));
     directories.push(directory);

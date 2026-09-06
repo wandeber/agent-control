@@ -24,11 +24,25 @@ describe("flow evidence and observer CLI commands", () => {
     const { controller, parse } = fixture();
     await parse(["flow", "context-update", "--flow", "flow-1", "--expected-revision", "1", "--context-json", '{"objective":"Revised"}']);
     expect(controller.updateFlowContext).toHaveBeenCalledWith({ flowInstanceId: "flow-1", expectedRevision: 1,
-      context: { objective: "Revised" }, adminKey: "test-admin" });
+      context: '{"objective":"Revised"}', adminKey: "test-admin" });
     await parse(["flow", "decision", "--flow", "flow-1", "--key", "plan_approved", "--value-json", "true", "--reason", "Approved exact plan",
       "--expected-revision", "2", "--artifact-key", "plan", "--artifact-digest", "digest"]);
     expect(controller.recordFlowDecision).toHaveBeenCalledWith({ flowInstanceId: "flow-1", key: "plan_approved", value: true,
       reason: "Approved exact plan", expectedRevision: 2, artifactKey: "plan", artifactDigest: "digest", adminKey: "test-admin" });
+  });
+  it("preserves a complete multiline accepted contract from text and UTF-8 files", async () => {
+    const first = fixture();
+    const contract = "Keep existing requirements.\nChange only the agreed behavior.\nAcceptance: preserve the user decision.";
+    await first.parse(["flow", "context-update", "--flow", "f", "--expected-revision", "2", "--context", contract]);
+    expect(first.controller.updateFlowContext).toHaveBeenCalledWith(expect.objectContaining({ context: contract, expectedRevision: 2 }));
+    const directory = mkdtempSync(join(tmpdir(), "accepted-context-cli-")); directories.push(directory);
+    const path = join(directory, "contract.md"); writeFileSync(path, contract);
+    const second = fixture();
+    await second.parse(["flow", "context-update", "--flow", "f", "--expected-revision", "3", "--context-file", path]);
+    expect(second.controller.updateFlowContext).toHaveBeenCalledWith(expect.objectContaining({ context: contract, expectedRevision: 3 }));
+    const empty = fixture();
+    await expect(empty.parse(["flow", "context-update", "--flow", "f", "--expected-revision", "0", "--context", "  "])).rejects.toThrow(/must not be empty/);
+    expect(empty.controller.updateFlowContext).not.toHaveBeenCalled();
   });
   it("loads evidence request files and forwards configured caller authentication", async () => {
     const { controller, parse } = fixture();
