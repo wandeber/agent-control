@@ -8,6 +8,8 @@ export type ConsoleSnapshotContent<TSnapshot> = Record<string, unknown> & {
   console: {
     requested_run_id: string | null;
     follow_latest: boolean;
+    action?: "reuse" | "close";
+    command_id?: string;
   };
 };
 

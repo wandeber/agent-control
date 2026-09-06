@@ -48,6 +48,7 @@ beforeEach(() => {
   execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "baseline"]);
   vi.stubEnv("AGENT_CONTROL_HOME", join(root, "state")); vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "fixture-admin");
   vi.stubEnv("CODEX_THREAD_ID", ""); vi.stubEnv("AGENT_CONTROL_REQUESTER_THREAD_ID", "");
+  vi.stubEnv("AC_FIXTURE_VALIDATION_EPOCH", "initial");
   store = new SqliteStore(join(root, "state.sqlite")); adapter = new ScriptedCodex();
   const registry = new AdapterRegistry(); registry.register(adapter); controller = new AgentController(store, registry);
   coordinator = controller.orchestratorLogin({ adminKey: resolveAdminKey(), title: "Conversation", runTitle: "Update value", repoDir: repo, backend: "codex-thread", backendHandle: { thread_id: "executor-thread" } });
@@ -70,7 +71,7 @@ async function enter(expected: string) {
   vi.stubEnv("CODEX_THREAD_ID", controller.getAgent(dispatched.agent!.agent_id).backend_handle!.thread_id as string);
   return current();
 }
-function report(result: Record<string, unknown>) { return controller.reportFlowStep({ stepInstanceId: current().step_instance_id, status: "completed", result, summary: `Fixture ${current().step_id} result` }); }
+function report(result: Record<string, unknown>, artifacts?: Record<string, string>) { return controller.reportFlowStep({ stepInstanceId: current().step_instance_id, status: "completed", result, artifacts, summary: `Fixture ${current().step_id} result` }); }
 function decision(key: string, value: string, artifactKey?: string) {
   vi.stubEnv("CODEX_THREAD_ID", "conversation-thread");
   return controller.recordFlowDecision({ flowInstanceId: id, key, value, reason: `${key}: ${value}; explicit fixture decision on current content.`, expectedRevision: snapshot().runtime!.revision,
@@ -114,7 +115,7 @@ async function toImplementation(planCorrection = false, packages: PackageSpec[] 
 async function prepareResult(checkpoint: string, previous?: string) {
   return evidence(`checkpoint-${checkpoint}`, { operation: "prepare_result", checkpoint_id: checkpoint, plan_path: artifact("plan"), base: snapshot().runtime!.packages!.base_commit, paths: Object.keys(taskPackages), ...(previous ? { previous } : {}) });
 }
-async function validate(checkpoint = "result-1", mode: "focused" | "complete_gate" = "complete_gate", previous?: string, reuse: string[] = []) {
+async function validate(checkpoint = "result-1", mode: "focused" | "complete_gate" = "complete_gate", previous?: string, reuse: string[] = [], options: { requestClosure?: boolean; deferReport?: boolean } = {}) {
   await enter(mode === "focused" ? "focused_validation" : "validation");
   const existing = snapshot().runtime!.evidence[`checkpoint-${checkpoint}`];
   if (existing) {
@@ -123,12 +124,12 @@ async function validate(checkpoint = "result-1", mode: "focused" | "complete_gat
   } else await prepareResult(checkpoint, previous);
   const receipt = await evidence(mode === "focused" ? "focused_validation" : "validation", {
     operation: "validation_run", checkpoint_id: checkpoint,
-    checks: [{ check_id: "value-check", argv: [process.execPath, "-e", `const fs=require("node:fs"); for(const path of ${JSON.stringify(Object.keys(taskPackages))}) if(!fs.readFileSync(path,"utf8").startsWith("after")) process.exit(1)`], sandbox: "workspace", volatile: false, context_complete: true }],
+    checks: [{ check_id: "value-check", argv: [process.execPath, "-e", `const fs=require("node:fs"); for(const path of ${JSON.stringify(Object.keys(taskPackages))}) if(!fs.readFileSync(path,"utf8").startsWith("after")) process.exit(1)`], sandbox: "workspace", volatile: false, context_complete: true, environment_names: ["AC_FIXTURE_VALIDATION_EPOCH"] }],
     coverage: { validation_mode: mode, path_packages: taskPackages, surfaces: [...new Set(Object.values(taskPackages))].map(surface_id => ({ surface_id, kind: "package" as const, check_ids: ["value-check"], no_applicable_checks_reason: null })) }, source_receipt_ids: reuse
   });
   expect(receipt.status).toBe("passed");
-  report({ conclusion: "passed", evidence_receipt_id: receipt.receipt_id });
   if (mode === "complete_gate") lastValidation = receipt;
+  if (!options.deferReport) report({ conclusion: "passed", evidence_receipt_id: receipt.receipt_id, ...(options.requestClosure === undefined ? {} : { request_closure: options.requestClosure }) });
   return receipt;
 }
 function resultDraft(gate: "planner" | "expert", rework = false, successor = false) {
@@ -142,12 +143,12 @@ function resultDraft(gate: "planner" | "expert", rework = false, successor = fal
     ...(gate === "expert" ? { safe_to_close: !rework } : {})
   };
 }
-async function planner() {
+async function planner(uat: "prepare" | "skip" = "skip") {
   await enter("implementation_review");
   const receipt = await evidence("implementation_review", { operation: "record_review", checkpoint_id: "result-1", gate: "planner", source_receipt_ids: [lastValidation.receipt_id], draft: resultDraft("planner") });
   report({ conclusion: "approved", evidence_receipt_id: receipt.receipt_id });
   expect(snapshot().runtime!.state.planner_approved).toBe(true);
-  decision("uat_preference", "skip");
+  decision("uat_preference", uat);
 }
 async function expert(checkpoint = "result-1", rework = false, successor = false) {
   await enter("final_review");
@@ -344,5 +345,70 @@ describe("bundled default flow with actual evidence and closure", () => {
     expect(approved.source_receipt_ids).toContain(first.receipt_id);
     expect(snapshot().runtime!.owners.final_reviewer).toBe(originalExpert);
     await close(approved);
+  }, 60_000);
+
+  it("refreshes stale mechanical evidence and closes without repeating unchanged expert review", async () => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await validate(); await planner(); const review = await expert();
+    const expertOwner = snapshot().runtime!.owners.final_reviewer;
+    const oldValidation = lastValidation;
+    vi.stubEnv("AC_FIXTURE_VALIDATION_EPOCH", "refreshed");
+    vi.stubEnv("CODEX_THREAD_ID", "executor-thread");
+    await expect(controller.executeFlowEvidence({ flowInstanceId: id, key: "closure", request: { operation: "verify_closure", expert_receipt_id: review.receipt_id, validation_receipt_id: oldValidation.receipt_id }, stepInstanceId: current().step_instance_id, agentToken: coordinator.agent_token })).rejects.toThrow(/input|toolchain|environment/i);
+    await controller.startFlowStep({ flowInstanceId: id, stepId: "validation", reason: "Refresh changed command environment; retain current expert approval.", agentToken: coordinator.agent_token });
+    const refreshed = await validate("result-1", "complete_gate", undefined, [oldValidation.receipt_id], { requestClosure: true });
+    expect(refreshed.summary.reused_check_count).toBe(0);
+    expect(current().step_id).toBe("closure");
+    expect(snapshot().runtime!.evidence.final_review).toBe(review.receipt_id);
+    expect(snapshot().runtime!.owners.final_reviewer).toBe(expertOwner);
+    expect(snapshot().steps.filter(step => step.step_id === "final_review")).toHaveLength(1);
+    await close(review);
+  }, 60_000);
+
+  it.each(["missing", "rejected", "changed"] as const)("rejects a closure routing request with %s expert evidence", async situation => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await validate(); await planner();
+    if (situation !== "missing") await expert("result-1", situation === "rejected");
+    const expertOwner = snapshot().runtime!.owners.final_reviewer;
+    if (situation === "changed") writeFileSync(join(repo, "value.txt"), "after-changed\n");
+    vi.stubEnv("CODEX_THREAD_ID", "executor-thread");
+    await controller.startFlowStep({ flowInstanceId: id, stepId: "validation", reason: "Check closure reuse against actual current evidence.", agentToken: coordinator.agent_token });
+    const receipt = await validate(situation === "changed" ? "result-2" : "result-1", "complete_gate", situation === "changed" ? "result-1" : undefined, [], { deferReport: true });
+    const reportsBefore = snapshot().reports.length;
+    expect(() => report({ conclusion: "passed", evidence_receipt_id: receipt.receipt_id, request_closure: true })).toThrow();
+    expect(current().step_id).toBe("validation");
+    expect(snapshot().reports).toHaveLength(reportsBefore);
+    expect(snapshot().instance.status).not.toBe("completed");
+    report({ conclusion: "passed", evidence_receipt_id: receipt.receipt_id });
+    expect(current().step_id).toBe("final_review");
+    if (expertOwner) expect(snapshot().runtime!.owners.final_reviewer).toBe(expertOwner);
+  }, 60_000);
+
+  it.each([false, true])("prepares selected UAT with optional guide=%s and retains the real user gate", async withGuide => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await validate(); await planner("prepare"); await enter("uat_preparation");
+    const guide = output("uat-guide");
+    if (withGuide) writeFileSync(guide, "# UAT\nOpen the preview and check the changed value.\n");
+    report({ conclusion: "ready", access_details: "Open http://localhost:3000 and check the changed value." }, withGuide ? { uat_guide: guide } : undefined);
+    expect(current().step_id).toBe("uat_review");
+    const binding = snapshot().artifact_bindings.find(item => item.artifact_key === "uat_guide");
+    expect(Boolean(binding)).toBe(withGuide);
+    if (binding) expect(snapshot().runtime!.artifacts!.uat_guide.snapshot_path).not.toBe(binding.path);
+    expect(snapshot().runtime!.state.uat_completed).toBe(false);
+    decision("uat_result", "approved");
+    expect(current().step_id).toBe("final_review");
+  }, 60_000);
+
+  it("returns a UAT preparation plan defect through analyst and human plan gates", async () => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await validate(); await planner("prepare"); await enter("uat_preparation");
+    report({ conclusion: "plan_changes_needed", access_details: "The approved plan omitted the required user access route." });
+    expect(current().step_id).toBe("planning");
+    expect(snapshot().runtime!.state.planner_approved).toBe(true);
+    expect(snapshot().runtime!.state.uat_completed).toBe(false);
+    await enter("planning"); writeFileSync(output("plan"), planText("Set value to after and define the user access route.")); report({ conclusion: "ready" });
+    expect(current().step_id).toBe("plan_review");
+    await reviewPlan("plan-2", "plan-1");
+    expect(current().step_id).toBe("plan_approval");
   }, 60_000);
 });

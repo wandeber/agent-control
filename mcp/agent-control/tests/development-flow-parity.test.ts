@@ -19,7 +19,7 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     const parsed = parseFlowConfig(raw) as unknown as Record<string, any>;
     expect(parsed.policy).toMatchObject({ strict: true, plan_artifact: "plan", work_packages: { approval_decision: "plan_approval", manifest_step: "plan_review", execution_step: "implementation", integration_step: "integration", success_condition: { equals: { var: "result.conclusion", value: "ready" } } } });
     expect(parsed.initial_step).toBe("context");
-    expect(parsed.steps.context.role).toBe(parsed.steps.analysis.role);
+    expect(parsed.steps.context.role).not.toBe(parsed.steps.analysis.role);
     expect(route("context", { conclusion: "ready" })?.to).toBe("analysis");
   });
 
@@ -107,8 +107,12 @@ describe("development-flow-v1 responsibility and routing parity", () => {
 
   it("keeps only real document artifacts and preserves configured worker models", () => {
     expect(Object.keys(raw.artifacts ?? {}).sort()).toEqual(["analysis", "context", "plan", "uat_guide"]);
-    expect(raw.roles?.final_reviewer?.model).toBe("gpt-5.5");
-    for (const name of ["analyst", "planner", "implementer", "validator"]) {
+    expect(raw.roles?.analyst).toMatchObject({ backend: "codex-thread", model: "gpt-6-astra", reasoning_effort: "xhigh", agent_lifecycle: "reuse" });
+    expect(raw.roles?.final_reviewer).toMatchObject({ backend: "codex-thread", model: "gpt-5.6-sol", reasoning_effort: "xhigh", agent_lifecycle: "reuse" });
+    expect(record.steps.context.role).toBe("context");
+    expect(record.steps.analysis.role).toBe("analyst");
+    expect(record.steps.plan_review.role).toBe("analyst");
+    for (const name of ["context", "planner", "implementer", "validator"]) {
       expect(raw.roles?.[name]).toMatchObject({ backend: "codex-thread", model: "gpt-5.6-luna", reasoning_effort: "max", agent_lifecycle: "reuse" });
     }
   });

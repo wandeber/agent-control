@@ -9,7 +9,8 @@ the current date/time.
 - use deterministic date/time arithmetic
 - make timezone and precision assumptions explicit
 - produce a single integer millisecond value
-- if a review artifact is present, address its correction request directly
+- address the runtime's current causal correction and its linked open findings;
+  older review artifacts are history, not instructions to reopen resolved work
 
 ## Artifact
 

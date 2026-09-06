@@ -1,3 +1,4 @@
+import { ControllerError } from "../src/core/errors.js";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3466,6 +3467,23 @@ describe("AgentController", () => {
     expect(adapter.sent.at(-1)?.message).toContain("configured flow notification");
   });
 
+  it("keeps completion feedback within the all-runs supervision boundary", async () => {
+    const run = controller.createRun({ title: "First supervised run" });
+    const other = controller.createRun({ title: "Other work still pending" });
+    const subscriber = controller.registerAgent({ runId: run.run_id, backend: "fake", title: "Conversation", role: "orchestrator" });
+    await controller.startAgent({ agentId: subscriber.agent_id, prompt: "Supervise both runs." });
+    controller.createSubscription({ runId: run.run_id, subscriberAgentId: subscriber.agent_id, eventType: "flow.completed" });
+    const pending = controller.startFlow({ runId: other.run_id, config: { id: "pending", initial_step: "work", steps: { work: {} } } });
+    const ending = controller.startFlow({ runId: run.run_id, config: { id: "ending", initial_step: "work", steps: { work: { on: { reported: { finish: true } } } } } });
+    controller.reportFlowStep({ stepInstanceId: ending.active_step!.step_instance_id, status: "completed" });
+    await controller.drainDeliveries();
+    const notification = adapter.sent.at(-1)?.message;
+    expect(notification).toContain("update in commentary while any other supervised work remains");
+    expect(notification).toContain("only when all supervised work is resolved");
+    expect(notification).not.toContain("complete instruction for this short re-entry");
+    expect(controller.getFlowSnapshot(pending.instance.flow_instance_id).instance.status).not.toBe("completed");
+  });
+
   it("accepts markdown prompt references for roles and steps", () => {
     const run = controller.createRun({ title: "prompted flow run", repoDir: "/repo" });
     const started = controller.startFlow({
@@ -4796,6 +4814,67 @@ describe("AgentController", () => {
     expect(codexAdapter.sent[0]?.message).not.toContain("codex_app.send_message_to_thread");
   });
 
+  it("retries terminal notifications when a Codex thread is temporarily busy", async () => {
+    const codexAdapter = new DeferredFakeAdapter("codex-thread");
+    codexAdapter.sendErrorsAfterAccept = [
+      new Error("The current Codex turn is still writing the target thread."),
+      null
+    ];
+    registry.register(codexAdapter);
+    controller = new AgentController(store, registry, null, {
+      codexThreadDeliveryRetryDelaysMs: [0, 1]
+    });
+
+    const run = controller.createRun({ title: "Codex terminal notification retry" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "completed worker",
+      status: "completed"
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "codex-thread",
+      title: "Codex coordinator",
+      backendHandle: { thread_id: "busy-thread" },
+      status: "waiting_for_input"
+    });
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+    const sourceEvent = store.createEvent({
+      runId: run.run_id,
+      agentId: source.agent_id,
+      type: "agent.completed",
+      payload: { status: "completed", reason: "codex_thread_busy" }
+    });
+
+    await (controller as unknown as {
+      deliverSubscriptions(event: EventRecord): Promise<void>;
+    }).deliverSubscriptions(sourceEvent);
+    await controller.drainDeliveries();
+
+    expect(codexAdapter.sent).toHaveLength(2);
+    expect(controller.getAgent(subscriber.agent_id)).toMatchObject({
+      status: "running",
+      work_generation: 2
+    });
+    expect(controller.listSubscriptions({ runId: run.run_id })[0]).toMatchObject({
+      subscription_id: subscription.subscription_id,
+      last_delivered_event_id: sourceEvent.event_id
+    });
+    expect(
+      controller
+        .listEvents({ runId: run.run_id, type: "agent.delivery_failed" })
+        .filter((event) => event.payload.source_event_id === sourceEvent.event_id)
+    ).toHaveLength(1);
+
+    await controller.stopAgent(subscriber.agent_id);
+  });
+
   it("sends compact goal confirmation prompts through the owning agent", async () => {
     const run = controller.createRun({ title: "test run" });
     const agent = controller.registerAgent({
@@ -5382,6 +5461,22 @@ describe("AgentController", () => {
     expect(controller.getRun(run.run_id).status).toBe("stopped");
   });
 
+  it("preserves task ownership during backend disconnect and reconciles on recovery", async () => {
+    const run = controller.createRun({ title: "recover connection" });
+    const worker = controller.registerAgent({ runId: run.run_id, backend: "fake", title: "worker",
+      backendHandle: { id: "recovering-worker" }, status: "running" });
+    adapter.statusError = new ControllerError("offline", "backend_unavailable");
+    const disconnected = await controller.refreshAgentStatus(worker.agent_id);
+    expect(disconnected.status).toBe("running");
+    expect(disconnected.backend_handle).toEqual(worker.backend_handle);
+    expect(controller.listEvents({agentId: worker.agent_id, type: "agent.failed"})).toHaveLength(0);
+    adapter.statusError = null;
+    adapter.statuses.set("recovering-worker", "completed");
+    expect((await controller.refreshAgentStatus(worker.agent_id)).status).toBe("completed");
+    expect(adapter.starts).toHaveLength(0);
+    expect(adapter.sent).toHaveLength(0);
+  });
+
   it("keeps an asynchronous shutdown pending when status refresh fails", async () => {
     adapter.stopStatus = "stopping";
     const run = controller.createRun({ title: "failed status refresh run" });
@@ -5683,6 +5778,53 @@ describe("AgentController", () => {
         allow_blocking_wait: true
       })
     ).resolves.toMatchObject({ timed_out: true });
+  });
+
+  it("returns a matching subscription event when direct delivery is unavailable", async () => {
+    registry.register(new ManualAdapter());
+    const run = controller.createRun({ title: "subscription wakeup run" });
+    const source = controller.registerAgent({
+      runId: run.run_id,
+      backend: "fake",
+      title: "worker",
+      status: "running",
+      backendHandle: { id: "worker-handle" }
+    });
+    const subscriber = controller.registerAgent({
+      runId: run.run_id,
+      backend: "manual",
+      title: "coordinator",
+      role: "orchestrator",
+      status: "waiting_for_input",
+      backendHandle: { status: "waiting_for_input" }
+    });
+    adapter.statuses.set("worker-handle", "completed");
+    const subscription = controller.createSubscription({
+      runId: run.run_id,
+      sourceAgentId: source.agent_id,
+      subscriberAgentId: subscriber.agent_id,
+      eventType: "agent.completed"
+    });
+
+    const result = await handleTool(controller, "subscription_wait", {
+      subscription_id: subscription.subscription_id,
+      allow_blocking_wait: true,
+      interval_ms: 1,
+      timeout_ms: 100
+    });
+
+    expect(result).toMatchObject({
+      timed_out: false,
+      matched: true,
+      delivered: false,
+      event: { type: "agent.completed", agent_id: source.agent_id }
+    });
+    expect(
+      controller
+        .listSubscriptions({})
+        .find((entry) => entry.subscription_id === subscription.subscription_id)
+        ?.last_delivered_event_id
+    ).toBeNull();
   });
 
   it("dry-runs purge without deleting rows or runtime files", async () => {

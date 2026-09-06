@@ -3744,7 +3744,7 @@ def validate_plan_review_report(
                 f"Coverage dependencies for {section_id!r} are invalid: "
                 f"{sorted(unknown_dependencies | ({section_id} & set(dependencies)))}."
             )
-        validate_string_list(
+        validate_required_string_list(
             record.get("invariants"),
             f"Coverage invariants for {section_id!r}",
         )

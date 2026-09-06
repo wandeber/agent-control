@@ -55,6 +55,28 @@ describe("strict flow runtime", () => {
     const snapshot = controller.getFlowSnapshot(id);
     return controller.recordFlowDecision({ flowInstanceId: id, key: "plan", value: "approved", reason: "The user approved this exact plan.", expectedRevision: snapshot.runtime!.revision, artifactDigest: artifactDigest(snapshot.artifact_bindings[0]!.path), agentToken: owner.agent_token });
   }
+
+  it.each([false, true])("does not claim an omitted optional document, even if an old file exists=%s", async oldFile => {
+    const cfg = config();
+    cfg.artifacts!.guide = { path: join(root, "guide.md") };
+    cfg.steps.draft.outputs!.guide = { artifact: "guide", required: false };
+    if (oldFile) writeFileSync(join(root, "guide.md"), "A previous guide, not this delivery.");
+    const { started, reported } = await draft(cfg);
+    expect(reported.instance.current_step_id).toBe("approval");
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    expect(snapshot.artifact_bindings.map(binding => binding.artifact_key)).toEqual(["plan"]);
+    const reporting = started.active_step!.input_json.reporting_contract as any;
+    expect(reporting.artifact_example).toEqual({ plan: join(root, "plan.md") });
+  });
+
+  it("rejects a reported optional document that was not written", async () => {
+    const cfg = config(); cfg.artifacts!.guide = { path: join(root, "guide.md") };
+    cfg.steps.draft.outputs!.guide = { artifact: "guide", required: false };
+    const started = start(cfg); await dispatch(started.instance.flow_instance_id);
+    writeFileSync(join(root, "plan.md"), "# Plan\n");
+    expect(() => controller.reportFlowStep({ stepInstanceId: started.active_step!.step_instance_id, status: "completed", artifacts: { guide: join(root, "guide.md") } })).toThrow(/does not exist/);
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id).reports).toHaveLength(0);
+  });
   it("retains only the current accepted contract in prompts and rejects superseded step reports", async () => {
     const started = start(); const id = started.instance.flow_instance_id;
     controller.updateFlowContext({ flowInstanceId: id, context: "Obsolete acceptance", expectedRevision: 0, agentToken: owner.agent_token });

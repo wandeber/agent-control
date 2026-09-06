@@ -37,11 +37,12 @@ invalidates the dependent approvals; unchanged valid approval is reusable.
 1. Discover `development-flow-v1` through `flow_catalog_get`, then
    `flow_catalog_list` if needed. CLI fallback is `agentctl flow catalog get
    --flow development-flow-v1`. Do not search for a path before discovery.
-2. Immediately before the first launch, call `open_agent_control_console` once
-   without a `run_id`. It opens in `follow_latest` mode. This native MCP App
-   tool is required; if unavailable or failed, report that exact blocker before
-   dispatch. Do not replace it with a browser or web-console fallback. Never
-   reopen it on notifications, retries, or resumption.
+2. Immediately before the first launch, open or reuse the
+   [integrated Codex panel](../flow-runner/references/side-panel.md) through
+   `open_agent_control_console`. Omit `run_id` initially to follow the latest
+   run. Verify the integrated side panel, without browser chrome; do not use
+   a browser fallback. Reuse it on notifications, retries, and resumption.
+
 3. Call `flow_launch` once with the discovered flow and complete
    `acceptance_context`. Launch automatically registers the original conversation and its
    all-event subscription. Forward its original requester identity through
@@ -100,14 +101,20 @@ contract and current revision; never infer approval from a timeout, a worker's
   coordinator closure report with `conclusion: verified`. Finish only when strict
   expert approval and GREEN complete mechanical evidence cover the unchanged
   current result and all earlier user/workflow gates remain satisfied.
+  If only the complete mechanical evidence is stale, preserve the expert receipt
+  and use `flow_step_start` to return to `validation` with the observed refresh
+  reason. The validator can request closure against both verified current
+  receipts. Missing/rejected approval or a changed result returns to the same
+  expert; a worker flag alone never proves reuse eligibility.
 
 ## Phase And Evidence Policy
 
-Context and Analysis share an analyst with distinct responsibilities. The same
-analyst reviews the plan, and the exact planner reviews implementation until
-its first approval. Integration runs only when multiple outputs need it.
+Context uses a separate Luna `max` researcher. Analysis uses Astra `xhigh`, and
+the same analyst reviews the plan. The exact planner reviews implementation until
+its first approval. Integration consolidates external deliveries, including a
+single worktree; already consolidated inline work skips that phase.
 Mechanical Validation is a separate no-edit phase. The independent expert starts
-with clean context and remains the same owner through corrections.
+with clean context on Sol `xhigh` and remains the same owner through corrections.
 
 The first planner approval is permanent history; expert or UAT corrections go
 through affected validation and back to the same expert without another planner

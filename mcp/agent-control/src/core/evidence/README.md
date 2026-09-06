@@ -105,12 +105,14 @@ the same current snapshot; every reused source is dereferenced.
 ## Packaging and regression checks
 
 `vendor/hdt/provider.json` records the canonical source version, commit, paths
-and hashes. `scripts/sync-hdt-evidence.mjs --check` checks bundled bytes;
+and hashes. With `source_dirty: true`, the commit is the local base revision;
+the recorded hashes identify the unpublished working-tree bytes actually copied.
+`scripts/sync-hdt-evidence.mjs --check` checks bundled bytes;
 `--source <agent-settings-checkout> --check` also checks the canonical source.
 Omit `--check` only for an explicit provider update. The canonical helper and
 its contract/test companions are copied byte-for-byte, not edited here.
 
-Run the 46 canonical fixtures with:
+Run the canonical fixtures with:
 
 ```sh
 python3 -B -m unittest discover -s mcp/agent-control/vendor/hdt/tests -p test_review_checkpoint.py

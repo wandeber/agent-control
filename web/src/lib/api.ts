@@ -1,5 +1,7 @@
 "use client";
 
+import { AgentDetailReader } from "./agent-detail-reader";
+
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -181,8 +183,10 @@ export function useSnapshotStream(
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(() => getCachedMcpConsoleState().snapshot);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [agentLog, setAgentLog] = useState<AgentLogTail | null>(null);
+  const [agentError, setAgentError] = useState<Error | null>(null);
   const [streamError, setStreamError] = useState<Error | null>(null);
   const lastEventIds = useRef<Set<string>>(new Set());
+  const detailReader = useRef(new AgentDetailReader<AgentMessage[], AgentLogTail>());
   const refreshCoordinator = useRef<SerialRefreshCoordinator<McpRefreshPayload> | null>(null);
   refreshCoordinator.current ??= new SerialRefreshCoordinator<McpRefreshPayload>(1400);
   const requestedRunId = followLatestRun ? null : selectedRunId;
@@ -228,6 +232,8 @@ export function useSnapshotStream(
   useEffect(() => {
     if (mcpMode) {
       setConnection("connecting");
+      setAgentError(null);
+      setAgentLog(null);
       refreshCoordinator.current?.start({
         task: async () => {
           const nextSnapshot = await fetchSnapshot(requestedRunId);
@@ -244,13 +250,15 @@ export function useSnapshotStream(
           // Keep all reads inside one serialized task. Snapshot, messages, and
           // log therefore describe one selection generation and cannot overlap
           // the next 1.4-second refresh cycle.
-          const messages = await fetchAgentMessages(selectedAgentId, mcpMessageLimit);
-          const log = await fetchAgentLog(selectedAgentId, 24000);
-          return { snapshot: nextSnapshot, selectedAgentId, messageLimit: mcpMessageLimit, messages, log };
+          const details = await detailReader.current.read(selectedAgentId,
+            () => fetchAgentMessages(selectedAgentId, mcpMessageLimit),
+            () => fetchAgentLog(selectedAgentId, 24000));
+          return { snapshot: nextSnapshot, selectedAgentId, messageLimit: mcpMessageLimit, ...details };
         },
         onResult: (result) => {
           setConnection("live");
           setStreamError(null);
+          setAgentError(result.agentError ?? null);
           setSnapshot(result.snapshot);
           for (const item of result.snapshot.latest_events) {
             lastEventIds.current.add(item.event_id);
@@ -263,11 +271,11 @@ export function useSnapshotStream(
               agentMessagesQueryKey(result.selectedAgentId, result.messageLimit),
               result.messages
             );
-            if (result.log) {
-              queryClient.setQueryData<AgentLogTail>(agentLogQueryKey(result.selectedAgentId), result.log);
-            }
           }
-          setAgentLog(result.log);
+          if (result.selectedAgentId && result.log) {
+            queryClient.setQueryData<AgentLogTail>(agentLogQueryKey(result.selectedAgentId), result.log);
+          }
+          if (result.log || !result.agentError) setAgentLog(result.log);
         },
         onError: (error) => {
           setConnection("offline");
@@ -351,6 +359,7 @@ export function useSnapshotStream(
     selectedRun,
     connection,
     agentLog,
+    agentError,
     refresh,
     isLoading: snapshotStreamIsLoading({
       hasSnapshot: Boolean(snapshot),
@@ -363,6 +372,7 @@ export function useSnapshotStream(
 }
 
 interface McpRefreshPayload {
+  agentError?: Error;
   snapshot: DashboardSnapshot;
   selectedAgentId: string | null;
   messageLimit: number;

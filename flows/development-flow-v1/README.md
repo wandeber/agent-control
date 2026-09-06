@@ -1,7 +1,10 @@
 # Development Flow v1
 
-Version 1.2.0 levels the development workflow with HDT's responsibility and
-evidence model. Agent Control owns durable phases, decisions, owners, reports,
+Version 1.2.2 aligns phase instructions with executable routes: optional UAT
+documents, plan correction during UAT preparation, and guarded reuse of current
+expert approval after mechanical refresh. The workflow follows HDT's
+responsibility and evidence model. Agent Control owns durable phases,
+decisions, owners, reports,
 execution receipts, and transitions. Models own technical judgment and declared
 impact; identical hashes do not establish semantic independence.
 
@@ -10,8 +13,8 @@ impact; identical hashes do not establish semantic independence.
 | Phase | Authority and inputs | Result / required evidence | Owner | Omission / correction |
 | --- | --- | --- | --- | --- |
 | Clarification | User request, prior decisions, applicable constraints | Durable acceptance revision with no unresolved material user choice | Original conversation | Before launch; repository facts go to Context |
-| Context | Acceptance and actual repository | Grounded Context document with source pointers | Analyst | Refresh only affected factual gaps |
-| Analysis | Acceptance and Context | Solution decisions, invariants, boundaries, risks | Same analyst | Corrections amend decisions; material user ambiguity returns to clarification |
+| Context | Acceptance and actual repository | Grounded Context document with source pointers | Separate context researcher, Luna `max` | Refresh only affected factual gaps |
+| Analysis | Acceptance and Context | Solution decisions, invariants, boundaries, risks | Analyst, Astra `xhigh` | Corrections amend decisions; material user ambiguity returns to clarification |
 | Analysis intent | Current Analysis and accepted user intent | Recorded content-bound intent decision | Original clarification owner | Narrow intention check; no second technical review |
 | Planning | Intent-approved Analysis | Stable package/section IDs, dependencies, paths, interfaces, affected mechanical gate | Planner | Wrong solution returns to Analysis |
 | Plan intent | Current Plan and Analysis | Strict composed plan-review receipt | Exact analyst | First review full; later changed/dependent sections and findings |
@@ -22,12 +25,13 @@ impact; identical hashes do not establish semantic independence.
 | Complete validation | Current checkpoint and complete affected closure | GREEN controlled/reused receipts with paths, consumers, mandatory gates, risks | Validator, no-edit | Run once per relevant coherent result; failures return as a bundle |
 | Implementation intent | GREEN complete gate and exact approved Plan | Strict conformance receipt and first-approval milestone | Exact planner | Skip after first approval unless explicitly requested again |
 | UAT choice | Existing user preference or one concise question | Recorded `prepare` / `skip` | Original conversation | Apply already expressed preference without asking again |
-| UAT preparation | Validated result and selected experience | Useful access/steps guide; no product edits | Implementer | Only when selected; setup defects return to implementation |
+| UAT preparation | Validated result and selected experience | Structured access/steps; optional useful guide; no product edits | Implementer | Only when selected; result defects return to Implementation, plan defects to Planning |
 | UAT observation | User's actual observations | Recorded acceptance, correction, explicit skip, or blocker | Original conversation | Preparation and elapsed time never imply approval |
 | Independent review | Current acceptance, exact Plan, result, mechanical evidence | Strict full/incremental expert receipt with complete finding dispositions | New independent expert first; exact same expert thereafter | Earliest useful correction route; no automatic second review under single-review instruction |
-| Closure | Current expert + complete validation evidence and earlier gates | Provider-verified closure receipt bound to unchanged result | Runtime verification requested by coordinator | No new worker or semantic review; stale/invalid evidence blocks |
+| Closure | Current expert + complete validation evidence and earlier gates | Provider-verified closure receipt bound to unchanged result | Runtime verification requested by coordinator | Stale mechanical evidence returns to Validation; unchanged approved result can reuse the expert receipt |
 
-Context and Analysis deliberately share an owner. The clarification-owner
+Context has its own researcher; Analysis and plan-intent review share the exact
+analyst. The clarification-owner
 analysis-intent gate is retained as an additional user-intent safeguard. There
 is one independent heavy reviewer. Coordinator decision steps are separate
 flow states without delegated workers.
@@ -54,12 +58,25 @@ flow states without delegated workers.
 - An explicit single-review-only instruction stops automatic expert rework.
   Nothing approves due to a timeout or lack of user response.
 
+When a complete mechanical receipt becomes stale after expert approval, the
+coordinator returns to `validation` with the specific refresh reason. The
+validator executes or reuses the applicable checks and may report
+`request_closure: true` only for the same currently approved result. This flag
+requests routing; both current owner-bound receipts must pass the transition
+guards, and `verify_closure` still checks their common snapshot and earlier
+gates. Missing, rejected, changed, or uncertain expert evidence follows the
+existing route to the same reviewer. No expert command execution, new reviewer,
+or renewed first-planner approval is implied by a mechanical refresh.
+
 ## Evidence Contract
 
 Only Context, Analysis, Plan, and a useful UAT guide are document artifacts.
 Implementation outcomes, reviews, ledgers, mechanical runs, decisions, and
 closure are structured runtime records; do not duplicate them in Markdown.
 Current aliases remain readable while evidence binds immutable revisions.
+Keep the same current Plan path on correction. For UAT, report `access_details`
+for the current attempt and include `uat_guide` only when actually written;
+an omitted optional output does not publish a previous file as a new delivery.
 
 Use `flow_evidence` with the operation allowed by the active step. Read its
 current generated schema. Preparation, scope, and delta operations return
@@ -136,9 +153,12 @@ Decision `owner: requester` preserves the original conversation separately
 from the executing coordinator. `authority` distinguishes coordinator judgment
 from an actual user decision; ownership determines which thread may record it.
 
-Configured model defaults remain Codex Luna Max for ordinary workers and the
-existing explicit final-reviewer model. Changing instruction contracts does not
-migrate model routes. Effective config/prompts are pinned for each run; override
+Model defaults are Luna `max` for Context, Astra `xhigh` for Analysis and its
+same-owner plan-intent review, and Sol `xhigh` for independent final review.
+Planner, implementer, and validator retain Luna `max`. The `DEVFLOW_CONTEXT_*`
+settings configure discovery independently of `DEVFLOW_ANALYST_*`;
+`DEVFLOW_FINAL_REVIEWER_REASONING_EFFORT` controls the review effort.
+Effective config/prompts are pinned for each run; override
 changes apply to future launches unless an explicit revision is accepted.
 
 ## Current Parallelism And Reuse Boundaries

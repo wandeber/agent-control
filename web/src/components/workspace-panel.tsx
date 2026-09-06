@@ -45,6 +45,7 @@ export function WorkspacePanel({
   selectedAgentId,
   selectedStepInstanceId,
   liveLog,
+  connectionError = null,
   messageLimit,
   onRequestOlderMessages
 }: {
@@ -53,6 +54,7 @@ export function WorkspacePanel({
   selectedAgentId: string | null;
   selectedStepInstanceId: string | null;
   liveLog: AgentLogTail | null;
+  connectionError?: Error | null;
   messageLimit: number;
   onRequestOlderMessages: () => void;
 }) {
@@ -84,6 +86,9 @@ export function WorkspacePanel({
     enabled: refreshPolicy.messagesEnabled,
     queryKey: agentMessagesQueryKey(agentId, messageLimit),
     queryFn: () => fetchAgentMessages(agentId!, messageLimit),
+    // A larger history request keeps this agent's last page during an outage;
+    // never carry another agent's transcript across a selection change.
+    placeholderData: (previous, query) => query?.queryKey[1] === agentId ? previous : undefined,
     refetchInterval: refreshPolicy.messagesRefetchInterval
   });
   const log = useQuery({
@@ -97,7 +102,7 @@ export function WorkspacePanel({
   const logError = log.error instanceof Error ? log.error : log.error ? new Error(String(log.error)) : null;
   const messageReady = messages.status === "success";
   const logReady = !refreshPolicy.logEnabled || log.status === "success" || activeLog !== null;
-  const chatLoading = Boolean(agentId) && !messageError && !logError && (!messageReady || !logReady);
+  const chatLoading = Boolean(agentId) && !connectionError && !messageError && !logError && (!messageReady || !logReady);
 
   return (
     <section className="workspace-panel flex h-full min-h-0 flex-col bg-white" data-compact={compact ? "true" : "false"}>
@@ -138,7 +143,7 @@ export function WorkspacePanel({
               onRequestOlder={onRequestOlderMessages}
               requestedLimit={messageLimit}
               compact
-              error={messageError ?? logError}
+              error={connectionError ?? messageError ?? logError}
               loading={chatLoading}
               showSidecar={false}
             />
@@ -324,7 +329,8 @@ function ChatView({
   }, [agentId, blocks.length, maxWindowStart, windowStart]);
 
   if (blocks.length === 0 && error) {
-    return <EmptyState detail={error.message} title="Could not load thread" />;
+    // Connection state belongs in the compact header, never over the chat.
+    return null;
   }
 
   if (blocks.length === 0 && loading) {

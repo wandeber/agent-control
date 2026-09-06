@@ -17,8 +17,10 @@ include cross-cutting constraints and interfaces, not only a task summary.
 Preserve IDs across edits, moves, and insertions. Record dependencies honestly;
 removing edges or semantically remapping scope requires full plan review.
 
-Write the assigned Plan document with exact done criteria and rationale for
-material choices. A material correction goes through the same analyst's review
+Write or update the same assigned Plan path with exact done criteria and rationale
+for material choices. Runtime checkpoints preserve earlier revisions; do not
+create numbered plan files for corrections. A material correction goes through
+the same analyst's review
 and explicit user approval of the resulting plan before implementation resumes.
 
 Use external packages only when parallel work materially helps. Identify each

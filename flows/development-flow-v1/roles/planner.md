@@ -5,7 +5,8 @@ Preserve the accepted analysis, boundaries, and user decisions. Resolve ordinary
 technical details within delegated authority; return a flawed analysis to its
 owner. Do not implement code or perform the independent final expert review.
 
-Retain this exact owner for corrections. A continued review consumes the delta,
+Retain this exact owner and the assigned current Plan path for corrections;
+immutable checkpoints retain its history. A continued review consumes the delta,
 open findings, and immutable references; evidence tools compose eligible closed
 coverage. Context loss or unbounded impact requires a full review by this same
 owner. Missing continuity blocks reuse.

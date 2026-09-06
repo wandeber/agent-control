@@ -18,7 +18,7 @@ export function SubagentsShell() {
   const { selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
   const [messageLimit, setMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [narrowViewport, setNarrowViewport] = useState<boolean | null>(null);
-  const { agentLog, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
+  const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
     followLatestRun,
@@ -61,12 +61,8 @@ export function SubagentsShell() {
     }
   }, [narrowViewport, selectedAgentId, subagents, snapshot, followLatestRun, selectedRunId]);
 
-  if (error) {
-    return (
-      <main className="subagents-shell">
-        <EmptyState detail={error.message} title="Agent Control unavailable" />
-      </main>
-    );
+  if (error && !snapshot) {
+    return <main className="subagents-shell"><span role="status" className="p-3 text-xs text-ink-400">Offline</span></main>;
   }
 
   if (isLoading && !snapshot) {
@@ -123,12 +119,14 @@ export function SubagentsShell() {
                   <h2>{selectedAgent.title}</h2>
                   <p>{selectedAgent.model ?? selectedAgent.backend}</p>
                 </div>
+                {agentError ? <span role="status" className="text-xs text-ink-400">Offline</span> : null}
                 <StatusPill status={selectedAgent.status} />
               </header>
               <div className="subagents-chat-body">
                 <WorkspacePanel
                   compact
                   liveLog={agentLog}
+                  connectionError={agentError}
                   messageLimit={messageLimit}
                   onRequestOlderMessages={() => setMessageLimit((value) => Math.min(MAX_AGENT_MESSAGE_LIMIT, value + AGENT_MESSAGE_LOAD_STEP))}
                   selectedAgentId={selectedAgent.agent_id}

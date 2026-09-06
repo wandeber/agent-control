@@ -1,14 +1,19 @@
+import { ConnectionRecovery, connectWithStartup } from "./connection-recovery.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { ControllerError } from "../core/errors.js";
 import { codexThreadActivity } from "../core/agent-activity.js";
 const DEFAULT_APP_SERVER_URL = "unix://";
 const DEFAULT_STDIO_COMMAND = "codex app-server";
+const DEFAULT_DESKTOP_CODEX_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const DEFAULT_DESKTOP_CODEX_COMMAND = `${DEFAULT_DESKTOP_CODEX_BINARY} app-server`;
 const DEFAULT_UNIX_SOCKET_PATH = join(process.env.HOME ?? "", ".codex/app-server-control/app-server-control.sock");
+const connectionRecovery = new ConnectionRecovery();
 const TURN_START_TIMEOUT_MS = 3_000;
+const ROLLOUT_COMPATIBILITY_ERROR = /does not start with session metadata/i;
 const CAPABILITIES = {
     canStart: true,
     canSendMessage: true,
@@ -98,6 +103,22 @@ export class CodexThreadAdapter {
     }
     async sendMessage(handle, message) {
         const data = parseHandle(handle);
+        // Codex Desktop's orchestrator thread is often the currently active user
+        // turn. `thread/inject_items` appends a model-visible user item without
+        // opening a competing writer, which gives Agent Control a real staging
+        // path for terminal notifications. Worker threads still use a normal
+        // turn so that a waiting worker is actually resumed.
+        if (data.agent_control_role === "orchestrator") {
+            try {
+                await injectMessage(data, message.message);
+                return;
+            }
+            catch (error) {
+                if (!isInjectionFallbackError(error)) {
+                    throw error;
+                }
+            }
+        }
         await startTurn(data, message.message);
     }
     async getStatus(handle) {
@@ -161,13 +182,35 @@ export class CodexThreadAdapter {
                 message: "Codex thread has no active turn to interrupt."
             };
         }
-        const client = new CodexAppServerClient(resolveAppServerUrl(undefined, undefined, data), resolveAuthToken(undefined, data));
+        const client = createAppServerClient(data);
         try {
             await client.initialize();
-            await client.request("turn/interrupt", {
-                threadId: data.thread_id,
-                turnId: latestTurn.id
-            });
+            try {
+                await client.request("turn/interrupt", {
+                    threadId: data.thread_id,
+                    turnId: latestTurn.id
+                });
+            }
+            catch (error) {
+                if (!isRolloutCompatibilityError(error)) {
+                    throw error;
+                }
+                client.close();
+                const fallback = createCompatibilityAppServerClient(data);
+                if (!fallback) {
+                    throw error;
+                }
+                try {
+                    await fallback.initialize();
+                    await fallback.request("turn/interrupt", {
+                        threadId: data.thread_id,
+                        turnId: latestTurn.id
+                    });
+                }
+                finally {
+                    fallback.close();
+                }
+            }
             return {
                 status: "stopped",
                 message: "Codex thread turn interrupted.",
@@ -183,70 +226,175 @@ export class CodexThreadAdapter {
     }
 }
 async function startTurn(data, message, model) {
-    const client = new CodexAppServerClient(resolveAppServerUrl(undefined, undefined, data), resolveAuthToken(undefined, data));
+    const client = createAppServerClient(data);
     try {
         await client.initialize();
         try {
-            const resumed = await resumeThread(client, data);
-            return await startTurnOnLoadedThread(client, data, message, model, resumed.cwd ?? data.cwd);
+            return await resumeAndStartTurn(client, data, message, model);
         }
         catch (error) {
-            if (!isMissingRolloutError(error)) {
+            if (!isRolloutCompatibilityError(error)) {
                 throw error;
+            }
+            client.close();
+            const fallback = createCompatibilityAppServerClient(data);
+            if (!fallback) {
+                throw error;
+            }
+            try {
+                await fallback.initialize();
+                return await resumeAndStartTurn(fallback, data, message, model);
+            }
+            finally {
+                fallback.close();
+            }
+        }
+    }
+    finally {
+        client.close();
+    }
+}
+async function injectMessage(data, message) {
+    const client = createAppServerClient(data);
+    try {
+        await client.initialize();
+        try {
+            await injectMessageThroughClient(client, data, message);
+            return;
+        }
+        catch (error) {
+            if (!isRolloutCompatibilityError(error)) {
+                throw error;
+            }
+            client.close();
+            const fallback = createCompatibilityAppServerClient(data);
+            if (!fallback) {
+                throw error;
+            }
+            try {
+                await fallback.initialize();
+                await injectMessageThroughClient(fallback, data, message);
+            }
+            finally {
+                fallback.close();
+            }
+        }
+    }
+    finally {
+        client.close();
+    }
+}
+async function injectMessageThroughClient(client, data, message) {
+    await client.request("thread/inject_items", {
+        threadId: data.thread_id,
+        items: [
+            {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: message }]
+            }
+        ]
+    });
+}
+async function resumeAndStartTurn(client, data, message, model) {
+    try {
+        // A loaded Codex thread can accept a same-turn input through turn/start.
+        // Trying it first lets notifications steer an active user turn instead of
+        // failing on thread/resume's single-writer guard. Persisted/unloaded
+        // threads reject this direct request; those still take the resume path.
+        return await startTurnOnLoadedThread(client, data, message, model, data.cwd);
+    }
+    catch (error) {
+        if (!isThreadNotLoadedError(error) && !isMissingRolloutError(error)) {
+            throw error;
+        }
+        let resumed;
+        try {
+            resumed = await resumeThread(client, data);
+        }
+        catch (resumeError) {
+            if (!isMissingRolloutError(resumeError)) {
+                throw resumeError;
             }
             // A newly-created but still empty thread has no rollout to resume yet.
             // In that state the first turn must be started directly on the loaded
             // thread, using the cwd captured from `thread/start`.
             return await startTurnOnLoadedThread(client, data, message, model, data.cwd);
         }
-    }
-    finally {
-        client.close();
+        return await startTurnOnLoadedThread(client, data, message, model, resumed.cwd ?? data.cwd);
     }
 }
 async function startTurnOnLoadedThread(client, data, message, model, cwd) {
     const waiter = createTurnActivationWaiter(client, data.thread_id);
     const turnCwd = cwd ?? data.cwd;
-    const result = await client.request("turn/start", {
-        threadId: data.thread_id,
-        clientUserMessageId: `agent-control-${randomUUID()}`,
-        input: [{ type: "text", text: message, text_elements: [] }],
-        cwd: turnCwd ?? undefined,
-        model: model ?? undefined,
-        // Retain the explicit effort when this worker receives another turn.
-        effort: data.reasoning_effort ?? undefined,
-        ...(data.sandbox === "read_only" ? { sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" } : data.sandbox === "workspace" ? { sandboxPolicy: { type: "workspaceWrite", writableRoots: [turnCwd, data.flow_writable_root].filter(Boolean), networkAccess: true }, approvalPolicy: "never" } : {})
-    });
-    const turnResponse = result;
-    if (turnResponse.turn?.id) {
-        await waiter.waitForTurn(turnResponse.turn.id).catch((error) => {
-            if (!isTimeoutError(error)) {
-                throw error;
-            }
-            // `turn/start` returning a turn id is already the durable acceptance
-            // signal. Some app-server transports do not replay the matching
-            // `turn/started` notification to this short-lived connection, so status
-            // polling remains the source of truth after dispatch.
+    try {
+        const result = await client.request("turn/start", {
+            threadId: data.thread_id,
+            clientUserMessageId: `agent-control-${randomUUID()}`,
+            input: [{ type: "text", text: message, text_elements: [] }],
+            cwd: turnCwd ?? undefined,
+            model: model ?? undefined,
+            // Retain the explicit effort when this worker receives another turn.
+            effort: data.reasoning_effort ?? undefined,
+            ...(data.sandbox === "read_only" ? { sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" } : data.sandbox === "workspace" ? { sandboxPolicy: { type: "workspaceWrite", writableRoots: [turnCwd, data.flow_writable_root].filter(Boolean), networkAccess: true }, approvalPolicy: "never" } : {})
         });
+        const turnResponse = result;
+        if (turnResponse.turn?.id) {
+            await waiter.waitForTurn(turnResponse.turn.id).catch((error) => {
+                if (!isTimeoutError(error)) {
+                    throw error;
+                }
+                // `turn/start` returning a turn id is already the durable acceptance
+                // signal. Some app-server transports do not replay the matching
+                // `turn/started` notification to this short-lived connection, so status
+                // polling remains the source of truth after dispatch.
+            });
+        }
+        else {
+            waiter.dispose();
+        }
+        return turnResponse;
     }
-    else {
+    catch (error) {
         waiter.dispose();
+        throw error;
     }
-    return turnResponse;
 }
 async function readThread(data) {
-    const client = new CodexAppServerClient(resolveAppServerUrl(undefined, undefined, data), resolveAuthToken(undefined, data));
+    const client = createAppServerClient(data);
     try {
         await client.initialize();
-        const result = await client.request("thread/read", {
-            threadId: data.thread_id,
-            includeTurns: true
-        });
-        return readThreadFromResponse(result, "thread/read");
+        try {
+            return await readThreadThroughClient(client, data);
+        }
+        catch (error) {
+            if (!isRolloutCompatibilityError(error)) {
+                throw error;
+            }
+            client.close();
+            const fallback = createCompatibilityAppServerClient(data);
+            if (!fallback) {
+                throw error;
+            }
+            try {
+                await fallback.initialize();
+                return await readThreadThroughClient(fallback, data);
+            }
+            finally {
+                fallback.close();
+            }
+        }
     }
     finally {
         client.close();
     }
+}
+async function readThreadThroughClient(client, data) {
+    const result = await client.request("thread/read", {
+        threadId: data.thread_id,
+        includeTurns: true
+    });
+    return readThreadFromResponse(result, "thread/read");
 }
 async function resumeThread(client, data) {
     // The Codex app server keeps historical threads readable while unloaded.
@@ -337,6 +485,7 @@ function sleep(ms) {
 class CodexAppServerClient {
     url;
     authToken;
+    stdioCommand;
     socket = null;
     process = null;
     processBuffer = "";
@@ -344,9 +493,10 @@ class CodexAppServerClient {
     nextId = 1;
     pending = new Map();
     notificationHandlers = new Set();
-    constructor(url, authToken) {
+    constructor(url, authToken, stdioCommand) {
         this.url = url;
         this.authToken = authToken;
+        this.stdioCommand = stdioCommand;
     }
     async initialize() {
         await this.connect();
@@ -394,15 +544,18 @@ class CodexAppServerClient {
         if (this.isConnected()) {
             return;
         }
-        if (this.usesStdio()) {
-            await this.connectStdio();
-            return;
-        }
-        if (this.usesUnixSocket()) {
-            await this.connectUnixSocket();
-            return;
-        }
-        await this.connectWebSocket();
+        await connectionRecovery.connect(this.usesStdio() ? `${this.url}:${this.resolveStdioCommand()}` : this.url, async () => {
+            if (this.usesStdio()) {
+                await this.connectStdio();
+            }
+            else if (this.usesUnixSocket()) {
+                await this.connectUnixSocket();
+            }
+            else {
+                // External endpoints are reconnected, never started from a guessed command.
+                await this.connectWebSocket();
+            }
+        });
     }
     isConnected() {
         return Boolean(this.process && !this.process.killed) || this.socket?.readyState === WebSocket.OPEN;
@@ -420,8 +573,12 @@ class CodexAppServerClient {
         }
         this.socket?.send(JSON.stringify(payload));
     }
+    resolveStdioCommand() {
+        return this.stdioCommand ?? process.env.CODEX_APP_SERVER_STDIO_COMMAND ??
+            process.env.CODEX_APP_SERVER_COMMAND ?? DEFAULT_STDIO_COMMAND;
+    }
     async connectStdio() {
-        const command = process.env.CODEX_APP_SERVER_STDIO_COMMAND ?? process.env.CODEX_APP_SERVER_COMMAND ?? DEFAULT_STDIO_COMMAND;
+        const command = this.resolveStdioCommand();
         const [bin, ...args] = splitCommand(command);
         if (!bin) {
             throw new ControllerError("Codex app-server stdio command is empty.", "backend_unavailable", {
@@ -509,8 +666,8 @@ class CodexAppServerClient {
             // sockets and remote servers retain their configured lifecycle.
             if (this.url !== "unix://" || !(error instanceof Error) || !/ENOENT|ECONNREFUSED/.test(error.message))
                 throw error;
-            await startDefaultDaemon();
-            await this.openUnixSocket();
+            // Recovery connects only; it must never replay a thread or turn start.
+            await connectWithStartup(() => this.openUnixSocket(), startDefaultDaemon);
         }
     }
     async openUnixSocket() {
@@ -684,10 +841,56 @@ function compactHandle(data) {
     return handle;
 }
 function isMissingRolloutError(error) {
-    return error instanceof ControllerError && /no rollout found/i.test(error.message);
+    return error instanceof Error && /no rollout found/i.test(error.message);
+}
+function isThreadNotLoadedError(error) {
+    return (error instanceof Error &&
+        /thread (?:not found|is not loaded|must be resumed)|not loaded/i.test(error.message));
+}
+function isInjectionFallbackError(error) {
+    if (!(error instanceof Error)) {
+        return false;
+    }
+    return /active writer|unknown method|method .*not found|thread (?:not found|is not loaded|must be resumed)|not loaded|does not start with session metadata|no rollout found/i.test(error.message);
+}
+function isRolloutCompatibilityError(error) {
+    return error instanceof ControllerError && ROLLOUT_COMPATIBILITY_ERROR.test(error.message);
 }
 function isTimeoutError(error) {
     return error instanceof ControllerError && error.reason === "timeout";
+}
+function createAppServerClient(data) {
+    return new CodexAppServerClient(resolveAppServerUrl(undefined, undefined, data), resolveAuthToken(undefined, data));
+}
+function createCompatibilityAppServerClient(data) {
+    const primaryUrl = resolveAppServerUrl(undefined, undefined, data);
+    const explicitCommand = process.env.CODEX_APP_SERVER_COMPAT_COMMAND;
+    if (!explicitCommand &&
+        primaryUrl !== "unix://" &&
+        !primaryUrl.startsWith("unix:///") &&
+        primaryUrl !== "stdio://" &&
+        primaryUrl !== "stdio") {
+        return null;
+    }
+    const command = resolveCompatibilityStdioCommand();
+    if (!command) {
+        return null;
+    }
+    return new CodexAppServerClient("stdio://", resolveAuthToken(undefined, data), command);
+}
+function resolveCompatibilityStdioCommand() {
+    const explicitCommand = process.env.CODEX_APP_SERVER_COMPAT_COMMAND;
+    if (explicitCommand) {
+        return explicitCommand;
+    }
+    // Codex Desktop can advance its rollout format ahead of the standalone CLI
+    // app-server. On macOS, use the bundled Desktop binary for that compatibility
+    // retry when the persistent Unix app-server cannot parse the thread history.
+    if (existsSync(DEFAULT_DESKTOP_CODEX_BINARY)) {
+        return DEFAULT_DESKTOP_CODEX_COMMAND;
+    }
+    const configuredCommand = process.env.CODEX_APP_SERVER_STDIO_COMMAND ?? process.env.CODEX_APP_SERVER_COMMAND;
+    return configuredCommand && configuredCommand !== DEFAULT_STDIO_COMMAND ? configuredCommand : undefined;
 }
 function resolveAppServerUrl(server, metadata, handle) {
     return (server ??
@@ -789,7 +992,10 @@ function startDefaultDaemon() {
             child.kill();
             rejectStart(new ControllerError("Timed out starting the local Codex app-server daemon.", "backend_unavailable"));
         }, 15_000);
-        child.once("error", (error) => { clearTimeout(timer); rejectStart(error); });
+        child.once("error", (error) => {
+            clearTimeout(timer);
+            rejectStart(new ControllerError(`Could not start the local Codex daemon: ${error.message}`, "backend_unavailable"));
+        });
         child.once("exit", (code) => {
             clearTimeout(timer);
             if (code === 0)

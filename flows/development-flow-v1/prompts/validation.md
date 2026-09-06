@@ -39,3 +39,14 @@ keys. The tool's `coverage.validation_mode` values are `complete_gate` and
 `focused` (the latter implements the logical `focused_recheck` phase). Submit
 the current receipt as `result.evidence_receipt_id`. A complete phase cannot
 report success using the focused receipt, even when both are GREEN.
+
+When refreshing a complete gate after expert approval, read the registered
+`final_review` receipt. Set `result.request_closure: true` only when that strict
+approval covers this unchanged result and the same current plan/acceptance,
+with no unresolved semantic correction. This requests a guarded route; the
+controller rechecks the exact expert owner and both current receipts, and
+closure verifies their common result. It is not a new semantic approval.
+For missing, rejected, changed, or uncertain expert evidence, omit the flag or
+use `false`; the existing route returns to the same expert after prior gates.
+Focused validation never requests closure. If a guard rejects a reuse request,
+report the observed blocker to the coordinator; do not retry with weaker proof.

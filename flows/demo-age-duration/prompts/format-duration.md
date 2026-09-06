@@ -8,7 +8,8 @@ and remaining milliseconds.
 - use integer arithmetic
 - preserve the original millisecond value
 - show the breakdown formula
-- if a review artifact is present, address its correction request directly
+- address the runtime's current causal correction and its linked open findings;
+  older review artifacts are history, not instructions to reopen resolved work
 
 ## Artifact
 

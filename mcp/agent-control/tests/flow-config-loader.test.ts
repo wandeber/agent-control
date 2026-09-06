@@ -11,15 +11,18 @@ import { parseFlowConfig, resolveFlowAgentLifecycle } from "../src/core/flow.js"
 import { flowConfigJsonSchema } from "../src/core/flow-config-schema.js";
 
 describe("flow config loader", () => {
-  it("loads migrated bundled workers as Codex Luna Max and preserves the existing reviewer", () => {
+  it("loads role-specific Codex defaults while keeping discovery separate from analysis", () => {
     for (const name of ["development-flow-v1", "demo-age-duration"]) {
       const config = parseFlowConfig(loadFlowConfigFile(resolve(import.meta.dirname, "../../../flows", name, "flow.yaml"), { env: {} }));
       for (const [role, settings] of Object.entries(config.roles ?? {})) {
         if (role === "orchestrator") continue;
         expect(settings.backend).toBe("codex-thread");
-        if (name === "development-flow-v1" && role === "final_reviewer") {
-          expect(settings.model).toBe("gpt-5.5");
-          expect(settings.reasoning_effort).toBeUndefined();
+        if (role === "final_reviewer") {
+          expect(settings.model).toBe("gpt-5.6-sol");
+          expect(settings.reasoning_effort).toBe("xhigh");
+        } else if (name === "development-flow-v1" && role === "analyst") {
+          expect(settings.model).toBe("gpt-6-astra");
+          expect(settings.reasoning_effort).toBe("xhigh");
         } else {
           expect(settings.model).toBe("gpt-5.6-luna");
           expect(settings.reasoning_effort).toBe("max");

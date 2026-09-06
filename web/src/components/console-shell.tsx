@@ -61,7 +61,7 @@ export function ConsoleShell() {
   const [resizing, setResizing] = useState<ResizeTarget | null>(null);
   const latestStepByAgentRef = useRef<Map<string, string | null>>(new Map());
   const { bottomPanel, runsOpen, threadOpen } = layout;
-  const { agentLog, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
+  const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
     followLatestRun,
@@ -303,7 +303,7 @@ export function ConsoleShell() {
     >
       <div className="console-top">
         <TopBar
-          connection={connection}
+          connection={agentError ? "offline" : connection}
           inspectorOpen={bottomPanel === "agent"}
           onOpenAgent={() => toggleBottomPanel("agent")}
           onOpenRuns={toggleRunsPanel}
@@ -316,11 +316,7 @@ export function ConsoleShell() {
       </div>
 
       <section className="console-graph">
-        {error ? (
-          <Panel className="h-full">
-            <EmptyState detail={error instanceof Error ? error.message : "Unknown connection error"} title="Controller unavailable" />
-          </Panel>
-        ) : isLoading ? (
+        {error && !snapshot ? null : isLoading && !snapshot ? (
           <Panel className="h-full">
             <EmptyState detail="Connecting to Agent Control API and WebSocket." title="Loading controller state" />
           </Panel>
@@ -390,6 +386,7 @@ export function ConsoleShell() {
           <div className="console-panel-body">
             <WorkspacePanel
               liveLog={agentLog}
+              connectionError={agentError}
               messageLimit={selectedAgentMessageLimit}
               onRequestOlderMessages={() =>
                 setSelectedAgentMessageLimit((value) =>

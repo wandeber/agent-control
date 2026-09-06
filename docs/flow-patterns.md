@@ -47,20 +47,25 @@ Report schemas should include only the fields needed for routing or diagnosis.
 Do not bake one workflow's domain labels into Agent Control itself; keep those
 labels inside the flow config.
 
-Workers should report through Agent Control tools or CLI using the generated
-reporting contract. If a worker cannot produce valid structured data, Agent
+Workers report through the generated tool contract. Use CLI only when that
+contract permits it; strict workers return its blocked handback on a missing
+tool, approval denial, or authentication failure instead of changing transport.
+If a worker cannot produce valid structured data, Agent
 Control should mark the step blocked and notify the configured owner instead of
 guessing.
 
-Use `status: "completed"` whenever the required artifact was written, even if a
-structured conclusion routes to a correction or blocker step. Use `blocked`,
+Use `status: "completed"` for valid step work with its required artifacts and
+evidence, including a structured conclusion that routes to correction. A
+required-tool capability failure is not semantic completion. Use `blocked`,
 `failed`, or `cancelled` only when the worker cannot write the required artifact
 or cannot produce a valid report.
 
 ## Artifacts
 
 Model every handoff file as a named artifact. Steps declare `inputs` and
-`outputs`; runtime contracts pass the resolved paths to workers.
+`outputs`; runtime contracts pass the resolved paths to workers. Explicitly
+report optional outputs only when produced in the current attempt; their
+configured paths alone do not claim a new delivery.
 
 Do not ask coordinators to create or rewrite step artifacts. If a worker
 terminates without a required artifact, the step should block or the same worker
@@ -118,8 +123,11 @@ steps:
     role: classifier
     report:
       schema:
-        size:
-          enum: [s, m, l, xl]
+        type: object
+        required: [size]
+        properties:
+          size:
+            enum: [s, m, l, xl]
     "on":
       reported:
         transitions:

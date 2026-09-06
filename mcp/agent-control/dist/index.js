@@ -30,6 +30,8 @@ const MODEL_CONSOLE_META = {
     "openai/outputTemplate": CONSOLE_RESOURCE_URI,
     "openai/widgetAccessible": true
 };
+let pendingConsoleCommand = null;
+let nextConsoleCommandId = 1;
 const APP_TOOL_DEFINITIONS = [
     {
         name: "agent_control_console_snapshot",
@@ -37,7 +39,11 @@ const APP_TOOL_DEFINITIONS = [
         inputSchema: {
             type: "object",
             properties: {
-                run_id: { type: "string", description: "Optional run id to select." }
+                run_id: { type: "string", description: "Optional run id to select." },
+                command_id: {
+                    type: "string",
+                    description: "Internal app acknowledgement for the last console command. Do not set from the model."
+                }
             },
             additionalProperties: false
         },
@@ -74,7 +80,7 @@ const APP_TOOL_DEFINITIONS = [
 ];
 const OPEN_CONSOLE_TOOL = {
     name: "open_agent_control_console",
-    description: "Open the native Agent Control console as a Codex MCP App panel, pinning run_id when supplied or following the latest run otherwise.",
+    description: "Open the single native Agent Control console as a Codex MCP App panel, pinning run_id when supplied or following the latest run otherwise. Call this at most once; use the app-only snapshot tool to refresh the existing panel instead of opening another tab.",
     inputSchema: {
         type: "object",
         properties: {
@@ -83,6 +89,26 @@ const OPEN_CONSOLE_TOOL = {
         additionalProperties: false
     },
     _meta: MODEL_CONSOLE_META
+};
+const REUSE_CONSOLE_TOOL = {
+    name: "reuse_agent_control_console",
+    description: "Reuse and update the already-open Agent Control panel without opening another tab. Optionally pin run_id; use this after the first open_agent_control_console call.",
+    inputSchema: {
+        type: "object",
+        properties: {
+            run_id: { type: "string", description: "Optional run id to select in the existing panel." }
+        },
+        additionalProperties: false
+    }
+};
+const CLOSE_CONSOLE_TOOL = {
+    name: "close_agent_control_console",
+    description: "Request the currently-open Agent Control panel to close. The MCP host may decline the teardown; this command never opens a new panel.",
+    inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false
+    }
 };
 const server = new Server({
     name: "agent_control",
@@ -101,6 +127,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: tool.inputSchema
         })),
         OPEN_CONSOLE_TOOL,
+        REUSE_CONSOLE_TOOL,
+        CLOSE_CONSOLE_TOOL,
         ...APP_TOOL_DEFINITIONS
     ]
 }));
@@ -192,6 +220,9 @@ function jsonResult(value, isError = false) {
 async function handleConsoleTool(name, input) {
     if (name === "open_agent_control_console") {
         const runId = stringField(input, "run_id");
+        // Opening a fresh native surface starts a new lifecycle. Do not replay a
+        // command that was queued for an older surface into this one.
+        pendingConsoleCommand = null;
         const structuredContent = await loadConsoleSnapshot(controller, runId);
         return {
             content: [
@@ -204,11 +235,46 @@ async function handleConsoleTool(name, input) {
             _meta: { "openai/outputTemplate": CONSOLE_RESOURCE_URI }
         };
     }
+    if (name === "reuse_agent_control_console") {
+        const runId = stringField(input, "run_id");
+        const command = queueConsoleCommand("reuse", runId);
+        const snapshot = await loadConsoleSnapshot(controller, runId);
+        return {
+            content: [{ type: "text", text: "Reused Agent Control console." }],
+            structuredContent: {
+                ...snapshot,
+                console: {
+                    ...snapshot.console,
+                    action: command.action,
+                    command_id: command.command_id
+                }
+            }
+        };
+    }
+    if (name === "close_agent_control_console") {
+        const command = queueConsoleCommand("close");
+        return {
+            content: [{ type: "text", text: "Requested Agent Control console teardown." }],
+            structuredContent: {
+                console: {
+                    requested_run_id: null,
+                    follow_latest: false,
+                    action: command.action,
+                    command_id: command.command_id
+                }
+            }
+        };
+    }
     if (name === "agent_control_console_snapshot") {
         const runId = stringField(input, "run_id");
+        acknowledgeConsoleCommand(stringField(input, "command_id"));
+        const structuredContent = await loadConsoleSnapshot(controller, runId);
+        if (pendingConsoleCommand) {
+            structuredContent.console = pendingConsoleCommand;
+        }
         return {
             content: [{ type: "text", text: "Loaded Agent Control dashboard snapshot." }],
-            structuredContent: await loadConsoleSnapshot(controller, runId)
+            structuredContent
         };
     }
     if (name === "agent_control_console_agent_messages") {
@@ -293,6 +359,21 @@ function stringField(input, key) {
     }
     const value = input[key];
     return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function queueConsoleCommand(action, runId) {
+    const command = {
+        requested_run_id: runId ?? null,
+        follow_latest: !runId,
+        action,
+        command_id: `console-command-${nextConsoleCommandId++}`
+    };
+    pendingConsoleCommand = command;
+    return command;
+}
+function acknowledgeConsoleCommand(commandId) {
+    if (commandId && pendingConsoleCommand?.command_id === commandId) {
+        pendingConsoleCommand = null;
+    }
 }
 function requiredStringField(input, key) {
     const value = stringField(input, key);

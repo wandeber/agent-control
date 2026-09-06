@@ -541,7 +541,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "subscription_wait",
     description:
-      "Block until a subscription's matching event exists, refreshing the source agent when possible. Use for explicit manual/debug waits or short opt-in foreground waits. Normal long-running orchestrators should use detached watchers/subscriptions.",
+      "Block until a subscription's matching event exists, refreshing the source agent when possible. Use this when the current coordinator must stay in its turn and receive the event directly; set allow_blocking_wait=true. The result includes matched and delivered, so an event is still returned when the subscriber backend cannot receive an inbound message. Normal long-running orchestrators may use detached watchers instead.",
     inputSchema: objectSchema(
       {
         subscription_id: stringProperty("Subscription id."),

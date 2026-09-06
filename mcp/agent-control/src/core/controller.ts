@@ -108,6 +108,9 @@ const EXTERNAL_MISSING_CONFIRMATION_MS = 5_000;
 const MAX_EXTERNAL_LATEST_MESSAGE_BYTES = 4 * 1024;
 const DEFAULT_NATIVE_ACTION_DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
 const MAX_NATIVE_ACTION_DELIVERY_RETRIES = 5;
+const DEFAULT_CODEX_THREAD_DELIVERY_RETRY_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 120_000] as const;
+const MAX_CODEX_THREAD_DELIVERY_RETRIES = 5;
+const SUBSCRIPTION_WAIT_DELIVERY_TIMEOUT_MS = 5_000;
 
 interface ControllerEventInput {
   eventId?: string;
@@ -120,6 +123,8 @@ interface ControllerEventInput {
 interface AgentControllerOptions {
   /** Override the bounded native-owner retry backoff, primarily for deterministic tests. */
   nativeActionDeliveryRetryDelaysMs?: readonly number[];
+  /** Override terminal notification retries for Codex thread subscribers. */
+  codexThreadDeliveryRetryDelaysMs?: readonly number[];
 }
 
 export class AgentController {
@@ -134,9 +139,11 @@ export class AgentController {
   private readonly pendingDeliveries = new Set<Promise<void>>();
   private readonly inFlightSubscriberDeliveries = new Set<string>();
   private readonly nativeActionDeliveryRetryTasks = new Map<string, Promise<void>>();
+  private readonly codexThreadDeliveryRetryTasks = new Map<string, Promise<void>>();
   private readonly suppressedDeliveryRunIds = new Set<string>();
   private readonly suppressedDeliveryAgentIds = new Set<string>();
   private readonly nativeActionDeliveryRetryDelaysMs: readonly number[];
+  private readonly codexThreadDeliveryRetryDelaysMs: readonly number[];
 
   constructor(
     private readonly store: SqliteStore,
@@ -154,6 +161,16 @@ export class AgentController {
       .map((delay) => {
         if (!Number.isFinite(delay) || delay < 0) {
           throw new Error("Native action delivery retry delays must be finite non-negative numbers.");
+        }
+        return delay;
+      });
+    const configuredCodexThreadDelays =
+      options.codexThreadDeliveryRetryDelaysMs ?? DEFAULT_CODEX_THREAD_DELIVERY_RETRY_DELAYS_MS;
+    this.codexThreadDeliveryRetryDelaysMs = configuredCodexThreadDelays
+      .slice(0, MAX_CODEX_THREAD_DELIVERY_RETRIES)
+      .map((delay) => {
+        if (!Number.isFinite(delay) || delay < 0) {
+          throw new Error("Codex thread delivery retry delays must be finite non-negative numbers.");
         }
         return delay;
       });
@@ -6566,6 +6583,13 @@ export class AgentController {
           );
           return { agent: uncertain, ordinaryFailure: false, rearmUncertainty: true };
         }
+        if (payload.reason === "backend_unavailable") {
+          // A disconnected server is not evidence that its task failed. Keep
+          // exact ownership and allow the next read to reconcile backend truth.
+          // Do not reset the watcher here: that would turn its bounded probes
+          // into an endless three-second retry loop while nobody is observing.
+          return { agent: current, ordinaryFailure: false, rearmUncertainty: false };
+        }
         const failed = this.store.updateAgent(current.agent_id, {
           status: "failed",
           failureReason: payload.reason as FailureReason
@@ -6783,13 +6807,6 @@ export class AgentController {
         });
       }
 
-      if (subscription.source_agent_id) {
-        await this.refreshAgentStatus(subscription.source_agent_id);
-      } else if (subscription.run_id) {
-        await this.pollActiveAgents(subscription.run_id);
-      }
-      await this.checkHeartbeats();
-
       const refreshed = this.store
         .listSubscriptions({})
         .find((entry) => entry.subscription_id === subscriptionId);
@@ -6815,22 +6832,36 @@ export class AgentController {
           };
         }
 
-        await this.deliverSubscriptions(event);
-        await this.drainDeliveries();
+        // A blocking wait is the in-turn wakeup path for coordinators. The
+        // subscriber backend may be unable to receive an inbound message (for
+        // example, an already-running Codex Desktop turn), so never make the
+        // model wait indefinitely for physical delivery to succeed.
+        await settleWithin(
+          this.deliverSubscriptions(event),
+          SUBSCRIPTION_WAIT_DELIVERY_TIMEOUT_MS
+        );
         const afterDelivery = this.store
           .listSubscriptions({})
           .find((entry) => entry.subscription_id === subscriptionId);
         const afterDeliveryEventId = afterDelivery?.last_delivered_event_id;
-        if (afterDeliveryEventId === event.event_id) {
-          return {
-            timed_out: false,
-            matched: true,
-            delivered: true,
-            subscription: afterDelivery ?? refreshed ?? subscription,
-            event
-          };
-        }
+        return {
+          timed_out: false,
+          matched: true,
+          delivered: afterDeliveryEventId === event.event_id,
+          subscription: afterDelivery ?? refreshed ?? subscription,
+          event
+        };
       }
+
+      // Check durable events before refreshing the backend. This lets a
+      // coordinator consume a terminal event that Agent Control already
+      // recorded even when the worker's external status endpoint is gone.
+      if (subscription.source_agent_id) {
+        await this.refreshAgentStatus(subscription.source_agent_id);
+      } else if (subscription.run_id) {
+        await this.pollActiveAgents(subscription.run_id);
+      }
+      await this.checkHeartbeats();
       if (options.timeoutMs !== undefined && Date.now() - startedAt >= options.timeoutMs) {
         return {
           timed_out: true,
@@ -8601,7 +8632,10 @@ export class AgentController {
             runDir: runRuntimeDir(instance.run_id)
           })
         : undefined;
-      let path = reportedArtifacts[outputName] ?? reportedArtifacts[ref.artifact] ?? configuredPath;
+      const reportedPath = reportedArtifacts[outputName] ?? reportedArtifacts[ref.artifact];
+      // An omitted optional output is not a claim to have produced a prior file.
+      if (!ref.required && !reportedPath) continue;
+      let path = reportedPath ?? configuredPath;
       if (!path) {
         if (ref.required) {
           throw new ControllerError("Flow step report is missing a required output artifact path.", "missing_artifact", {
@@ -8612,8 +8646,8 @@ export class AgentController {
         }
         continue;
       }
-      if (ref.required && !existsSync(path)) {
-        throw new ControllerError("Flow step report required output artifact does not exist.", "missing_artifact", {
+      if (!existsSync(path)) {
+        throw new ControllerError("Flow step report output artifact does not exist.", "missing_artifact", {
           step_id: step.step_id,
           output: outputName,
           artifact: ref.artifact,
@@ -8861,6 +8895,76 @@ export class AgentController {
       });
     this.nativeActionDeliveryRetryTasks.set(deliveryKey, retryTask);
     this.pendingDeliveries.add(retryTask);
+  }
+
+  private scheduleCodexThreadDeliveryRetry(
+    event: EventRecord,
+    subscriberAgentId: string,
+    deliveryKey: string
+  ): void {
+    if (
+      this.codexThreadDeliveryRetryDelaysMs.length === 0 ||
+      this.codexThreadDeliveryRetryTasks.has(deliveryKey)
+    ) {
+      return;
+    }
+
+    let retryTask!: Promise<void>;
+    retryTask = (async () => {
+      for (const delayMs of this.codexThreadDeliveryRetryDelaysMs) {
+        await sleep(delayMs);
+        if (
+          this.codexThreadDeliveryWasDelivered(event.event_id, subscriberAgentId) ||
+          !this.codexThreadDeliveryIsStillRequired(event, subscriberAgentId)
+        ) {
+          return;
+        }
+        await this.deliverSubscriptions(event);
+        if (this.codexThreadDeliveryWasDelivered(event.event_id, subscriberAgentId)) {
+          return;
+        }
+      }
+    })()
+      .catch(() => {
+        // Delivery retries are best-effort and bounded. The durable
+        // subscription row remains available for a later controller poll.
+      })
+      .finally(() => {
+        this.codexThreadDeliveryRetryTasks.delete(deliveryKey);
+        this.pendingDeliveries.delete(retryTask);
+      });
+    this.codexThreadDeliveryRetryTasks.set(deliveryKey, retryTask);
+    this.pendingDeliveries.add(retryTask);
+  }
+
+  private codexThreadDeliveryWasDelivered(eventId: string, subscriberAgentId: string): boolean {
+    return this.store
+      .listSubscriptions({ enabledOnly: true })
+      .some(
+        (subscription) =>
+          subscription.subscriber_agent_id === subscriberAgentId &&
+          subscription.last_delivered_event_id === eventId
+      );
+  }
+
+  private codexThreadDeliveryIsStillRequired(
+    event: EventRecord,
+    subscriberAgentId: string
+  ): boolean {
+    return this.store
+      .listSubscriptions({ enabledOnly: true })
+      .some((subscription) => {
+        const runMatches = !subscription.run_id || subscription.run_id === event.run_id;
+        const sourceMatches =
+          !subscription.source_agent_id || subscription.source_agent_id === event.agent_id;
+        return (
+          subscription.subscriber_agent_id === subscriberAgentId &&
+          subscription.event_type === event.type &&
+          runMatches &&
+          sourceMatches &&
+          subscription.last_delivered_event_id !== event.event_id
+        );
+      });
   }
 
   private nativeActionWakeWasDelivered(eventId: string, subscriberAgentId: string): boolean {
@@ -9214,6 +9318,15 @@ export class AgentController {
             subscriber.agent_id,
             deliveryKey
           );
+        }
+        if (
+          subscriber.backend === "codex-thread" &&
+          (event.type === "agent.completed" ||
+            event.type === "agent.failed" ||
+            event.type === "agent.blocked" ||
+            event.type === "agent.stopped")
+        ) {
+          this.scheduleCodexThreadDeliveryRetry(event, subscriber.agent_id, deliveryKey);
         }
       } finally {
         stopDeliveryLeaseHeartbeat?.();
@@ -9709,7 +9822,7 @@ function compactEventMessage(event: EventRecord, subscriber: AgentRecord, source
   if (flowInstanceId) {
     lines.push("For this existing flow, do not call `flow_start` again.");
     lines.push(
-      "This notification is the complete instruction for this short re-entry; do not reload skills, docs, flow configs, prompt files, logs, or artifacts unless you need them to resolve the blocker or user-feedback request."
+      "This notification is a routing update within the existing supervision contract. Reuse instructions already in context; load only the state or references needed for this event."
     );
     if (
       event.type === "flow.notification" &&
@@ -9727,7 +9840,7 @@ function compactEventMessage(event: EventRecord, subscriber: AgentRecord, source
         "This is a blocker. Inspect only the minimum required state, decide whether to retry, route manually, or tell the user what is blocked."
       );
     } else if (event.type === "flow.completed") {
-      lines.push("The flow has completed. Give a compact final user-facing update if this thread owns user feedback.");
+      lines.push("This flow has completed. If this thread owns user feedback, give a compact update in commentary while any other supervised work remains, then resume its event wait. A final response is allowed only when all supervised work is resolved or the user explicitly pauses or cancels supervision.");
     } else {
       lines.push(
         "Normal flow advancement is handled by Agent Control. Do not dispatch another step from this notification unless a prior tool result explicitly asks you to."
@@ -9871,6 +9984,22 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      }
+    );
+  });
+}
+
 function artifactSummary(artifact: ArtifactRecord): Record<string, unknown> {
   return {
     artifact_id: artifact.artifact_id,
@@ -9999,13 +10128,16 @@ function artifactMarkdownLines(
 }
 
 function exampleFromResultSchema(
-  schema: { required?: string[]; properties?: Record<string, { enum?: unknown[] }> } | undefined
+  schema: { required?: string[]; properties?: Record<string, { type?: string; enum?: unknown[] }> } | undefined
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   const keys = new Set([...Object.keys(schema?.properties ?? {}), ...(schema?.required ?? [])]);
   for (const key of keys) {
-    const allowed = schema?.properties?.[key]?.enum;
-    result[key] = allowed && allowed.length > 0 ? allowed[0] : `<${key}>`;
+    const property = schema?.properties?.[key];
+    const allowed = property?.enum;
+    // Keep generated examples type-valid without asserting optional routing flags.
+    const samples: Record<string, unknown> = { boolean: false, number: 0, object: {}, array: [], null: null };
+    result[key] = allowed?.length ? allowed[0] : property?.type && property.type in samples ? samples[property.type] : `<${key}>`;
   }
   return result;
 }
@@ -10015,6 +10147,8 @@ function exampleArtifactReport(
 ): Record<string, string> {
   const artifacts: Record<string, string> = {};
   for (const [outputName, descriptor] of Object.entries(outputArtifacts)) {
+    // Optional documents are reported only if the worker actually produced them.
+    if (descriptor.required !== true) continue;
     artifacts[outputName] =
       typeof descriptor.path === "string" && descriptor.path.length > 0
         ? descriptor.path
@@ -10152,7 +10286,7 @@ function buildFlowReportingMarkdown(input: {
     JSON.stringify(input.outputArtifacts, null, 2),
     "```",
     "",
-    "MCP tool input example:",
+    "MCP tool input example (replace illustrative values with the actual outcome; include optional artifacts only when written):",
     "",
     "```json",
     JSON.stringify(input.mcpInput, null, 2),

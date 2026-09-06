@@ -26,9 +26,15 @@ For each current section, record:
 - non-empty `invariants`; and
 - a non-empty `carry_forward_rationale` only when carried forward.
 
-The ledger also contains `mode: full | incremental`, every deleted section
-reviewed, and limitations. The first pass is full and directly reviews every
-section. A later incremental report directly reviews every helper-required and
+`coverage_ledger` is an object containing `mode`, `sections`,
+`deleted_section_ids_reviewed`, and `limitations`. `sections` is an object keyed
+by stable section ID, not an array or a flat list of section records.
+`deleted_section_ids_reviewed` is the exact array of deleted IDs from the delta
+(empty on the first pass); `limitations` is a unique string array. Dependencies
+and invariants are unique string arrays; each invariant must be non-blank.
+
+The first pass is full and directly reviews every section. A later incremental
+report directly reviews every helper-required and
 analyst-affected section; the helper composes the closed records without asking
 the owner to reproduce or revalidate them.
 
@@ -49,3 +55,38 @@ The report also states:
 - the plan artifact checked;
 - whether its summary and link are ready for user approval; and
 - the correct verdict and route.
+
+## Draft Shape
+
+This first-pass example illustrates one section and an approved outcome. Replace
+its IDs and judgments with the actual review, include every current section,
+and use `rework_required` or `blocked` when warranted; it is not a default
+approval. Describe the analysis disposition and other findings above in the
+summary or compact semantic fields. The helper binds checkpoint identity.
+
+```json
+{
+  "verdict": "approved",
+  "summary": "The current plan preserves completed analysis with no amendments, covers the accepted scope, and is ready for the linked-plan approval gate.",
+  "recommended_next_phase": "user_plan_approval",
+  "coverage_ledger": {
+    "mode": "full",
+    "sections": {
+      "work-package": {
+        "disposition": "reviewed",
+        "status": "validated",
+        "depends_on": [],
+        "invariants": ["This package preserves the accepted input and output contract."]
+      }
+    },
+    "deleted_section_ids_reviewed": [],
+    "limitations": []
+  }
+}
+```
+
+For an incremental draft, include only directly reviewed records in `sections`
+and add `impact_analysis` with `summary` and
+`additionally_affected_section_ids`; keep deleted-section dispositions explicit.
+Do not turn the full prior ledger into the new draft or invent invariants merely
+to fill the schema.

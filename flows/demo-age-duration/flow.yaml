@@ -2,7 +2,7 @@
 # use ${VAR-default}: an explicitly empty model lets the opt-in codex-subagent backend inherit the root model.
 
 id: demo-age-duration
-version: 0.1.1
+version: 0.1.2
 description: Overengineered demo flow that answers how long a person has been alive from their birth date.
 initial_step: resolve_current_date
 
@@ -89,8 +89,8 @@ roles:
     description: Turns the verified duration into a compact answer for the user.
   final_reviewer:
     backend: ${DEMO_AGE_FINAL_REVIEW_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_FINAL_REVIEW_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_FINAL_REVIEW_REASONING_EFFORT-max}
+    model: ${DEMO_AGE_FINAL_REVIEW_MODEL-gpt-5.6-sol}
+    reasoning_effort: ${DEMO_AGE_FINAL_REVIEW_REASONING_EFFORT-xhigh}
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
     description: Clean-context reviewer created once and reused for every final-answer review iteration.
@@ -267,7 +267,7 @@ steps:
   format_duration:
     role: duration_formatter
     prompt_ref: step_format_duration
-    description: Format elapsed milliseconds as days, hours, minutes, and seconds.
+    description: Format elapsed milliseconds as days, hours, minutes, seconds, and remaining milliseconds.
     inputs:
       duration_ms:
         artifact: duration_ms
@@ -417,7 +417,7 @@ steps:
   final_review:
     role: final_reviewer
     prompt_ref: step_final_review
-    description: Fresh final review of the answer and supporting artifacts.
+    description: Independent review of the answer and supporting artifacts; reuse the same reviewer on correction.
     inputs:
       current_date:
         artifact: current_date

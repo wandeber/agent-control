@@ -1,10 +1,10 @@
 # Backend defaults preserve Codex Luna Max; the explicit final-reviewer model is retained.
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
-version: 1.2.1
+version: 1.2.2
 description: Development with durable acceptance, same-owner incremental
   reviews, exact human plan approval, conditional integration, controlled
-  validation, optional UAT, and verified closure.
+  validation, optional UAT, and verified closure with reusable current expert approval.
 initial_step: context
 policy:
   strict: true
@@ -34,6 +34,8 @@ state:
   uat_completed: false
   validation_mode: complete_gate
 prompts:
+  role_context:
+    path: roles/context.md
   role_analyst:
     path: roles/analyst.md
   role_planner:
@@ -65,10 +67,16 @@ prompts:
   step_final_review:
     path: prompts/final-review.md
 roles:
+  context:
+    backend: ${DEVFLOW_CONTEXT_BACKEND:-codex-thread}
+    model: ${DEVFLOW_CONTEXT_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_CONTEXT_REASONING_EFFORT-max}
+    agent_lifecycle: reuse
+    prompt_ref: role_context
   analyst:
     backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
-    model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
+    model: ${DEVFLOW_ANALYST_MODEL-gpt-6-astra}
+    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-xhigh}
     agent_lifecycle: reuse
     prompt_ref: role_analyst
   planner:
@@ -91,7 +99,8 @@ roles:
     prompt_ref: role_validator
   final_reviewer:
     backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
-    model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.5}
+    model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.6-sol}
+    reasoning_effort: ${DEVFLOW_FINAL_REVIEWER_REASONING_EFFORT-xhigh}
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
   orchestrator:
@@ -108,10 +117,10 @@ artifacts:
     path: "{run_dir}/uat-guide.md"
 steps:
   context:
-    role: analyst
+    role: context
     prompt_ref: step_context
-    description: Discover task-relevant repository facts; the same analyst later
-      synthesizes Analysis.
+    description: A separate Luna Max context owner discovers repository facts
+      and hands the grounded document to the Astra analyst.
     outputs:
       context:
         artifact: context
@@ -665,8 +674,8 @@ steps:
   validation:
     role: validator
     prompt_ref: step_validation
-    description: No-edit complete affected gate with actual or conservatively reused
-      execution receipts.
+    description: No-edit complete affected gate with controlled execution receipts;
+      request closure when an existing expert approval still covers the same result.
     requires:
       all:
         - equals:
@@ -692,9 +701,40 @@ steps:
               - blocked
           evidence_receipt_id:
             type: string
+          request_closure:
+            type: boolean
     on:
       reported:
         transitions:
+          # This flag requests routing; both current owner-bound receipts prove eligibility.
+          - id: validated-existing-expert-approval
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: passed
+                - equals:
+                    var: state.planner_approved
+                    value: true
+                - equals:
+                    var: state.uat_completed
+                    value: true
+                - equals:
+                    var: result.request_closure
+                    value: true
+            to: closure
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: complete_gate
+              - receipt: evidence.final_review
+                kind: expert_review
+                require_current: true
+                require_approved: true
+                owner_role: final_reviewer
           - id: validated-first-planner
             when:
               all:
@@ -952,8 +992,8 @@ steps:
   uat_preparation:
     role: implementer
     prompt_ref: step_uat_preparation
-    description: Prepare the selected UAT experience without editing product code or
-      claiming user approval.
+    description: Prepare user-selected access and test steps, with an optional guide;
+      route setup or plan defects without editing product code or claiming approval.
     requires:
       all:
         - equals:
@@ -976,18 +1016,22 @@ steps:
     outputs:
       uat_guide:
         artifact: uat_guide
-        required: true
+        required: false
     report:
       schema:
         type: object
         required:
           - conclusion
+          - access_details
         properties:
           conclusion:
             enum:
               - ready
               - implementation_changes_needed
+              - plan_changes_needed
               - blocked
+          access_details:
+            type: string
     on:
       reported:
         transitions:
@@ -1005,6 +1049,15 @@ steps:
             to: implementation
             set:
               validation_mode: focused_recheck
+          - id: uat-plan-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: plan_changes_needed
+            to: planning
+            set:
+              uat_completed: false
+              validation_mode: complete_gate
           - id: uat-setup-blocked
             when:
               equals:

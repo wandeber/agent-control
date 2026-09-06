@@ -33,9 +33,11 @@ if (sourceIndex !== -1) {
   } else {
     writeFileSync(resolve(target, 'review_checkpoint.py'), bytes);
     const commit = execFileSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    // During local development HEAD is a base revision; hashes identify the copied bytes.
+    const sourceDirty = Boolean(execFileSync('git', ['-C', checkout, 'status', '--porcelain', '--', sourcePath, ...Object.values(companions)], { encoding: 'utf8' }).trim());
     const companionManifest = {};
     for (const [path, source] of Object.entries(companions)) { const content = readFileSync(resolve(checkout, source)); mkdirSync(dirname(resolve(target, path)), { recursive: true }); writeFileSync(resolve(target, path), content); companionManifest[path] = { source_path: source, sha256: sha(content) }; }
-    writeFileSync(manifestPath, JSON.stringify({ schema_version: 1, provider: 'hdt-review-checkpoint', source_repository: 'https://github.com/wandeber/agent-settings', source_path: sourcePath, source_version: version, source_commit: commit, sha256: sha(bytes), companions: companionManifest }, null, 2) + '\n');
+    writeFileSync(manifestPath, JSON.stringify({ schema_version: 1, provider: 'hdt-review-checkpoint', source_repository: 'https://github.com/wandeber/agent-settings', source_path: sourcePath, source_version: version, source_commit: commit, source_dirty: sourceDirty, sha256: sha(bytes), companions: companionManifest }, null, 2) + '\n');
   }
 }
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));

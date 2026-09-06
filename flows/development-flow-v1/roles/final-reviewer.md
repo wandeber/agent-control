@@ -2,7 +2,8 @@
 
 Start with clean context and remain the exact same reviewer for every later
 iteration. You must not have authored, integrated, or intent-validated this
-work. Remain review-only; return corrections to their owners.
+work. Remain review-only; return corrections to their owners. Consume controlled
+mechanical evidence; its refresh belongs to the validator, not this reviewer.
 
 Review the current result against the acceptance contract and exact approved
 plan. Do not rely on authoring history or implementation claims. First review

@@ -111,7 +111,7 @@ require installing Agent Settings.
 
 ## Development Flow Evidence
 
-The bundled `development-flow-v1` version 1.2.1 records the current accepted
+The bundled `development-flow-v1` version 1.2.2 records the current accepted
 contract before dispatch, preserves Context and Analysis with the same analyst,
 checks intent with the clarification owner, and requires approval of the exact
 plan after the analyst's review. Integration is conditional; mechanical
@@ -224,18 +224,41 @@ requesting another panel. Client library imports are eagerly bundled so chat
 diagrams and graph layout do not require an external asset server.
 
 Pass `run_id` to pin a specific run. With no `run_id`, the panel follows the
-latest run. The tool result includes the initial snapshot and that selection
-mode so the panel can paint immediately; later app-only reads run through one
-serial refresh coordinator instead of overlapping polling loops. Explicit URL,
-tool, and sidebar selections remain pinned until the user returns to an
-unpinned URL.
+latest run. Treat this as a singleton opening operation: call it once per
+supervised task and use the app-only snapshot/messages/log tools to refresh the
+existing panel. Repeated calls ask the host for another output surface and can
+create duplicate tabs. The tool result includes the initial snapshot and that
+selection mode so the panel can paint immediately; later app-only reads run
+through one serial refresh coordinator instead of overlapping polling loops.
+Explicit URL, tool, and sidebar selections remain pinned until the user returns
+to an unpinned URL.
 
-The bundled `development-flow` skill calls `open_agent_control_console`
-exactly once after clarification and catalog discovery, immediately before the
-first launch. Opening the native console is a required pre-dispatch gate for
-that skill: a missing or failed tool stops the launch, and Browser/local-web
-fallbacks are not substituted. Agent Control wakeups and resumed turns never
-reopen it.
+Once the native panel exists, model-visible `reuse_agent_control_console` can
+select another run and refresh that same surface. `close_agent_control_console`
+requests teardown of the currently mounted app; the MCP host remains
+authoritative and may decline the request. These are plain MCP lifecycle
+commands: they carry no UI resource metadata, so calling either one cannot
+open a replacement panel. The existing app-only snapshot stream delivers and
+acknowledges the command in the already-mounted surface. These commands are
+the supported lifecycle path after the initial `open_agent_control_console`
+call.
+
+The bundled `development-flow` and `flow-runner` skills open the native MCP App
+with `open_agent_control_console` before first dispatch and reuse its integrated
+Codex side panel. Browser tabs with an address bar do not satisfy this contract.
+Verify host placement instead of inferring it from a fullscreen request.
+Wakeups and resumed turns reuse the existing panel and its run selection.
+
+Backend recovery is demand-driven. Reads reconnect to the recorded endpoint;
+only the managed default Codex Unix-socket daemon may be started automatically.
+External WebSocket endpoints and custom sockets are never launched from guessed
+commands. Failed connections and selected-agent reads have a 30-second cooldown;
+managed startup checks socket readiness at most three times. Reconnection never
+starts a new task or resends a turn. A backend outage preserves task ownership
+and the last known status, while the panel keeps its healthy team snapshot and
+already loaded conversation visible with a compact Offline indicator. Technical
+connection errors never replace the graph or conversation. This UI cache is
+not a durable transcript archive and does not survive a fresh app session.
 
 The native panel reads compact snapshots, agent messages, and log tails through
 app-only MCP tools. Snapshot reads ask the controller to refresh only adapters
@@ -305,6 +328,12 @@ agentctl sub wait --subscription <subscription-id> --allow-blocking-wait --inter
 `sub wait` waits for the matching event even when the subscriber backend cannot
 receive an inbound message. The returned JSON includes whether the event was
 actually delivered to the subscriber.
+
+For an in-turn Codex coordinator, use the MCP `subscription_wait` tool with
+`allow_blocking_wait: true` (or keep `agentctl sub wait` in a foreground
+process). Agent Control returns the durable matching event directly to the
+waiting coordinator; `delivered: false` means the physical subscriber message
+could not be injected, but the coordinator has still been woken with the event.
 
 While a blocking wait is open, the model is not polling or reading worker
 transcripts; Agent Control refreshes status in normal code and returns compact
@@ -624,6 +653,18 @@ The first backend adapters are:
   ```bash
   export CODEX_APP_SERVER_URL=stdio://
   ```
+
+  If the persistent Unix app-server is older than the Codex Desktop build that
+  created a target thread, Agent Control retries rollout reads and wakeups
+  through a compatible stdio app-server. On macOS it automatically detects the
+  Codex binary bundled inside `ChatGPT.app`; another compatible command can be
+  supplied with `CODEX_APP_SERVER_COMPAT_COMMAND`.
+
+  Handles marked with `agent_control_role: "orchestrator"` use the app-server's
+  `thread/inject_items` operation for notifications first. That appends a
+  model-visible user item to an already active Codex turn without opening a
+  competing writer; if the target server cannot inject into the loaded thread,
+  Agent Control falls back to the normal turn/resume path.
 
   The current Codex thread id is usually available to runner shells as
   `CODEX_THREAD_ID`.

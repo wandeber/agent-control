@@ -8,7 +8,8 @@ Write the final user-facing answer from the verified duration artifacts.
 - include the calculated duration in a readable sentence
 - avoid dumping intermediate math unless it improves clarity
 - use the current date/time context only as supporting context
-- if final review requested answer changes, address them directly
+- address the current causal final-review correction and its linked open findings;
+  do not reapply superseded requests from older review artifacts
 
 ## Artifact
 

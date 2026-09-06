@@ -4,7 +4,10 @@ Review the final answer against the supporting duration artifacts.
 
 Use the same independent reviewer for every iteration. On the first iteration,
 start from clean context; on later iterations, verify the corrected answer
-against that reviewer's own prior findings.
+against that reviewer's own prior findings and current causal correction. Keep
+resolved findings closed when their supporting inputs are unchanged; inspect
+affected calculations or formatting when an input changes. Return all current
+findings together, with concrete corrections and the configured target phase.
 
 ## Must
 

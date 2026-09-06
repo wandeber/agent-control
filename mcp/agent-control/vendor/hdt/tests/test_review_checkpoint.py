@@ -921,6 +921,43 @@ Consume the API.
         self.assertFalse(mismatch["matches"])
         self.assertIn("scope", mismatch["delta"]["changed_section_ids"])
 
+    def test_plan_review_requires_non_empty_invariants_before_persistence(self) -> None:
+        _, checkpoint = self.create_plan("plan-invariants")
+        assert checkpoint is not None
+        records = {
+            section_id: {
+                "disposition": "reviewed", "status": "validated", "depends_on": [],
+                "invariants": ["The plan preserves the accepted task boundary."],
+            }
+            for section_id in checkpoint["sections"]
+        }
+        complete = {
+            "verdict": "approved", "checkpoint_id": checkpoint["checkpoint_id"],
+            "snapshot_sha256": checkpoint["snapshot_sha256"], "previous_checkpoint": None,
+            "coverage_ledger": {
+                "mode": "full", "sections": records,
+                "deleted_section_ids_reviewed": [], "limitations": [],
+            },
+        }
+        first_section = next(iter(records))
+        for compose in (False, True):
+            for invariants in ([], [" "], ["Scope is preserved.", "Scope is preserved."]):
+                with self.subTest(compose=compose, invariants=invariants):
+                    invalid = json.loads(json.dumps(complete))
+                    invalid["coverage_ledger"]["sections"][first_section]["invariants"] = invariants
+                    if compose:
+                        invalid = self.semantic_draft(invalid, plan=True)
+                    result, _ = self.record_plan_review(
+                        checkpoint, invalid, compose=compose, expected=2,
+                    )
+                    self.assertIn("invariants", result.stderr)
+        # The rejected approvals did not reserve or overwrite the immutable slot.
+        _, receipt = self.record_plan_review(
+            checkpoint, self.semantic_draft(complete, plan=True), compose=True,
+        )
+        assert receipt is not None
+        self.assertEqual(receipt["verdict"], "approved")
+
     def test_plan_review_rejects_incomplete_first_pass_and_unsafe_carry(self) -> None:
         self.write(
             "plan.md",
@@ -954,7 +991,7 @@ Original scope.
                 "disposition": "reviewed",
                 "status": "validated",
                 "depends_on": [],
-                "invariants": [],
+                "invariants": ["The section preserves the accepted scope."],
             }
             for section_id in first["sections"]
         }
@@ -1127,7 +1164,7 @@ Remove me later.
                 "disposition": "reviewed",
                 "status": "validated",
                 "depends_on": [],
-                "invariants": [],
+                "invariants": ["The section's work remains part of the current plan."],
             }
             for section_id in first["sections"]
         }
@@ -1154,7 +1191,7 @@ Remove me later.
                 "disposition": "reviewed",
                 "status": "validated",
                 "depends_on": [],
-                "invariants": [],
+                "invariants": ["The remaining plan accounts for the removed package."],
             }
             for section_id in second["sections"]
         }

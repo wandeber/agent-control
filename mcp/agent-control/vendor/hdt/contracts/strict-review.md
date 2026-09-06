@@ -86,8 +86,8 @@ set; resolved IDs do not. The first report has no prior results.
 
 `coverage_ledger` contains exactly `mode`, `surfaces`,
 `surface_transitions`, and `limitations`. Mode is `full | incremental`;
-`surfaces` is non-empty; limitations is a unique string array. Each stable
-surface records exactly:
+`surfaces` is a non-empty object keyed by stable surface ID, not an array;
+limitations is a unique string array. Each surface value records exactly:
 
 - non-empty unique current-manifest `paths`;
 - `disposition: reviewed | carried_forward`;
@@ -142,3 +142,57 @@ and the summary cites the pending evidence that revealed it.
 
 Expert reports set `safe_to_close: false` for both non-approved verdicts.
 Never approve because time elapsed.
+
+## Draft Shape
+
+This first expert-review example illustrates one reviewed surface and an
+approved outcome. Replace its scope and judgments with actual evidence; include
+every current path and use the finding/blocked forms above when needed. An
+example is not permission to approve. The owner sends this semantic draft,
+without the checkpoint identities supplied by `--compose`:
+
+```json
+{
+  "verdict": "approved",
+  "summary": "The assigned implementation preserves the reviewed contract and has no actionable findings.",
+  "recommended_next_phase": "closure",
+  "blocking_findings": [],
+  "non_blocking_findings": [],
+  "required_corrections": [],
+  "prior_finding_results": [],
+  "recommended_rollback_phase": null,
+  "coverage_ledger": {
+    "mode": "full",
+    "surfaces": {
+      "input-contract": {
+        "paths": ["src/example.ts"],
+        "disposition": "reviewed",
+        "status": "validated",
+        "depends_on": [],
+        "invariants": ["Valid inputs preserve the documented output; invalid inputs fail without side effects."],
+        "finding_ids": []
+      }
+    },
+    "surface_transitions": [],
+    "limitations": []
+  },
+  "impact_analysis": null,
+  "safe_to_close": true
+}
+```
+
+For a planner draft, omit `safe_to_close` and use `post_planner_choice` when
+approved. Supply the mechanical binding through the active execution boundary:
+
+- Direct `record-review --compose`: include the observed
+  `mechanical_validation_report_sha256` in the draft.
+- Authenticated Agent Control evidence `record_review`: include the verified
+  current complete-validation receipt for the same result in the request's
+  `source_receipt_ids`, outside `draft`, and omit
+  `mechanical_validation_report_sha256`. Agent Control derives the hash from
+  that receipt before invoking the helper; never fabricate or copy a placeholder
+  hash to satisfy the complete persisted-record schema.
+
+For incremental mode, send only directly reviewed surface records, the required
+transitions and prior-finding results, and the exact impact object. The helper
+composes eligible closed records; the owner does not reproduce them.
