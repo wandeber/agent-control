@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createController } from "./core/factory.js";
 import { errorToPayload } from "./core/errors.js";
+import { withMcpCaller } from "./core/caller-context.js";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
 import { escapeInlineScript } from "./inline-script.js";
@@ -152,7 +153,7 @@ server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
         }
         try {
             const input = tool.schema.parse(request.params.arguments ?? {});
-            const result = await handleTool(controller, tool.name, input, AbortSignal.any([extra.signal, shutdownCancellation.signal]));
+            const result = await withMcpCaller(request.params._meta, () => handleTool(controller, tool.name, input, AbortSignal.any([extra.signal, shutdownCancellation.signal])));
             await controller.drainDeliveries();
             return jsonResult(result);
         }

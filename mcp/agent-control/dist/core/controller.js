@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, wr
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
+import { currentCodexThreadId } from "./caller-context.js";
 import { RunObservation, isPassiveObserver } from "./run-observation.js";
 import { parseActivity, activityText } from "./agent-activity.js";
 import { evaluateCondition, parseFlowConfig, resolveFlowAgentLifecycle, resolveArtifactPath, resolveInputArtifacts, resolveStepPromptSources, resolveStepEventAction, selectTransition, validateStepResult } from "./flow.js";
@@ -318,7 +319,7 @@ export class AgentController {
                     if (reusable.instance.orchestrator_agent_id !== caller.agent_id) {
                         throw new ControllerError("The reusable native flow belongs to a different orchestrator.", "auth_required", { flow_instance_id: reusable.instance.flow_instance_id });
                     }
-                    const ownerTaskIdentity = normalizeOptionalIdentity(input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null);
+                    const ownerTaskIdentity = normalizeOptionalIdentity(input.ownerTaskIdentity ?? currentCodexThreadId() ?? null);
                     const ownerTaskPath = normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root");
                     const originatingGrant = this.resolveNativeFlowBridgeGrant(reusable.instance);
                     if (originatingGrant.owner_task_path !== ownerTaskPath ||
@@ -360,7 +361,7 @@ export class AgentController {
                 const grant = this.store.createBridgeGrant({
                     runId: run.run_id,
                     orchestratorAgentId: caller.agent_id,
-                    ownerTaskIdentity: normalizeOptionalIdentity(input.ownerTaskIdentity ?? process.env.CODEX_THREAD_ID ?? null),
+                    ownerTaskIdentity: normalizeOptionalIdentity(input.ownerTaskIdentity ?? currentCodexThreadId() ?? null),
                     ownerTaskPath: normalizeOwnerTaskPath(input.ownerTaskPath ?? "/root"),
                     tokenHash: hashToken(rawBridgeToken)
                 });
@@ -438,11 +439,12 @@ export class AgentController {
             bridge_credential: initialized.bridgeCredential
         };
     }
-    /** Identity comes from the locally hosted tool process, never an agent id in a report payload. */
+    /** Identity comes from the local host's MCP request context or CLI environment,
+     * never an agent id in a model-generated report payload. */
     flowCaller(agentToken, expectedIds) {
         if (agentToken)
             return this.requireAgentToken(agentToken);
-        const threadId = process.env.CODEX_THREAD_ID;
+        const threadId = currentCodexThreadId();
         if (!threadId)
             return null;
         const matches = this.store.listAgents().filter(agent => !agent.unregistered_at && (!expectedIds || expectedIds.includes(agent.agent_id)) &&

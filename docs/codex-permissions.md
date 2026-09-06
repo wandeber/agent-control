@@ -64,6 +64,12 @@ operations, caller identity, approved plans, and evidence still apply.
 
 ## Verify activation
 
+Use Agent Control 0.2.2 or newer for Codex worker identity. Codex supplies its
+actual thread in each MCP request's `_meta.threadId`; the controller must read
+that request identity rather than the long-lived server's environment. An
+`auth_required` result from the controller is distinct from a Codex approval
+denial and does not call for broader tool grants.
+
 Verify the saved entries and use a fresh Codex task or app-server process to
 load the installed plugin and updated policy together. An already-open task's
 tool catalog does not prove that it loaded the new configuration. Preserve the

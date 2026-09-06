@@ -1,3 +1,4 @@
+import { currentCodexThreadId } from "./caller-context.js";
 import { conversationWaitContract } from "./conversation-wait.js";
 import { compactFlowEvent } from "./flow-event-summary.js";
 import { ObserverCursors } from "../storage/observer-cursors.js";
@@ -50,7 +51,7 @@ export class RunObservation {
         const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
         const threadId = input.requesterThreadId ?? this.requesterThread(runId) ??
             (caller ? this.requesterThread(caller.run_id) : undefined) ??
-            process.env.AGENT_CONTROL_REQUESTER_THREAD_ID ?? process.env.CODEX_THREAD_ID;
+            process.env.AGENT_CONTROL_REQUESTER_THREAD_ID ?? currentCodexThreadId();
         // Headless/non-Codex callers have no conversation to fabricate.
         if (!threadId)
             return null;
@@ -105,7 +106,7 @@ export class RunObservation {
             throw new ControllerError("Run observation requires an authorized run identity.", "auth_required");
         }
         const run = this.controller.getRun(input.runId);
-        const threadId = (input.threadId ?? process.env.CODEX_THREAD_ID)?.trim();
+        const threadId = (input.threadId ?? currentCodexThreadId())?.trim();
         if (!threadId || threadId.length > 256 || /[\r\n\0]/.test(threadId)) {
             throw new ControllerError("Run observation requires the actual Codex thread id.", "tool_error");
         }
@@ -170,7 +171,7 @@ export class RunObservation {
                 ? this.controller.canAgentAccessRun(caller, input.runId) && (caller.agent_id === agent.agent_id || this.observationOwners(agent, input.runId).includes(caller.agent_id))
                 : input.adminKey ? verifyAdminKey(input.adminKey)
                     // The local MCP/CLI host supplies this identity; explicit credentials never fall back to it.
-                    : process.env.CODEX_THREAD_ID === observer.thread_id;
+                    : currentCodexThreadId() === observer.thread_id;
             if (!authorized)
                 throw new ControllerError("Acknowledgement requires the observing identity or an authorized administrator.", "auth_required");
             const state = this.cursors.state(agent.agent_id, observer.start_sequence);

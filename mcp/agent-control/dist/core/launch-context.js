@@ -1,5 +1,6 @@
 import { ControllerError } from "./errors.js";
 import { verifyAdminKey } from "./identity.js";
+import { currentCodexThreadId } from "./caller-context.js";
 /** Bootstrap local launches without exposing a coordinator token in task text. */
 export function prepareLaunchOwner(controller, input) {
     if (input.agentToken) {
@@ -8,7 +9,7 @@ export function prepareLaunchOwner(controller, input) {
     }
     if (!verifyAdminKey(input.adminKey))
         throw new ControllerError("Local launch requires Agent Control authorization.", "auth_required");
-    const threadId = process.env.CODEX_THREAD_ID?.trim();
+    const threadId = currentCodexThreadId();
     if (threadId) {
         // App-server workers do not inherit a per-worker MCP token. Recover their
         // existing participant locally, keeping its role and original run requester.
