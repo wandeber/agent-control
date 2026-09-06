@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { initializeObserverCursorSchema } from "./observer-cursors.js";
 
 /** Keep observation order independent of timestamps and SQLite's mutable rowids. */
 export function initializeObservationSchema(db: Database.Database): void {
@@ -49,5 +50,6 @@ export function initializeObservationSchema(db: Database.Database): void {
     if (!exists) {
       db.exec("insert or ignore into event_order(event_id) select event_id from events order by created_at, rowid");
     }
+    initializeObserverCursorSchema(db);
   }).immediate();
 }

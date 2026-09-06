@@ -7,7 +7,9 @@ export function conversationWaitContract(runId: string, observerAgentId: string,
     instruction: "While any supervised Agent Control work remains pending, keep this Codex turn open. " +
       "Use the observation for your own thread: a separate executor uses coordinator_observer, the original conversation uses observer. " +
       "After launch, an event batch, a timeout, or a user message (including another topic), respond in commentary when useful, " +
-      "then call run_wait again with the latest processed cursor. Use a one-hour timeout, or 30 minutes if the host requires it. " +
+      "explicitly call run_ack after successfully handling all events through the returned cursor, then call run_wait again. " +
+      "Fetching events or receiving a notification never acknowledges processing. Omit the cursor to recover the durable processed position, " +
+      "or pass the latest processed cursor explicitly. Use a one-hour timeout, or 30 minutes if the host requires it. " +
       "An unrelated user message or timeout does not cancel the work. Preserve every active run and its own observer/cursor; " +
       "wait on multiple runs concurrently when supported. You may end each update with a localized sentence such as " +
       "'The <flow> flow is still running; I am continuing to wait.' " +

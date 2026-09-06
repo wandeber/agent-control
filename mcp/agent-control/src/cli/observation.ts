@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import type { EventType } from "../core/types.js";
 import { parseDurationMs } from "../core/duration.js";
+import type { AcknowledgeRunInput, RunObservation } from "../core/run-observation.js";
 import { collect, type CliDeps } from "./shared.js";
 
 export interface RequesterOptions {
@@ -40,9 +41,9 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
     .description("Wait for subscribed events with a durable cursor. Keep the turn open while work remains; answer user messages and resume this wait. Omit timeout for indefinite waiting, or use 1h.")
     .requiredOption("--run <id>", "Observed run.")
     .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
-    .requiredOption("--cursor <cursor>", "Cursor returned by run observe or the previous run wait.")
+    .option("--cursor <cursor>", "Explicit replay cursor; omit to resume the durable processed position. Fetching never acknowledges processing.")
     .option("--timeout <duration>", "Optional timeout such as 1h.")
-    .action(async (options: { run: string; observerAgentId: string; cursor: string; timeout?: string }) => {
+    .action(async (options: { run: string; observerAgentId: string; cursor?: string; timeout?: string }) => {
       const cancellation = new AbortController();
       const abort = () => cancellation.abort(new Error("Observation cancelled"));
       process.once("SIGINT", abort);
@@ -54,5 +55,15 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
         process.removeListener("SIGINT", abort);
         process.removeListener("SIGTERM", abort);
       }
+    });
+  run.command("ack")
+    .description("Commit successful handling of all delivered events through a cursor. ACK is explicit, monotonic and recoverable after restart.")
+    .requiredOption("--run <id>", "Observed run.")
+    .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
+    .requiredOption("--cursor <cursor>", "Observer-bound cursor returned by run wait after handling the events.")
+    .action((options: { run: string; observerAgentId: string; cursor: string }) => {
+      const controller = deps.controller as typeof deps.controller & { acknowledgeRunEvents(input: AcknowledgeRunInput): ReturnType<RunObservation["acknowledge"]> };
+      deps.output(controller.acknowledgeRunEvents({ runId: options.run, observerAgentId: options.observerAgentId,
+        cursor: options.cursor, ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
 }
