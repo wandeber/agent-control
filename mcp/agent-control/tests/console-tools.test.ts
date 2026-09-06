@@ -32,5 +32,6 @@ describe("loadConsoleSnapshot", () => {
     const result = await loadConsoleSnapshot(controller);
 
     expect(result.console).toEqual({ requested_run_id: null, follow_latest: true });
+    expect(controller.pollActiveAgents).toHaveBeenCalledWith("latest-run");
   });
 });

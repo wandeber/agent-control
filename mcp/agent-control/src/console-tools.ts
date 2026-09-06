@@ -24,7 +24,13 @@ export async function loadConsoleSnapshot<TSnapshot>(
   controller: ConsoleSnapshotProvider<TSnapshot>,
   runId?: string
 ): Promise<ConsoleSnapshotContent<TSnapshot>> {
-  await controller.pollActiveAgents(runId);
+  // Following the latest run must not poll every historical backend. Apart
+  // from wasting CPU, unavailable old endpoints delay the selected chat.
+  const initial = runId ? null : controller.getDashboardSnapshot();
+  const latestRunId = initial && typeof initial === "object" && "selected_run_id" in initial
+    ? initial.selected_run_id : null;
+  const effectiveRunId = runId ?? (typeof latestRunId === "string" ? latestRunId : undefined);
+  if (effectiveRunId) await controller.pollActiveAgents(effectiveRunId);
   return {
     snapshot: controller.getDashboardSnapshot(runId),
     console: {
