@@ -286,7 +286,7 @@ select {
   margin: 0 0 0.75rem;
   border-left: 3px solid rgba(89, 200, 184, 0.55);
   padding-left: 0.85rem;
-  color: #9da3ad;
+  color: var(--muted);
 }
 
 .chat-prose a {
@@ -322,7 +322,7 @@ select {
 
 .chat-prose th {
   background: rgba(255, 255, 255, 0.06);
-  color: #f0f1f3;
+  color: var(--foreground);
   font-weight: 650;
 }
 
@@ -361,7 +361,7 @@ select {
 .chat-code-language {
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   padding: 0.35rem 0.7rem;
-  color: #9298a3;
+  color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.65rem;
   letter-spacing: 0.05em;
@@ -616,7 +616,7 @@ select {
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: #64748b;
+  color: var(--muted);
   transition:
     background 140ms ease,
     color 140ms ease;
@@ -887,7 +887,7 @@ select {
 .subagents-group h2 {
   margin: 0 0 0.35rem;
   padding: 0 0.35rem;
-  color: #858a95;
+  color: var(--muted);
   font-size: 0.65rem;
   font-weight: 650;
   letter-spacing: 0.08em;
@@ -910,7 +910,7 @@ select {
   border: 1px solid transparent;
   border-radius: 0.55rem;
   background: transparent;
-  color: #d8dae0;
+  color: var(--foreground);
   text-align: left;
   transition: background 150ms ease, border-color 150ms ease;
 }
@@ -941,13 +941,13 @@ select {
 }
 
 .subagent-list-title {
-  color: #f0f1f3;
+  color: var(--foreground);
   font-size: 0.75rem;
   font-weight: 600;
 }
 
 .subagent-list-detail {
-  color: #9296a0;
+  color: var(--muted);
   font-size: 0.65rem;
 }
 
@@ -959,7 +959,7 @@ select {
 .subagents-shell .subagents-chat-heading > span {
   border-color: rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.08);
-  color: #c4c8d0;
+  color: var(--foreground);
 }
 
 .subagents-shell .subagent-list-item > span:first-child {
@@ -1073,7 +1073,7 @@ select {
 
 .codex-activity-row {
   margin: 0.3rem 0;
-  color: #8f949f;
+  color: var(--muted);
 }
 
 .codex-activity-row summary {
@@ -1094,7 +1094,7 @@ select {
 .codex-activity-chevron {
   display: inline-block;
   flex: 0 0 auto;
-  color: #7f8792;
+  color: var(--muted);
   font-size: 1.15rem;
   line-height: 1;
   transform: rotate(0deg);
@@ -1107,14 +1107,14 @@ select {
 
 .codex-activity-label {
   flex: 0 0 auto;
-  color: #9ca2ac;
+  color: var(--muted);
   font-weight: 650;
 }
 
 .codex-activity-preview {
   min-width: 0;
   overflow: hidden;
-  color: #707782;
+  color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1126,7 +1126,7 @@ select {
 }
 
 .codex-activity-content .chat-prose {
-  color: #aeb2ba;
+  color: var(--muted);
   font-size: 0.75rem;
 }
 
@@ -1142,7 +1142,7 @@ select {
   border-radius: 1rem;
   background: rgba(34, 36, 40, 0.97);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
-  color: #c5c8cf;
+  color: var(--foreground);
   backdrop-filter: blur(18px);
 }
 
@@ -1151,14 +1151,14 @@ select {
   align-items: center;
   justify-content: space-between;
   padding: 0.72rem 0.9rem 0.35rem;
-  color: #bfc3cc;
+  color: var(--foreground);
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.1em;
 }
 
 .codex-todo-heading > span:last-child {
-  color: #9297a1;
+  color: var(--muted);
   font-size: 0.68rem;
   font-weight: 500;
   letter-spacing: 0;
@@ -1181,12 +1181,12 @@ select {
 
 .codex-todo-marker {
   flex: 0 0 0.8rem;
-  color: #8f959f;
+  color: var(--muted);
   text-align: center;
 }
 
 .codex-todo-item-completed {
-  color: #777d87;
+  color: var(--muted);
   text-decoration: line-through;
 }
 
@@ -1195,7 +1195,7 @@ select {
 }
 
 .codex-todo-item-active {
-  color: #d2d4da;
+  color: var(--foreground);
 }
 
 .codex-todo-item-active .codex-todo-marker {
@@ -1214,7 +1214,7 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 9999px;
   background: rgba(42, 44, 49, 0.96);
-  color: #e9ebef;
+  color: var(--foreground);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.3);
   transform: translateX(-50%);
   transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
@@ -1289,7 +1289,7 @@ select {
   align-items: center;
   border: 1px solid rgba(21, 25, 29, 0.1);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.86);
+  background: var(--panel-solid);
   overflow: hidden;
   backdrop-filter: blur(16px);
 }
@@ -1303,7 +1303,7 @@ select {
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: #64748b;
+  color: var(--muted);
   transition:
     background 140ms ease,
     color 140ms ease,
@@ -1335,7 +1335,7 @@ select {
   border-radius: 0;
   background: transparent;
   padding: 0 10px;
-  color: #64748b;
+  color: var(--muted);
   font-size: 11px;
   font-weight: 650;
   transition:
@@ -1537,3 +1537,10 @@ select {
 .agent-control-app [class*="border-black"] { border-color: var(--line); }
 .screen-navigation, .screen-navigation-link { border-color: var(--line); }
 .subagents-shell, .agent-chat { --subagents-line: var(--line); }
+
+.agent-control-app :is([class*="text-slate-"], [class*="text-gray-"]) { color: var(--foreground); }
+.agent-control-app :is([class*="text-slate-5"], [class*="text-slate-6"], [class*="text-gray-5"]) { color: var(--muted); }
+.agent-control-app :is([class*="bg-slate-"], [class*="bg-gray-"]) { background-color: var(--raised); }
+.agent-control-app :is([class*="border-slate-"], [class*="border-gray-"]) { border-color: var(--line); }
+.agent-control-app .react-flow__controls-button { background: var(--panel-solid); color: var(--foreground); border-color: var(--line); fill: currentColor; }
+.agent-control-app .react-flow__minimap { background: var(--panel-solid); }

@@ -1,6 +1,6 @@
 {
   "name": "agent-control",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Local agent control plane for declarative flows, native Codex subagent orchestration, supervision, and live inspection through MCP, CLI, and a native console.",
   "author": {
     "name": "wandeber",
