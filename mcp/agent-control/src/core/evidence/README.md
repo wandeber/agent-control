@@ -37,6 +37,10 @@ semantic draft containing directly reviewed sections/surfaces to `record_review`
 or `record_plan_review`; never synthesize carried records. The provider composes
 eligible history. A plan successor may refer to its explicit predecessor's old
 plan revision, but acceptance and authenticated review ownership must match.
+Review predecessor lookup uses a per-kind/checkpoint index. Legacy lookup skips
+malformed unrelated receipts but never treats a missing or corrupt selected
+origin as reusable evidence. Recovery uses an explicitly fresh full-review
+checkpoint and records no inherited approval.
 For a planner implementation review, `source_receipt_ids` must explicitly include
 the current complete validation receipt for the same result. Omit
 `mechanical_validation_report_sha256` from the semantic draft: Agent Control

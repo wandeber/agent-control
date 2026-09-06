@@ -86,6 +86,37 @@ describe('run-owned canonical evidence', () => {
     expect(third.source_receipt_ids).toEqual([]);
   }, 30_000);
 
+  it('ignores corrupt unrelated receipts when resolving an indexed or legacy review predecessor', async () => {
+    await result();
+    const first = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'expert', draft: draft() });
+    const unrelated = await service.execute(context, { operation: 'snapshot_artifact', path: 'unrelated.txt' });
+    writeFileSync(join(root, 'run/evidence/run-test/flow-test/receipts', `${unrelated.receipt_id}.json`), '{corrupt unrelated artifact');
+    write('value.txt', 'second\n'); await result('result-2', 'result-1');
+    const second = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-2', gate: 'expert', draft: draft() });
+    expect(second.source_receipt_ids).toContain(first.receipt_id);
+    // Exercise compatibility with receipts created before the per-review index.
+    rmSync(join(root, 'run/evidence/run-test/flow-test/review-index/expert_review-result-2.json'));
+    write('value.txt', 'third\n'); await result('result-3', 'result-2');
+    const third = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-3', gate: 'expert', draft: draft() });
+    expect(third.source_receipt_ids).toContain(second.receipt_id);
+    expect(service.verifyReceiptSync(context, third.receipt_id, { requireApproved: true, requireCurrent: true }).status).toBe('approved');
+  }, 30_000);
+
+  it('rejects a corrupt relevant predecessor while allowing an explicit fresh full review', async () => {
+    await result();
+    const first = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'expert', draft: draft() });
+    writeFileSync(join(root, 'run/evidence/run-test/flow-test/receipts', `${first.receipt_id}.json`), '{corrupt relevant review');
+    write('value.txt', 'correction\n'); await result('result-2', 'result-1');
+    const incremental = draft();
+    (incremental.coverage_ledger as Record<string, unknown>).mode = 'incremental';
+    await expect(service.execute(context, { operation: 'record_review', checkpoint_id: 'result-2', gate: 'expert', draft: incremental })).rejects.toThrow();
+    await result('fresh-full');
+    const fresh = await service.execute(context, { operation: 'record_review', checkpoint_id: 'fresh-full', gate: 'expert', draft: draft() });
+    expect(fresh.source_receipt_ids).toEqual([]);
+    expect(fresh.summary.carried_count).toBe(0);
+    expect(service.verifyReceiptSync(context, fresh.receipt_id, { requireApproved: true, requireCurrent: true }).status).toBe('approved');
+  }, 30_000);
+
   it('retains inspectable evidence after the worktree is removed, but refuses a current gate', async () => {
     await result();
     const expert = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'expert', draft: draft() });

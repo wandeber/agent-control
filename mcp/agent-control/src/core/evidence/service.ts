@@ -81,7 +81,45 @@ export class EvidenceService {
     };
     const receipt = evidenceReceiptSchema.parse({ ...record, record_sha256: fingerprint(record) });
     immutableJson(this.receiptPath(context, receipt.receipt_id), receipt);
+    if (['plan_review', 'planner_review', 'expert_review'].includes(kind) && receipt.checkpoint_id) {
+      immutableJson(this.reviewIndexPath(context, kind, receipt.checkpoint_id), {
+        kind, checkpoint_id: receipt.checkpoint_id, receipt_id: receipt.receipt_id,
+      });
+    }
     return receipt;
+  }
+
+  private reviewIndexPath(context: EvidenceContext, kind: EvidenceReceiptKind, checkpointId: string): string {
+    return resolve(this.namespace(context), 'review-index', `${kind}-${checkpointId}.json`);
+  }
+
+  private findPredecessorReceipt(context: EvidenceContext, kind: EvidenceReceiptKind, checkpointId: string): EvidenceReceipt | undefined {
+    const indexPath = this.reviewIndexPath(context, kind, checkpointId);
+    if (existsSync(indexPath)) {
+      const index = z.object({ kind: z.string(), checkpoint_id: z.string(), receipt_id: z.string() }).strict()
+        .parse(JSON.parse(readRegular(indexPath).toString()));
+      if (index.kind !== kind || index.checkpoint_id !== checkpointId) throw new Error('Review predecessor index identity is invalid.');
+      const receipt = evidenceReceiptSchema.parse(JSON.parse(readRegular(this.receiptPath(context, index.receipt_id)).toString()));
+      if (receipt.receipt_id !== index.receipt_id || receipt.kind !== kind || receipt.checkpoint_id !== checkpointId) throw new Error('Review predecessor index does not identify its expected receipt.');
+      return receipt;
+    }
+    // Receipts created before the index existed remain readable. Unrelated
+    // malformed files are not prerequisites for this review; selected origins
+    // still undergo strict schema, digest, provider and ownership verification.
+    const directory = resolve(this.namespace(context), 'receipts');
+    if (!existsSync(directory)) return undefined;
+    let predecessor: EvidenceReceipt | undefined;
+    for (const file of readdirSync(directory)) {
+      let candidate: unknown;
+      try { candidate = JSON.parse(readRegular(resolve(directory, file)).toString()); } catch { continue; }
+      if (!candidate || typeof candidate !== 'object') continue;
+      const identity = candidate as Record<string, unknown>;
+      if (identity.kind !== kind || identity.checkpoint_id !== checkpointId) continue;
+      if (predecessor) throw new Error('Review predecessor receipt is ambiguous; start an explicit fresh full-review lineage.');
+      predecessor = evidenceReceiptSchema.parse(candidate);
+      if (file !== `${predecessor.receipt_id}.json`) throw new Error('Review predecessor filename does not match its receipt identity.');
+    }
+    return predecessor;
   }
 
   async execute(rawContext: EvidenceContext, rawRequest: EvidenceRequest): Promise<EvidenceReceipt> {
@@ -149,13 +187,16 @@ export class EvidenceService {
       const previousId = plan ? manifest.previous_checkpoint : manifest.scope?.previous_checkpoint;
       const kind = plan ? 'plan_review' : request.operation === 'record_review' && request.gate === 'planner' ? 'planner_review' : 'expert_review';
       if (previousId) {
-        const directory = resolve(this.namespace(context), 'receipts');
-        const previous = existsSync(directory) ? readdirSync(directory).map(file => evidenceReceiptSchema.parse(JSON.parse(readRegular(resolve(directory, file)).toString())))
-          .find(receipt => receipt.kind === kind && receipt.checkpoint_id === previousId) : undefined;
+        const previous = this.findPredecessorReceipt(context, kind, previousId);
         if (previous) {
           if (previous.actor_id !== context.actorId) throw new Error('Incremental review requires the same authenticated review owner.');
           sources.push(previous.receipt_id);
-        } else if ((request.draft.coverage_ledger as Record<string, unknown>)?.mode === 'incremental') throw new Error('Incremental review predecessor lacks an authenticated Agent Control receipt.');
+        } else {
+          const priorProviderReview = resolve(provider.store, 'flow', ...(plan ? ['plan', 'reviews'] : ['reviews', request.operation === 'record_review' ? request.gate : 'planner']), `${previousId}.json`);
+          if ((request.draft.coverage_ledger as Record<string, unknown>)?.mode === 'incremental' || existsSync(priorProviderReview)) {
+            throw new Error('Review predecessor lacks an authenticated Agent Control receipt; recover with an explicit fresh full-review checkpoint.');
+          }
+        }
       }
       for (const source of new Set(sources)) this.verifyReviewSource(context, source, previousId, kind);
       const semanticDraft = { ...request.draft };
