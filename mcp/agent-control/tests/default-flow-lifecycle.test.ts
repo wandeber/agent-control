@@ -10,7 +10,7 @@ import { artifactDigest } from "../src/core/flow-runtime.js";
 import { resolveAdminKey } from "../src/core/identity.js";
 import { runRuntimeDir } from "../src/core/paths.js";
 import type { EvidenceReceipt, EvidenceRequest } from "../src/core/evidence/service.js";
-import type { AgentAdapter, AgentHandle, AgentStatus, StartAgentInput } from "../src/core/types.js";
+import { EVENT_TYPES, type AgentAdapter, type AgentHandle, type AgentStatus, type StartAgentInput } from "../src/core/types.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 
 // Only model execution is replaced. The actual bundled YAML, controller,
@@ -110,7 +110,7 @@ async function toImplementation(planCorrection = false, packages: PackageSpec[] 
   expect(current().step_id).toBe("implementation");
 }
 async function prepareResult(checkpoint: string, previous?: string) {
-  return evidence(`checkpoint-${checkpoint}`, { operation: "prepare_result", checkpoint_id: checkpoint, plan_path: artifact("plan"), paths: Object.keys(taskPackages), ...(previous ? { previous } : {}) });
+  return evidence(`checkpoint-${checkpoint}`, { operation: "prepare_result", checkpoint_id: checkpoint, plan_path: artifact("plan"), base: snapshot().runtime!.packages!.base_commit, paths: Object.keys(taskPackages), ...(previous ? { previous } : {}) });
 }
 async function validate(checkpoint = "result-1", mode: "focused" | "complete_gate" = "complete_gate", previous?: string, reuse: string[] = []) {
   await enter(mode === "focused" ? "focused_validation" : "validation");
@@ -163,10 +163,10 @@ async function close(expertReceipt: EvidenceReceipt) {
 
 // These disposable worktrees model Codex-provisioned checkouts. Production
 // package launch receives existing Codex worktrees and never creates them.
-function packageFixture(): PackageSpec[] {
-  taskPackages = { "alpha.txt": "alpha", "beta.txt": "beta" };
-  startFixture("Goal: update alpha.txt and beta.txt to after. Scope: independent alpha and beta packages. Preserve value.txt and unrelated.txt. Acceptance: both values contain after. UAT preference: skip.");
-  return ["alpha", "beta"].map(packageId => {
+function packageFixture(packageIds = ["alpha", "beta"], acceptedContext?: string): PackageSpec[] {
+  taskPackages = Object.fromEntries(packageIds.map(packageId => [`${packageId}.txt`, packageId]));
+  startFixture(acceptedContext ?? "Goal: update alpha.txt and beta.txt to after. Scope: independent alpha and beta packages. Preserve value.txt and unrelated.txt. Acceptance: both values contain after. UAT preference: skip.");
+  return packageIds.map(packageId => {
     const worktree = join(root, `${packageId}-tree`);
     execFileSync("git", ["-C", repo, "worktree", "add", "--quiet", "--detach", worktree, "HEAD"]);
     return { id: packageId, title: `Update ${packageId}`, role: "implementer", worktree, paths: [`${packageId}.txt`], deliverables: [`${packageId}.txt`] };
@@ -180,39 +180,44 @@ function asAgent(agentId: string) {
   vi.stubEnv("CODEX_THREAD_ID", controller.getAgent(agentId).backend_handle!.thread_id as string);
 }
 
+async function toPackageIntegration() {
+  const manifest = packageFixture();
+  await toImplementation(false, manifest, packagePlan);
+  const approvedManifest = snapshot().runtime!.packages!.manifest_digest;
+  const step = await enter("implementation");
+  const ownerThread = process.env.CODEX_THREAD_ID!;
+  const launched = await packages({ operation: "launch" });
+  expect(Object.values(launched.branches).map(branch => branch.state)).toEqual(["running", "running"]);
+  expect(new Set(Object.values(launched.branches).map(branch => branch.agent_id)).size).toBe(2);
+  expect(snapshot().runtime!.packages!.manifest_digest).toBe(approvedManifest);
+  const deliveries: Array<{ package_id: string; delivery_id: string }> = [];
+  for (const entry of manifest) {
+    const branch = launched.branches[entry.id]!;
+    writeFileSync(join(entry.worktree, `${entry.id}.txt`), `after-${entry.id}\n`);
+    asAgent(branch.agent_id!);
+    // Child delivery authority cannot report the parent phase as complete.
+    expect(() => controller.reportFlowStep({ stepInstanceId: step.step_instance_id, status: "completed", result: { conclusion: "ready" } })).toThrow();
+    const delivered = await packages({ operation: "deliver", package_id: entry.id, attempt: branch.attempt, summary: `${entry.id} completed within its approved scope.` });
+    deliveries.push({ package_id: entry.id, delivery_id: delivered.branches[entry.id]!.delivery!.delivery_id });
+    adapter.statuses.set(branch.agent_id!, "completed");
+  }
+  vi.stubEnv("CODEX_THREAD_ID", ownerThread);
+  const accepted = await packages({ operation: "accept", deliveries, reason: "Both exact deliveries satisfy their approved package contracts." });
+  expect(Object.values(accepted.branches).every(branch => branch.state === "accepted")).toBe(true);
+  // Even a false worker claim cannot bypass runtime-derived integration.
+  report({ conclusion: "ready", integration_needed: false });
+  await enter("integration");
+  expect(() => report({ conclusion: "ready" })).toThrow(/integration/i);
+  for (const branch of Object.values(accepted.branches)) {
+    for (const file of branch.delivery!.files) writeFileSync(join(repo, file.path), readFileSync(file.snapshot_path!));
+  }
+  return { accepted, deliveries, approvedManifest };
+}
+
 describe("bundled default flow with actual evidence and closure", () => {
 
   it("joins two approved packages and verifies exact consolidation through closure", async () => {
-    const manifest = packageFixture();
-    await toImplementation(false, manifest, packagePlan);
-    const approvedManifest = snapshot().runtime!.packages!.manifest_digest;
-    const step = await enter("implementation");
-    const ownerThread = process.env.CODEX_THREAD_ID!;
-    const launched = await packages({ operation: "launch" });
-    expect(Object.values(launched.branches).map(branch => branch.state)).toEqual(["running", "running"]);
-    expect(new Set(Object.values(launched.branches).map(branch => branch.agent_id)).size).toBe(2);
-    expect(snapshot().runtime!.packages!.manifest_digest).toBe(approvedManifest);
-    const deliveries: Array<{ package_id: string; delivery_id: string }> = [];
-    for (const entry of manifest) {
-      const branch = launched.branches[entry.id]!;
-      writeFileSync(join(entry.worktree, `${entry.id}.txt`), `after-${entry.id}\n`);
-      asAgent(branch.agent_id!);
-      // Child delivery authority cannot report the parent phase as complete.
-      expect(() => controller.reportFlowStep({ stepInstanceId: step.step_instance_id, status: "completed", result: { conclusion: "ready" } })).toThrow();
-      const delivered = await packages({ operation: "deliver", package_id: entry.id, attempt: branch.attempt, summary: `${entry.id} completed within its approved scope.` });
-      deliveries.push({ package_id: entry.id, delivery_id: delivered.branches[entry.id]!.delivery!.delivery_id });
-      adapter.statuses.set(branch.agent_id!, "completed");
-    }
-    vi.stubEnv("CODEX_THREAD_ID", ownerThread);
-    const accepted = await packages({ operation: "accept", deliveries, reason: "Both exact deliveries satisfy their approved package contracts." });
-    expect(Object.values(accepted.branches).every(branch => branch.state === "accepted")).toBe(true);
-    // Even a false worker claim cannot bypass runtime-derived integration.
-    report({ conclusion: "ready", integration_needed: false });
-    await enter("integration");
-    expect(() => report({ conclusion: "ready" })).toThrow(/integration/i);
-    for (const branch of Object.values(accepted.branches)) {
-      for (const file of branch.delivery!.files) writeFileSync(join(repo, file.path), readFileSync(file.snapshot_path!));
-    }
+    const { accepted, deliveries, approvedManifest } = await toPackageIntegration();
     const checkpoint = await prepareResult("result-1");
     const integrated = await packages({ operation: "integrate", result_receipt_id: checkpoint.receipt_id });
     expect(integrated.integration).toMatchObject({ manifest_digest: approvedManifest, result_receipt_id: checkpoint.receipt_id, delivery_ids: deliveries.map(item => item.delivery_id).sort() });
@@ -222,7 +227,42 @@ describe("bundled default flow with actual evidence and closure", () => {
     const packageAgents = Object.values(accepted.branches).map(branch => controller.getAgent(branch.agent_id!));
     expect(packageAgents.every(agent => agent.run_id === coordinator.run.run_id)).toBe(true);
     expect(store.db.prepare("select thread_id from run_requesters where run_id = ?").get(coordinator.run.run_id)).toEqual({ thread_id: "conversation-thread" });
-    expect(snapshot().runtime!.decision_owners!.requester).not.toBe(snapshot().runtime!.decision_owners!.orchestrator);
+    const requester = snapshot().runtime!.decision_owners!.requester;
+    expect(requester).not.toBe(snapshot().runtime!.decision_owners!.orchestrator);
+    const observedTypes = store.listSubscriptions({ runId: coordinator.run.run_id, enabledOnly: true }).filter(subscription => subscription.subscriber_agent_id === requester).map(subscription => subscription.event_type);
+    expect(new Set(observedTypes)).toEqual(new Set(EVENT_TYPES));
+  }, 60_000);
+
+  it("rejects a result checkpoint that omits an accepted package even when both files exist", async () => {
+    await toPackageIntegration();
+    const partial = await evidence("checkpoint-partial", { operation: "prepare_result", checkpoint_id: "partial-result", plan_path: artifact("plan"), base: snapshot().runtime!.packages!.base_commit, paths: ["alpha.txt"] });
+    expect(readFileSync(join(repo, "beta.txt"), "utf8")).toBe("after-beta\n");
+    await expect(packages({ operation: "integrate", result_receipt_id: partial.receipt_id })).rejects.toThrow(/cover|path|file|checkpoint/i);
+    expect(snapshot().runtime!.packages!.integration).toBeUndefined();
+    expect(() => report({ conclusion: "ready" })).toThrow(/integration/i);
+    expect(current().step_id).toBe("integration");
+  }, 60_000);
+
+  it("integrates one external package whose accepted delivery deletes a file", async () => {
+    const manifest = packageFixture(["alpha"], "Goal: remove alpha.txt. Scope: alpha package only. Acceptance: alpha.txt is absent; beta.txt, value.txt, and unrelated.txt remain unchanged. UAT preference: skip.");
+    await toImplementation(false, manifest, "# Plan\n\n<!-- hdt-section: alpha -->\n## Alpha\n\nRemove alpha.txt and consolidate the deletion. Preserve every other file.\n");
+    await enter("implementation");
+    const ownerThread = process.env.CODEX_THREAD_ID!;
+    const launched = await packages({ operation: "launch" });
+    const branch = launched.branches.alpha!;
+    rmSync(join(manifest[0]!.worktree, "alpha.txt")); asAgent(branch.agent_id!);
+    const delivered = await packages({ operation: "deliver", package_id: "alpha", attempt: branch.attempt, summary: "Removed alpha.txt as planned." });
+    expect(delivered.branches.alpha!.delivery!.files).toMatchObject([{ path: "alpha.txt", sha256: null, mode: null }]);
+    adapter.statuses.set(branch.agent_id!, "completed"); vi.stubEnv("CODEX_THREAD_ID", ownerThread);
+    await packages({ operation: "accept", deliveries: [{ package_id: "alpha", delivery_id: delivered.branches.alpha!.delivery!.delivery_id }], reason: "The deletion is the complete required delivery." });
+    report({ conclusion: "ready" }); await enter("integration");
+    rmSync(join(repo, "alpha.txt"));
+    const checkpoint = await prepareResult("deleted-result");
+    const integrated = await packages({ operation: "integrate", result_receipt_id: checkpoint.receipt_id });
+    expect(integrated.integration!.delivery_ids).toHaveLength(1);
+    report({ conclusion: "ready" });
+    expect(current().step_id).toBe("validation");
+    expect(readFileSync(join(repo, "beta.txt"), "utf8")).toBe("before\n");
   }, 60_000);
 
   it("blocks an omitted, pending, or failed required package from leaving implementation", async () => {
@@ -243,6 +283,8 @@ describe("bundled default flow with actual evidence and closure", () => {
     await expect(packages({ operation: "accept", deliveries: [{ package_id: "beta", delivery_id: "missing-delivery" }], reason: "Failure must not count as delivery." })).rejects.toThrow(/delivered|successful|package/i);
     expect(() => report({ conclusion: "ready" })).toThrow(/package|join|accepted/i);
     expect(current().step_id).toBe("implementation");
+    report({ conclusion: "needs_plan_revision" });
+    expect(current().step_id).toBe("planning");
   }, 60_000);
 
   it("keeps the original requester’s analysis decision separate from its executing coordinator", async () => {

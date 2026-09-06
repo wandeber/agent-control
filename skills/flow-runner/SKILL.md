@@ -596,15 +596,18 @@ is still active before allowing implementation to finish.
 
 `packages.integration_required` is runtime state, not a worker claim. The
 integration owner consolidates exact accepted deliveries and records `integrate`
-with a verified current result-checkpoint receipt. Missing, stale, failed, or
+with a verified current result-checkpoint receipt covering every delivery and
+using `base: runtime.packages.base_commit`. Missing, stale, failed, or
 unaccepted package results block the join; changing the manifest after approval
 requires the ordinary renewed plan/acceptance decision. Retry/cancellation must
 name the current attempt and a concrete reason.
 
-Native bridge workers must not directly spawn siblings. If a package launch
-requires native worktree or bridge actions, the existing authorized coordinator
-performs the returned actions. Do not bypass this contract with ad hoc launches,
-manual worktree creation, or parent step reports submitted by children.
+Managed package workers currently require an explicitly configured
+`codex-thread` role. Resolve an incompatible role override before defining a
+group; do not silently change an explicitly requested backend. Native bridge
+workers must not directly spawn siblings. The authorized coordinator provisions
+Codex worktrees before registration. Do not bypass this contract with ad hoc
+launches, manual worktree creation, or parent step reports submitted by children.
 
 ## Incremental Evidence And Recovery
 

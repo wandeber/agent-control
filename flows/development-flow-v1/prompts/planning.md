@@ -21,10 +21,10 @@ Write the assigned Plan document with exact done criteria and rationale for
 material choices. A material correction goes through the same analyst's review
 and explicit user approval of the resulting plan before implementation resumes.
 
-When parallel packages materially help, include their stable IDs, exact owned
-relative paths, required deliverables, dependencies, and integration boundaries
-in the Plan. Keep independent writers disjoint and identify the Codex-managed
-worktrees needed. A single inline owner uses an empty external package manifest;
+Use external packages only when parallel work materially helps. Identify each
+package's configured `codex-thread` role, required deliverables, and needed
+Codex-managed worktree; keep concurrent writers disjoint. A single inline owner
+uses an empty external package manifest;
 do not create workers or worktrees merely to populate a group. One external
 worktree still requires consolidation. The existing exact-plan decision also
 approves the registered package-manifest digest; there is no additional human

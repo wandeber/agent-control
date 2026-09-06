@@ -251,8 +251,10 @@ plan includes its manifest digest; delegation does not add another human gate.
 Use an empty manifest when one inline owner is sufficient.
 
 `flow_packages` launches the ready set in a batch and gives each child a scoped
-delivery contract. Codex-managed worktrees must already exist, share the
-repository/base, and have disjoint write boundaries. Preserve each worker's
+delivery contract. Package roles currently require the `codex-thread` backend.
+Codex-managed worktrees must already exist, share the
+repository/base, and have disjoint declared paths. Delivery capture rejects
+changes outside those paths. Preserve each worker's
 owner and attempt generation. The original conversational requester stays
 attached to the run and the implementation owner consumes the event stream.
 
@@ -265,7 +267,9 @@ cannot stand in for a successful joined group.
 The engine exposes `packages.integration_required`; the worker cannot opt out
 with a report boolean. Consolidate every accepted external delivery, including
 a single external worktree, then record `integrate` against a current result
-checkpoint. Its binding proves which group was consolidated into that result.
+checkpoint covering every delivery path against `runtime.packages.base_commit`.
+Its binding proves which group was consolidated into that result; merely having
+the files on disk does not prove the checkpoint included them.
 Semantic integration quality is still checked by validation and review.
 
 This is a durable package group within a declared phase. It does not introduce

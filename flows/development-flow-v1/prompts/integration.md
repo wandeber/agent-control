@@ -17,7 +17,10 @@ together. The subsequent no-edit Validation phase owns the complete affected
 gate, so do not duplicate that suite just to record consolidation.
 
 Prepare a result checkpoint for the consolidated current result through
-`flow_evidence`, reusing an unchanged existing checkpoint where appropriate.
+`flow_evidence`, using `base: runtime.packages.base_commit` and a scope that
+includes every delivered changed/deleted path plus any additional consolidated
+changes. Reuse an unchanged existing checkpoint only if it covers that complete
+result. Physical files alone cannot compensate for omitted checkpoint coverage.
 Call `flow_packages` operation `integrate` with its `result_receipt_id`. This
 binds the exact accepted delivery IDs, plan/acceptance revision, and result
 snapshot. A plain `ready` report cannot replace that integration evidence; the

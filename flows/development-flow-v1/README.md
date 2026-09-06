@@ -149,7 +149,8 @@ worker cannot bypass it with `integration_needed: false`.
 
 The same exact-plan decision binds the package-manifest digest. Provision
 parallel worktrees through Codex before registration; runtime launches only the
-registered disjoint worktrees from the same repository/base. Package children
+registered disjoint worktrees from the same repository/base with configured
+`codex-thread` roles. Package children
 report their delivery, never the parent flow step. The original requester
 remains attached. Empty manifests keep inline work simple, with no child
 launch/acceptance/integration ceremony. One external worktree still requires

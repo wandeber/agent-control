@@ -131,7 +131,8 @@ substituting a reviewer.
 Use `flow_packages` for the package group declared by `policy.work_packages`.
 The plan-review owner defines it, or the authorized coordinator completes that
 setup at the existing plan-approval gate. Definitions include the required
-packages, literal owned paths, deliverables, dependencies, assigned role, and
+packages, literal owned paths, deliverables, dependencies, a configured
+`codex-thread` role, and
 Codex-managed worktree paths. All worktrees must exist and share the approved
 repository/base; do not manufacture them with shell Git commands or reuse dirty
 unrelated checkouts. Preserve the original requester identity.
@@ -151,6 +152,7 @@ branch launch, delivery, acceptance, or integration calls.
 
 The engine derives integration from external deliveries. The integration owner
 consolidates the exact accepted group, prepares a current result checkpoint,
-and records `flow_packages` operation `integrate`. This receipt binds the group
+with `base: runtime.packages.base_commit` and every delivery path, then records
+`flow_packages` operation `integrate`. This receipt binds the group
 and current result before no-edit validation. One external worktree still needs
 consolidation; completion of one child never closes the entire group.

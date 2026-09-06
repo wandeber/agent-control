@@ -146,7 +146,8 @@ without progress return to a concrete user decision, never timeout approval.
 
 Use `policy.work_packages` to bind the package lifecycle to a flow's existing
 approval decision, manifest step, execution step, and integration step. Define
-required package IDs, roles, disjoint literal paths, deliverables, dependencies,
+required package IDs, configured `codex-thread` roles, disjoint literal paths,
+deliverables, dependencies,
 and provisioned Codex worktrees through the runtime package contract before the
 same exact-plan decision. An empty manifest represents inline execution.
 
