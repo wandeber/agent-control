@@ -1,7 +1,9 @@
 # Implementation
 
 Implement the exact user-approved Plan and assigned work-package projections.
-Read the current causal correction and relevant immutable references. Confirm
+Read the current causal correction and relevant immutable references. Use
+`read_receipt` for the linked review findings and checkpoint lineage; reading
+historical evidence does not make it current approval. Confirm
 the plan remains valid before editing; return a broken plan to Planning.
 
 Make only scoped changes and preserve unrelated work. Use justified tests at

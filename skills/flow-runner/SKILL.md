@@ -581,7 +581,7 @@ the flow config explicitly defines that retry strategy.
 ## Incremental Evidence And Recovery
 
 Use `flow_evidence` only through its generated operation schema. The current
-provider supports plan/result preparation, deltas and review scope, semantic
+provider supports `read_receipt` for immutable prior evidence, plan/result preparation, deltas and review scope, semantic
 review composition, approved plan projection, controlled validation, immutable
 artifact snapshots, and closure verification. The caller supplies the semantic
 draft or intended check; the runtime binds actor, flow, acceptance/plan revision,

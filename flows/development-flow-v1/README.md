@@ -69,6 +69,7 @@ shared provider is the authority for complete draft structure. Typical operation
 
 | Need | Operation | Model responsibility |
 | --- | --- | --- |
+| Prior evidence and lineage | `read_receipt` | Read relevant historical findings/checkpoint references without treating them as current approval |
 | Plan snapshot and delta | `prepare_plan`, `diff_plan` | Stable sections, honest dependencies, relevant review intent |
 | Result snapshot and pending scope | `prepare_result`, `diff_result`; `review_scope` for the planner | Task-owned scope, cumulative changed paths, affected surfaces |
 | Plan review | `record_plan_review` | Direct decisions and prior finding dispositions |

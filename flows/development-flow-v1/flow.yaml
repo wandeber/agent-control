@@ -138,6 +138,8 @@ steps:
                 value: blocked
             notify: orchestrator
     sandbox: workspace
+    evidence_operations:
+      - read_receipt
   analysis:
     role: analyst
     prompt_ref: step_analysis
@@ -184,6 +186,8 @@ steps:
                 value: blocked
             notify: orchestrator
     sandbox: workspace
+    evidence_operations:
+      - read_receipt
   analysis_intent:
     role: orchestrator
     execution: coordinator
@@ -229,6 +233,8 @@ steps:
         required: true
     description: The original clarification owner checks Analysis only for
       preservation of user intent.
+    evidence_operations:
+      - read_receipt
   planning:
     role: planner
     prompt_ref: step_planning
@@ -279,6 +285,8 @@ steps:
                 value: blocked
             notify: orchestrator
     sandbox: workspace
+    evidence_operations:
+      - read_receipt
   plan_review:
     role: analyst
     prompt_ref: step_plan_review
@@ -351,6 +359,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - prepare_plan
       - diff_plan
       - record_plan_review
@@ -406,6 +415,8 @@ steps:
         owner_role: analyst
     description: Record explicit user approval of the exact current plan; unchanged
       valid approval can be reused.
+    evidence_operations:
+      - read_receipt
   implementation:
     role: implementer
     prompt_ref: step_implementation
@@ -490,6 +501,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - project_plan
     sandbox: workspace
   integration:
@@ -552,6 +564,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - project_plan
     sandbox: workspace
   focused_validation:
@@ -618,6 +631,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - prepare_result
       - validation_run
     sandbox: read_only
@@ -752,6 +766,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - prepare_result
       - validation_run
     sandbox: read_only
@@ -838,6 +853,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - prepare_result
       - diff_result
       - record_review
@@ -891,6 +907,8 @@ steps:
         value: true
     description: Apply the recorded user preference, or ask once whether to prepare
       optional UAT or proceed.
+    evidence_operations:
+      - read_receipt
   uat_preparation:
     role: implementer
     prompt_ref: step_uat_preparation
@@ -950,6 +968,8 @@ steps:
                 value: blocked
             notify: orchestrator
     sandbox: workspace
+    evidence_operations:
+      - read_receipt
   uat_review:
     role: orchestrator
     execution: coordinator
@@ -1008,6 +1028,8 @@ steps:
         value: prepare
     description: Wait for the user’s UAT observations; never infer acceptance from
       preparation or elapsed time.
+    evidence_operations:
+      - read_receipt
   final_review:
     role: final_reviewer
     prompt_ref: step_final_review
@@ -1181,6 +1203,7 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - prepare_result
       - diff_result
       - record_review
@@ -1246,4 +1269,5 @@ steps:
                 value: blocked
             notify: orchestrator
     evidence_operations:
+      - read_receipt
       - verify_closure

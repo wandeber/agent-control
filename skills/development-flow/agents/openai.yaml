@@ -1,4 +1,4 @@
 interface:
   display_name: "Development Flow"
   short_description: "Clarify and run the Agent Control development flow"
-  default_prompt: "Use $development-flow to clarify this software task completely, then run development-flow-v1 through Agent Control."
+  default_prompt: "Use $development-flow to resolve material user decisions for this software task, then run development-flow-v1 with exact plan approval, incremental evidence, optional UAT, and verified closure through Agent Control."
