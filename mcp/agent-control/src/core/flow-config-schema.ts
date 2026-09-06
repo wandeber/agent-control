@@ -12,7 +12,7 @@ export const flowConfigJsonSchema = {
     initial_step: { type: "string", minLength: 1 },
     policy: { type: "object", additionalProperties: false, properties: { strict: { type: "boolean" }, plan_artifact: { type: "string" } } },
     state: { type: "object", additionalProperties: true },
-    preferences: { type: "object", additionalProperties: { type: "object", properties: { values: { type: "array", minItems: 1, items: { type: "string" } }, artifact_key: { type: "string" } }, required: ["values"], additionalProperties: false } },
+    preferences: { type: "object", additionalProperties: { type: "object", properties: { values: { type: "array", minItems: 1, items: { type: "string" } }, artifact_key: { type: "string" }, owner: { enum: ["requester", "orchestrator"] } }, required: ["values"], additionalProperties: false } },
     prompts: {
       type: "object",
       additionalProperties: { $ref: "#/$defs/promptSource" }
@@ -41,7 +41,7 @@ export const flowConfigJsonSchema = {
         properties: {
           execution: { enum: ["worker", "coordinator"] },
           sandbox: { enum: ["read_only", "workspace"] },
-          decision: { type: "object", properties: { key: { type: "string" }, artifact_key: { type: "string" }, authority: { enum: ["user", "coordinator"] } }, required: ["key"], additionalProperties: false },
+          decision: { type: "object", properties: { key: { type: "string" }, artifact_key: { type: "string" }, authority: { enum: ["user", "coordinator"] }, owner: { enum: ["requester", "orchestrator"] } }, required: ["key"], additionalProperties: false },
           evidence_operations: { type: "array", items: { type: "string" } },
           evidence_gates: { type: "array", items: { enum: ["planner", "expert"] } },
           requires: { $ref: "#/$defs/condition" },

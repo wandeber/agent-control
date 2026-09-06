@@ -526,6 +526,8 @@ export interface FlowTransitionRecord {
 }
 
 export interface FlowArtifactBindingRecord {
+  sha256?: string;
+  snapshot_path?: string;
   binding_id: string;
   flow_instance_id: string;
   artifact_key: string;
@@ -542,7 +544,7 @@ export interface FlowConfig {
   description?: string;
   initial_step: string;
   policy?: { strict?: boolean; plan_artifact?: string };
-  preferences?: Record<string, { values: string[]; artifact_key?: string }>;
+  preferences?: Record<string, { values: string[]; artifact_key?: string; owner?: "requester" | "orchestrator" }>;
   state?: Record<string, unknown>;
   prompts?: Record<string, FlowPromptConfig>;
   artifacts?: Record<string, FlowArtifactConfig>;
@@ -599,7 +601,7 @@ export interface FlowStepConfig {
   sandbox?: "read_only" | "workspace";
   evidence_operations?: string[];
   evidence_gates?: Array<"planner" | "expert">;
-  decision?: { key: string; artifact_key?: string; authority?: "user" | "coordinator" };
+  decision?: { key: string; artifact_key?: string; authority?: "user" | "coordinator"; owner?: "requester" | "orchestrator" };
   requires?: FlowConditionConfig;
   requires_evidence?: FlowEvidenceRequirement[];
   role?: string;

@@ -361,3 +361,5 @@ export const flowContextUpdateSchema = z.object({ ...flowCoordinatorFields, cont
 export const flowDecisionSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), value: z.unknown(), reason: z.string().min(1), expected_revision: z.number().int().nonnegative(), artifact_key: z.string().optional(), artifact_digest: z.string().regex(/^[a-f0-9]{64}$/).optional() });
 export const flowEvidenceSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), request: evidenceRequestSchema, step_instance_id: z.string().optional() });
 export const runAckSchema = z.object({ run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1), agent_token: z.string().optional(), admin_key: z.string().optional() });
+
+export const flowOwnerRecoverSchema = z.object({ ...flowCoordinatorFields, role: z.string().min(1), restart_step_id: z.string().min(1), reason: z.string().min(1), expected_revision: z.number().int().nonnegative() });

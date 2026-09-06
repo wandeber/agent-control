@@ -1,7 +1,7 @@
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
 import { EvidenceService, type EvidenceRequest, type EvidenceReceiptKind } from "./evidence/service.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError, errorToPayload } from "./errors.js";
 import { RunObservation, isPassiveObserver, type ObserveRunInput, type WaitRunInput, type AcknowledgeRunInput, type RequesterInput } from "./run-observation.js";
@@ -547,6 +547,7 @@ export class AgentController {
         agentToken: input.agentToken ?? null
       });
       const runtimeState = this.flowRuntime.get(instance.flow_instance_id)!;
+      runtimeState.decision_owners = { requester: observer?.observer_agent_id ?? null, orchestrator: caller?.agent_id ?? null };
       runtimeState.owners = Object.fromEntries([...declaredOwners].map(([role, agent]) => [role, agent.agent_id]));
       this.flowRuntime.save(instance.flow_instance_id, runtimeState);
       if (caller) {
@@ -621,7 +622,7 @@ export class AgentController {
   updateFlowContext(input: { flowInstanceId: string; context: string; expectedRevision: number; agentToken?: string | null; adminKey?: string | null }) {
     return this.store.immediateTransaction(() => {
       const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
-      const actorId = this.requireFlowCoordinator(instance, input);
+      const actorId = this.requireFlowDecisionActor(instance, { owner: this.flowRuntime.get(instance.flow_instance_id)?.decision_owners?.requester ? "requester" : "orchestrator" }, input);
       if (!input.context.trim()) throw new ControllerError("Acceptance context must not be empty.", "tool_error");
       const runtime = this.flowRuntime.changeContext(instance.flow_instance_id, input.context, actorId, input.expectedRevision);
       this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "acceptance_updated", acceptance_revision: runtime.acceptance_revision } });
@@ -629,10 +630,53 @@ export class AgentController {
     });
   }
 
+  recoverFlowOwner(input: { flowInstanceId: string; role: string; restartStepId: string; reason: string; expectedRevision: number; agentToken?: string | null; adminKey?: string | null }): FlowSnapshot {
+    return this.store.immediateTransaction(() => {
+      const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
+      this.requireFlowCoordinator(instance, input);
+      const flow = this.getFlowOrThrow(instance.flow_record_id);
+      if (!flow.config.policy?.strict) throw new ControllerError("Explicit owner recovery requires a strict flow with pinned role ownership.", "tool_error");
+      const state = this.flowRuntime.get(instance.flow_instance_id)!;
+      const requestDigest = digest({ role: input.role, restart_step: input.restartStepId, reason: input.reason, expected_revision: input.expectedRevision });
+      if (state.recovery?.request_digest === requestDigest) return this.getFlowSnapshot(instance.flow_instance_id);
+      if (state.revision !== input.expectedRevision) throw new ControllerError("Flow state changed before owner recovery; read the current state before retrying.", "tool_error");
+      const roleConfig = flow.config.roles?.[input.role];
+      const stepConfig = flow.config.steps[input.restartStepId];
+      const previousId = state.owners[input.role];
+      if (!previousId || !roleConfig?.backend || !stepConfig || stepConfig.role !== input.role || !input.reason.trim()) throw new ControllerError("Recovery must select the pinned role and one of its configured steps with an explicit reason.", "tool_error");
+      const previous = this.getAgent(previousId);
+      if (!previous.unregistered_at && !TERMINAL_STATUSES.has(previous.status)) throw new ControllerError("Stop or detach the previous role owner before replacing it; recovery does not interrupt active work implicitly.", "tool_error");
+      const activeSteps = this.store.listFlowStepInstances(instance.flow_instance_id).filter(step => step.status === "active");
+      if (activeSteps.some(step => step.agent_id && step.agent_id !== previousId)) throw new ControllerError("Another worker owns the active phase; recover the missing owner after that work reaches a handoff.", "tool_error");
+      const { agent_token: _privateToken, ...replacement } = this.registerAgent({ runId: instance.run_id, backend: roleConfig.backend,
+        title: declaredFlowAgentTitle(`${flow.flow_id}/${instance.flow_instance_id}/recovery-${state.revision + 1}`, input.role),
+        role: input.role, objective: state.context ?? this.getRun(instance.run_id).title, repoDir: this.getRun(instance.run_id).repo_dir,
+        model: roleConfig.model, status: "planned", ...(input.agentToken ? { agentToken: input.agentToken } : { adminKey: input.adminKey ?? undefined }) });
+      for (const active of activeSteps) this.store.updateFlowStepInstance(active.step_instance_id, { status: "cancelled", summary: `Explicit owner recovery: ${input.reason}`, completedAt: nowIso() });
+      state.owners[input.role] = replacement.agent_id;
+      state.revision += 1;
+      state.recovery = { request_digest: requestDigest, role: input.role, previous_agent_id: previousId, agent_id: replacement.agent_id,
+        reason: input.reason, restart_step_id: input.restartStepId, full_review_required: true };
+      state.correction = { from_step_id: instance.current_step_id, summary: input.reason, reason: "explicit_owner_recovery", role: input.role, full_review_required: true };
+      this.flowRuntime.save(instance.flow_instance_id, state);
+      const next = this.activateFlowStep(flow.config, instance, input.restartStepId);
+      this.emit({ runId: instance.run_id, agentId: replacement.agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, step_instance_id: next.step_instance_id, reason: "owner_recovered", role: input.role, previous_agent_id: previousId, full_review_required: true, summary: input.reason } });
+      return this.getFlowSnapshot(instance.flow_instance_id);
+    });
+  }
+
+  private requireFlowDecisionActor(instance: FlowInstanceRecord, declaration: { owner?: "requester" | "orchestrator" }, input: { agentToken?: string | null; adminKey?: string | null }): string {
+    const ownerKind = declaration.owner ?? "orchestrator";
+    const ownerId = this.flowRuntime.get(instance.flow_instance_id)?.decision_owners?.[ownerKind] ?? (ownerKind === "orchestrator" ? instance.orchestrator_agent_id : null);
+    if (!ownerId) throw new ControllerError("This decision requires the original requesting conversation to be identified at launch.", "auth_required");
+    const caller = this.flowCaller(input.agentToken, [ownerId]);
+    if (!caller || caller.agent_id !== ownerId) throw new ControllerError("This decision belongs to a different conversation; its configured owner must record it.", "auth_required");
+    return caller.agent_id;
+  }
+
   recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; agentToken?: string | null; adminKey?: string | null }) {
     return this.store.immediateTransaction(() => {
       const instance = this.getFlowInstanceOrThrow(input.flowInstanceId);
-      const actorId = this.requireFlowCoordinator(instance, input);
       const flow = this.getFlowOrThrow(instance.flow_record_id);
       const state = this.flowRuntime.get(instance.flow_instance_id)!;
       if (state.revision !== input.expectedRevision) throw new ControllerError("The flow revision changed before this decision; read the current gate first.", "tool_error");
@@ -640,12 +684,14 @@ export class AgentController {
       const declaration = step ? flow.config.steps[step.step_id].decision : flow.config.preferences?.[input.key];
       if (!declaration || !input.reason.trim()) throw new ControllerError("This decision is not a configured active gate or preference, or has no human decision record.", "tool_error");
       if ("values" in declaration && declaration.values && !declaration.values.includes(input.value as string)) throw new ControllerError("Decision is outside configured preference values.", "tool_error");
+      const actorId = this.requireFlowDecisionActor(instance, declaration, input);
+      const authority = "authority" in declaration ? declaration.authority ?? "user" : "user";
       const artifactKey = declaration.artifact_key;
       if (input.artifactKey && input.artifactKey !== artifactKey) throw new ControllerError("Decision artifact differs from its configured gate.", "tool_error");
       const binding = artifactKey ? this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === artifactKey) : null;
-      const boundDigest = binding ? artifactDigest(binding.path) : undefined;
+      const boundDigest = binding ? this.boundFlowArtifactDigest(instance, artifactKey!) : undefined;
       if (artifactKey && (!binding || !input.artifactDigest || input.artifactDigest !== boundDigest)) throw new ControllerError("The human decision must name the exact current artifact digest.", "tool_error");
-      state.decisions[input.key] = { value: input.value, reason: input.reason, actor_id: actorId, acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
+      state.decisions[input.key] = { value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
       state.revision += 1;
       this.flowRuntime.save(instance.flow_instance_id, state);
       this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "human_decision_recorded", decision_key: input.key, decision: input.value } });
@@ -661,9 +707,18 @@ export class AgentController {
       if (decision.acceptance_revision !== state.acceptance_revision) return false;
       if (!decision.artifact_key) return true;
       const binding = bindings.find(item => item.artifact_key === decision.artifact_key);
-      try { return Boolean(binding && artifactDigest(binding.path) === decision.artifact_digest); } catch { return false; }
+      try { return Boolean(binding && this.boundFlowArtifactDigest(instance, decision.artifact_key!) === decision.artifact_digest); } catch { return false; }
     }));
     return { state: state.state, decisions, evidence: state.evidence, acceptance_revision: state.acceptance_revision };
+  }
+
+  private boundFlowArtifactDigest(instance: FlowInstanceRecord, key: string): string {
+    const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === key);
+    if (!binding) throw new ControllerError("Required bound artifact is missing.", "missing_artifact", { artifact: key });
+    const current = artifactDigest(binding.path);
+    const recorded = this.flowRuntime.get(instance.flow_instance_id)?.artifacts?.[key];
+    if (this.getFlowOrThrow(instance.flow_record_id).config.policy?.strict && (!recorded || recorded.path !== binding.path || recorded.sha256 !== current || artifactDigest(recorded.snapshot_path) !== recorded.sha256)) throw new ControllerError("A bound artifact changed outside its producing report; restore or explicitly report the new revision before proceeding.", "tool_error", { artifact: key });
+    return current;
   }
 
   private evidenceContext(instance: FlowInstanceRecord, actorId: string, actorRole: string) {
@@ -674,7 +729,7 @@ export class AgentController {
     const planKey = config.policy?.plan_artifact;
     const binding = planKey ? this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey) : null;
     return { runId: instance.run_id, flowInstanceId: instance.flow_instance_id, repoPath: run.repo_dir, actorId, actorRole,
-      acceptanceRevision: String(state.acceptance_revision), planRevision: binding ? artifactDigest(binding.path) : "unplanned" };
+      acceptanceRevision: String(state.acceptance_revision), planRevision: binding ? this.boundFlowArtifactDigest(instance, planKey!) : "unplanned" };
   }
 
   async executeFlowEvidence(input: { flowInstanceId: string; key: string; request: EvidenceRequest; stepInstanceId?: string; reportToken?: string; agentToken?: string | null; adminKey?: string | null }) {
@@ -683,6 +738,7 @@ export class AgentController {
     const step = input.stepInstanceId ? this.getFlowStepInstanceOrThrow(input.stepInstanceId) : this.store.listFlowStepInstances(instance.flow_instance_id).find(item => item.status === "active");
     if (!step || step.flow_instance_id !== instance.flow_instance_id || step.status !== "active") throw new ControllerError("Evidence requires a current step generation in this flow.", "tool_error");
     const stepConfig = config.steps[step.step_id];
+    if (input.request.operation !== "read_receipt" && step.input_json.acceptance_revision !== this.flowRuntime.get(instance.flow_instance_id)?.acceptance_revision) throw new ControllerError("The acceptance changed after this step started; evidence cannot be authored for the new contract by an obsolete attempt.", "tool_error");
     let actorId: string;
     if (stepConfig.execution === "coordinator") actorId = this.requireFlowCoordinator(instance, input);
     else {
@@ -693,6 +749,17 @@ export class AgentController {
     }
     if (config.policy?.strict && !stepConfig.evidence_operations?.includes(input.request.operation)) throw new ControllerError("This evidence operation is not authorized for the current step.", "auth_required");
     if (input.request.operation === "record_review" && !stepConfig.evidence_gates?.includes(input.request.gate)) throw new ControllerError("This step cannot author this review gate.", "auth_required");
+    const recovery = this.flowRuntime.get(instance.flow_instance_id)?.recovery;
+    if (recovery?.full_review_required && recovery.agent_id === actorId) {
+      if ((input.request.operation === "prepare_result" || input.request.operation === "prepare_plan") && input.request.previous) throw new ControllerError("A replacement review owner must start a full checkpoint without inheriting another owner's evidence.", "tool_error");
+      if ((input.request.operation === "record_review" || input.request.operation === "record_plan_review") &&
+        ((input.request.draft.coverage_ledger as Record<string, unknown> | undefined)?.mode !== "full" || (input.request.source_receipt_ids?.length ?? 0) > 0)) throw new ControllerError("The replacement owner must complete a full review before incremental reuse is enabled.", "tool_error");
+    }
+    if (input.request.operation === "prepare_plan" || input.request.operation === "prepare_result") {
+      const planKey = config.policy?.plan_artifact;
+      const binding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(item => item.artifact_key === planKey);
+      if (!binding || resolve(input.request.plan_path) !== resolve(binding.path)) throw new ControllerError("Evidence must use the flow's exact bound plan artifact, not a worker-selected substitute.", "tool_error");
+    }
     const context = this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator");
     const service = new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") });
     const receipt = await service.execute(context, input.request);
@@ -700,7 +767,8 @@ export class AgentController {
     return this.store.immediateTransaction(() => {
       const current = this.getFlowStepInstanceOrThrow(step.step_instance_id);
       const state = this.flowRuntime.get(instance.flow_instance_id)!;
-      if (current.status !== "active" || String(state.acceptance_revision) !== context.acceptanceRevision || this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator").planRevision !== context.planRevision) throw new ControllerError("Work changed while evidence was being prepared; its receipt cannot advance this flow.", "tool_error");
+      if ((current.agent_id && (current.agent_id !== actorId || this.getAgent(current.agent_id).unregistered_at)) || current.status !== "active" || String(state.acceptance_revision) !== context.acceptanceRevision || this.evidenceContext(instance, actorId, stepConfig.role ?? "coordinator").planRevision !== context.planRevision) throw new ControllerError("Work changed while evidence was being prepared; its receipt cannot advance this flow.", "tool_error");
+      if (state.recovery?.agent_id === actorId && ["plan_review", "planner_review", "expert_review"].includes(receipt.kind)) state.recovery.full_review_required = false;
       state.evidence[input.key] = receipt.receipt_id;
       state.evidence_summaries ??= {};
       state.evidence_summaries[input.key] = { receipt_id: receipt.receipt_id, kind: receipt.kind, status: receipt.status, step_instance_id: step.step_instance_id, acceptance_revision: state.acceptance_revision, summary: receipt.summary };
@@ -721,7 +789,7 @@ export class AgentController {
       if (requirement.owner_role && !ownerId) throw new ControllerError("Evidence has no pinned review owner.", "tool_error");
       const receipt = new EvidenceService({ rootDir: join(runRuntimeDir(instance.run_id), "evidence") }).verifyReceiptSync(
         this.evidenceContext(instance, instance.orchestrator_agent_id ?? "coordinator", "coordinator"), receiptId,
-        { kind: requirement.kind as EvidenceReceiptKind | undefined, requireCurrent: requirement.require_current ?? true, requireApproved: requirement.require_approved ?? true, actorId: ownerId });
+        { kind: requirement.kind as EvidenceReceiptKind | undefined, requireCurrent: requirement.require_current ?? true, requireApproved: requirement.require_approved ?? true, actorId: ownerId, validationMode: requirement.validation_mode });
       if (requirement.validation_mode) {
         const mechanical = receipt.payload.mechanical_report as Record<string, unknown> | undefined;
         if (receipt.kind !== "validation" || mechanical?.validation_mode !== requirement.validation_mode) throw new ControllerError("The validation receipt does not cover the required mechanical gate.", "tool_error");
@@ -739,7 +807,7 @@ export class AgentController {
       steps: this.store.listFlowStepInstances(flowInstanceId),
       reports: this.store.listFlowStepReports(flowInstanceId),
       transitions: this.store.listFlowTransitions(flowInstanceId),
-      artifact_bindings: this.store.listFlowArtifactBindings(flowInstanceId).map(binding => ({ ...binding, ...(existsSync(binding.path) && statSync(binding.path).isFile() ? { sha256: artifactDigest(binding.path) } : {}) }))
+      artifact_bindings: this.store.listFlowArtifactBindings(flowInstanceId).map(binding => ({ ...binding, ...(this.flowRuntime.get(flowInstanceId)?.artifacts?.[binding.artifact_key] ?? {}) }))
     };
   }
 
@@ -7839,6 +7907,7 @@ export class AgentController {
     this.assertFlowRequirements(instance, stepConfig);
     const bindings = this.store.listFlowArtifactBindings(instance.flow_instance_id);
     const inputArtifacts = resolveInputArtifacts(stepConfig.inputs, bindings);
+    if (config.policy?.strict) for (const ref of Object.values(stepConfig.inputs ?? {})) if (bindings.some(binding => binding.artifact_key === ref.artifact)) this.boundFlowArtifactDigest(instance, ref.artifact);
     const promptSources = resolveStepPromptSources(config, stepId);
     const stepInstanceId = newId("flowstep");
     const run = this.getRun(instance.run_id);
@@ -8021,6 +8090,7 @@ export class AgentController {
     if (config.policy?.strict) sections.push(section("Report identity", "Report from this assigned Codex thread. Agent Control derives the worker identity from the local tool process; if MCP cannot identify this thread, use the shown local CLI command. Never copy credentials into prompts, artifacts or reports."));
     if (input.correction) sections.push(section("Transition cause", JSON.stringify(input.correction)));
     const state = this.flowRuntime.get(step.flow_instance_id);
+    if (state?.recovery?.agent_id === step.agent_id && state.recovery.full_review_required) sections.push(section("Explicit owner recovery", "You are the new owner after a visible recovery. Perform a full review with a fresh checkpoint and no prior-owner source receipts. Do not inherit or carry earlier approval merely because the role name is unchanged."));
     if (state && Object.keys(state.evidence).length) sections.push(section("Evidence references", JSON.stringify({ evidence: state.evidence, summaries: state.evidence_summaries })));
     return sections.join("\n\n");
   }
@@ -8378,21 +8448,26 @@ export class AgentController {
         });
       }
       if (config.policy?.strict && existsSync(path)) {
+        const priorBinding = this.store.listFlowArtifactBindings(instance.flow_instance_id).find(binding => binding.artifact_key === ref.artifact);
+        if ((configuredPath && resolve(path) !== resolve(configuredPath)) || (priorBinding && resolve(path) !== resolve(priorBinding.path))) throw new ControllerError("A strict artifact must keep its configured canonical path across revisions.", "tool_error");
         if (!statSync(path).isFile()) throw new ControllerError("Flow artifacts must be regular files.", "missing_artifact");
         const content = readFileSync(path);
         const contentDigest = artifactDigest(path);
         const directory = join(runRuntimeDir(instance.run_id), "flow-artifacts", instance.flow_instance_id, digest(ref.artifact));
         mkdirSync(directory, { recursive: true });
-        const immutablePath = join(directory, contentDigest);
+        const immutablePath = join(directory, `${contentDigest}${extname(path)}`);
         if (!existsSync(immutablePath)) writeFileSync(immutablePath, content, { flag: "wx", mode: 0o444 });
         if (artifactDigest(immutablePath) !== contentDigest) throw new ControllerError("The immutable artifact store contains conflicting content.", "tool_error");
-        path = immutablePath;
+        const state = this.flowRuntime.get(instance.flow_instance_id)!;
+        state.artifacts ??= {};
+        state.artifacts[ref.artifact] = { path, sha256: contentDigest, snapshot_path: immutablePath, produced_by_step_instance_id: step.step_instance_id };
+        this.flowRuntime.save(instance.flow_instance_id, state);
       }
       const artifact = this.store.createArtifact({
         runId: instance.run_id,
         agentId: step.agent_id,
         label: ref.artifact,
-        path,
+        path: this.flowRuntime.get(instance.flow_instance_id)?.artifacts?.[ref.artifact]?.snapshot_path ?? path,
         expected: false
       });
       this.store.upsertFlowArtifactBinding({

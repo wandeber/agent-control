@@ -11,6 +11,7 @@ export async function handleTool(
   signal?: AbortSignal
 ): Promise<unknown> {
   switch (name) {
+    case "flow_owner_recover": return controller.recoverFlowOwner({ flowInstanceId: String(input.flow_instance_id), role: String(input.role), restartStepId: String(input.restart_step_id), reason: String(input.reason), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "flow_context_update": return controller.updateFlowContext({ flowInstanceId: String(input.flow_instance_id), context: String(input.context), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "flow_decision": return controller.recordFlowDecision({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), value: input.value, reason: String(input.reason), expectedRevision: Number(input.expected_revision), artifactKey: maybeString(input.artifact_key), artifactDigest: maybeString(input.artifact_digest), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "flow_evidence": return controller.executeFlowEvidence({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), request: input.request as import("../core/evidence/service.js").EvidenceRequest, stepInstanceId: maybeString(input.step_instance_id), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });

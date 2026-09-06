@@ -111,7 +111,7 @@ const stepSchema: z.ZodType<FlowStepConfig> = z.object({
   sandbox: z.enum(["read_only", "workspace"]).optional(),
   evidence_operations: z.array(z.string().min(1)).optional(),
   evidence_gates: z.array(z.enum(["planner", "expert"])).optional(),
-  decision: z.object({ key: z.string().min(1), artifact_key: z.string().min(1).optional(), authority: z.enum(["user", "coordinator"]).optional() }).optional(),
+  decision: z.object({ key: z.string().min(1), artifact_key: z.string().min(1).optional(), authority: z.enum(["user", "coordinator"]).optional(), owner: z.enum(["requester", "orchestrator"]).optional() }).optional(),
   requires: conditionSchema.optional(),
   requires_evidence: z.array(evidenceRequirementSchema).optional(),
   role: z.string().min(1).optional(),
@@ -158,7 +158,7 @@ export const flowConfigSchema: z.ZodType<FlowConfig> = z.object({
   description: z.string().min(1).optional(),
   initial_step: z.string().min(1),
   policy: z.object({ strict: z.boolean().optional(), plan_artifact: z.string().optional() }).optional(),
-  preferences: z.record(z.object({ values: z.array(z.string()).min(1), artifact_key: z.string().optional() })).optional(),
+  preferences: z.record(z.object({ values: z.array(z.string()).min(1), artifact_key: z.string().optional(), owner: z.enum(["requester", "orchestrator"]).optional() })).optional(),
   state: z.record(z.unknown()).optional(),
   prompts: z.record(promptSourceSchema).optional(),
   artifacts: z

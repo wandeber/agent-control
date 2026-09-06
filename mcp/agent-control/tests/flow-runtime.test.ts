@@ -46,8 +46,8 @@ describe("strict flow runtime", () => {
     const dispatched = await controller.dispatchActiveFlowStep({ flowInstanceId: id, agentToken: owner.agent_token });
     vi.stubEnv("CODEX_THREAD_ID", controller.getAgent(dispatched.agent!.agent_id).backend_handle!.thread_id as string); return dispatched;
   }
-  async function draft() {
-    const started = start(); await dispatch(started.instance.flow_instance_id); writeFileSync(join(root, "plan.md"), "# Approved plan\n");
+  async function draft(cfg = config()) {
+    const started = start(cfg); await dispatch(started.instance.flow_instance_id); writeFileSync(join(root, "plan.md"), "# Approved plan\n");
     const reported = controller.reportFlowStep({ stepInstanceId: started.active_step!.step_instance_id, status: "completed", summary: "Plan ready" }); return { started, reported };
   }
   function approve(id: string) {
@@ -82,7 +82,9 @@ describe("strict flow runtime", () => {
     expect(reported.instance.status).toBe("waiting_for_orchestrator");
     await expect(controller.startFlowStep({ flowInstanceId: id, stepId: "work", agentToken: owner.agent_token })).rejects.toThrow(/decision or milestone/);
     expect(() => controller.recordFlowDecision({ flowInstanceId: id, key: "plan", value: "approved", reason: "yes", expectedRevision: reported.runtime!.revision, artifactDigest: "0".repeat(64), agentToken: owner.agent_token })).toThrow(/exact current artifact digest/);
-    writeFileSync(join(root, "plan.md"), "Mutated source"); expect(readFileSync(reported.artifact_bindings[0]!.path, "utf8")).toContain("Approved plan");
+    writeFileSync(join(root, "plan.md"), "Mutated source"); expect(readFileSync(reported.artifact_bindings[0]!.snapshot_path!, "utf8")).toContain("Approved plan");
+    expect(() => approve(id)).toThrow(/outside its producing report/);
+    writeFileSync(join(root, "plan.md"), "# Approved plan\n");
     approve(id); expect(controller.getFlowSnapshot(id).instance.current_step_id).toBe("work");
   });
   it("replays identical reports without duplicate transitions and rejects conflicting retries", async () => {
@@ -125,4 +127,38 @@ describe("strict flow runtime", () => {
     expect(adapter.starts[0]!.prompt).toContain("Persistent owner policy"); expect(adapter.starts.at(-1)!.prompt).toContain("Implement approved plan");
     expect(adapter.starts.at(-1)!.prompt).not.toContain("Persistent owner policy");
   });
+  it("recovers a detached role with a fresh identity and an idempotent full-review requirement", async () => {
+    const cfg = config(); cfg.steps.draft.evidence_operations = ["prepare_plan", "record_plan_review"];
+    const started = start(cfg); await dispatch(started.instance.flow_instance_id);
+    const before = controller.getFlowSnapshot(started.instance.flow_instance_id); const previous = before.runtime!.owners.author!;
+    store.updateAgent(previous, { unregisteredAt: new Date().toISOString() });
+    const input = { flowInstanceId: started.instance.flow_instance_id, role: "author", restartStepId: "draft", reason: "Owner was lost; perform a fresh full review.", expectedRevision: before.runtime!.revision, agentToken: owner.agent_token };
+    const recovered = controller.recoverFlowOwner(input);
+    expect(recovered.runtime!.owners.author).not.toBe(previous); expect(recovered.runtime!.recovery?.full_review_required).toBe(true);
+    expect(recovered.steps.find(step => step.step_instance_id === started.active_step!.step_instance_id)?.status).toBe("cancelled");
+    expect(controller.recoverFlowOwner(input).runtime!.owners.author).toBe(recovered.runtime!.owners.author);
+    await dispatch(started.instance.flow_instance_id);
+    await expect(controller.executeFlowEvidence({ flowInstanceId: started.instance.flow_instance_id, key: "plan", request: { operation: "prepare_plan", checkpoint_id: "replacement", plan_path: join(root, "plan.md"), previous: "old-owner" } })).rejects.toThrow(/full checkpoint/);
+  });
+
+  it("keeps requester-owned decisions with the original conversation rather than the executor", async () => {
+    const cfg = config(); cfg.steps.draft = { execution: "coordinator", decision: { key: "intent", authority: "coordinator", owner: "requester" }, on: { completed: { finish: true } } };
+    const started = controller.startFlow({ config: cfg, runId: owner.run.run_id, agentToken: owner.agent_token, requesterThreadId: "original-user-thread" });
+    const snapshot = controller.getFlowSnapshot(started.instance.flow_instance_id);
+    const decision = { flowInstanceId: started.instance.flow_instance_id, key: "intent", value: "approved", reason: "The analysis preserves the user's clarified intent.", expectedRevision: snapshot.runtime!.revision };
+    expect(() => controller.recordFlowDecision({ ...decision, agentToken: owner.agent_token })).toThrow(/different conversation/);
+    vi.stubEnv("CODEX_THREAD_ID", "original-user-thread");
+    const approved = controller.recordFlowDecision(decision);
+    expect("instance" in approved && approved.instance.status).toBe("completed");
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id).runtime!.decisions.intent).toMatchObject({ authority: "coordinator", source: "coordinator_review", actor_id: started.observer!.observer_agent_id });
+  });
+
+  it("rejects a worker-selected plan substitute before creating evidence", async () => {
+    const cfg = config(); cfg.steps.work.evidence_operations = ["prepare_plan"];
+    const { started } = await draft(cfg); approve(started.instance.flow_instance_id); await dispatch(started.instance.flow_instance_id);
+    const substitute = join(root, "substitute.md"); writeFileSync(substitute, "Unapproved substitute");
+    await expect(controller.executeFlowEvidence({ flowInstanceId: started.instance.flow_instance_id, key: "wrong", request: { operation: "prepare_plan", checkpoint_id: "wrong", plan_path: substitute } })).rejects.toThrow(/worker-selected substitute/);
+    expect(controller.getFlowSnapshot(started.instance.flow_instance_id).runtime!.evidence).toEqual({});
+  });
+
 });

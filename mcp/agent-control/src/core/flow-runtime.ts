@@ -11,11 +11,14 @@ export interface FlowRuntimeState {
   context_history: Array<{ revision: number; text: string; actor_id: string | null }>;
   config_digest: string;
   state: Record<string, unknown>;
-  decisions: Record<string, { value: unknown; reason: string; actor_id: string; acceptance_revision: number; artifact_key?: string; artifact_digest?: string }>;
+  decision_owners?: { requester: string | null; orchestrator: string | null };
+  decisions: Record<string, { value: unknown; reason: string; actor_id: string; authority?: "user" | "coordinator"; source?: "user_reply" | "coordinator_review"; acceptance_revision: number; artifact_key?: string; artifact_digest?: string }>;
   evidence: Record<string, string>;
   evidence_summaries?: Record<string, { receipt_id: string; kind: string; status: string; step_instance_id?: string; acceptance_revision?: number; summary: Record<string, unknown> }>;
   owners: Record<string, string>;
+  artifacts?: Record<string, { path: string; sha256: string; snapshot_path: string; produced_by_step_instance_id: string }>;
   correction: Record<string, unknown> | null;
+  recovery?: { request_digest: string; role: string; previous_agent_id: string; agent_id: string; reason: string; restart_step_id: string; full_review_required: boolean };
 }
 
 export function digest(value: unknown): string {
