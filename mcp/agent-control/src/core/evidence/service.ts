@@ -158,9 +158,22 @@ export class EvidenceService {
         } else if ((request.draft.coverage_ledger as Record<string, unknown>)?.mode === 'incremental') throw new Error('Incremental review predecessor lacks an authenticated Agent Control receipt.');
       }
       for (const source of new Set(sources)) this.verifyReviewSource(context, source, previousId, kind);
+      const semanticDraft = { ...request.draft };
+      if (request.operation === 'record_review' && request.gate === 'planner') {
+        const validation = request.source_receipt_ids.map(id => this.verifyReceiptSync(context, id))
+          .find(receipt => receipt.kind === 'validation' && receipt.snapshot_sha256 === manifest.snapshot_sha256
+            && (receipt.payload.mechanical_report as Record<string, unknown>).validation_mode === 'complete_gate');
+        if (!validation) throw new Error('Planner review requires source_receipt_ids containing a complete validation receipt for this exact result.');
+        this.verifyReceiptSync(context, validation.receipt_id, { kind: 'validation', requireCurrent: true, requireApproved: true, validationMode: 'complete_gate' });
+        const mechanicalDigest = fingerprint(validation.payload.mechanical_report);
+        if (semanticDraft.mechanical_validation_report_sha256 !== undefined && semanticDraft.mechanical_validation_report_sha256 !== mechanicalDigest) {
+          throw new Error('Planner mechanical report digest contradicts its verified validation source; omit it and let Agent Control compose the binding.');
+        }
+        semanticDraft.mechanical_validation_report_sha256 = mechanicalDigest;
+      }
       const args = ['--checkpoint-id', request.checkpoint_id, '--compose'];
       if (request.operation === 'record_review') args.push('--gate', request.gate);
-      const payload = provider.invoke(context, plan ? 'record-plan-review' : 'record-review', args, { flag: '--report', value: request.draft });
+      const payload = provider.invoke(context, plan ? 'record-plan-review' : 'record-review', args, { flag: '--report', value: semanticDraft });
       return this.makeReceipt(context, provider, kind, payload.verdict === 'approved' ? 'approved' : 'rejected', payload,
         { checkpointId: request.checkpoint_id, snapshot: payload.snapshot_sha256, sources,
           summary: { reviewed_count: payload.reviewed_ids.length, reviewed_scopes: payload.reviewed_ids.map(label),
@@ -247,6 +260,12 @@ export class EvidenceService {
         const reviewPath = resolve(provider.store, 'flow', ...(receipt.kind === 'plan_review' ? ['plan', 'reviews'] : ['reviews', receipt.kind === 'expert_review' ? 'expert' : 'planner']), `${receipt.checkpoint_id}.json`);
         const envelope = JSON.parse(readRegular(reviewPath).toString());
         if (envelope.report_sha256 !== receipt.payload.report_sha256 || envelope.snapshot_sha256 !== receipt.snapshot_sha256) throw new Error('Review receipt no longer matches its exact provider record.');
+        if (receipt.kind === 'planner_review') {
+          const validation = sources.find(source => source.kind === 'validation' && source.snapshot_sha256 === receipt.snapshot_sha256
+            && source.status === 'passed' && (source.payload.mechanical_report as Record<string, unknown>).validation_mode === 'complete_gate'
+            && fingerprint(source.payload.mechanical_report) === envelope.report.mechanical_validation_report_sha256);
+          if (!validation) throw new Error('Planner review does not bind a verified complete mechanical source for its exact result.');
+        }
       }
       if (receipt.kind === 'validation') {
         this.verifyValidation(context, receipt, sources, provider);

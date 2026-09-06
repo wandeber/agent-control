@@ -37,6 +37,11 @@ semantic draft containing directly reviewed sections/surfaces to `record_review`
 or `record_plan_review`; never synthesize carried records. The provider composes
 eligible history. A plan successor may refer to its explicit predecessor's old
 plan revision, but acceptance and authenticated review ownership must match.
+For a planner implementation review, `source_receipt_ids` must explicitly include
+the current complete validation receipt for the same result. Omit
+`mechanical_validation_report_sha256` from the semantic draft: Agent Control
+derives it from that verified receipt. A contradictory supplied hash is rejected,
+and later gates dereference and check that exact mechanical binding again.
 
 All records and snapshot blobs live under the run's evidence directory, outside
 the repository. Historical integrity verification remains available after the

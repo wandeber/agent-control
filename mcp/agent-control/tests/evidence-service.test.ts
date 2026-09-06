@@ -134,6 +134,24 @@ describe('run-owned canonical evidence', () => {
     expect(() => service.verifyReceiptSync({ ...context, planRevision: forged.plan_revision }, plan.receipt_id)).toThrow(/controller-bound plan revision/);
   });
 
+  it('composes the planner mechanical binding only from an explicit verified current complete receipt', async () => {
+    await result();
+    const plannerDraft: Record<string, unknown> = { ...draft(), recommended_next_phase: 'post_planner_choice' };
+    delete plannerDraft.safe_to_close;
+    await expect(service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'planner', draft: plannerDraft })).rejects.toThrow(/source_receipt_ids/);
+    const checks = await service.execute(context, validation());
+    await expect(service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'planner',
+      draft: { ...plannerDraft, mechanical_validation_report_sha256: 'a'.repeat(64) }, source_receipt_ids: [checks.receipt_id] })).rejects.toThrow(/contradicts/);
+    const review = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'planner',
+      draft: plannerDraft, source_receipt_ids: [checks.receipt_id] });
+    const report = JSON.parse(readFileSync(payload(review).record_path, 'utf8')).report;
+    expect(report.mechanical_validation_report_sha256).toBe(fingerprint(payload(checks).mechanical_report));
+    expect(service.verifyReceiptSync(context, review.receipt_id, { kind: 'planner_review', requireApproved: true, requireCurrent: true }).status).toBe('approved');
+    write('value.txt', 'correction\n'); await result('result-2', 'result-1');
+    await expect(service.execute(context, { operation: 'record_review', checkpoint_id: 'result-2', gate: 'planner',
+      draft: plannerDraft, source_receipt_ids: [checks.receipt_id] })).rejects.toThrow(/exact result/);
+  }, 30_000);
+
   it('reruns volatile or incomplete contexts and preserves actionable redacted failures', async () => {
     await result();
     const first = await service.execute(context, validation());
