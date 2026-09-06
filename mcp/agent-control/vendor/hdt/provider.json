@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "provider": "hdt-review-checkpoint",
+  "source_repository": "https://github.com/wandeber/agent-settings",
+  "source_path": "plugins/development-workflow/skills/handle-development-task/scripts/review_checkpoint.py",
+  "source_version": "0.1.11",
+  "source_commit": "5c18d60f294d557a722ab701bf5aea3ce4b0e0f3",
+  "sha256": "96a8333a3bfc78d875125129b6b3055b7428f0b4404bc0e22bc9775025b61670",
+  "companions": {
+    "contracts/strict-review.md": {
+      "source_path": "plugins/development-workflow/skills/handle-development-task/references/workflow/contracts/strict-review.md",
+      "sha256": "a3613b658d8782270fbbd4035ef7cc1ba2d884defe736e56c84eeaa83adef40d"
+    },
+    "contracts/plan-intent-review.md": {
+      "source_path": "plugins/development-workflow/skills/handle-development-task/references/workflow/contracts/plan-intent-review.md",
+      "sha256": "695b07f527c2d71f10876ae64666f5c5afee572b08e55766b124ad6b3f479a89"
+    },
+    "contracts/mechanical-validation.md": {
+      "source_path": "plugins/development-workflow/skills/handle-development-task/references/workflow/contracts/mechanical-validation.md",
+      "sha256": "4110b4ff2dcd81db4327747c2f98a8ef8a8bb49764d00923080d81c37ddddda0"
+    },
+    "contracts/incremental-review.md": {
+      "source_path": "plugins/development-workflow/skills/handle-development-task/references/workflow/handoffs/incremental-review.md",
+      "sha256": "95fe45b9e2dfe6fa28a098192220a9c39aaaf45bda1d83e6f5287eebec37e582"
+    },
+    "tests/test_review_checkpoint.py": {
+      "source_path": "plugins/development-workflow/skills/handle-development-task/scripts/tests/test_review_checkpoint.py",
+      "sha256": "f2cc9d461f4b31b06276c608fbf1fffa7e77926ced4df43fa98a390e2f0a9469"
+    }
+  }
+}
