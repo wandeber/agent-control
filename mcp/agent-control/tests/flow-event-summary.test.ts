@@ -6,6 +6,24 @@ const event = (payload: Record<string, unknown>, type: EventRecord["type"] = "fl
   ({ type, payload } as EventRecord);
 
 describe("compact flow event evidence", () => {
+  it("carries actionable package join progress without private worker or manifest data", () => {
+    expect(compactFlowEvent(event({ reason: "package_delivered", package_progress: {
+      package_id: "api", label: "Update API", status: "delivered", generation: 2,
+      required_count: 3, accepted_count: 1, reason: "Waiting for coordinator acceptance",
+      worktree: "/private/worktree", agent_token: "private", result: { output: "full report" }
+    } }))).toEqual({ reason: "package_delivered", package_progress: {
+      package_id: "api", label: "Update API", status: "delivered", generation: 2,
+      required_count: 3, accepted_count: 1, reason: "Waiting for coordinator acceptance"
+    } });
+  });
+  it("bounds package diagnostics and omits malformed progress counts", () => {
+    expect(compactFlowEvent(event({ package_progress: {
+      label: "x".repeat(4000), reason: "y".repeat(4000), generation: Infinity,
+      required_count: 2, accepted_count: 3, deliveries: Array(100).fill("private")
+    } }))).toEqual({ package_progress: {
+      label: "x".repeat(320), reason: "y".repeat(320), required_count: 2
+    } });
+  });
   it("explains a reported capability failure without certifying the worker's diagnosis", () => {
     expect(compactFlowEvent(event({ reason: "worker_capability_unavailable", failure_source: "worker_reported",
       summary: "Worker reported an unavailable Agent Control capability: flow_evidence | Approval required",
