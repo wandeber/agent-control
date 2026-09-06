@@ -28,3 +28,10 @@ export function prepareLaunchOwner(controller, input) {
         backendHandle: threadId ? { thread_id: threadId, agent_control_role: "orchestrator", cwd: input.repoDir } : undefined });
     return { agent: login.agent, runId: login.run.run_id, agentToken: login.agent_token };
 }
+/** A separate executing conversation needs its own cursor and action visibility. */
+export function observeLaunchCoordinator(controller, owner, runId, requester) {
+    const threadId = owner.agent?.backend === "codex-thread" ? owner.agent.backend_handle?.thread_id : undefined;
+    if (typeof threadId !== "string" || !threadId || threadId === requester?.thread_id)
+        return null;
+    return controller.observeRun({ runId, threadId, title: "Executing coordinator", agentToken: owner.agentToken });
+}

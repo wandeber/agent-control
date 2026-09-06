@@ -1,10 +1,11 @@
+import { conversationWaitContract } from "./conversation-wait.js";
 import { ControllerError } from "./errors.js";
 import { resolveAdminKey, verifyAdminKey } from "./identity.js";
 import { EVENT_TYPES } from "./types.js";
 // Match the complete subscription before applying the event batch limit. Owner subscriptions may be source-scoped.
 const MATCHING_OBSERVER_SUBSCRIPTION = `exists (
   select 1 from subscriptions s
-  where s.enabled = 1 and s.subscriber_agent_id = ?
+  where s.enabled = 1 and (s.subscriber_agent_id = ? or s.subscriber_agent_id in (select value from json_each(?)))
     and (? = 1 or exists (
       select 1 from observer_subscriptions os
       where os.subscription_id = s.subscription_id and os.observer_agent_id = s.subscriber_agent_id
@@ -62,11 +63,34 @@ export class RunObservation {
         return Boolean(this.store.db.prepare("select 1 from run_observers where observer_agent_id = ?").get(agentId));
     }
     coversEvent(agentId, event) {
-        if (!event.run_id || !this.store.db.prepare("select 1 from run_observers where observer_agent_id = ? and run_id = ?").get(agentId, event.run_id))
+        if (!event.run_id)
             return false;
-        const owner = this.store.getAgent(agentId)?.role === "orchestrator";
-        return Boolean(this.store.db.prepare(`select 1 from events e where e.event_id = ? and ${MATCHING_OBSERVER_SUBSCRIPTION}`)
-            .get(event.event_id, agentId, owner ? 1 : 0));
+        const observers = this.store.db.prepare(`select o.observer_agent_id from run_observers o
+      where o.run_id = ? and (o.observer_agent_id = ? or exists (
+        select 1 from observer_owners owners where owners.observer_agent_id = o.observer_agent_id and owners.orchestrator_agent_id = ?
+      ))`).all(event.run_id, agentId, agentId);
+        return observers.some(observer => {
+            const agent = this.store.getAgent(observer.observer_agent_id);
+            if (!agent || agent.unregistered_at)
+                return false;
+            const owners = this.observationOwners(agent, event.run_id);
+            if (agent.agent_id !== agentId && !owners.includes(agentId))
+                return false;
+            return Boolean(this.store.db.prepare(`select 1 from events e where e.event_id = ? and ${MATCHING_OBSERVER_SUBSCRIPTION}`)
+                .get(event.event_id, agent.agent_id, JSON.stringify(owners), owners.length ? 1 : 0));
+        });
+    }
+    /** Cross-run cursors retain authenticated ownership without promoting the observer. */
+    observationOwners(agent, runId) {
+        const ownIdentity = agent.role === "orchestrator" ? [agent.agent_id] : [];
+        const rows = this.store.db.prepare("select orchestrator_agent_id from observer_owners where observer_agent_id = ?")
+            .all(agent.agent_id);
+        const additionalOwners = rows.filter(row => {
+            const owner = this.store.getAgent(row.orchestrator_agent_id);
+            return owner && !owner.unregistered_at && owner.role === "orchestrator" && owner.backend === "codex-thread" &&
+                owner.backend_handle?.thread_id === agent.backend_handle?.thread_id && this.controller.canAgentAccessRun(owner, runId);
+        }).map(row => row.orchestrator_agent_id);
+        return [...new Set([...ownIdentity, ...additionalOwners])];
     }
     ownsSubscription(subscriptionId) {
         return Boolean(this.store.db.prepare("select 1 from observer_subscriptions where subscription_id = ?").get(subscriptionId));
@@ -106,6 +130,11 @@ export class RunObservation {
             this.store.db.prepare(`insert into run_observers(observer_agent_id, run_id, thread_id, events_json, delivery, start_sequence, created_at)
         values (?, ?, ?, ?, ?, ?, ?) on conflict(observer_agent_id) do update set events_json = excluded.events_json, delivery = excluded.delivery`)
                 .run(agent.agent_id, run.run_id, threadId, JSON.stringify(events), delivery, start, new Date().toISOString());
+            // This private binding comes only from the authenticated owner, never public backend metadata.
+            if (caller?.role === "orchestrator" && caller.backend === "codex-thread" &&
+                caller.backend_handle?.thread_id === threadId && caller.agent_id !== agent.agent_id) {
+                this.store.db.prepare("insert or ignore into observer_owners values (?, ?)").run(agent.agent_id, caller.agent_id);
+            }
             const existing = this.store.db.prepare(`select s.* from subscriptions s join observer_subscriptions o using(subscription_id)
         where o.observer_agent_id = ?`).all(agent.agent_id);
             for (const sub of existing)
@@ -117,8 +146,9 @@ export class RunObservation {
                 const sub = this.store.createSubscription({ runId: run.run_id, subscriberAgentId: agent.agent_id, eventType });
                 this.store.db.prepare("insert into observer_subscriptions values (?, ?)").run(sub.subscription_id, agent.agent_id);
             }
+            const cursor = encodeCursor(run.run_id, start);
             return { run_id: run.run_id, observer_agent_id: agent.agent_id, thread_id: threadId, event_types: events,
-                delivery, cursor: encodeCursor(run.run_id, start), reused: Boolean(previous) };
+                delivery, cursor, reused: Boolean(previous), wait_contract: conversationWaitContract(run.run_id, agent.agent_id, cursor) };
         });
     }
     async wait(input) {
@@ -129,7 +159,8 @@ export class RunObservation {
         const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 20)));
         const started = Date.now();
         const empty = (timedOut, closed) => ({ run_id: input.runId, observer_agent_id: input.observerAgentId,
-            events: [], cursor: input.cursor, timed_out: timedOut, closed });
+            events: [], cursor: input.cursor, timed_out: timedOut, closed,
+            wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId, input.cursor) });
         while (true) {
             input.signal?.throwIfAborted();
             const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
@@ -141,18 +172,20 @@ export class RunObservation {
             if (sequence < observer.start_sequence || sequence > this.currentSequence()) {
                 throw new ControllerError("Observation cursor is outside this subscription's history.", "tool_error");
             }
+            const owners = this.observationOwners(agent, input.runId);
             const types = this.eventTypes(observer.observer_agent_id);
             if (!types.length)
                 return empty(false, true);
             const rows = this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
         where e.run_id = ? and o.sequence > ? and ${MATCHING_OBSERVER_SUBSCRIPTION}
-        order by o.sequence limit ?`).all(input.runId, sequence, agent.agent_id, agent.role === "orchestrator" ? 1 : 0, limit);
+        order by o.sequence limit ?`).all(input.runId, sequence, agent.agent_id, JSON.stringify(owners), owners.length ? 1 : 0, limit);
             if (rows.length) {
+                const cursor = encodeCursor(input.runId, Number(rows.at(-1).sequence));
                 return { run_id: input.runId, observer_agent_id: input.observerAgentId,
                     events: rows.map((row) => publicEvent({ event_id: String(row.event_id), run_id: input.runId,
                         agent_id: row.agent_id === null ? null : String(row.agent_id), type: String(row.type),
-                        created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) }, agent, this.notificationStatus(agent.agent_id, String(row.event_id)))),
-                    cursor: encodeCursor(input.runId, Number(rows.at(-1).sequence)), timed_out: false, closed: false };
+                        created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) }, owners, this.notificationStatus(agent.agent_id, String(row.event_id)))),
+                    cursor, timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId, cursor) };
             }
             if (run.status === "stopped")
                 return empty(false, true);
@@ -172,8 +205,9 @@ export class RunObservation {
             const agent = this.store.getAgent(observer.observer_agent_id);
             if (!agent || agent.unregistered_at)
                 continue;
+            const owners = this.observationOwners(agent, event.run_id);
             const matches = this.store.db.prepare(`select 1 from events e where e.event_id = ? and ${MATCHING_OBSERVER_SUBSCRIPTION}`)
-                .get(event.event_id, agent.agent_id, agent.role === "orchestrator" ? 1 : 0);
+                .get(event.event_id, agent.agent_id, JSON.stringify(owners), owners.length ? 1 : 0);
             if (!matches)
                 continue;
             const claim = this.store.db.prepare("insert or ignore into observer_notifications values (?, ?, 'invoking')").run(agent.agent_id, event.event_id);
@@ -183,10 +217,10 @@ export class RunObservation {
                 const adapter = this.adapters.get(agent.backend);
                 if (!adapter.stageNotification || !agent.backend_handle)
                     throw new Error("Notification staging unavailable");
-                const item = publicEvent(event, agent);
+                const item = publicEvent(event, owners);
                 await adapter.stageNotification({ backend: agent.backend, id: observer.thread_id, data: agent.backend_handle }, {
                     message: `Agent Control observation\nRun: ${event.run_id}\nObserver: ${agent.agent_id}\nEvent ID: ${event.event_id}\n${item.summary}\n` +
-                        (agent.role === "orchestrator"
+                        (owners.length
                             ? `You remain the workflow owner. React to configured notifications using the existing run and flow. Safe action reference: ${JSON.stringify(item.orchestrator_action ?? null)}. Never restart the flow.`
                             : "This is an observation for the user's conversation. Give a concise update when useful. The workflow owner retains routing and native-action authority; do not claim or execute its actions.")
                 });
@@ -202,12 +236,17 @@ export class RunObservation {
         return this.store.db.prepare("select status from observer_notifications where observer_agent_id = ? and event_id = ?").get(agentId, eventId)?.status;
     }
     eventTypes(agentId) {
-        const owner = this.store.getAgent(agentId)?.role === "orchestrator";
-        // Owner subscriptions still carry mandatory coordination work. Move their delivery into the same cursor stream.
-        const rows = owner
-            ? this.store.db.prepare("select event_type from subscriptions where subscriber_agent_id = ? and enabled = 1").all(agentId)
-            : this.store.db.prepare(`select s.event_type from subscriptions s join observer_subscriptions o using(subscription_id)
-          where o.observer_agent_id = ? and s.enabled = 1`).all(agentId);
+        const agent = this.store.getAgent(agentId);
+        if (!agent)
+            return [];
+        const owners = this.observationOwners(agent, agent.run_id);
+        // Include operational owner subscriptions even when the conversation requests fewer updates.
+        const rows = this.store.db.prepare(`select s.event_type from subscriptions s where s.enabled = 1
+      and (s.run_id is null or s.run_id = ?) and (
+        s.subscriber_agent_id in (select value from json_each(?)) or exists (
+          select 1 from observer_subscriptions o where o.subscription_id = s.subscription_id and o.observer_agent_id = ?
+        )
+      )`).all(agent.run_id, JSON.stringify(owners), agentId);
         return [...new Set(rows.map((row) => row.event_type))];
     }
     currentSequence() {
@@ -227,9 +266,9 @@ function decodeCursor(cursor, runId) {
     catch { /* Reject malformed and cross-run cursors uniformly. */ }
     throw new ControllerError("Invalid observation cursor for this run.", "tool_error");
 }
-function publicEvent(event, observer, notificationStatus) {
+function publicEvent(event, owners = [], notificationStatus) {
     const action = event.payload.orchestrator_action;
-    const ownerAction = observer?.role === "orchestrator" && action?.orchestrator_agent_id === observer.agent_id
+    const ownerAction = typeof action?.orchestrator_agent_id === "string" && owners.includes(action.orchestrator_agent_id)
         ? Object.fromEntries(["action_id", "run_id", "orchestrator_agent_id", "agent_id", "operation", "status", "flow_instance_id", "step_instance_id"].filter((key) => action[key] !== undefined).map((key) => [key, action[key]]))
         : undefined;
     const phase = typeof event.payload.step_id === "string" ? event.payload.step_id : typeof event.payload.target_step_id === "string" ? event.payload.target_step_id : undefined;

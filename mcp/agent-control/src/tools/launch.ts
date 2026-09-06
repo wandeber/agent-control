@@ -1,6 +1,6 @@
 import type { AgentController } from "../core/controller.js";
 import { resolveAdminKey } from "../core/identity.js";
-import { prepareLaunchOwner } from "../core/launch-context.js";
+import { observeLaunchCoordinator, prepareLaunchOwner } from "../core/launch-context.js";
 import { launchWorker, startDetachedWatch } from "../cli/worker.js";
 import type { EventType } from "../core/types.js";
 
@@ -36,6 +36,8 @@ export async function launchFlowTool(controller: AgentController, input: Record<
   const owner = prepareLaunchOwner(controller, { title, repoDir: input.repo_dir as string | undefined,
     runId: input.run_id as string | undefined, agentToken: input.agent_token as string | undefined,
     adminKey: (input.admin_key as string | undefined) ?? resolveAdminKey(), ...requesterOptions(input) });
+  const requester = controller.ensureRequester(owner.runId, { ...requesterOptions(input), agentToken: owner.agentToken });
+  const coordinatorObserver = observeLaunchCoordinator(controller, owner, owner.runId, requester);
   const start = controller.startFlow({ config, runId: owner.runId, runTitle: title,
     repoDir: input.repo_dir as string | undefined, agentToken: owner.agentToken,
     adminKey: owner.agentToken ? undefined : (input.admin_key as string | undefined) ?? resolveAdminKey(),
@@ -49,5 +51,5 @@ export async function launchFlowTool(controller: AgentController, input: Record<
     : null;
   return { run_id: start.instance.run_id, flow_instance_id: start.instance.flow_instance_id,
     orchestrator_agent_id: owner.agent?.agent_id ?? null, observer: start.observer,
-    start, continuation, watch };
+    coordinator_observer: coordinatorObserver, start, continuation, watch };
 }

@@ -10,7 +10,7 @@ const requesterProperties = {
 export const TOOL_DEFINITIONS = [
     {
         name: "worker_launch",
-        description: "Launch a Codex Luna Max worker in one call. Automatically creates local coordinator/run identity, registers the original user conversation, subscribes it to all events and starts detached supervision. Return observer contains the cursor for run_wait. No separate login, registration or observe call is needed.",
+        description: "Launch a Codex Luna Max worker in one call. Automatically creates local coordinator/run identity, registers the original user conversation, subscribes it to all events and starts detached supervision. Return observer contains the cursor for run_wait. No separate login, registration or observe call is needed. Keep this turn open while work remains: use the wait_contract for your own thread (coordinator_observer for a separate executor, observer for the requester), answer user messages in commentary even on another topic, then resume run_wait with the latest processed cursor and a one-hour timeout. Do not rely on notify to wake an ended turn.",
         inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Worker title."),
             prompt: stringProperty("Ad hoc task text; choose prompt or prompt_file."), prompt_file: stringProperty("Existing canonical skill prompt file."),
             repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."),
@@ -26,7 +26,7 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "flow_launch",
-        description: "Launch and dispatch a flow in one call using config or a catalog flow_id. Automatically establishes local owner identity, registers/subscribes the original user conversation to all events before dispatch and returns its run_wait cursor. Keeps native bridge authority with the coordinator.",
+        description: "Launch and dispatch a flow in one call using config or a catalog flow_id. Automatically establishes local owner identity, registers/subscribes the original user conversation to all events before dispatch and returns its run_wait cursor. Keeps native bridge authority with the coordinator. Keep this turn open while work remains; after responding to any user message, resume run_wait using your own thread's wait_contract (coordinator_observer for a separate executor, observer for the requester) and its latest processed cursor with a one-hour timeout. Notify cannot reliably wake an ended turn.",
         inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Run objective/title."),
             config: { type: "object", description: "Flow config; choose config or flow_id." }, flow_id: stringProperty("Bundled/user catalog flow id."),
             repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."), server: stringProperty("Optional explicit backend endpoint."),
@@ -44,7 +44,7 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "run_wait",
-        description: "Wait for subscribed run events. Reuse the returned cursor to avoid repeats. Omit timeout for indefinite wait or use 3600000 for one hour. Cancellation ends the wait without starting a competing Codex turn.",
+        description: "Wait for subscribed run events. Reuse the returned cursor to avoid repeats. Omit timeout for indefinite wait or use 3600000 for one hour. Tool cancellation ends only this wait. After answering new user input, resume with the last processed cursor unless the user explicitly pauses or cancels supervision. Preserve all active runs. A timeout or unrelated topic is not completion; keep the turn open and reattach. Each response provides the next wait_contract; closed only closes that observation.",
         inputSchema: objectSchema({ run_id: stringProperty("Observed run."), observer_agent_id: stringProperty("Observing participant id."),
             cursor: stringProperty("Durable cursor from run_observe or run_wait."), timeout_ms: numberProperty("Optional positive timeout; 3600000 is one hour."), limit: numberProperty("Maximum batch size, up to 100.") }, ["run_id", "observer_agent_id", "cursor"]),
         schema: runWaitSchema
@@ -101,7 +101,7 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "flow_dispatch_active",
-        description: "Dispatch the active flow step to its configured backend worker, optionally subscribe an orchestrator to terminal events, and return immediately. This is the normal non-polling coordinator operation.",
+        description: "Dispatch the active flow step to its configured backend worker, optionally subscribe an orchestrator to terminal events, and return immediately. The caller keeps its turn open and resumes run_wait after user replies or event processing while work remains.",
         inputSchema: objectSchema({
             flow_instance_id: stringProperty("Flow instance id."),
             subscriber_agent_id: stringProperty("Agent to notify on worker terminal events."),
@@ -263,7 +263,7 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "agent_start",
-        description: "Start a registered agent and automatically attach its run requester before dispatch. Returns observer for run_wait.",
+        description: "Start a registered agent and automatically attach its run requester before dispatch. Returns observer.wait_contract for run_wait. Keep this turn open while work remains; answer user messages in commentary and resume the one-hour event wait with the latest processed cursor.",
         inputSchema: objectSchema({
             ...requesterProperties,
             agent_id: stringProperty("Agent id."),

@@ -466,17 +466,19 @@ agentctl flow get --flow <flow-instance-id>
 coordinators. The stable fields are `next`, `run_id`, `flow_instance_id`,
 `active_step`, `worker_agent_id`, `expected_artifacts`, `blocked_reason`, and
 `ui_url`. A `next` value of
-`worker_dispatched_end_turn_until_agent_control_wakeup` or
-`worker_already_running_end_turn_until_agent_control_wakeup` means the
-coordinator should stop its turn until Agent Control wakes it again.
+`worker_dispatched_wait_for_run_events`,
+`worker_already_running_wait_for_run_events`, or
+`worker_start_in_progress_wait_for_run_events` means the coordinator keeps
+its turn open and calls `run_wait` with the returned `observer.wait_contract`.
 `native_subagent_action_required` means the root must claim the returned safe
 action reference, execute its exact native collaboration tool, acknowledge it,
-and then end the turn after a successful spawn. The CLI returns a public
+and then enter `run_wait` after a successful spawn without ending the turn. The CLI returns a public
 `bridge_grant` reference while persisting the scoped bridge credential
 privately; neither the reference nor any token is copied into the user-facing
 launch summary.
 `orchestrator_action_required`, `flow_blocked`, `flow_completed`, and
-`flow_cancelled` are terminal or human-decision control states.
+`flow_cancelled` are terminal or human-decision control states. A blocker
+stops dependent dispatch but does not automatically end event observation.
 
 The same surface is available through MCP as `flow_catalog_list`,
 `flow_catalog_get`, `flow_validate_config`, `flow_start`, `flow_get`,
@@ -713,12 +715,37 @@ Agent Control is available under the [MIT License](LICENSE).
 
 ## Conversational run observation
 
+When execution and the original conversation are in different Codex threads,
+launch also registers and returns `coordinator_observer` for the executing
+thread. `observer` remains the original user's observation. The executor uses
+`coordinator_observer.wait_contract` when present; the original conversation
+uses `observer.wait_contract`. Each keeps its own processed cursor. Do not use
+a passive requester's event stream for the coordinator's native actions, or
+replace one thread's cursor with the other's. Same-thread launches reuse one
+observation and return `coordinator_observer: null`. Lower-level/manual starts
+can attach the additional coordinator explicitly with `run_observe` under its
+existing authorization; one-shot launches do not need that extra call.
+
+
 MCP and CLI flow/worker launches attach the initiating Codex conversation to
 the run before dispatch and subscribe it to all supported events by default.
 Lower-level `flow_start` and `agent_start` share this behavior. The original
 requester persists across nested runs; pass `requester_thread_id` (MCP) or
 `--requester-thread-id` (CLI) when a separate executor cannot inherit it.
-Explicit filters and delivery choices survive repeated launches. `agentctl run observe` attaches to an existing run; `agentctl run
+Explicit filters and delivery choices survive repeated launches.
+
+While any supervised work remains, keep the Codex turn open. Respond to new
+user messages in commentary, even on another topic, then resume `run_wait` with
+the last processed cursor. Preserve all active runs and their separate cursors.
+Use one-hour waits, or 30 minutes if the host requires it, and renew a timed-out
+wait. An optional localized status sentence can say: "The <flow> flow is still
+running; I am continuing to wait." Notifications cannot reliably reactivate an
+ended turn, even if delivery succeeds. Finish only when all supervised work is
+resolved or the user explicitly pauses or cancels supervision.
+
+Launch returns `observer.wait_contract`; each open `run_wait` response refreshes
+that contract with the next cursor and executable wait arguments. Launch itself
+returns immediately so the conversation can speak before waiting. `agentctl run observe` attaches to an existing run; `agentctl run
 wait` consumes its subscribed events with a durable cursor, indefinitely or
 with `--timeout 1h`. The conversational observer stays available when the run
 stops and does not acquire worker or native bridge ownership. See

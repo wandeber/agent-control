@@ -1,4 +1,4 @@
-import { prepareLaunchOwner } from "../core/launch-context.js";
+import { observeLaunchCoordinator, prepareLaunchOwner } from "../core/launch-context.js";
 import { addRequesterOptions, attachRequester, type RequesterOptions } from "./observation.js";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -280,6 +280,7 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
   }
 
   const observer = attachRequester(workerAgent.run_id, options, deps, agentToken);
+  const coordinatorObserver = observeLaunchCoordinator(deps.controller, owner, workerAgent.run_id, observer);
 
   const artifact = outputArtifact ? deps.controller.createArtifact({
     runId: workerAgent.run_id,
@@ -400,6 +401,7 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
   return {
     run_id: workerAgent.run_id,
     observer,
+    coordinator_observer: coordinatorObserver,
     agent_id: workerAgent.agent_id,
     backend: workerAgent.backend,
     title: workerAgent.title,

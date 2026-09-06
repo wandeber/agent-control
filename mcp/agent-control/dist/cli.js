@@ -8,7 +8,7 @@ import { addRequesterOptions, attachRequester, registerObservationCommands } fro
 import { registerWebCommands } from "./cli/web.js";
 import { startControlServer } from "./control-server.js";
 import { parseDurationMs } from "./core/duration.js";
-import { prepareLaunchOwner } from "./core/launch-context.js";
+import { observeLaunchCoordinator, prepareLaunchOwner } from "./core/launch-context.js";
 import { createController } from "./core/factory.js";
 import { flowConfigJsonSchema } from "./core/flow-config-schema.js";
 import { loadFlowConfigFile, parseFlowConfigText } from "./core/flow-config-loader.js";
@@ -18,7 +18,7 @@ const program = new Command();
 program
     .name("agentctl")
     .description("Control local agent workers through the Agent Control core.")
-    .version("0.1.7")
+    .version("0.1.8")
     .option("--token <token>", "Agent identity token. Defaults to AGENT_CONTROL_TOKEN.")
     .option("--admin-key <key>", "Agent Control admin key for root/orchestrator operations.");
 program.exitOverride();
@@ -222,6 +222,7 @@ addRequesterOptions(flow
         backendHandle
     });
     const observer = attachRequester(login.run.run_id, options, cliDeps, login.agent_token);
+    const coordinatorObserver = observeLaunchCoordinator(controller, { agent: login.agent, agentToken: login.agent_token }, login.run.run_id, observer);
     const start = controller.startFlow({
         config,
         runId: login.run.run_id,
@@ -262,7 +263,7 @@ addRequesterOptions(flow
             uiHost: options.uiHost,
             uiPort: options.uiPort,
             uiApiPort: options.uiApiPort
-        }), watch });
+        }), coordinator_observer: coordinatorObserver, watch });
 });
 flow
     .command("get")
@@ -943,13 +944,13 @@ function flowLaunchNext(start, continuation) {
     }
     switch (continuation.action) {
         case "dispatched":
-            return "worker_dispatched_end_turn_until_agent_control_wakeup";
+            return "worker_dispatched_wait_for_run_events";
         case "orchestrator_action_required":
             return "native_subagent_action_required";
         case "waiting_for_report":
-            return "worker_already_running_end_turn_until_agent_control_wakeup";
+            return "worker_already_running_wait_for_run_events";
         case "start_in_progress":
-            return "worker_start_in_progress_end_turn_until_agent_control_wakeup";
+            return "worker_start_in_progress_wait_for_run_events";
         case "start_superseded":
             return "flow_route_advanced_during_worker_start";
         case "waiting_for_orchestrator":
@@ -969,9 +970,9 @@ function flowLaunchReason(next, continuation) {
         return continuation.blocked_reason;
     }
     const reasons = {
-        worker_dispatched_end_turn_until_agent_control_wakeup: "A worker was dispatched; end the current turn until Agent Control wakes the coordinator.",
-        worker_already_running_end_turn_until_agent_control_wakeup: "The active step already has a running worker; end the current turn until its report is available.",
-        worker_start_in_progress_end_turn_until_agent_control_wakeup: "Another controller owns the durable backend-start lease; end the current turn until it completes.",
+        worker_dispatched_wait_for_run_events: "A worker was dispatched. Keep this turn open and use the wait_contract for your own observing thread to wait for run events; after answering the user, resume the wait.",
+        worker_already_running_wait_for_run_events: "The active step already has a running worker. Keep this turn open, respond to the user when needed, and resume run_wait with the latest processed cursor.",
+        worker_start_in_progress_wait_for_run_events: "Another controller owns the durable backend-start lease. Keep this turn open and wait for run events; a timeout or unrelated user message does not end supervision.",
         flow_route_advanced_during_worker_start: "The flow advanced while an older backend start was unresolved; Agent Control retained the newer route and cleaned up the late worker.",
         orchestrator_action_required: "The flow reached a configured orchestrator decision point.",
         native_subagent_action_required: "A scoped native subagent action must be claimed, executed with the root collaboration tool, and acknowledged.",

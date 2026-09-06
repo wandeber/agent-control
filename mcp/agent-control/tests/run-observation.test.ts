@@ -468,4 +468,114 @@ describe("run observation", () => {
     expect(store.db.prepare("select count(*) n from agent_tokens where agent_id = ?").get(observer.agent_id)).toEqual({ n: 0 });
   });
 
+  it("resumes after a user interruption with events accumulated while answering another topic", async () => {
+    const observation = observe(run().run_id);
+    expect(observation.wait_contract).toMatchObject({ turn_policy: "keep_open_while_work_pending", tool: "run_wait",
+      arguments: { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: observation.cursor, timeout_ms: 3_600_000 } });
+    const firstEvent = emit(observation.run_id, "flow.step_started", { step_id: "analysis" });
+    const first = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
+      cursor: observation.wait_contract.arguments.cursor });
+    expect(first.events.map(e => e.event_id)).toEqual([firstEvent.event_id]);
+    const cancellation = new AbortController();
+    const pending = handleTool(controller, "run_wait", first.wait_contract!.arguments, cancellation.signal);
+    cancellation.abort(new Error("new user message on another topic"));
+    await expect(pending).rejects.toThrow(/new user message/);
+    // The model answers the user while backend events continue to be persisted.
+    const duringReply = emit(observation.run_id, "flow.step_started", { step_id: "implementation" });
+    const resumed = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
+      cursor: first.wait_contract!.arguments.cursor, timeoutMs: 3_600_000 });
+    expect(resumed.events.map(e => e.event_id)).toEqual([duringReply.event_id]);
+    expect(resumed.wait_contract!.arguments.cursor).toBe(resumed.cursor);
+    const timeout = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
+      cursor: resumed.cursor, timeoutMs: 1, intervalMs: 1 });
+    expect(timeout).toMatchObject({ timed_out: true, closed: false,
+      wait_contract: { arguments: { cursor: resumed.cursor, timeout_ms: 3_600_000 } } });
+  });
+
+  it("closes only the finished observation and preserves a separate active run's wait contract", async () => {
+    const first = observe(run().run_id), second = observe(run().run_id);
+    for (const subscription of controller.listSubscriptions({ runId: first.run_id })) controller.deleteSubscription(subscription.subscription_id);
+    expect(await wait(first)).toMatchObject({ closed: true, wait_contract: null });
+    const event = emit(second.run_id, "flow.step_started", { step_id: "still-running" });
+    const ongoing = await wait(second);
+    expect(ongoing).toMatchObject({ closed: false, wait_contract: { tool: "run_wait", arguments: { run_id: second.run_id } } });
+    expect(ongoing.events.map(e => e.event_id)).toEqual([event.event_id]);
+  });
+
+  it("automatically gives a separate executing coordinator its own action-aware observation", async () => {
+    const launched = await handleTool(controller, "worker_launch", { title: "Separate executor", prompt: "Review", repo_dir: directory,
+      backend: "fake", requester_thread_id: "original-requester", watch: false }) as any;
+    const requester = launched.observer, coordinator = launched.coordinator_observer;
+    expect(requester.thread_id).toBe("original-requester");
+    expect(coordinator.thread_id).toBe("user-thread");
+    expect(coordinator.observer_agent_id).not.toBe(requester.observer_agent_id);
+    expect(controller.ensureRequester(launched.run_id)!.thread_id).toBe(requester.thread_id);
+    const action = { action_id: "action-safe", orchestrator_agent_id: coordinator.observer_agent_id, operation: "spawn_agent", status: "pending" };
+    const event = emit(launched.run_id, "flow.notification", { orchestrator_action: action });
+    const ownerBatch = await wait(coordinator), userBatch = await wait(requester);
+    expect(ownerBatch.closed).toBe(false);
+    expect(ownerBatch.events.find(e => e.event_id === event.event_id)?.orchestrator_action).toMatchObject(action);
+    expect(userBatch.events.find(e => e.event_id === event.event_id)).not.toHaveProperty("orchestrator_action");
+    expect(ownerBatch.wait_contract!.arguments.observer_agent_id).toBe(coordinator.observer_agent_id);
+    expect(userBatch.wait_contract!.arguments.observer_agent_id).toBe(requester.observer_agent_id);
+  });
+
+  it("keeps cross-run owner actions in separate cursors without promoting child observers", async () => {
+    const owner = controller.orchestratorLogin({ title: "Parent owner", adminKey: "observer-test-admin", backend: "codex-thread",
+      backendHandle: { thread_id: "user-thread", agent_control_role: "orchestrator" } });
+    const parentObservation = observe(owner.run.run_id, { agentToken: owner.agent_token });
+    const child = controller.createRun({ title: "Child", agentToken: owner.agent_token });
+    const launched = await handleTool(controller, "worker_launch", { title: "Child work", prompt: "Review", repo_dir: directory,
+      backend: "fake", run_id: child.run_id, agent_token: owner.agent_token, requester_thread_id: "original-requester", watch: false }) as any;
+    const observation = launched.coordinator_observer;
+    expect(controller.getAgent(observation.observer_agent_id).role).toBe("observer");
+    expect(observation.observer_agent_id).not.toBe(parentObservation.observer_agent_id);
+    const worker = controller.listAgents({ runId: child.run_id }).find(agent => agent.backend === "fake")!;
+    const other = controller.registerAgent({ runId: child.run_id, backend: "fake", title: "Other" });
+    controller.createSubscription({ runId: child.run_id, sourceAgentId: worker.agent_id, subscriberAgentId: owner.agent.agent_id, eventType: "flow.notification" });
+    observe(child.run_id, { agentToken: owner.agent_token, eventTypes: ["flow.completed"] });
+    const action = { action_id: "child-action", orchestrator_agent_id: owner.agent.agent_id, operation: "spawn_agent", secret: "never-render" };
+    emit(child.run_id, "flow.notification", { orchestrator_action: action }, other.agent_id);
+    const event = emit(child.run_id, "flow.notification", { orchestrator_action: action }, worker.agent_id);
+    const batch = await wait(observation, { limit: 1 });
+    expect(batch.events.map(item => item.event_id)).toEqual([event.event_id]);
+    expect(batch.events[0]?.orchestrator_action).toMatchObject({ action_id: "child-action", orchestrator_agent_id: owner.agent.agent_id });
+    expect(JSON.stringify(batch)).not.toContain("never-render");
+    expect((await wait(launched.observer)).events.every(item => !item.orchestrator_action)).toBe(true);
+    await controller.drainDeliveries();
+    expect(sent).not.toHaveBeenCalled();
+    const parentEvent = emit(owner.run.run_id, "flow.completed");
+    expect((await wait(parentObservation)).events.some(item => item.event_id === parentEvent.event_id)).toBe(true);
+    store.updateAgent(owner.agent.agent_id, { unregisteredAt: new Date().toISOString() });
+    observe(child.run_id, { eventTypes: [...EVENT_TYPES] });
+    const afterRevocation = emit(child.run_id, "flow.notification", { orchestrator_action: action }, worker.agent_id);
+    expect((await wait(observation, { cursor: batch.cursor })).events.find(item => item.event_id === afterRevocation.event_id)).not.toHaveProperty("orchestrator_action");
+  });
+
+  it("does not derive cross-run action visibility from public observer metadata", async () => {
+    const owner = controller.orchestratorLogin({ title: "Owner", adminKey: "observer-test-admin", backend: "codex-thread",
+      backendHandle: { thread_id: "owner-thread", agent_control_role: "orchestrator" } });
+    const observation = observe(owner.run.run_id);
+    store.updateAgent(observation.observer_agent_id, { backendHandle: { thread_id: "owner-thread", agent_control_role: "observer",
+      agent_control_observation_owner_id: owner.agent.agent_id } });
+    emit(owner.run.run_id, "flow.notification", { orchestrator_action: { action_id: "private-action", orchestrator_agent_id: owner.agent.agent_id } });
+    expect((await wait(observation)).events[0]).not.toHaveProperty("orchestrator_action");
+  });
+
+  it("preserves parent and existing child owner actions when their Codex thread is shared", async () => {
+    const parent = controller.orchestratorLogin({ title: "Parent", adminKey: "observer-test-admin", backend: "codex-thread",
+      backendHandle: { thread_id: "user-thread", agent_control_role: "orchestrator" } });
+    const child = controller.createRun({ title: "Child", agentToken: parent.agent_token });
+    const childOwner = controller.orchestratorLogin({ title: "Child owner", runId: child.run_id,
+      adminKey: "observer-test-admin", backend: "codex-thread",
+      backendHandle: { thread_id: "user-thread", agent_control_role: "orchestrator" } });
+    const observation = observe(child.run_id, { agentToken: parent.agent_token });
+    expect(observation.observer_agent_id).toBe(childOwner.agent.agent_id);
+    for (const owner of [parent.agent, childOwner.agent]) emit(child.run_id, "flow.notification", {
+      orchestrator_action: { action_id: `action-${owner.agent_id}`, orchestrator_agent_id: owner.agent_id, operation: "spawn_agent" }
+    });
+    expect((await wait(observation)).events.map(event => event.orchestrator_action?.orchestrator_agent_id))
+      .toEqual([parent.agent.agent_id, childOwner.agent.agent_id]);
+  });
+
 });

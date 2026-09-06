@@ -236,12 +236,25 @@ only its declared arguments to the exact native tool. The worker receives its
 intended task message, never bridge/action control data. A missing, revoked,
 expired, unsafe, or ambiguous credential blocks the flow instead of triggering
 a new login or broader fallback. After dispatch, the conversational thread
-consumes `run_wait` or resumes from configured observer notifications. A
-separate executing root may end its turn while the requester waits.
+consumes `run_wait` and keeps the turn open while work remains. A separate
+executing root that still supervises work follows the same policy; notification
+delivery does not reliably reactivate an ended Codex turn.
 `wait_agent` remains reserved for explicit native diagnostics; it is not the
 Agent Control run event stream.
 
 ## Initiating Thread Observation
+
+When execution and the original conversation are in different Codex threads,
+launch also registers and returns `coordinator_observer` for the executing
+thread. `observer` remains the original user's observation. The executor uses
+`coordinator_observer.wait_contract` when present; the original conversation
+uses `observer.wait_contract`. Each keeps its own processed cursor. Do not use
+a passive requester's event stream for the coordinator's native actions, or
+replace one thread's cursor with the other's. Same-thread launches reuse one
+observation and return `coordinator_observer: null`. Lower-level/manual starts
+can attach the additional coordinator explicitly with `run_observe` under its
+existing authorization; one-shot launches do not need that extra call.
+
 
 Identify the conversational requester in the run before dispatching either
 free workers or a declared flow. The coordinator registers its own thread;
@@ -272,7 +285,21 @@ filters and does not replace the original requester with a nested executor.
 The default `wait` mode uses `run_wait` with the returned durable cursor,
 without a timeout or with `timeout_ms: 3600000` (`--timeout 1h` in the CLI).
 Consume the batch, retain its new cursor, and resume the long wait. Timeout is
-not completion. Preserve the last acknowledged cursor when reusing a launch.
+not completion. Preserve the last processed cursor when reusing a launch.
+When the user asks something else, answer in commentary and resume event waiting
+in the same open turn. Do not cancel or forget the original work. Retain each
+active run, observer, completion condition, and its own cursor. Where supported,
+wait on active runs concurrently; closure of one observation does not close the
+others. End only after all supervised work is resolved or the user explicitly
+pauses or cancels supervision. A short localized update may mention that the
+flow is still running and the conversation is returning to the wait.
+
+`observer.wait_contract` on launch and `wait_contract` on open event/timeout
+responses provide `run_wait` arguments with a one-hour timeout. A host that
+requires a shorter wide timeout may use 30 minutes. The contract includes the
+current response cursor; acknowledge it only after processing that batch. After
+interruption, resume from the last processed cursor. A closed observation returns
+`wait_contract: null`; check the remaining active runs before ending the turn.
 By default every supported event type is selected, covering present and future
 agents in the run, including phase changes, blockers, and completion. A completion-only flow observer uses
 `flow.completed`; a free-worker observer chooses its agent terminal events.

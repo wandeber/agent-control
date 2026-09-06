@@ -1,5 +1,8 @@
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { promisify } from "node:util";
+import { once } from "node:events";
+import { WebSocketServer } from "ws";
+import { execFile, execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -32,4 +35,44 @@ describe("observer launch CLI", () => {
       expect(result.orchestrator_action).toMatchObject({ operation: "spawn_agent", status: "pending" });
     } finally { store.close(); }
   });
+  it("instructs fresh and reused non-native flow launches to keep the turn open", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-control-cli-wait-contract-"));
+    directories.push(directory);
+    const server = new WebSocketServer({ port: 0 });
+    await once(server, "listening");
+    const port = (server.address() as { port: number }).port;
+    server.on("connection", socket => socket.on("message", raw => {
+      const { id, method } = JSON.parse(String(raw));
+      if (id === undefined) return;
+      const thread = { id: "simulated-thread", cwd: directory, status: { type: "active", activeFlags: [] },
+        turns: [{ id: "simulated-turn", status: "inProgress", items: [] }] };
+      const result = method === "turn/start" ? { turn: { id: "simulated-turn" } }
+        : method.startsWith("thread/") ? { thread } : {};
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    }));
+    const config = join(directory, "flow.json");
+    writeFileSync(config, JSON.stringify({ id: "cli-wait-contract", initial_step: "work", roles: { worker: { backend: "codex-thread" } },
+      steps: { work: { role: "worker", prompt: "Simulated task", on: { reported: { finish: true } } } } }));
+    const env = { ...process.env, AGENT_CONTROL_HOME: directory, AGENT_CONTROL_DB: join(directory, "state.sqlite"),
+      AGENT_CONTROL_ADMIN_KEY: "cli-contract-test", AGENT_CONTROL_TOKEN: "", CODEX_THREAD_ID: "launch-conversation" };
+    const args = ["--import", "tsx", "src/cli.ts", "flow", "launch", "--config-file", config, "--title", "Keep waiting",
+      "--repo-dir", directory, "--server", `ws://localhost:${port}`];
+    let watcher: number | undefined;
+    try {
+      const launch = JSON.parse((await promisify(execFile)(process.execPath, args, { cwd: resolve("."), env })).stdout);
+      watcher = launch.watch?.pid;
+      expect(launch.next).toBe("worker_dispatched_wait_for_run_events");
+      expect(launch.reason).toContain("Keep this turn open");
+      expect(launch.observer.wait_contract.arguments).toMatchObject({ run_id: launch.run_id, cursor: launch.observer.cursor, timeout_ms: 3_600_000 });
+      const reuse = JSON.parse((await promisify(execFile)(process.execPath, [...args, "--run", launch.run_id], { cwd: resolve("."), env })).stdout);
+      expect(reuse.next).toBe("worker_already_running_wait_for_run_events");
+      expect(reuse.reason).toContain("resume run_wait");
+      expect(reuse.observer.observer_agent_id).toBe(launch.observer.observer_agent_id);
+    } finally {
+      if (watcher) { try { process.kill(watcher, "SIGTERM"); } catch {} }
+      for (const client of server.clients) client.terminate();
+      await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+    }
+  }, 15_000);
+
 });

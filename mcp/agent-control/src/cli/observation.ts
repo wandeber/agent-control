@@ -37,7 +37,7 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
         eventTypes: options.event.length ? options.event : undefined, delivery: options.delivery, ...auth }));
     });
   run.command("wait")
-    .description("Wait for the next subscribed run events using a durable cursor; omit timeout to wait indefinitely.")
+    .description("Wait for subscribed events with a durable cursor. Keep the turn open while work remains; answer user messages and resume this wait. Omit timeout for indefinite waiting, or use 1h.")
     .requiredOption("--run <id>", "Observed run.")
     .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
     .requiredOption("--cursor <cursor>", "Cursor returned by run observe or the previous run wait.")

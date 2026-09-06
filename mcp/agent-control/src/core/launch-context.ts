@@ -1,3 +1,4 @@
+import type { AgentRecord, RunObserverResult } from "./types.js";
 import type { AgentController } from "./controller.js";
 import type { RequesterInput } from "./run-observation.js";
 import { ControllerError } from "./errors.js";
@@ -29,4 +30,13 @@ export function prepareLaunchOwner(controller: AgentController, input: Requester
     runTitle: input.title, runId: input.runId, repoDir: input.repoDir, backend: threadId ? "codex-thread" : "manual", objective: input.title,
     backendHandle: threadId ? { thread_id: threadId, agent_control_role: "orchestrator", cwd: input.repoDir } : undefined });
   return { agent: login.agent, runId: login.run.run_id, agentToken: login.agent_token };
+}
+
+/** A separate executing conversation needs its own cursor and action visibility. */
+export function observeLaunchCoordinator(controller: AgentController,
+  owner: { agent: AgentRecord | null; agentToken?: string }, runId: string,
+  requester: RunObserverResult | null) {
+  const threadId = owner.agent?.backend === "codex-thread" ? owner.agent.backend_handle?.thread_id : undefined;
+  if (typeof threadId !== "string" || !threadId || threadId === requester?.thread_id) return null;
+  return controller.observeRun({ runId, threadId, title: "Executing coordinator", agentToken: owner.agentToken });
 }

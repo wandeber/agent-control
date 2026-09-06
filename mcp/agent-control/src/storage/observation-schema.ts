@@ -22,6 +22,11 @@ export function initializeObservationSchema(db: Database.Database): void {
         created_at text not null,
         unique(run_id, thread_id)
       );
+      create table if not exists observer_owners (
+        observer_agent_id text not null references run_observers(observer_agent_id) on delete cascade,
+        orchestrator_agent_id text not null references agents(agent_id) on delete cascade,
+        primary key(observer_agent_id, orchestrator_agent_id)
+      );
       create table if not exists run_requesters (
         run_id text primary key references runs(run_id) on delete cascade,
         thread_id text not null

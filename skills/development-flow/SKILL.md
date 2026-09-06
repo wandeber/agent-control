@@ -109,9 +109,14 @@ on the analyst's behalf.
    observer record returned by launch and uses `run_wait` with its cursor,
    indefinitely or with a one-hour timeout. It can report phase changes,
    blockers, and completion. It subscribes to all supported events by default;
-   narrow filters only on an explicit request. A separate executing
-   coordinator may end its turn after dispatch. If both roles share the same
-   thread, waiting does not transfer or duplicate orchestration ownership.
+   narrow filters only on an explicit request. Keep the launching conversation
+   open while work remains. Answer new user messages in commentary, including
+   unrelated questions, then resume the long wait with the last processed
+   cursor. Preserve every active run. A short localized update may end with
+   "The <flow> flow is still running; I am continuing to wait." Follow the
+   `flow-runner` turn boundary contract for all waiting and resumption behavior.
+   A separate coordinator with pending supervisory work follows the same rule;
+   waiting does not transfer or duplicate orchestration ownership.
 
 Do not ask the user for the flow path unless discovery fails. Do not manually
 search the repository for flow files before using Agent Control discovery.

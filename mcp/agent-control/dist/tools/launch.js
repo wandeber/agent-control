@@ -1,5 +1,5 @@
 import { resolveAdminKey } from "../core/identity.js";
-import { prepareLaunchOwner } from "../core/launch-context.js";
+import { observeLaunchCoordinator, prepareLaunchOwner } from "../core/launch-context.js";
 import { launchWorker, startDetachedWatch } from "../cli/worker.js";
 export function requesterOptions(input) {
     return { requesterThreadId: input.requester_thread_id,
@@ -31,6 +31,8 @@ export async function launchFlowTool(controller, input) {
     const owner = prepareLaunchOwner(controller, { title, repoDir: input.repo_dir,
         runId: input.run_id, agentToken: input.agent_token,
         adminKey: input.admin_key ?? resolveAdminKey(), ...requesterOptions(input) });
+    const requester = controller.ensureRequester(owner.runId, { ...requesterOptions(input), agentToken: owner.agentToken });
+    const coordinatorObserver = observeLaunchCoordinator(controller, owner, owner.runId, requester);
     const start = controller.startFlow({ config, runId: owner.runId, runTitle: title,
         repoDir: input.repo_dir, agentToken: owner.agentToken,
         adminKey: owner.agentToken ? undefined : input.admin_key ?? resolveAdminKey(),
@@ -44,5 +46,5 @@ export async function launchFlowTool(controller, input) {
         : null;
     return { run_id: start.instance.run_id, flow_instance_id: start.instance.flow_instance_id,
         orchestrator_agent_id: owner.agent?.agent_id ?? null, observer: start.observer,
-        start, continuation, watch };
+        coordinator_observer: coordinatorObserver, start, continuation, watch };
 }

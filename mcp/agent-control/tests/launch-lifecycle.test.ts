@@ -48,19 +48,26 @@ describe("launch and shutdown boundaries", () => {
     try {
       await client.connect(transport);
       const launch = await client.callTool({ name: "flow_launch", arguments: {
-        title: "One-call observation", repo_dir: path,
+        title: "One-call observation", repo_dir: path, requester_thread_id: "original-user",
         config: { id: "observed-native-flow", initial_step: "work", roles: { worker: { backend: "codex-subagent" } },
           steps: { work: { role: "worker", prompt: "Inspect only", on: { reported: { finish: true } } } } }
       } });
       expect(launch.isError).toBe(false);
       const result = JSON.parse((launch.content as Array<{ text: string }>)[0]!.text);
-      expect(result.observer).toMatchObject({ thread_id: "conversation-lifecycle", event_types: [...EVENT_TYPES], delivery: "wait" });
+      expect(result.observer).toMatchObject({ thread_id: "original-user", event_types: [...EVENT_TYPES], delivery: "wait" });
       expect(result.continuation.action).toBe("orchestrator_action_required");
-      const waitArgs = { run_id: result.run_id, observer_agent_id: result.observer.observer_agent_id,
-        cursor: result.observer.cursor, timeout_ms: 20 };
+      expect(result.coordinator_observer.thread_id).toBe("conversation-lifecycle");
+      const waitArgs = { ...result.coordinator_observer.wait_contract.arguments, timeout_ms: 20 };
       const first = await client.callTool({ name: "run_wait", arguments: waitArgs });
       const batch = JSON.parse((first.content as Array<{ text: string }>)[0]!.text);
       expect(batch.events.map((event: { type: string }) => event.type)).toContain("flow.step_started");
+      // Initial native work is returned by launch; later native actions arrive as owner events.
+      expect(result.continuation.orchestrator_action).toMatchObject({
+        operation: "spawn_agent", orchestrator_agent_id: result.coordinator_observer.observer_agent_id
+      });
+      const userWait = await client.callTool({ name: "run_wait", arguments: result.observer.wait_contract.arguments });
+      const userBatch = JSON.parse((userWait.content as Array<{ text: string }>)[0]!.text);
+      expect(userBatch.events.every((event: any) => event.orchestrator_action === undefined)).toBe(true);
       const pending = client.callTool({ name: "run_wait", arguments: { ...waitArgs, cursor: batch.cursor, timeout_ms: 3_600_000 } });
       // A later request proves the indefinite wait has entered the server before SIGTERM.
       await client.callTool({ name: "run_list", arguments: {} });
