@@ -3,9 +3,11 @@
 import { Activity, Bell, Boxes, FileText, GitBranch, Goal, Link2, Server, TimerReset } from "lucide-react";
 import { compactId, formatDateTime, formatDuration, formatNumber, safeJson } from "@/lib/format";
 import { agentFlowSteps, flowStepOptionLabel, flowStepOrdinal } from "@/lib/flow-steps";
+import { buildFlowEvidenceView } from "@/lib/flow-evidence";
 import { isRenderableRelationType } from "@/lib/graph";
 import type { AgentRecord, DashboardSnapshot, FlowStepInstanceRecord } from "@/lib/types";
 import { EmptyState, Metric, StatusPill } from "./ui";
+import { FlowEvidenceDetails } from "./flow-evidence";
 
 export function AgentInspector({
   onSelectStepInstance,
@@ -42,6 +44,7 @@ export function AgentInspector({
   const flowSteps = agentFlowSteps(snapshot, agent.agent_id);
   const selectedStep =
     flowSteps.find((step) => step.step_instance_id === selectedStepInstanceId) ?? flowSteps[0] ?? null;
+  const evidence = selectedStep ? buildFlowEvidenceView(snapshot, { stepInstanceId: selectedStep.step_instance_id }) : null;
   const startedRuns = snapshot.runs.filter((run) => run.created_by_agent_id === agent.agent_id);
   const latestEvents = snapshot.latest_events.filter((event) => event.agent_id === agent.agent_id).slice(0, 5);
   const usage = computed?.latest_usage;
@@ -68,6 +71,7 @@ export function AgentInspector({
           snapshot={snapshot}
           steps={flowSteps}
         />
+        {evidence ? <FlowEvidenceDetails expanded view={evidence} /> : null}
 
         <div className="grid grid-cols-2 gap-x-4 gap-y-2 border-t border-black/8 pt-3">
           <Metric label="elapsed" value={formatDuration(computed?.elapsed_ms)} />

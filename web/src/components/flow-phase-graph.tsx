@@ -7,12 +7,14 @@ import {
 import { ArrowRight, CheckCircle2, Crosshair, GitBranch, LayoutGrid, LocateFixed, Radio, Workflow } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildFlowVisualModel, type FlowVisualNode } from "@/lib/flow-graph";
+import { buildFlowEvidenceView } from "@/lib/flow-evidence";
 import {
   diagramPath, flowDiagramEdges, flowDiagramPositions, routeFlowDiagram, visibleFlowDiagramEdges,
   PHASE_HEIGHT, PHASE_WIDTH, type DiagramRoute, type Point
 } from "@/lib/flow-diagram";
 import { cx } from "@/lib/format";
 import type { DashboardSnapshot } from "@/lib/types";
+import { FlowEvidenceDetails } from "./flow-evidence";
 
 const nodeTypes = { phase: FlowPhaseNode };
 type PhaseNodeData = FlowVisualNode & Record<string, unknown> & {
@@ -45,6 +47,7 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
   const [follow, setFollow] = useState(false);
   const [allRoutes, setAllRoutes] = useState(false);
   const [focusedStepId, setFocusedStepId] = useState<string | null>(null);
+  const [phaseDetailsOpen, setPhaseDetailsOpen] = useState(false);
   const [flowReady, setFlowReady] = useState(false);
   const flowRef = useRef<ReactFlowInstance<PhaseFlowNode, Edge> | null>(null);
   const graphRootRef = useRef<HTMLDivElement | null>(null);
@@ -52,6 +55,11 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
   const fittedKeyRef = useRef<string | null>(null);
   const programmaticViewportRef = useRef(false);
   const storageKey = `agent-control:phase-graph:v8:${columns}:${snapshot.selected_run_id ?? "none"}:${model?.instance.flow_instance_id ?? "none"}`;
+  const focusedPhase = focusedStepId ?? selectedStepId ?? model?.instance.current_step_id;
+  const evidence = useMemo(() => model ? buildFlowEvidenceView(snapshot, {
+    flowInstanceId: model.instance.flow_instance_id,
+    stepId: focusedPhase
+  }) : null, [focusedPhase, model, snapshot]);
 
   useEffect(() => {
     const root = graphRootRef.current;
@@ -169,9 +177,11 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
             <input checked={allRoutes} className="accent-teal-700" onChange={(event) => { fittedKeyRef.current = null; setAllRoutes(event.target.checked); setFollow(false); }} type="checkbox" />
             All routes
           </label>
+          <button aria-expanded={phaseDetailsOpen} aria-controls="flow-phase-evidence" className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 shadow-sm" onClick={() => setPhaseDetailsOpen((value) => !value)} type="button">Phase details</button>
           <div className="w-full text-[11px] text-slate-600">{hiddenCount > 0 ? `Select a phase to see its other routes · ${hiddenCount} hidden` : "All routes shown"}</div>
         </> : null}
       </div>
+      {phaseDetailsOpen && evidence ? <div className="absolute left-4 top-36 z-30 w-80 max-w-[calc(100%-32px)] shadow-panel" id="flow-phase-evidence"><FlowEvidenceDetails expanded view={evidence} /></div> : null}
 
       {model ? <>
         <div className="agent-graph-actions absolute z-20">
@@ -212,7 +222,7 @@ function FlowPhaseNode({ data }: NodeProps<PhaseFlowNode>) {
   const result = typeof data.latestStep?.result_json?.conclusion === "string" ? data.latestStep.result_json.conclusion.replaceAll("_", " ") : null;
   const status = data.kind === "notify" ? (data.isCurrent ? "Waiting here" : "Chooses next phase")
     : data.kind === "finish" ? (completed ? "Completed" : "Not reached")
-    : data.isCurrent ? `Current${failed ? ` · ${data.status}` : ""}` : data.status === "planned" ? "Not started" : completed ? `Reported${result ? `: ${result}` : ""}` : data.status;
+    : data.waitingLabel ?? (data.isCurrent ? `Current${failed ? ` · ${data.status}` : ""}` : data.status === "planned" ? "Not started" : completed ? `Reported${result ? `: ${result}` : ""}` : data.status);
   return (
     <div className={cx("relative flex h-[80px] w-[264px] flex-col justify-center rounded-xl border bg-white px-3 shadow-sm", failed ? "border-red-500 ring-2 ring-red-100" : data.isCurrent ? "border-teal-600 ring-2 ring-teal-100" : data.selected ? "border-slate-500 ring-2 ring-slate-200" : "border-slate-300")}
       role={data.onSelectStep ? "button" : undefined} tabIndex={data.onSelectStep ? 0 : undefined}

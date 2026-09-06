@@ -76,6 +76,18 @@ describe("flow diagram semantics", () => {
     data.flow_steps = [step("analysis", "old", 0, "cancelled"), step("analysis", "new", 0, "active")];
     expect(buildFlowVisualModel(data)!.nodes.find((node) => node.stepId === "analysis")?.latestStep?.step_instance_id).toBe("new");
   });
+
+  it("identifies a pending user gate without inventing an assigned worker", () => {
+    const data = snapshot();
+    data.flows[0]!.config.steps.planning = { execution: "coordinator", decision: { key: "approve_plan" } };
+    data.flow_instances[0]!.status = "waiting_for_orchestrator";
+    data.flow_instances[0]!.current_step_id = "planning";
+    data.flow_steps = [step("planning", "approval", 0, "active")];
+    const node = buildFlowVisualModel(data)!.nodes.find((candidate) => candidate.stepId === "planning")!;
+    expect(node.waitingLabel).toBe("Waiting for your decision");
+    expect(node.latestStep?.agent_id).toBeNull();
+    expect(node.status).toBe("active");
+  });
 });
 
 describe("readable flow routes", () => {

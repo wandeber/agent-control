@@ -9,6 +9,7 @@ import type {
   FlowTransitionConfigRecord
 } from "./types";
 import { compareFlowStepsNewestFirst } from "./flow-steps";
+import { phaseWaitingLabel } from "./flow-evidence";
 
 export type FlowVisualNodeKind = "decision" | "finish" | "notify" | "step";
 export type FlowVisualStepStatus = FlowStepInstanceRecord["status"] | "planned";
@@ -36,6 +37,7 @@ export interface FlowVisualNode {
   reportValues: string[];
   inputCount: number;
   outputCount: number;
+  waitingLabel?: string | null;
 }
 
 export interface FlowVisualEdge {
@@ -98,7 +100,8 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
       status: latestStep?.status ?? (isCurrent ? "active" : "planned"),
       reportValues: reportEnumValues(step),
       inputCount: Object.keys(step.inputs ?? {}).length,
-      outputCount: Object.keys(step.outputs ?? {}).length
+      outputCount: Object.keys(step.outputs ?? {}).length,
+      waitingLabel: phaseWaitingLabel(instance, stepId, step)
     });
   });
 

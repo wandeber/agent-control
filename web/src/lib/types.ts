@@ -170,6 +170,8 @@ export interface FlowConfigRecord {
 }
 
 export interface FlowStepConfigRecord {
+  execution?: "agent" | "coordinator";
+  decision?: { key: string; artifact_key?: string };
   role?: string;
   agent_id?: string;
   prompt?: string;
@@ -217,6 +219,43 @@ export interface FlowInstanceRecord {
   current_step_id: string | null;
   created_at: string;
   updated_at: string;
+  runtime?: FlowRuntimeRecord | null;
+}
+
+/** Optional for older runs, which have reports but no verified evidence ledger. */
+export interface FlowRuntimeRecord {
+  revision: number;
+  acceptance_revision: number;
+  context: string | null;
+  config_digest: string;
+  state: Record<string, unknown>;
+  decisions: Record<string, { value: unknown; reason: string; actor_id: string; acceptance_revision: number; artifact_key?: string; artifact_digest?: string }>;
+  evidence: Record<string, string>;
+  evidence_summaries?: Record<string, FlowEvidenceSummaryRecord>;
+  owners: Record<string, string>;
+  correction: Record<string, unknown> | null;
+}
+
+export interface FlowEvidenceSummaryRecord {
+  receipt_id: string;
+  kind: string;
+  status: string;
+  step_instance_id?: string;
+  step_id?: string;
+  acceptance_revision?: number;
+  summary: {
+    reviewed_count?: number;
+    carried_count?: number;
+    reopened_count?: number;
+    executed_check_count?: number;
+    reused_check_count?: number;
+    reason?: string;
+    reviewed_scopes?: string[];
+    carried_scopes?: string[];
+    reopened_scopes?: Array<{ label: string; reason: string }>;
+    executed_checks?: string[];
+    reused_checks?: string[];
+  };
 }
 
 export interface FlowStepInstanceRecord {

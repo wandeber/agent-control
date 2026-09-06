@@ -24,6 +24,7 @@ import { isValidElement, useEffect, useId, useMemo, useRef, useState, type Mouse
 import { artifactImageUrl, fetchAgentLog, fetchAgentMessages } from "@/lib/api";
 import { compactId, formatDateTime, safeJson } from "@/lib/format";
 import { agentFlowSteps, artifactReferencesFlowStep, eventReferencesFlowStep, flowStepOrdinal } from "@/lib/flow-steps";
+import { buildFlowEvidenceView } from "@/lib/flow-evidence";
 import { shouldTryMcpApp } from "@/lib/mcp-app";
 import type { AgentLogTail, AgentMessage, ArtifactRecord, DashboardSnapshot, EventRecord, FlowStepInstanceRecord } from "@/lib/types";
 import {
@@ -33,6 +34,7 @@ import {
   workspaceRefreshPolicy
 } from "@/lib/workspace-refresh-policy";
 import { EmptyState } from "./ui";
+import { FlowEvidenceDetails } from "./flow-evidence";
 
 type Tab = "chat" | "events" | "artifacts" | "logs";
 const MAX_VISIBLE_MESSAGES = 42;
@@ -60,6 +62,9 @@ export function WorkspacePanel({
   const flowSteps = agentFlowSteps(snapshot, agentId);
   const selectedStep =
     flowSteps.find((step) => step.step_instance_id === selectedStepInstanceId) ?? flowSteps[0] ?? null;
+  const evidence = buildFlowEvidenceView(snapshot, { stepInstanceId: selectedStep?.step_instance_id });
+  const currentPhaseEvidence = buildFlowEvidenceView(snapshot, { flowInstanceId: selectedStep?.flow_instance_id });
+  const visibleEvidence = currentPhaseEvidence?.decision || currentPhaseEvidence?.continuation ? currentPhaseEvidence : evidence;
   const scopedEvents = useMemo(
     () => filterEventsForSelection(snapshot.latest_events, agentId, selectedStep?.step_instance_id ?? null),
     [agentId, selectedStep?.step_instance_id, snapshot.latest_events]
@@ -119,6 +124,7 @@ export function WorkspacePanel({
           </div>
         </div>
       ) : null}
+      {visibleEvidence?.available ? <div className="shrink-0 px-3 py-2"><FlowEvidenceDetails view={visibleEvidence} /></div> : null}
       <div className="min-h-0 flex-1">
         {tab === "chat" ? (
           <div className="agent-chat h-full min-h-0">
