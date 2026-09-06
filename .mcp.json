@@ -7,6 +7,7 @@
         "runner=\"${CODEX_AGENT_CONTROL_MCP_RUNNER:-./mcp/agent-control/run-agent-control-mcp.sh}\"; if [ ! -x \"$runner\" ]; then echo \"agent_control runner not found: $runner\" >&2; exit 127; fi; exec \"$runner\""
       ],
       "cwd": ".",
+      "tool_timeout_sec": 3700,
       "env": {},
       "note": "Local agent controller MCP. State defaults to $HOME/.agent-control/state.sqlite and artifacts/logs stay outside target repositories."
     }
