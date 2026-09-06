@@ -2,7 +2,19 @@ import { describe, expect, it, vi } from "vitest";
 import { loadConsoleSnapshot } from "../src/console-tools.js";
 
 describe("loadConsoleSnapshot", () => {
-  it("refreshes controller-approved adapters before reading a pinned snapshot", async () => {
+  it("returns the snapshot while one slow refresh remains in flight", async () => {
+    let finish!: () => void;
+    const controller = {
+      pollActiveAgents: vi.fn(() => new Promise<void>(resolve => { finish = resolve; })),
+      getDashboardSnapshot: () => ({ selected_run_id: "run-42" })
+    };
+    expect((await loadConsoleSnapshot(controller, "run-42")).snapshot.selected_run_id).toBe("run-42");
+    await loadConsoleSnapshot(controller, "run-42");
+    expect(controller.pollActiveAgents).toHaveBeenCalledTimes(1);
+    finish();
+  });
+
+  it("starts refreshing controller-approved adapters when reading a pinned snapshot", async () => {
     const calls: string[] = [];
     const controller = {
       pollActiveAgents: vi.fn(async (runId?: string) => {

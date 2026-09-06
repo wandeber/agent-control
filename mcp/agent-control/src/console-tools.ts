@@ -13,13 +13,10 @@ export type ConsoleSnapshotContent<TSnapshot> = Record<string, unknown> & {
   };
 };
 
-/**
- * Refreshes only backends that the controller considers cheap before reading a
- * console snapshot. Adapter capability filtering lives in pollActiveAgents;
- * this helper must not bypass it because native collaboration status is pushed
- * through explicit bridge synchronization rather than inspected by the MCP
- * server.
- */
+// Status updates must never block reading the already persisted dashboard.
+// One in-flight refresh per controller/run avoids duplicate backend work.
+const refreshes = new WeakMap<object, Set<string>>();
+
 export async function loadConsoleSnapshot<TSnapshot>(
   controller: ConsoleSnapshotProvider<TSnapshot>,
   runId?: string
@@ -30,7 +27,16 @@ export async function loadConsoleSnapshot<TSnapshot>(
   const latestRunId = initial && typeof initial === "object" && "selected_run_id" in initial
     ? initial.selected_run_id : null;
   const effectiveRunId = runId ?? (typeof latestRunId === "string" ? latestRunId : undefined);
-  if (effectiveRunId) await controller.pollActiveAgents(effectiveRunId);
+  if (effectiveRunId) {
+    let pending = refreshes.get(controller);
+    if (!pending) { pending = new Set(); refreshes.set(controller, pending); }
+    if (!pending.has(effectiveRunId)) {
+      pending.add(effectiveRunId);
+      void controller.pollActiveAgents(effectiveRunId).catch(() => {
+        // Backend availability is reflected by detail reads; retain the snapshot.
+      }).finally(() => pending.delete(effectiveRunId));
+    }
+  }
   return {
     snapshot: controller.getDashboardSnapshot(runId),
     console: {
