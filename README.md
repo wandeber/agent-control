@@ -101,6 +101,14 @@ After a Git marketplace refresh or a local plugin version/cachebuster change,
 rerun `codex plugin add agent-control@agent-control` and start a new Codex task
 so the updated MCP server and skills are loaded together.
 
+Complete the [Codex worker permission setup](docs/codex-permissions.md) during
+installation, update, or verification, including an already-installed plugin.
+Explain the four persistent tool grants and obtain explicit user confirmation
+before changing them. An existing authorization for that exact scope is enough.
+The `install-agent-control` skill in Agent Settings' `development-workflow`
+plugin includes this setup step; the standalone instructions below do not
+require installing Agent Settings.
+
 ## Development Flow Evidence
 
 The bundled `development-flow-v1` version 1.2.1 records the current accepted
