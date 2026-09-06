@@ -141,9 +141,21 @@ describe('run-owned canonical evidence', () => {
     input.coverage.validation_mode = 'focused';
     const focused = await service.execute(context, input);
     expect(() => service.verifyReceiptSync(context, focused.receipt_id, { requireApproved: true })).toThrow(/Focused/);
+    expect(service.verifyReceiptSync(context, focused.receipt_id, {
+      kind: 'validation', requireApproved: true, requireCurrent: true, validationMode: 'focused',
+    }).status).toBe('passed');
+    expect(() => service.verifyReceiptSync(context, focused.receipt_id, {
+      requireApproved: true, validationMode: 'complete_gate',
+    })).toThrow(/Focused/);
     const full = await service.execute(context, validation('result-1', [focused.receipt_id]));
     expect(full.summary.reused_check_count).toBe(1);
     expect(service.verifyReceiptSync(context, full.receipt_id, { requireApproved: true }).status).toBe('passed');
+    expect(service.verifyReceiptSync(context, full.receipt_id, {
+      kind: 'validation', requireApproved: true, requireCurrent: true, validationMode: 'complete_gate',
+    }).status).toBe('passed');
+    expect(() => service.verifyReceiptSync(context, full.receipt_id, {
+      requireApproved: true, validationMode: 'focused',
+    })).toThrow(/required focused/);
   }, 30_000);
 
   it('rechecks actual environment identity at the final transition guard', async () => {

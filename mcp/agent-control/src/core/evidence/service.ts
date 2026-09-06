@@ -206,7 +206,14 @@ export class EvidenceService {
       if (expected.checkpointId && receipt.checkpoint_id !== expected.checkpointId) throw new Error('Evidence receipt checkpoint does not satisfy this gate.');
       if (expected.actorId && receipt.actor_id !== expected.actorId) throw new Error('Evidence receipt author does not own this review.');
       if (expected.requireApproved && !['approved', 'passed', 'verified'].includes(receipt.status)) throw new Error('Evidence receipt has not passed its gate.');
-      if (expected.requireApproved && receipt.kind === 'validation' && payload.mechanical_report.validation_mode !== 'complete_gate') throw new Error('Focused validation cannot satisfy a complete validation gate.');
+      if (receipt.kind === 'validation') {
+        const requiredMode = expected.validationMode ?? (expected.requireApproved ? 'complete_gate' : undefined);
+        if (requiredMode && payload.mechanical_report.validation_mode !== requiredMode) {
+          throw new Error(requiredMode === 'complete_gate'
+            ? 'Focused validation cannot satisfy a complete validation gate.'
+            : 'Validation receipt does not satisfy the required focused validation mode.');
+        }
+      } else if (expected.validationMode) throw new Error('A validation mode requires a validation receipt.');
       const sources = receipt.source_receipt_ids.map(id => {
         if (receipt.kind === 'plan_review') {
           const manifest = provider.manifestFor(context, receipt.checkpoint_id!, true);

@@ -121,5 +121,6 @@ export interface EvidenceExpectation {
   checkpointId?: string;
   requireCurrent?: boolean;
   requireApproved?: boolean;
+  validationMode?: 'focused' | 'complete_gate';
   actorId?: string;
 }

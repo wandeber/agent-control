@@ -17,8 +17,10 @@ review gates; review transitions additionally specify the expected owner.
   or verifies final closure. The strict operation union is `schema.ts`.
 - `verifyReceiptSync(context, receiptId, expectation)` is suitable inside a
   transition transaction. `requireCurrent` rechecks both repository identity and
-  actual command inputs/toolchain/environment. `requireApproved` rejects focused
-  validation for a complete gate. A historical planner milestone can be checked
+  actual command inputs/toolchain/environment. `requireApproved` requires a
+  complete gate unless `validationMode: 'focused'` explicitly requests a GREEN
+  focused check; a supplied mode must match before the transition commits.
+  A historical planner milestone can be checked
   without claiming it validates later changes.
 - `readReceipt(context, receiptId)` and the `read_receipt` operation verify and
   return historical records using their original revisions. Reading must not
