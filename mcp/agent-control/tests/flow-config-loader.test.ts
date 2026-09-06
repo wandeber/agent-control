@@ -12,7 +12,7 @@ import { flowConfigJsonSchema } from "../src/core/flow-config-schema.js";
 
 describe("flow config loader", () => {
   it("loads migrated bundled workers as Codex Luna Max and preserves the existing reviewer", () => {
-    for (const name of ["development-flow-v0", "development-flow-v1", "demo-age-duration"]) {
+    for (const name of ["development-flow-v1", "demo-age-duration"]) {
       const config = parseFlowConfig(loadFlowConfigFile(resolve(import.meta.dirname, "../../../flows", name, "flow.yaml"), { env: {} }));
       for (const [role, settings] of Object.entries(config.roles ?? {})) {
         if (role === "orchestrator") continue;
@@ -158,7 +158,6 @@ steps:
 
   it("keeps one bundled independent reviewer across correction iterations", () => {
     const flowPaths = [
-      "../../flows/development-flow-v0/flow.yaml",
       "../../flows/development-flow-v1/flow.yaml",
       "../../flows/demo-age-duration/flow.yaml"
     ];

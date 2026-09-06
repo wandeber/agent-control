@@ -9,7 +9,7 @@ import { launchWorker, registerWorkerCommands, type WorkerLaunchOptions } from "
 import type { AgentRecord } from "../src/core/types.js";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const CANONICAL_PROMPT_FILE = resolve(REPOSITORY_ROOT, "flows/development-flow-v0/prompts/analysis.md");
+const CANONICAL_PROMPT_FILE = resolve(REPOSITORY_ROOT, "flows/development-flow-v1/prompts/analysis.md");
 const OUTPUT_ARTIFACT = resolve(tmpdir(), "agent-control-worker-input-handoffs-report.md");
 
 describe("worker launch input handoffs", () => {

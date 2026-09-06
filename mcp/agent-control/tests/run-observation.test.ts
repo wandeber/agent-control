@@ -375,7 +375,7 @@ describe("run observation", () => {
       return { backend: "fake", id: agent.agent_id, data: { id: agent.agent_id } };
     };
     const options: WorkerLaunchOptions = { backend: "fake", title: "Worker", phase: "analysis", run: observedRun.run_id,
-      promptFile: resolve("../../flows/development-flow-v0/prompts/analysis.md"), repoDir: directory,
+      promptFile: resolve("../../flows/development-flow-v1/prompts/analysis.md"), repoDir: directory,
       outputArtifact: join(directory, "output.md"), startTimeoutMs: 1000, inputArtifact: [], constraint: [],
       expectArtifact: [], file: [], subscribeEvent: [], subscriberAgentId: [], watchIntervalMs: 1000,
       watch: false, requesterThreadId: "user-thread", requesterEvent: ["agent.completed"] };
