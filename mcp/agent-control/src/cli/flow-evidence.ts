@@ -4,8 +4,9 @@ import { parseJsonObjectOption, type CliDeps } from "./shared.js";
 
 interface FlowRuntimeCommands {
   updateFlowContext(input: { flowInstanceId: string; context: string; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
-  recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; agentToken?: string; adminKey?: string }): unknown;
+  recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; packageManifestDigest?: string; agentToken?: string; adminKey?: string }): unknown;
   executeFlowEvidence(input: { flowInstanceId: string; key: string; request: Record<string, unknown>; stepInstanceId?: string; agentToken?: string; adminKey?: string }): Promise<unknown>;
+  executeFlowPackages(input: { flowInstanceId: string; request: Record<string, unknown>; agentToken?: string; adminKey?: string }): Promise<unknown>;
   recoverFlowOwner(input: { flowInstanceId: string; role: string; restartStepId: string; reason: string; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
 }
 
@@ -34,6 +35,14 @@ function acceptedContext(options: { context?: string; contextFile?: string; cont
 
 export function registerFlowEvidenceCommands(flow: Command, deps: CliDeps): void {
   const controller = deps.controller as typeof deps.controller & FlowRuntimeCommands;
+  flow.command("packages")
+    .description("Manage approved package manifests, parallel workers, immutable deliveries and verified joins.")
+    .requiredOption("--flow-instance-id <id>", "Flow instance id.")
+    .option("--request-file <path>", "Read a structured package operation from JSON.")
+    .option("--request-json <json>", "Structured package operation JSON.")
+    .action(async (options: { flowInstanceId: string; requestFile?: string; requestJson?: string }) => {
+      deps.output(await controller.executeFlowPackages({ flowInstanceId: options.flowInstanceId, request: jsonSource(options.requestFile, options.requestJson, "request"), ...deps.authOptions({ allowStoredAdminKey: true }) }));
+    });
   flow.command("recover-owner")
     .description("Replace a stopped or detached pinned role owner and restart its configured step with a fresh full-review requirement.")
     .requiredOption("--flow <id>", "Flow instance id.")
@@ -66,10 +75,11 @@ export function registerFlowEvidenceCommands(flow: Command, deps: CliDeps): void
     .requiredOption("--expected-revision <n>", "Current context revision.", revision)
     .option("--artifact-key <key>", "Artifact to which this decision applies.")
     .option("--artifact-digest <sha256>", "Exact artifact digest displayed for the decision.")
-    .action((options: { flow: string; key: string; valueJson: string; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string }) => {
+    .option("--package-manifest-digest <sha256>", "Exact package manifest digest shown with the approved plan.")
+    .action((options: { flow: string; key: string; valueJson: string; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; packageManifestDigest?: string }) => {
       deps.output(controller.recordFlowDecision({ flowInstanceId: options.flow, key: options.key,
         value: JSON.parse(options.valueJson), reason: options.reason, expectedRevision: options.expectedRevision,
-        artifactKey: options.artifactKey, artifactDigest: options.artifactDigest, ...deps.authOptions({ allowStoredAdminKey: true }) }));
+        artifactKey: options.artifactKey, artifactDigest: options.artifactDigest, packageManifestDigest: options.packageManifestDigest, ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
   flow.command("evidence")
     .description("Execute a versioned evidence operation and bind its verified receipt to the flow.")

@@ -5,6 +5,7 @@ import type { FlowConfig } from "./types.js";
 import { ControllerError } from "./errors.js";
 
 export interface FlowRuntimeState {
+  packages?: import("./flow-packages.js").PackageGroup;
   revision: number;
   acceptance_revision: number;
   context: string | null;
@@ -12,7 +13,7 @@ export interface FlowRuntimeState {
   config_digest: string;
   state: Record<string, unknown>;
   decision_owners?: { requester: string | null; orchestrator: string | null };
-  decisions: Record<string, { value: unknown; reason: string; actor_id: string; authority?: "user" | "coordinator"; source?: "user_reply" | "coordinator_review"; acceptance_revision: number; artifact_key?: string; artifact_digest?: string }>;
+  decisions: Record<string, { value: unknown; reason: string; actor_id: string; authority?: "user" | "coordinator"; source?: "user_reply" | "coordinator_review"; acceptance_revision: number; artifact_key?: string; artifact_digest?: string; package_manifest_digest?: string }>;
   evidence: Record<string, string>;
   evidence_summaries?: Record<string, { receipt_id: string; kind: string; status: string; step_instance_id?: string; acceptance_revision?: number; summary: Record<string, unknown> }>;
   owners: Record<string, string>;

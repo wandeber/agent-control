@@ -543,7 +543,7 @@ export interface FlowConfig {
   version?: string;
   description?: string;
   initial_step: string;
-  policy?: { strict?: boolean; plan_artifact?: string };
+  policy?: { strict?: boolean; plan_artifact?: string; work_packages?: { approval_decision: string; approval_value?: string; success_condition?: FlowConditionConfig; manifest_step: string; execution_step: string; integration_step: string } };
   preferences?: Record<string, { values: string[]; artifact_key?: string; owner?: "requester" | "orchestrator" }>;
   state?: Record<string, unknown>;
   prompts?: Record<string, FlowPromptConfig>;

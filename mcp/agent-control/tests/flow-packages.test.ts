@@ -1,0 +1,115 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AgentController } from "../src/core/controller.js";
+import { SqliteStore } from "../src/storage/sqlite-store.js";
+import { AdapterRegistry } from "../src/adapters/registry.js";
+import { artifactDigest } from "../src/core/flow-runtime.js";
+import type { AgentAdapter, AgentHandle, AgentStatus, FlowConfig, StartAgentInput } from "../src/core/types.js";
+import type { FlowPackagesRequest, PackageGroup } from "../src/core/flow-packages.js";
+import { flowPackagesSchema } from "../src/tools/schemas.js";
+import { TOOL_DEFINITIONS } from "../src/tools/tool-definitions.js";
+
+class Fixture implements AgentAdapter {
+  readonly kind = "codex-thread"; starts: StartAgentInput[] = []; statuses = new Map<string, AgentStatus>(); gate?: Promise<void>;
+  capabilities() { return { canStart: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: true }; }
+  async start(input: StartAgentInput): Promise<AgentHandle> { this.starts.push(input); if (input.metadata?.package_id && this.gate) await this.gate; this.statuses.set(input.agent.agent_id,"running"); return { backend:this.kind,id:input.agent.agent_id,data:{thread_id:`thread-${input.agent.agent_id}`} }; }
+  async getStatus(handle: AgentHandle) { return { status:this.statuses.get(handle.id) ?? "running" as AgentStatus }; }
+  async readLatest() { return []; } async sendMessage() {} async stop(handle: AgentHandle) { this.statuses.set(handle.id,"stopped");return {status:"stopped" as const}; } async unregister() {}
+}
+describe("durable work package fork and join", () => {
+  let root: string, repo: string, db: string, controller: AgentController, store: SqliteStore, adapter: Fixture;
+  let owner: ReturnType<AgentController["orchestratorLogin"]>, id: string, parentId: string;
+  const git = (cwd:string,...args:string[]) => execFileSync("git",["-C",cwd,...args],{encoding:"utf8"}).trim();
+  const request = (value:FlowPackagesRequest, worker=false) => controller.executeFlowPackages({flowInstanceId:id,request:value,...(worker?{}:{agentToken:owner.agent_token})});
+  const group = () => controller.getFlowSnapshot(id).runtime!.packages!;
+  function actor(agentId:string) { vi.stubEnv("CODEX_THREAD_ID",`thread-${agentId}`); }
+  async function dispatch() { const result = await controller.dispatchActiveFlowStep({flowInstanceId:id,agentToken:owner.agent_token}); actor(result.agent!.agent_id); return result; }
+  function report() { const step=controller.getFlowSnapshot(id).steps.find(s=>s.status==="active")!; return controller.reportFlowStep({stepInstanceId:step.step_instance_id,status:"completed"}); }
+  function config():FlowConfig { return {id:"packages",policy:{strict:true,plan_artifact:"plan",work_packages:{approval_decision:"plan",manifest_step:"review",execution_step:"implementation",integration_step:"integration"}},initial_step:"draft",roles:{planner:{backend:"codex-thread"},implementer:{backend:"codex-thread"}},artifacts:{plan:{path:join(repo,"plan.md")}},steps:{
+    draft:{role:"planner",outputs:{plan:{artifact:"plan",required:true}},on:{completed:{to:"review"}}},
+    review:{role:"planner",on:{completed:{to:"approval"}}},
+    approval:{execution:"coordinator",decision:{key:"plan",artifact_key:"plan"},on:{completed:{to:"implementation"}}},
+    implementation:{role:"implementer",on:{completed:{transitions:[{id:"packages",when:{equals:{var:"packages.integration_required",value:true}},to:"integration"},{id:"inline",finish:true}]}}},
+    integration:{role:"implementer",requires:{equals:{var:"packages.joined",value:true}},evidence_operations:["prepare_result"],on:{completed:{finish:true}}}
+  }}; }
+  beforeEach(async()=>{
+    root=mkdtempSync(join(tmpdir(),"flow-packages-"));repo=join(root,"repo");mkdirSync(repo);db=join(root,"state.sqlite");
+    vi.stubEnv("AGENT_CONTROL_HOME",join(root,"runtime"));vi.stubEnv("AGENT_CONTROL_ADMIN_KEY","fixture");vi.stubEnv("CODEX_THREAD_ID","");vi.stubEnv("AGENT_CONTROL_REQUESTER_THREAD_ID","");
+    git(repo,"init","-q");git(repo,"config","user.email","fixture@example.invalid");git(repo,"config","user.name","Fixture");
+    writeFileSync(join(repo,"plan.md"),"# Plan\n\n<!-- hdt-section: packages -->\n## Packages\n\nUpdate a and b independently.\n");writeFileSync(join(repo,"a.txt"),"a\n");writeFileSync(join(repo,"b.txt"),"b\n");git(repo,"add",".");git(repo,"commit","-qm","base");
+    for(const branch of ["a","b"]) git(repo,"worktree","add","--quiet","--detach",join(root,branch),"HEAD");
+    adapter=new Fixture();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
+    owner=controller.orchestratorLogin({adminKey:"fixture",title:"Owner",runTitle:"Implement approved packages",repoDir:repo,backend:"codex-thread",backendHandle:{thread_id:"owner-thread"}});
+    const started=controller.startFlow({config:config(),runId:owner.run.run_id,agentToken:owner.agent_token,requesterThreadId:"original-user"});id=started.instance.flow_instance_id;
+    await dispatch();report();await dispatch();
+  });
+  afterEach(async()=>{await controller.dispose();store.close();rmSync(root,{recursive:true,force:true});vi.unstubAllEnvs();});
+  async function approve(packages=entries()) {
+    await request({operation:"define",packages});report();
+    const snapshot=controller.getFlowSnapshot(id);controller.recordFlowDecision({flowInstanceId:id,key:"plan",value:"approved",reason:"Approved exact plan and work packages",expectedRevision:snapshot.runtime!.revision,artifactDigest:artifactDigest(join(repo,"plan.md")),packageManifestDigest:group().manifest_digest,agentToken:owner.agent_token});
+    parentId=(await dispatch()).agent!.agent_id;
+  }
+  function entries(dependent=false) {return ["a","b"].map(name=>({id:name,title:`Package ${name}`,role:"implementer",worktree:join(root,name),paths:[`${name}.txt`],deliverables:[`${name}.txt`],depends_on:dependent&&name==="b"?["a"]:[]}));}
+  async function deliver(name:string,value=`${name} changed\n`) {
+    const branch=group().branches[name]!;writeFileSync(join(root,name,`${name}.txt`),value);actor(branch.agent_id!);
+    const result=await request({operation:"deliver",package_id:name,attempt:branch.attempt,summary:`Delivered ${name}`},true);return result.branches[name]!.delivery!;
+  }
+  async function accept(names:string[]) { for(const name of names)adapter.statuses.set(group().branches[name]!.agent_id!,"completed"); return request({operation:"accept",deliveries:names.map(name=>({package_id:name,delivery_id:group().branches[name]!.delivery!.delivery_id})),reason:"Delivery meets its assigned package."}); }
+  it("binds scope before exact approval and preserves the inline path",async()=>{
+    await request({operation:"define",packages:[]});report();const snapshot=controller.getFlowSnapshot(id);
+    expect(()=>controller.recordFlowDecision({flowInstanceId:id,key:"plan",value:"approved",reason:"Approved",expectedRevision:snapshot.runtime!.revision,artifactDigest:artifactDigest(join(repo,"plan.md")),agentToken:owner.agent_token})).toThrow(/manifest digest/);
+    controller.recordFlowDecision({flowInstanceId:id,key:"plan",value:"approved",reason:"Approved",expectedRevision:snapshot.runtime!.revision,artifactDigest:artifactDigest(join(repo,"plan.md")),packageManifestDigest:group().manifest_digest,agentToken:owner.agent_token});
+    await dispatch();expect(report().instance.status).toBe("completed");
+  });
+  it("launches two branches concurrently once, blocks premature join, and verifies consolidation",async()=>{
+    await approve();let release!:()=>void;adapter.gate=new Promise<void>(r=>release=r);const pending=request({operation:"launch"});
+    await vi.waitFor(()=>expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2));
+    await request({operation:"launch"});expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);release();await pending;adapter.gate=undefined;
+    actor(parentId);expect(()=>report()).toThrow(/join/);
+    await expect(controller.startFlowStep({flowInstanceId:id,stepId:"integration",agentToken:owner.agent_token})).rejects.toThrow(/decision or milestone/);
+    const a=await deliver("a");await expect(request({operation:"accept",deliveries:[{package_id:"a",delivery_id:a.delivery_id}],reason:"yes"})).rejects.toThrow(/inactive/);
+    await deliver("b");await accept(["a","b"]);actor(parentId);expect(report().instance.current_step_id).toBe("integration");await dispatch();
+    expect(()=>report()).toThrow(/integration receipt/);
+    writeFileSync(join(repo,"a.txt"),readFileSync(join(root,"a","a.txt")));
+    let receipt=await controller.executeFlowEvidence({flowInstanceId:id,key:"integration",request:{operation:"prepare_result",checkpoint_id:"premature",plan_path:join(repo,"plan.md"),paths:["a.txt"]}});
+    await expect(request({operation:"integrate",result_receipt_id:receipt.receipt_id})).rejects.toThrow(/Consolidated result/);
+    for(const name of ["a","b"])writeFileSync(join(repo,`${name}.txt`),readFileSync(join(root,name,`${name}.txt`)));
+    receipt=await controller.executeFlowEvidence({flowInstanceId:id,key:"integration",request:{operation:"prepare_result",checkpoint_id:"consolidated",plan_path:join(repo,"plan.md"),paths:["a.txt","b.txt"]}});
+    const integrated=await request({operation:"integrate",result_receipt_id:receipt.receipt_id});expect(integrated.integration!.delivery_ids).toHaveLength(2);expect(report().instance.status).toBe("completed");
+  },30000);
+  it("releases dependency successors in the batch acceptance call",async()=>{
+    await approve(entries(true));await request({operation:"launch"});expect(group().branches.b!.agent_id).toBeUndefined();await deliver("a");await accept(["a"]);expect(group().branches.b!.state).toBe("running");
+    expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);
+  });
+  it("rejects wrong owners, conflicting retries and writes outside scope",async()=>{
+    await approve();await request({operation:"launch"});actor(parentId);await expect(request({operation:"deliver",package_id:"a",attempt:1,summary:"forged"},true)).rejects.toThrow(/assigned worker/);
+    writeFileSync(join(root,"a","b.txt"),"outside");actor(group().branches.a!.agent_id!);await expect(request({operation:"deliver",package_id:"a",attempt:1,summary:"bad"},true)).rejects.toThrow(/outside/);writeFileSync(join(root,"a","b.txt"),"b\n");
+    const receipt=await deliver("a");expect((await request({operation:"deliver",package_id:"a",attempt:1,summary:"Delivered a"},true)).branches.a!.delivery!.delivery_id).toBe(receipt.delivery_id);
+    await expect(request({operation:"deliver",package_id:"a",attempt:1,summary:"different"},true)).rejects.toThrow(/conflicting/);
+    expect(()=>controller.reportFlowStep({stepInstanceId:controller.getFlowSnapshot(id).steps.find(s=>s.status==="active")!.step_instance_id,status:"completed"})).toThrow();
+  });
+  it("reconciles terminal missing deliveries, retries generations, and rejects stale authors",async()=>{
+    await approve();await request({operation:"launch"});const old=group().branches.a!;adapter.statuses.set(old.agent_id!,"failed");await controller.pollActiveAgents(owner.run.run_id);expect(group().branches.a!.state).toBe("failed");
+    await request({operation:"retry",package_id:"a",attempt:1,reason:"Retry failed attempt"});expect(group().branches.a!.attempt).toBe(2);expect(group().branches.a!.agent_id).toBe(old.agent_id);
+    actor(old.agent_id!);await expect(request({operation:"deliver",package_id:"a",attempt:1,summary:"old"},true)).rejects.toThrow(/obsolete/);
+    const count=adapter.starts.length;await request({operation:"retry",package_id:"a",attempt:1,reason:"Retry failed attempt"});expect(adapter.starts).toHaveLength(count);
+  });
+  it("retains accepted deliveries across controller restart and rejects plan drift",async()=>{
+    await approve();await request({operation:"launch"});await deliver("a");await deliver("b");await accept(["a","b"]);
+    const previous=group();await controller.dispose();store.close();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
+    expect(group().manifest_digest).toBe(previous.manifest_digest);await request({operation:"launch"});expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);
+    writeFileSync(join(repo,"plan.md"),"Changed unreported plan");actor(parentId);expect(()=>report()).toThrow(/outside its producing report/);
+  });
+  it("rejects overlapping writes, shared worktrees and postapproval manifest rewrites",async()=>{
+    await expect(request({operation:"define",packages:[entries()[0]!,{...entries()[1]!,paths:["a.txt"],deliverables:["a.txt"]}]})).rejects.toThrow(/disjoint/);
+    await expect(request({operation:"define",packages:[entries()[0]!,{...entries()[1]!,worktree:join(root,"a")}]})).rejects.toThrow(/distinct/);
+    await approve();await expect(request({operation:"define",packages:[]})).rejects.toThrow(/manifest review|immutable/);
+  });
+  it("validates the compact public operation schema",()=>{
+    expect(flowPackagesSchema.safeParse({flow_instance_id:id,request:{operation:"deliver",package_id:"a",attempt:1,summary:"done",agent_id:"spoof"}}).success).toBe(false);
+    const tool=TOOL_DEFINITIONS.find(t=>t.name==="flow_packages")!;expect(JSON.stringify(tool.inputSchema)).toContain("integrate");expect(JSON.stringify(tool.inputSchema)).not.toContain('"$ref"');
+  });
+});

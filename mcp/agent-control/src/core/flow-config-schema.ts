@@ -10,7 +10,7 @@ export const flowConfigJsonSchema = {
     version: { type: "string", minLength: 1 },
     description: { type: "string", minLength: 1 },
     initial_step: { type: "string", minLength: 1 },
-    policy: { type: "object", additionalProperties: false, properties: { strict: { type: "boolean" }, plan_artifact: { type: "string" } } },
+    policy: { type: "object", additionalProperties: false, properties: { strict: { type: "boolean" }, plan_artifact: { type: "string" }, work_packages: { type: "object", additionalProperties: false, required: ["approval_decision", "manifest_step", "execution_step", "integration_step"], properties: { approval_decision: { type: "string" }, approval_value: { type: "string" }, success_condition: { $ref: "#/$defs/condition" }, manifest_step: { type: "string" }, execution_step: { type: "string" }, integration_step: { type: "string" } } } } },
     state: { type: "object", additionalProperties: true },
     preferences: { type: "object", additionalProperties: { type: "object", properties: { values: { type: "array", minItems: 1, items: { type: "string" } }, artifact_key: { type: "string" }, owner: { enum: ["requester", "orchestrator"] } }, required: ["values"], additionalProperties: false } },
     prompts: {
