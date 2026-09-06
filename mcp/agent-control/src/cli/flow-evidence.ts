@@ -6,6 +6,7 @@ interface FlowRuntimeCommands {
   updateFlowContext(input: { flowInstanceId: string; context: string; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
   recordFlowDecision(input: { flowInstanceId: string; key: string; value: unknown; reason: string; expectedRevision: number; artifactKey?: string; artifactDigest?: string; agentToken?: string; adminKey?: string }): unknown;
   executeFlowEvidence(input: { flowInstanceId: string; key: string; request: Record<string, unknown>; stepInstanceId?: string; agentToken?: string; adminKey?: string }): Promise<unknown>;
+  recoverFlowOwner(input: { flowInstanceId: string; role: string; restartStepId: string; reason: string; expectedRevision: number; agentToken?: string; adminKey?: string }): unknown;
 }
 
 function revision(value: string): number {
@@ -33,6 +34,18 @@ function acceptedContext(options: { context?: string; contextFile?: string; cont
 
 export function registerFlowEvidenceCommands(flow: Command, deps: CliDeps): void {
   const controller = deps.controller as typeof deps.controller & FlowRuntimeCommands;
+  flow.command("recover-owner")
+    .description("Replace a stopped or detached pinned role owner and restart its configured step with a fresh full-review requirement.")
+    .requiredOption("--flow <id>", "Flow instance id.")
+    .requiredOption("--role <role>", "Exact configured role whose owner is unavailable.")
+    .requiredOption("--restart-step <id>", "Configured step owned by this role to restart.")
+    .requiredOption("--reason <text>", "Explicit reason for replacing the previous owner.")
+    .requiredOption("--expected-revision <n>", "Current flow runtime revision.", revision)
+    .action((options: { flow: string; role: string; restartStep: string; reason: string; expectedRevision: number }) => {
+      deps.output(controller.recoverFlowOwner({ flowInstanceId: options.flow, role: options.role,
+        restartStepId: options.restartStep, reason: options.reason, expectedRevision: options.expectedRevision,
+        ...deps.authOptions({ allowStoredAdminKey: true }) }));
+    });
   flow.command("context-update")
     .description("Replace the complete current accepted task contract with compare-and-swap protection; previous revisions remain in history.")
     .requiredOption("--flow <id>", "Flow instance id.")

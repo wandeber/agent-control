@@ -13,13 +13,24 @@ describe("flow evidence and observer CLI commands", () => {
   function fixture() {
     const controller = { updateFlowContext: vi.fn(() => ({ revision: 2 })), recordFlowDecision: vi.fn(() => ({ recorded: true })),
       executeFlowEvidence: vi.fn(async () => ({ receipt_id: "receipt" })), acknowledgeRunEvents: vi.fn(() => ({ advanced: true })),
-      waitForRun: vi.fn(async () => ({ events: [] })) };
+      waitForRun: vi.fn(async () => ({ events: [] })), recoverFlowOwner: vi.fn(() => ({ runtime: { recovery: { full_review_required: true } } })) };
     const program = new Command(); program.exitOverride();
     const deps = { controller, output: vi.fn(), authOptions: vi.fn(() => ({ adminKey: "test-admin" })) } as unknown as CliDeps;
     registerFlowEvidenceCommands(program.command("flow"), deps);
     registerObservationCommands(program.command("run"), deps);
-    return { controller, deps, parse: (args: string[]) => program.parseAsync(args, { from: "user" }) };
+    return { controller, deps, program, parse: (args: string[]) => program.parseAsync(args, { from: "user" }) };
   }
+  it("exposes explicit owner recovery with exact routing, revision and caller authentication", async () => {
+    const { controller, deps, parse, program } = fixture();
+    vi.mocked(deps.authOptions).mockReturnValue({ agentToken: "test-owner-token" });
+    await parse(["flow", "recover-owner", "--flow", "flow-1", "--role", "reviewer", "--restart-step", "review",
+      "--reason", "The assigned reviewer was detached; perform a full review.", "--expected-revision", "4"]);
+    expect(controller.recoverFlowOwner).toHaveBeenCalledWith({ flowInstanceId: "flow-1", role: "reviewer", restartStepId: "review",
+      reason: "The assigned reviewer was detached; perform a full review.", expectedRevision: 4, agentToken: "test-owner-token" });
+    expect(deps.output).toHaveBeenCalledWith({ runtime: { recovery: { full_review_required: true } } });
+    const help = program.commands.find(command => command.name() === "flow")!.commands.find(command => command.name() === "recover-owner")!.helpInformation();
+    expect(help).toContain("--expected-revision"); expect(help).toContain("--restart-step"); expect(help).toContain("stopped or detached");
+  });
   it("passes context CAS and artifact-bound decisions to production controller methods", async () => {
     const { controller, parse } = fixture();
     await parse(["flow", "context-update", "--flow", "flow-1", "--expected-revision", "1", "--context-json", '{"objective":"Revised"}']);
