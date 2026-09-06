@@ -736,6 +736,32 @@ select {
   overflow: hidden;
 }
 
+/* The shared evidence view follows the simple screen's existing dark palette. */
+.subagents-shell .flow-evidence-details {
+  border-color: var(--subagents-line);
+  background: var(--subagents-panel);
+}
+
+.subagents-shell .flow-evidence-details > div {
+  border-color: var(--subagents-line);
+}
+
+.subagents-shell .flow-evidence-details :is(.text-slate-800, .text-slate-700) {
+  color: var(--subagents-text);
+}
+
+.subagents-shell .flow-evidence-details :is(.text-slate-600, .text-slate-500) {
+  color: #b7bbc4;
+}
+
+.subagents-shell .flow-evidence-details :is(.text-amber-800, .text-amber-900) {
+  color: #f5cf92;
+}
+
+.subagents-shell .flow-evidence-details .bg-amber-50 {
+  background: rgb(245 207 146 / 8%);
+}
+
 .subagents-layout {
   display: grid;
   grid-template-columns: minmax(240px, 18rem) minmax(0, 1fr);

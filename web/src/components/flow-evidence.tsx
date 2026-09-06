@@ -4,7 +4,7 @@ import React from "react";
 import type { FlowEvidenceView } from "../lib/flow-evidence";
 
 export function FlowEvidenceDetails({ view, expanded = false }: { view: FlowEvidenceView; expanded?: boolean }) {
-  return <details className="min-w-0 rounded-lg border border-slate-200 bg-white text-xs" open={expanded}>
+  return <details className="flow-evidence-details min-w-0 rounded-lg border border-slate-200 bg-white text-xs" open={expanded}>
     <summary className="cursor-pointer px-3 py-2 font-semibold text-slate-800">
       {view.title} · {view.decision ? "Decision needed" : view.history ? "Earlier attempt" : view.waitingLabel ?? "Phase details"}
     </summary>
