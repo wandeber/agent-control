@@ -1,13 +1,15 @@
 import { compareFlowStepsNewestFirst } from "./flow-steps";
-import type { DashboardSnapshot, FlowEvidenceSummaryRecord, FlowInstanceRecord } from "./types";
+import type { DashboardSnapshot, FlowEvidenceSummaryRecord, FlowInstanceRecord, FlowStepConfigRecord } from "./types";
 
 export interface FlowEvidenceView {
   title: string;
   history: boolean;
   available: boolean;
   decision: string | null;
+  waitingLabel?: string | null;
   continuation: string | null;
   correction: { title: string; text: string } | null;
+  recovery?: { reason: string; fullReviewRequired: boolean } | null;
   receipts: Array<{ title: string; status: string; notice: string | null; reason: string | null; sections: Array<{ title: string; items: string[] }> }>;
   unscopedEvidence: boolean;
 }
@@ -63,19 +65,27 @@ export function buildFlowEvidenceView(snapshot: DashboardSnapshot, selection: {
   const correction = current ? runtime?.correction : null;
   const reason = text(correction?.summary);
   const source = text(correction?.from_step_id);
+  const userDecision = waiting && config?.decision?.authority === "user";
+  const ownerReview = waiting && config?.decision?.authority === "coordinator";
+  const recoveryReason = current ? text(runtime?.recovery?.reason) : null;
 
   return {
     title: stepId ? humanizePhase(stepId) : "Flow",
     history,
     available: Boolean(runtime),
-    decision: waiting && config?.decision ? humanizePhase(config.decision.key) : null,
+    decision: userDecision ? humanizePhase(config!.decision!.key) : null,
+    waitingLabel: stepId ? phaseWaitingLabel(instance, stepId, config ?? undefined) : null,
     continuation: current && instance.status === "blocked"
       ? "This flow is paused. Check the Codex conversation for the required recovery action."
-      : waiting && !config?.decision ? "Waiting for the Codex conversation to continue the flow." : null,
+      : ownerReview ? (config?.decision?.owner === "requester"
+        ? "The conversation that clarified the request must complete this review before the flow can continue."
+        : "The coordinator must complete this review before the flow can continue.")
+        : waiting && !userDecision ? "Waiting for the Codex conversation to continue the flow." : null,
     correction: reason ? {
       title: `Phase handoff${source ? ` from ${humanizePhase(source)}` : ""}`,
       text: reason
     } : null,
+    recovery: recoveryReason ? { reason: recoveryReason, fullReviewRequired: runtime?.recovery?.full_review_required === true } : null,
     receipts: scopedReceipts.map((receipt) => receiptView(receipt, runtime?.acceptance_revision)),
     unscopedEvidence: Boolean(stepId && allReceipts.some((receipt) => !receipt.step_instance_id))
   };
@@ -126,7 +136,10 @@ export function humanizePhase(value: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-export function phaseWaitingLabel(instance: FlowInstanceRecord, stepId: string, step?: { decision?: { key: string }; execution?: string }): string | null {
+export function phaseWaitingLabel(instance: FlowInstanceRecord, stepId: string, step?: Pick<FlowStepConfigRecord, "decision" | "execution">): string | null {
   if (instance.current_step_id !== stepId || instance.status !== "waiting_for_orchestrator") return null;
-  return step?.decision ? "Waiting for your decision" : step?.execution === "coordinator" ? "Waiting for Codex" : null;
+  if (step?.decision?.authority === "user") return "Waiting for your decision";
+  if (step?.decision?.authority === "coordinator") return step.decision.owner === "requester"
+    ? "Waiting for clarification owner review" : "Waiting for coordinator review";
+  return step?.execution === "coordinator" || step?.decision ? "Waiting for Codex" : null;
 }

@@ -39,6 +39,13 @@ describe("phase evidence detail", () => {
     expect(html).toContain("A completed phase records progress, not validation of the current result.");
   });
 
+  it("does not ask the user to decide a clarification-owner review", () => {
+    const html = renderToStaticMarkup(<FlowEvidenceDetails view={{ ...view, waitingLabel: "Waiting for clarification owner review", continuation: "The conversation that clarified the request must complete this review before the flow can continue." }} />);
+    expect(html).toContain("Waiting for clarification owner review");
+    expect(html).not.toContain("Waiting for your decision");
+    expect(html).not.toContain("Reply in the Codex conversation");
+  });
+
   it("renders recovery reasons as escaped text", () => {
     const html = renderToStaticMarkup(<FlowEvidenceDetails view={{ ...view, correction: { title: "Flow paused", text: "Owner unavailable <script>alert(1)</script>" } }} />);
     expect(html).toContain("Owner unavailable &lt;script&gt;");

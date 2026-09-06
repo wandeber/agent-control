@@ -171,7 +171,7 @@ export interface FlowConfigRecord {
 
 export interface FlowStepConfigRecord {
   execution?: "agent" | "coordinator";
-  decision?: { key: string; artifact_key?: string };
+  decision?: { key: string; artifact_key?: string; authority?: "user" | "coordinator"; owner?: "requester" | "orchestrator" };
   role?: string;
   agent_id?: string;
   prompt?: string;
@@ -234,6 +234,7 @@ export interface FlowRuntimeRecord {
   evidence_summaries?: Record<string, FlowEvidenceSummaryRecord>;
   owners: Record<string, string>;
   correction: Record<string, unknown> | null;
+  recovery?: { request_digest: string; role: string; previous_agent_id: string; agent_id: string; reason: string; restart_step_id: string; full_review_required: boolean };
 }
 
 export interface FlowEvidenceSummaryRecord {

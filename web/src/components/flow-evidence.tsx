@@ -6,7 +6,7 @@ import type { FlowEvidenceView } from "../lib/flow-evidence";
 export function FlowEvidenceDetails({ view, expanded = false }: { view: FlowEvidenceView; expanded?: boolean }) {
   return <details className="min-w-0 rounded-lg border border-slate-200 bg-white text-xs" open={expanded}>
     <summary className="cursor-pointer px-3 py-2 font-semibold text-slate-800">
-      {view.title} · {view.decision ? "Decision needed" : view.history ? "Earlier attempt" : "Phase details"}
+      {view.title} · {view.decision ? "Decision needed" : view.history ? "Earlier attempt" : view.waitingLabel ?? "Phase details"}
     </summary>
     <div className="max-h-72 space-y-3 overflow-auto border-t border-slate-100 px-3 py-3 leading-5">
       {view.decision ? <div className="rounded-md bg-amber-50 px-3 py-2 text-amber-900" role="status">
@@ -14,6 +14,11 @@ export function FlowEvidenceDetails({ view, expanded = false }: { view: FlowEvid
         <p>Reply in the Codex conversation to continue.</p>
       </div> : null}
       {view.continuation ? <p className="text-amber-800">{view.continuation}</p> : null}
+      {view.recovery ? <div className="border-l-2 border-amber-400 pl-3">
+        <p className="font-semibold text-slate-800">Flow recovery</p>
+        <p className="whitespace-pre-wrap break-words text-slate-600">{view.recovery.reason}</p>
+        {view.recovery.fullReviewRequired ? <p className="text-amber-800">The new owner must complete a full review before this flow can advance.</p> : null}
+      </div> : null}
       {view.correction ? <div className="border-l-2 border-amber-400 pl-3">
         <p className="font-semibold text-slate-800">{view.correction.title}</p>
         <p className="whitespace-pre-wrap break-words text-slate-600">{view.correction.text}</p>

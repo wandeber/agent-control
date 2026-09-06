@@ -15,7 +15,7 @@ function evidenceSnapshot(withRuntime = true): DashboardSnapshot {
     flows: [{ flow_record_id: "definition", flow_id: "development", version: "1", description: null, created_at: "", updated_at: "", config: {
       id: "development", initial_step: "expert_review", steps: {
         expert_review: {},
-        plan_approval: { execution: "coordinator", decision: { key: "approve_plan", artifact_key: "plan" } }
+        plan_approval: { execution: "coordinator", decision: { key: "approve_plan", artifact_key: "plan", authority: "user" } }
       }
     } }],
     flow_instances: [{ flow_instance_id: "flow-1", flow_record_id: "definition", run_id: "run-1", status: "active", current_step_id: "expert_review", created_at: "", updated_at: "2026-09-06T12:00:00Z", ...(withRuntime ? { runtime: runtime() } : {}) }],
@@ -86,7 +86,7 @@ describe("phase evidence provenance", () => {
     expect(view.unscopedEvidence).toBe(true);
   });
 
-  it("shows coordinator decisions without needing an agent and keeps historical phases separate", () => {
+  it("shows user decisions without needing an agent and keeps historical phases separate", () => {
     const snapshot = evidenceSnapshot();
     const instance = snapshot.flow_instances[0]!;
     instance.current_step_id = "plan_approval";
@@ -96,6 +96,34 @@ describe("phase evidence provenance", () => {
     expect(buildFlowEvidenceView(snapshot, { stepInstanceId: "review-1" })!.decision).toBeNull();
     expect(phaseWaitingLabel(instance, "plan_approval", snapshot.flows[0]!.config.steps.plan_approval)).toBe("Waiting for your decision");
     expect(phaseWaitingLabel(instance, "expert_review", {})).toBeNull();
+  });
+
+  it("distinguishes requester and orchestrator reviews from user decisions without relying on phase names", () => {
+    const snapshot = evidenceSnapshot();
+    const instance = snapshot.flow_instances[0]!;
+    instance.status = "waiting_for_orchestrator";
+    const config = snapshot.flows[0]!.config.steps.expert_review!;
+    config.execution = "coordinator";
+    config.decision = { key: "custom_intent_check", authority: "coordinator", owner: "requester" };
+    let view = buildFlowEvidenceView(snapshot)!;
+    expect(view.decision).toBeNull();
+    expect(view.waitingLabel).toBe("Waiting for clarification owner review");
+    expect(view.continuation).toContain("The conversation that clarified the request");
+    config.decision.owner = "orchestrator";
+    view = buildFlowEvidenceView(snapshot)!;
+    expect(view.decision).toBeNull();
+    expect(view.waitingLabel).toBe("Waiting for coordinator review");
+    delete config.decision.authority;
+    expect(buildFlowEvidenceView(snapshot)!.waitingLabel).toBe("Waiting for Codex");
+    expect(buildFlowEvidenceView(snapshot)!.decision).toBeNull();
+  });
+
+  it("shows explicit recovery without exposing its internal identities", () => {
+    const snapshot = evidenceSnapshot();
+    snapshot.flow_instances[0]!.runtime!.recovery = { request_digest: "private-recovery-digest", role: "expert", previous_agent_id: "old-private-id", agent_id: "new-private-id", reason: "The previous review owner became unavailable.", restart_step_id: "expert_review", full_review_required: true };
+    const view = buildFlowEvidenceView(snapshot)!;
+    expect(view.recovery).toEqual({ reason: "The previous review owner became unavailable.", fullReviewRequired: true });
+    expect(JSON.stringify(view)).not.toContain("private-");
   });
 
   it("shows the current handoff reason without presenting normal forward progress as a rollback", () => {
