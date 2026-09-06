@@ -19,6 +19,7 @@ parser.add_argument("--report")
 parser.add_argument("--operation", choices=("validate-mechanical", "verify-stored", "verify-mechanical"), default="validate-mechanical")
 parser.add_argument("--evidence-id")
 parser.add_argument("--plan", action="store_true")
+parser.add_argument("--include-manifest", action="store_true")
 parser.add_argument("--require-review", action="append", default=[])
 args = parser.parse_args()
 try:
@@ -40,6 +41,8 @@ try:
             if state != "strict-approved":
                 raise provider.CheckpointError("Stored review is not strictly approved.")
         result["plan_sha256"] = manifest["plan"]["sha256"]
+        if args.include_manifest:
+            result["manifest"] = manifest
         print(json.dumps(result))
         raise SystemExit(0)
     if not args.report:

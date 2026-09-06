@@ -165,6 +165,42 @@ describe('run-owned canonical evidence', () => {
     expect(() => service.verifyReceiptSync({ ...context, planRevision: forged.plan_revision }, plan.receipt_id)).toThrow(/controller-bound plan revision/);
   });
 
+  it('returns canonical current result scope and rejects a rehashed expansion of partial checkpoint coverage', async () => {
+    const receipt = await result();
+    const verified = service.verifyResultManifestSync(context, receipt.receipt_id);
+    expect(Object.keys(verified.manifest.files)).toEqual(['value.txt']);
+    expect(verified.manifest.base_commit).toBe(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+    const original = JSON.parse(JSON.stringify(receipt));
+    const stored = join(root, 'run/evidence/run-test/flow-test/receipts', `${receipt.receipt_id}.json`);
+    const forge = (edit: (payload: Record<string, any>) => void) => {
+      const changed = JSON.parse(JSON.stringify(original));
+      edit(changed.payload);
+      const { record_sha256: _oldDigest, ...body } = changed;
+      changed.record_sha256 = fingerprint(body);
+      writeFileSync(stored, JSON.stringify(changed));
+    };
+    forge(value => { value.files['unrelated.txt'] = { kind: 'file', mode: '100644', sha256: sha256(readFileSync(join(repo, 'unrelated.txt'))), size: readFileSync(join(repo, 'unrelated.txt')).length }; });
+    expect(() => service.verifyResultManifestSync(context, receipt.receipt_id)).toThrow(/provider manifest: files/);
+    forge(value => { value.base_commit = 'a'.repeat(40); });
+    expect(() => service.verifyResultManifestSync(context, receipt.receipt_id)).toThrow(/provider manifest: base_commit/);
+    writeFileSync(stored, JSON.stringify(original));
+    write('value.txt', 'changed after capture\n');
+    expect(() => service.verifyResultManifestSync(context, receipt.receipt_id)).toThrow(/failed|drift/i);
+  }, 30_000);
+
+  it('returns canonical deletion entries and refuses a forged absent representation', async () => {
+    rmSync(join(repo, 'unrelated.txt'));
+    const receipt = await service.execute(context, { operation: 'prepare_result', checkpoint_id: 'deletion-result', plan_path: 'plan.md', paths: ['value.txt', 'unrelated.txt'] });
+    const verified = service.verifyResultManifestSync(context, receipt.receipt_id);
+    expect(verified.manifest.files['unrelated.txt']).toEqual({ kind: 'deleted', mode: null, sha256: null, size: 0 });
+    const forged = JSON.parse(JSON.stringify(receipt));
+    forged.payload.files['unrelated.txt'].kind = 'absent';
+    const { record_sha256: _oldDigest, ...body } = forged;
+    forged.record_sha256 = fingerprint(body);
+    writeFileSync(join(root, 'run/evidence/run-test/flow-test/receipts', `${receipt.receipt_id}.json`), JSON.stringify(forged));
+    expect(() => service.verifyResultManifestSync(context, receipt.receipt_id)).toThrow(/provider manifest: files/);
+  }, 30_000);
+
   it('composes the planner mechanical binding only from an explicit verified current complete receipt', async () => {
     await result();
     const plannerDraft: Record<string, unknown> = { ...draft(), recommended_next_phase: 'post_planner_choice' };
