@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import { AgentController } from "../src/core/controller.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 import { AdapterRegistry } from "../src/adapters/registry.js";
 import { artifactDigest } from "../src/core/flow-runtime.js";
+import { EVENT_TYPES } from "../src/core/types.js";
 import type { AgentAdapter, AgentHandle, AgentStatus, FlowConfig, StartAgentInput } from "../src/core/types.js";
 import type { FlowPackagesRequest, PackageGroup } from "../src/core/flow-packages.js";
 import { flowPackagesSchema } from "../src/tools/schemas.js";
@@ -80,7 +81,14 @@ describe("durable work package fork and join", () => {
     await expect(request({operation:"integrate",result_receipt_id:receipt.receipt_id})).rejects.toThrow(/Consolidated result/);
     for(const name of ["a","b"])writeFileSync(join(repo,`${name}.txt`),readFileSync(join(root,name,`${name}.txt`)));
     receipt=await controller.executeFlowEvidence({flowInstanceId:id,key:"integration",request:{operation:"prepare_result",checkpoint_id:"consolidated",plan_path:join(repo,"plan.md"),paths:["a.txt","b.txt"]}});
-    const integrated=await request({operation:"integrate",result_receipt_id:receipt.receipt_id});expect(integrated.integration!.delivery_ids).toHaveLength(2);expect(report().instance.status).toBe("completed");
+    const alternateBase=git(repo,"commit-tree","HEAD^{tree}","-m","Alternate package base");
+    const wrongBase=await controller.executeFlowEvidence({flowInstanceId:id,key:"wrong_base",request:{operation:"prepare_result",checkpoint_id:"wrong-base",plan_path:join(repo,"plan.md"),paths:["a.txt","b.txt"],base:alternateBase}});
+    await expect(request({operation:"integrate",result_receipt_id:wrongBase.receipt_id})).rejects.toThrow(/base commit/);
+    const integrated=await request({operation:"integrate",result_receipt_id:receipt.receipt_id});expect(integrated.integration!.delivery_ids).toHaveLength(2);
+    const recordPath=integrated.integration!.path,recordBytes=readFileSync(recordPath);chmodSync(recordPath,0o644);writeFileSync(recordPath,"{}");
+    await expect(request({operation:"integrate",result_receipt_id:receipt.receipt_id})).rejects.toThrow(/integrity/);
+    rmSync(recordPath);await expect(request({operation:"integrate",result_receipt_id:receipt.receipt_id})).rejects.toThrow(/ENOENT/);
+    writeFileSync(recordPath,recordBytes);expect(report().instance.status).toBe("completed");
   },30000);
   it("does not treat cancellation of an in-flight start as proof that it is inactive",async()=>{
     await approve([entries()[0]!]);let release!:()=>void;adapter.gate=new Promise<void>(r=>release=r);const pending=request({operation:"launch"});
@@ -89,6 +97,46 @@ describe("durable work package fork and join", () => {
     await expect(request({operation:"retry",package_id:"a",attempt:1,reason:"Start again"})).rejects.toThrow(/settle/);
     release();await pending;adapter.gate=undefined;expect(group().branches.a!.state).toBe("cancelled");
     expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(1);
+  });
+  it("recovers a cancelled late start only from matching durable compensating-stop evidence",async()=>{
+    await approve([entries()[0]!]);let release!:()=>void;adapter.gate=new Promise<void>(r=>release=r);const pending=request({operation:"launch"});
+    await vi.waitFor(()=>expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(1));
+    await request({operation:"cancel",package_id:"a",attempt:1,reason:"Cancel in-flight branch"});
+    const crashState=controller.getFlowSnapshot(id).runtime!;expect(crashState.packages!.branches.a!.launch_settled).toBe(false);
+    release();await pending;adapter.gate=undefined;const child=group().branches.a!.agent_id!;
+    expect(controller.getAgent(child).status).toBe("stopped");
+    // Keep the durable backend stop, but cut off the final package callback.
+    store.db.prepare("update flow_runtime set state_json=? where flow_instance_id=?").run(JSON.stringify(crashState),id);
+    await controller.dispose();store.close();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
+    const stop=store.listEvents({agentId:child,type:"agent.stopped"}).find(e=>e.payload.reason==="compensating_stop_after_late_start")!;
+    expect(stop.payload.work_generation).toBe(controller.getAgent(child).work_generation);
+    const stopBody=JSON.stringify(stop.payload);store.db.prepare("update events set payload_json=? where event_id=?").run(JSON.stringify({...stop.payload,work_generation:0}),stop.event_id);
+    await expect(request({operation:"retry",package_id:"a",attempt:1,reason:"Retry confirmed stopped attempt"})).rejects.toThrow(/settle/);
+    expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(1);
+    store.db.prepare("update events set payload_json=? where event_id=?").run(stopBody,stop.event_id);
+    await request({operation:"retry",package_id:"a",attempt:1,reason:"Retry confirmed stopped attempt"});
+    expect(group().branches.a!.attempt).toBe(2);expect(group().branches.a!.prior_attempts![0]!.launch_settled).toBe(true);
+    expect(adapter.starts.filter(s=>s.metadata?.package_id)).toHaveLength(2);
+  });
+  it("subscribes the launching worker before dispatch and resumes through explicit bound ACKs",async()=>{
+    await approve();actor(parentId);const original=controller.ensureRequester(owner.run.run_id).observer_agent_id;
+    let observedBeforeDispatch=false;const nativeStart=adapter.start.bind(adapter);adapter.start=async input=>{if(input.metadata?.package_id) observedBeforeDispatch=Boolean(store.db.prepare("select 1 from run_observers where run_id=? and thread_id=?").get(owner.run.run_id,`thread-${parentId}`));return nativeStart(input);};
+    const launched=await request({operation:"launch"},true),observer=launched.coordinator_observer!;
+    expect(observedBeforeDispatch).toBe(true);expect(observer.observer_agent_id).not.toBe(parentId);expect(observer.observer_agent_id).not.toBe(original);
+    expect(observer.event_types).toEqual(EVENT_TYPES);expect(controller.getAgent(parentId).backend_handle?.agent_control_role).not.toBe("observer");
+    expect(controller.ensureRequester(owner.run.run_id).observer_agent_id).toBe(original);
+    expect(launched.wait_contract).toMatchObject({tool:"flow_packages",arguments:{flow_instance_id:id,request:{operation:"wait",timeout_ms:3600000}}});
+    expect(observer.wait_contract.tool).toBe("flow_packages");
+    type Batch={events:Array<{event_id:string;type:string}>,cursor:string,processed_cursor:string,timed_out:boolean,ack_contract?:{tool:string;arguments:{request:{operation:string;cursor:string}}},wait_contract:{tool:string}};
+    const wait=()=>controller.executeFlowPackages({flowInstanceId:id,request:{operation:"wait",timeout_ms:1}}) as Promise<Batch>;
+    const batch=await wait();expect(batch.events.some(e=>e.type==="agent.started")).toBe(true);expect(batch.ack_contract!.tool).toBe("flow_packages");expect(batch.ack_contract!.arguments.request).toEqual({operation:"ack",cursor:batch.cursor});
+    expect(batch.processed_cursor).toBe(observer.processed_cursor);expect((await wait()).events).toEqual(batch.events);
+    await expect(controller.executeFlowPackages({flowInstanceId:id,request:{operation:"ack",cursor:batch.cursor},agentToken:"invalid-token"})).rejects.toThrow();
+    await expect(controller.executeFlowPackages({flowInstanceId:id,request:{operation:"ack",cursor:batch.cursor},agentToken:owner.agent_token})).rejects.toThrow(/cursor/i);
+    await controller.executeFlowPackages({flowInstanceId:id,request:{operation:"ack",cursor:batch.cursor}});
+    const resumed=await wait();expect(resumed.events).toEqual([]);expect(resumed.timed_out).toBe(true);expect(resumed.wait_contract.tool).toBe("flow_packages");
+    const abort=new AbortController();abort.abort();await expect(controller.executeFlowPackages({flowInstanceId:id,request:{operation:"wait"},signal:abort.signal})).rejects.toThrow();
+    expect(controller.ensureRequester(owner.run.run_id).observer_agent_id).toBe(original);
   });
   it("releases dependency successors in the batch acceptance call",async()=>{
     await approve(entries(true));await request({operation:"launch"});expect(group().branches.b!.agent_id).toBeUndefined();await deliver("a");await accept(["a"]);expect(group().branches.b!.state).toBe("running");
@@ -144,6 +192,12 @@ describe("durable work package fork and join", () => {
     await request({operation:"retry",package_id:"a",attempt:1,reason:"Fix the upstream behavior"});expect(group().branches.a!.attempt).toBe(2);expect(group().branches.b!.attempt).toBe(2);expect(group().branches.b!.state).toBe("pending");
     const start=adapter.starts.filter(s=>s.metadata?.package_id==="a").at(-1)!;expect(start.metadata?.reasoning_effort).toBe("max");expect(start.prompt).toContain("Fix the upstream behavior");
     await deliver("a","a corrected\n");await accept(["a"]);expect(group().branches.b!.state).toBe("running");expect(group().branches.b!.dependency_delivery_ids).toEqual([group().branches.a!.delivery!.delivery_id]);
+  });
+  it("preserves local consolidated changes rather than silently forking a stale HEAD",async()=>{
+    writeFileSync(join(repo,"a.txt"),"Uncommitted local work\n");
+    await expect(request({operation:"define",packages:entries()})).rejects.toThrow(/clean committed consolidated baseline/);
+    expect(readFileSync(join(repo,"a.txt"),"utf8")).toBe("Uncommitted local work\n");
+    expect((await request({operation:"define",packages:[]})).manifest).toEqual([]);
   });
   it("rejects altered manifest fields even when the stored approval hash was retained",async()=>{
     await approve();const state=controller.getFlowSnapshot(id).runtime!;state.packages!.manifest[0]!.required=false;

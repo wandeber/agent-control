@@ -1,4 +1,4 @@
-import { FlowPackages, type FlowPackagesRequest, type PackageContext } from "./flow-packages.js";
+import { FlowPackages, flowPackagesRequestSchema, type FlowPackagesRequest, type FlowPackagesToolRequest, type PackageGroup, type PackageContext } from "./flow-packages.js";
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
 import { EvidenceService, type EvidenceRequest, type EvidenceReceiptKind } from "./evidence/service.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -24,7 +24,8 @@ import {
   generateAgentToken,
   generateBridgeToken,
   hashToken,
-  verifyAdminKey
+  verifyAdminKey,
+  resolveAdminKey
 } from "./identity.js";
 import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "./ids.js";
 import type { LocalCredentialStore } from "./local-credential-store.js";
@@ -90,7 +91,7 @@ import type {
   StopResult,
   UsageSnapshotRecord
 } from "./types.js";
-import { AGENT_STATUSES } from "./types.js";
+import { AGENT_STATUSES, EVENT_TYPES } from "./types.js";
 
 const TERMINAL_STATUSES = new Set<AgentStatus>(["completed", "failed", "blocked", "stopped"]);
 const PURGE_SAFE_STATUSES = new Set<AgentStatus>(["planned", "completed", "failed", "blocked", "stopped"]);
@@ -658,7 +659,7 @@ export class AgentController {
         this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: branch.agent_id!, type: "parent_child", label: entry.id });
         return this.startAgent({ agentId: branch.agent_id!, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", ...(role.reasoning_effort ? { reasoning_effort: role.reasoning_effort } : {}), phase: context.policy.execution_step, parent_agent_id: context.parentAgentId, package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
       },
-      agent: id => this.getAgent(id), refresh: id => this.refreshAgentStatus(id), stop: id => this.stopAgent(id),
+      agent: id => this.getAgent(id), refresh: async id => { const agent = await this.refreshAgentStatus(id); this.packageRuntime().reconcile(agent); return agent; }, stop: id => this.stopAgent(id),
       verifyResult: (context, id) => new EvidenceService({ rootDir: join(runRuntimeDir(context.runId), "evidence") }).verifyResultManifestSync(this.evidenceContext(this.getFlowInstanceOrThrow(context.flowId), "package-integration", "integration"), id),
       emit: (context, reason, detail) => {
         const group = this.flowRuntime.get(context.flowId)?.packages; const packageId = typeof detail.package_id === "string" ? detail.package_id : undefined;
@@ -670,7 +671,40 @@ export class AgentController {
     });
   }
 
-  executeFlowPackages(input: { flowInstanceId: string; request: FlowPackagesRequest; agentToken?: string | null; adminKey?: string | null }) { return this.packageRuntime(input).execute(input.flowInstanceId, input.request); }
+  private packageObserver(flowId: string, auth: { agentToken?: string | null; adminKey?: string | null }) {
+    const instance = this.getFlowInstanceOrThrow(flowId); const context = this.packageContext(flowId, false);
+    const requesterId = this.flowRuntime.get(flowId)?.decision_owners?.requester ?? null;
+    const expected = [instance.orchestrator_agent_id, context.parentAgentId, requesterId];
+    const caller = this.flowCaller(auth.agentToken, expected);
+    const threadId = caller?.backend === "codex-thread" ? caller.backend_handle?.thread_id : null;
+    if (!caller || !expected.includes(caller.agent_id) || typeof threadId !== "string" || !threadId) throw new ControllerError("Package supervision requires the actual launching Codex conversation identity.", "auth_required");
+    // Register before dispatch so even a fast first delivery is in this
+    // observer's history. This never replaces the original requester binding.
+    this.ensureRequester(context.runId);
+    for (const branch of Object.values(this.flowRuntime.get(flowId)?.packages?.branches ?? {})) if (branch.agent_id) this.packageRuntime().reconcile(this.getAgent(branch.agent_id));
+    return { ...this.observeRun({ runId: context.runId, threadId, title: `Package coordinator: ${caller.title}`, eventTypes: [...EVENT_TYPES], delivery: "wait", adminKey: resolveAdminKey() }), wait_contract: packageWaitContract(flowId) };
+  }
+
+  executeFlowPackages(input: { flowInstanceId: string; request: FlowPackagesRequest; agentToken?: string | null; adminKey?: string | null; signal?: AbortSignal }): Promise<PackageGroup & { coordinator_observer?: ReturnType<AgentController["packageObserver"]>; wait_contract?: ReturnType<typeof packageWaitContract> }>;
+  executeFlowPackages(input: { flowInstanceId: string; request: FlowPackagesToolRequest; agentToken?: string | null; adminKey?: string | null; signal?: AbortSignal }): Promise<unknown>;
+  async executeFlowPackages(input: { flowInstanceId: string; request: FlowPackagesToolRequest; agentToken?: string | null; adminKey?: string | null; signal?: AbortSignal }): Promise<unknown> {
+    const request = flowPackagesRequestSchema.parse(input.request);
+    const observer = ["launch", "accept", "retry", "wait", "ack"].includes(request.operation) ? this.packageObserver(input.flowInstanceId, input) : undefined;
+    const waitContract = packageWaitContract(input.flowInstanceId);
+    if (request.operation === "wait") {
+      const result = await this.waitForRun({ runId: observer!.run_id, observerAgentId: observer!.observer_agent_id, cursor: request.cursor, timeoutMs: request.timeout_ms ?? 3_600_000, signal: input.signal });
+      return { ...result, coordinator_observer: observer, wait_contract: result.closed ? null : waitContract,
+        ...("ack_contract" in result && result.ack_contract ? { ack_contract: { tool: "flow_packages", arguments: { flow_instance_id: input.flowInstanceId, request: { operation: "ack", cursor: result.cursor } }, instruction: "Acknowledge this cursor only after handling every event in this batch, then wait again." } } : {}) };
+    }
+    if (request.operation === "ack") {
+      // The cursor is signed and checked by the existing observer protocol;
+      // its observer is derived from the authenticated thread, never submitted.
+      const result = this.acknowledgeRunEvents({ runId: observer!.run_id, observerAgentId: observer!.observer_agent_id, cursor: request.cursor, adminKey: resolveAdminKey() });
+      return { ...result, coordinator_observer: observer, wait_contract: waitContract };
+    }
+    const group = await this.packageRuntime(input).execute(input.flowInstanceId, request);
+    return { ...group, ...(observer ? { coordinator_observer: observer, wait_contract: waitContract } : {}) };
+  }
 
   updateFlowContext(input: { flowInstanceId: string; context: string; expectedRevision: number; agentToken?: string | null; adminKey?: string | null }) {
     return this.store.immediateTransaction(() => {
@@ -7267,7 +7301,9 @@ export class AgentController {
           runId: updated.run_id,
           agentId: updated.agent_id,
           type: this.statusEventType(updated.status),
-          payload
+          // Bind stop evidence to the actual generation/handle, including a
+          // late start whose compensating stop precedes package reconciliation.
+          payload: { ...payload, work_generation: updated.work_generation, backend_handle_sha256: digest(updated.backend_handle) }
         })
       );
       if (TERMINAL_STATUSES.has(updated.status)) {
@@ -10081,6 +10117,11 @@ function agentctlExecutable(): string {
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   const bundled = resolve(packageRoot, "bin/agentctl");
   return existsSync(bundled) ? bundled : "agentctl";
+}
+
+function packageWaitContract(flowInstanceId: string) {
+  return { turn_policy: "keep_open_while_work_pending", tool: "flow_packages", arguments: { flow_instance_id: flowInstanceId, request: { operation: "wait", timeout_ms: 3_600_000 } },
+    instruction: "Keep this Codex turn open while supervised packages remain pending. Use this wait contract after launch, after a timeout, and after answering a user message in commentary. Handle the returned events, explicitly call the returned flow_packages ack contract, then wait again. Fetching never acknowledges processing. Omit cursor to resume the durable processed position; the original requesting conversation remains separately subscribed. A timeout or unrelated user message does not cancel the work. End only when supervision is resolved or explicitly paused or cancelled." };
 }
 
 const STRICT_FLOW_CAPABILITY_FAILURE = "If a required Agent Control tool is unavailable, requires approval, is denied by host policy, or returns auth_required, stop this step immediately. Do not retry repeatedly, switch to CLI or shell reporting, write controller files or the database, search for step IDs or credentials, change tool approval settings, or claim completion. Return exactly one concise final line: AGENT_CONTROL_BLOCKED: <tool name> | <brief observed reason>. Report the observed limitation without guessing whether the host or controller caused it; the coordinator will handle recovery.";

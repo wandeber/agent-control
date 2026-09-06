@@ -13,7 +13,7 @@ const id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/);
 export const workPackageSchema = z.object({ id, title: z.string().min(1), role: z.string().min(1), worktree: z.string().min(1),
   paths: z.array(z.string().min(1)).min(1), deliverables: z.array(z.string().min(1)).min(1),
   depends_on: z.array(id).default([]), required: z.boolean().default(true) }).strict();
-export const flowPackagesRequestSchema = z.discriminatedUnion("operation", [
+const flowPackagesMutationSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("define"), packages: z.array(workPackageSchema) }).strict(),
   z.object({ operation: z.literal("launch") }).strict(),
   z.object({ operation: z.literal("deliver"), package_id: id, attempt: z.number().int().positive(), summary: z.string().min(1) }).strict(),
@@ -22,7 +22,13 @@ export const flowPackagesRequestSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("cancel"), package_id: id, attempt: z.number().int().positive(), reason: z.string().min(1) }).strict(),
   z.object({ operation: z.literal("integrate"), result_receipt_id: z.string().min(1) }).strict(),
 ]);
-export type FlowPackagesRequest = z.input<typeof flowPackagesRequestSchema>;
+export const flowPackagesRequestSchema = z.discriminatedUnion("operation", [
+  ...flowPackagesMutationSchema.options,
+  z.object({ operation: z.literal("wait"), timeout_ms: z.number().int().positive().max(3_600_000).optional(), cursor: z.string().min(1).optional() }).strict(),
+  z.object({ operation: z.literal("ack"), cursor: z.string().min(1) }).strict(),
+]);
+export type FlowPackagesRequest = z.input<typeof flowPackagesMutationSchema>;
+export type FlowPackagesToolRequest = z.input<typeof flowPackagesRequestSchema>;
 export type WorkPackage = z.output<typeof workPackageSchema>;
 const schemaDocument = toJsonSchemaCompat(z.object({ request: flowPackagesRequestSchema }));
 function inlineRefs(value: unknown): unknown {
@@ -190,7 +196,7 @@ export class FlowPackages {
     }
   }
   async execute(flowId: string, raw: FlowPackagesRequest): Promise<PackageGroup> {
-    const request = flowPackagesRequestSchema.parse(raw); const context = this.host.context(flowId, request.operation !== "cancel");
+    const request = flowPackagesMutationSchema.parse(raw); const context = this.host.context(flowId, request.operation !== "cancel");
     if (request.operation === "define") return this.host.store.immediateTransaction(() => {
       this.host.authorize(flowId, "define");
       if (context.stepId !== context.policy.manifest_step && context.config.steps[context.stepId ?? ""]?.decision?.key !== context.policy.approval_decision) fail("Package scope must be registered during manifest review or exact plan approval.");
@@ -201,6 +207,7 @@ export class FlowPackages {
       if (previous?.manifest_digest === manifestDigest) return previous;
       if (previous && context.approval?.package_manifest_digest === previous.manifest_digest && previous.plan_revision === context.planRevision && previous.acceptance_revision === context.acceptanceRevision) fail("Approved package scope is immutable; revise the plan before changing it.");
       if (previous && Object.values(previous.branches).some(b => b.agent_id && !terminal(this.host.agent(b.agent_id)))) fail("Cancel and settle existing package workers before replacing the manifest.");
+      if (manifest.length && git(context.repo, "status", "--porcelain", "--untracked-files=all")) fail("Parallel packages require a clean committed consolidated baseline. Preserve local changes and prepare matching worktrees before defining the manifest.");
       const ids = new Set(manifest.map(p => p.id)); if (ids.size !== manifest.length) fail("Duplicate package IDs are not allowed.");
       const registered = git(context.repo, "worktree", "list", "--porcelain", "-z").split("\0").filter(line => line.startsWith("worktree ")).map(line => line.slice(9));
       const roots = new Set<string>(); const paths: string[] = [];
@@ -337,7 +344,17 @@ export class FlowPackages {
     if (!terminal(agent)) return;
     for (const instance of this.host.store.listFlowInstances({ runId: agent.run_id })) {
       const state = this.host.runtime.get(instance.flow_instance_id); const group = state?.packages; if (!state || !group) continue;
-      for (const [id, branch] of Object.entries(group.branches)) if (branch.agent_id === agent.agent_id && !["failed", "cancelled", "accepted"].includes(branch.state)) {
+      for (const [id, branch] of Object.entries(group.branches)) {
+        if (branch.agent_id !== agent.agent_id) continue;
+        if (branch.state === "cancelled" && !branch.launch_settled && agent.backend_handle && agent.work_generation === (branch.work_generation ?? -1) + 1) {
+          // A crash can occur after the late backend handle has been stopped but
+          // before launch() records settlement. An old handle, arbitrary terminal
+          // row, or earlier attempt's stop does not prove this invocation stopped.
+          const stopped = this.host.store.listEvents({ agentId: agent.agent_id, type: "agent.stopped", limit: 20 }).some(event =>
+            event.payload.reason === "compensating_stop_after_late_start" && event.payload.work_generation === agent.work_generation && event.payload.backend_handle_sha256 === digest(agent.backend_handle));
+          if (stopped) { branch.launch_settled = true; branch.work_generation = agent.work_generation; state.revision++; this.host.runtime.save(instance.flow_instance_id, state); }
+        }
+        if (["pending", "failed", "cancelled", "accepted"].includes(branch.state)) continue;
         if (agent.status === "completed" && branch.delivery) continue;
         branch.state = "failed"; branch.reason = "Package worker terminated without an eligible immutable delivery.";
         state.revision++; this.host.runtime.save(instance.flow_instance_id, state);
