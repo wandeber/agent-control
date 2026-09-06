@@ -6,6 +6,14 @@ const event = (payload: Record<string, unknown>, type: EventRecord["type"] = "fl
   ({ type, payload } as EventRecord);
 
 describe("compact flow event evidence", () => {
+  it("explains a reported capability failure without certifying the worker's diagnosis", () => {
+    expect(compactFlowEvent(event({ reason: "worker_capability_unavailable", failure_source: "worker_reported",
+      summary: "Worker reported an unavailable Agent Control capability: flow_evidence | Approval required",
+      capability_failure: "unbounded backend diagnostic" }, "flow.step_blocked"))).toEqual({
+      reason: "worker_capability_unavailable", failure_source: "worker_reported",
+      detail: "Worker reported an unavailable Agent Control capability: flow_evidence | Approval required"
+    });
+  });
   it("carries actionable review and execution summaries without raw reports", () => {
     expect(compactFlowEvent(event({ result: { conclusion: "approved", evidence_receipt_id: "review-1", ledger: "large report", agent_token: "private" },
       evidence: { receipt_id: "review-1", kind: "expert_review", status: "approved", payload: { environment: "private" }, summary: {

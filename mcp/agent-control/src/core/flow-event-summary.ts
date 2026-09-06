@@ -40,6 +40,9 @@ export function compactFlowEvent(event: EventRecord): Record<string, unknown> {
     if (Object.keys(detail).length) compactEvidence.summary = detail;
   }
   return {
+    ...(short(event.payload.reason) ? { reason: short(event.payload.reason) } : {}),
+    ...(short(event.payload.summary) ? { detail: short(event.payload.summary) } : {}),
+    ...(event.payload.failure_source === "worker_reported" ? { failure_source: "worker_reported" } : {}),
     ...(Object.keys(compactResult).length ? { result: compactResult } : {}),
     ...(typeof compactEvidence.receipt_id === "string" ? { evidence: compactEvidence } : {})
   };
