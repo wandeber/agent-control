@@ -4,6 +4,7 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { requestMcpAppTeardown, subscribeMcpConsoleState, type ConsoleSelectionState } from "@/lib/mcp-app";
 
 function useSharedSelection() {
+  const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [followLatestRun, setFollowLatestRun] = useState(true);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -67,7 +68,7 @@ function useSharedSelection() {
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
-  return { selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
+  return { connection, setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
 }
 
 const SelectionContext = createContext<ReturnType<typeof useSharedSelection> | null>(null);

@@ -207,7 +207,7 @@ describe("CodexThreadAdapter", () => {
     const port = (server.address() as AddressInfo).port;
     for (const client of server.clients) client.terminate();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await expect(adapter.readLatest(handle, { limit: 10 })).rejects.toMatchObject({reason: "backend_unavailable"});
+    await expect(adapter.getStatus(handle)).rejects.toMatchObject({reason: "backend_unavailable"});
     server = new WebSocketServer({ port });
     await new Promise<void>((resolve) => server.once("listening", resolve));
     wireMockServer(server);
@@ -554,6 +554,39 @@ rl.on("line", (line) => {
         });
       });
     }
+  });
+
+  it("reads an archived local thread with tools without resuming or replaying work", async () => {
+    const fakeServer = join(tmp, "history.mjs");
+    const requestLog = join(tmp, "history-requests.jsonl");
+    writeFileSync(fakeServer, `
+import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+readline.createInterface({input: process.stdin}).on("line", line => {
+  const msg = JSON.parse(line);
+  appendFileSync(process.env.REQUEST_LOG, JSON.stringify(msg) + "\\n");
+  if (!msg.id) return;
+  const result = msg.method === "thread/read" ? {thread: {id: "thread-1", status: {type: "notLoaded"}, turns: [{id: "t1", status: "completed", items: [
+    {id: "m1", type: "agentMessage", text: "Done"},
+    {id: "p1", type: "mcpToolCall", tool: "update_plan", arguments: {plan: [{step: "Verify", status: "completed"}]}},
+    {id: "c1", type: "commandExecution", command: "pwd", aggregatedOutput: "/repo"}
+  ]}]}} : {};
+  process.stdout.write(JSON.stringify({id: msg.id, result}) + "\\n");
+});`);
+    process.env.CODEX_APP_SERVER_COMPAT_COMMAND = `${process.execPath} ${fakeServer}`;
+    process.env.REQUEST_LOG = requestLog;
+    // Port zero cannot host the retired worker and avoids closing the shared fixture.
+    const handle: AgentHandle = {backend: "codex-thread", id: "thread-1", data: {thread_id: "thread-1", app_server_url: "ws://localhost:0"}};
+    const original = JSON.stringify(handle);
+    const messages = await new CodexThreadAdapter().readLatest(handle, {limit: 10});
+    expect(messages.map(message => message.id)).toEqual(["m1", "p1", "c1"]);
+    expect(messages[1].metadata?.type).toBe("tool");
+    expect(messages[1].text).toContain('"step":"Verify"');
+    expect(messages[2].text).toContain("/repo");
+    expect(JSON.stringify(handle)).toBe(original);
+    const calls = readFileSync(requestLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.map(call => call.method)).toEqual(["initialize", "initialized", "thread/read"]);
+    expect(calls[2].params.threadId).toBe("thread-1");
   });
 
   it("uses documented stdio JSONL transport when configured", async () => {

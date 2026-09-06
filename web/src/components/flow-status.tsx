@@ -1,5 +1,6 @@
 "use client";
 
+import { Check } from "lucide-react";
 import { cx } from "@/lib/format";
 import type { FlowVisualNode } from "@/lib/flow-graph";
 
@@ -49,7 +50,7 @@ export function FlowStatusDot({
       )}
       title={label}
     >
-      <span className={cx("size-2 rounded-full", flowStatusDotClass(status, kind))} />
+      {status === "completed" ? <Check className={cx("size-3", statusClass.text)} /> : <span className={cx("size-2 rounded-full", flowStatusDotClass(status, kind))} />}
     </span>
   );
 }

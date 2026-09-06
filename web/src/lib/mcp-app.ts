@@ -35,6 +35,7 @@ interface PendingRequest<T> {
 type McpUiDisplayMode = "inline" | "fullscreen" | "pip";
 
 interface McpHostContext {
+  theme?: "light" | "dark";
   availableDisplayModes?: McpUiDisplayMode[];
   displayMode?: McpUiDisplayMode;
 }
@@ -175,6 +176,7 @@ class AgentControlMcpAppClient {
     const notification = asRecord(event.data) as JsonRpcNotification | null;
     if (notification?.method === "ui/notifications/host-context-changed") {
       this.hostContext = parseHostContext(notification.params);
+      applyHostTheme(this.hostContext);
       return;
     }
 
@@ -231,6 +233,7 @@ class AgentControlMcpAppClient {
         900
       );
       this.hostContext = parseHostContext(initializeResult?.hostContext);
+      applyHostTheme(this.hostContext);
       this.notify("ui/notifications/initialized", {});
       this.connected = true;
       // Codex exposes fullscreen MCP Apps in its shared app/sidebar surface.
@@ -413,6 +416,7 @@ function parseHostContext(value: unknown): McpHostContext | null {
     : undefined;
   const mode = displayMode(record.displayMode);
   return {
+    ...(record.theme === "light" || record.theme === "dark" ? { theme: record.theme } : {}),
     ...(availableDisplayModes ? { availableDisplayModes } : {}),
     ...(mode ? { displayMode: mode } : {})
   };
@@ -450,4 +454,8 @@ function firstTextContent(result: CallToolResult): string | null {
 // between bridge initialization and component mount.
 if (shouldTryMcpApp()) {
   void getMcpAppClient();
+}
+
+function applyHostTheme(context: McpHostContext | null) {
+  if (context?.theme && typeof document !== "undefined") document.documentElement.dataset.theme = context.theme;
 }

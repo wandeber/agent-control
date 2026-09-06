@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
 import { useConsoleSelection } from "./console-selection";
@@ -15,7 +15,7 @@ import { WorkspacePanel } from "./workspace-panel";
 
 /** Worker list and conversation, shown as the default Agent Control screen. */
 export function SubagentsShell() {
-  const { selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
+  const { setConnection, selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
   const [messageLimit, setMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [narrowViewport, setNarrowViewport] = useState<boolean | null>(null);
   const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
@@ -24,6 +24,8 @@ export function SubagentsShell() {
     followLatestRun,
     messageLimit
   );
+  useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
+
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
@@ -94,10 +96,6 @@ export function SubagentsShell() {
               <RefreshCw className="size-4" />
             </button>
           </div>
-          <div className="subagents-connection">
-            {connection === "live" ? <Wifi className="size-3.5" /> : <WifiOff className="size-3.5" />}
-            <span>{connection === "live" ? "Live" : connection === "connecting" ? "Connecting" : "Offline"}</span>
-          </div>
           <div className="subagents-list-scroll">
             {activeSubagents.length > 0 ? (
               <AgentGroup agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />
@@ -119,7 +117,6 @@ export function SubagentsShell() {
                   <h2>{selectedAgent.title}</h2>
                   <p>{selectedAgent.model ?? selectedAgent.backend}</p>
                 </div>
-                {agentError ? <span role="status" className="text-xs text-ink-400">Offline</span> : null}
                 <StatusPill status={selectedAgent.status} />
               </header>
               <div className="subagents-chat-body">

@@ -143,7 +143,7 @@ export class CodexThreadAdapter {
     }
     async readLatest(handle, options) {
         const data = parseHandle(handle);
-        const thread = await readThread(data);
+        const thread = await readThread(data, true);
         const messages = [];
         for (const turn of thread.turns ?? []) {
             for (const item of turn.items ?? []) {
@@ -154,6 +154,15 @@ export class CodexThreadAdapter {
                         text: item.text,
                         created_at: timestampFromSeconds(turn.completedAt ?? turn.startedAt),
                         metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type }
+                    });
+                }
+                if (["commandExecution", "mcpToolCall", "dynamicToolCall", "plan", "fileChange"].includes(item.type)) {
+                    messages.push({
+                        id: item.id ?? `${turn.id}-${messages.length}`,
+                        role: "tool",
+                        text: `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item.arguments ?? item)}${item.aggregatedOutput ? `\n${item.aggregatedOutput}` : ""}`,
+                        created_at: timestampFromSeconds(turn.completedAt ?? turn.startedAt),
+                        metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type, type: "tool" }
                     });
                 }
                 if (item.type === "userMessage") {
@@ -360,7 +369,7 @@ async function startTurnOnLoadedThread(client, data, message, model, cwd) {
         throw error;
     }
 }
-async function readThread(data) {
+async function readThread(data, allowHistoryFallback = false) {
     const client = createAppServerClient(data);
     try {
         await client.initialize();
@@ -383,6 +392,23 @@ async function readThread(data) {
             finally {
                 fallback.close();
             }
+        }
+    }
+    catch (error) {
+        // History recovery never resumes work or reports the archive as a live worker.
+        const url = resolveAppServerUrl(undefined, undefined, data);
+        const local = /^wss?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/.test(url);
+        const command = resolveCompatibilityStdioCommand();
+        if (!allowHistoryFallback || !local || !command || !(error instanceof ControllerError) || error.reason !== "backend_unavailable")
+            throw error;
+        client.close();
+        const archive = new CodexAppServerClient("stdio://", undefined, command);
+        try {
+            await archive.initialize();
+            return await readThreadThroughClient(archive, data);
+        }
+        finally {
+            archive.close();
         }
     }
     finally {

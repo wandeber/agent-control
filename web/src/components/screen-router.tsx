@@ -2,7 +2,7 @@
 
 import { ArrowLeft, Workflow } from "lucide-react";
 import { useEffect, useState } from "react";
-import { ConsoleSelectionProvider } from "./console-selection";
+import { ConsoleSelectionProvider, useConsoleSelection } from "./console-selection";
 import { ConsoleShell } from "./console-shell";
 import { SubagentsShell } from "./subagents-shell";
 
@@ -27,14 +27,14 @@ export function ScreenRouter() {
           <span>Agent Control <span aria-hidden="true">/</span> <strong>{fullConsole ? "Full console" : "Subagents"}</strong></span>
           {/* Fragment routes keep the single embedded MCP resource loaded.
               Both shells are eagerly bundled, and only the active one mounts. */}
-          <button className="screen-navigation-link" onClick={() => {
+          <div className="screen-navigation-actions"><ConnectionIndicator /><button className="screen-navigation-link" onClick={() => {
             const next = fullConsole ? "subagents" : "console";
             setScreen(next);
             try { window.location.hash = `/${next}`; } catch { /* Opaque hosts can restrict history. */ }
           }} type="button">
             {fullConsole ? <ArrowLeft className="size-4" /> : <Workflow className="size-4" />}
             {fullConsole ? "Back to subagents" : "Full console"}
-          </button>
+          </button></div>
         </nav>
         <div className="agent-control-screen">
           {fullConsole ? <ConsoleShell /> : <SubagentsShell />}
@@ -42,4 +42,12 @@ export function ScreenRouter() {
       </div>
     </ConsoleSelectionProvider>
   );
+}
+
+function ConnectionIndicator() {
+  const { connection } = useConsoleSelection();
+  return <span role="status" className="screen-connection" data-state={connection}>
+    <span aria-hidden="true" className="connection-dot" />
+    {connection === "live" ? "Live" : connection === "connecting" ? "Connecting" : "Offline"}
+  </span>;
 }

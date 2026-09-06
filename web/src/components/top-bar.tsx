@@ -1,13 +1,12 @@
 "use client";
 
-import { GitBranch, Maximize2, MessageSquareText, PanelBottom, RefreshCw, Wifi, WifiOff, type LucideIcon } from "lucide-react";
+import { GitBranch, Maximize2, MessageSquareText, PanelBottom, RefreshCw, type LucideIcon } from "lucide-react";
 import type { ConnectionState } from "@/lib/api";
 import type { RunRecord } from "@/lib/types";
 import { IconButton } from "./ui";
 
 export function TopBar({
   run,
-  connection,
   inspectorOpen,
   runsOpen,
   threadOpen,
@@ -28,7 +27,6 @@ export function TopBar({
   onOpenThread?: () => void;
   onRefresh?: () => void;
 }) {
-  const connectionTone = connection === "live" ? "text-teal-700" : connection === "connecting" ? "text-amber-700" : "text-red-700";
   const runPath = run?.repo_dir ?? run?.run_id ?? "Waiting for Agent Control data";
   return (
     <header className="flex h-16 items-center justify-between gap-4 border-b border-black/10 bg-white/74 px-4 backdrop-blur-xl">
@@ -40,10 +38,7 @@ export function TopBar({
             {runPath}
           </p>
         </div>
-        <span className={["inline-flex shrink-0 items-center gap-1 text-xs font-medium", connectionTone].join(" ")}>
-          {connection === "live" ? <Wifi className="size-3.5" /> : <WifiOff className="size-3.5" />}
-          {connection}
-        </span>
+
       </div>
 
       <div className="top-bar-button-group shrink-0" role="group" aria-label="Console view controls">

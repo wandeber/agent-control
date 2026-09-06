@@ -47,7 +47,7 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 };
 
 export function ConsoleShell() {
-  const { selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
+  const { setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
   const [agentSelectionPinned, setAgentSelectionPinned] = useState(Boolean(selectedAgentId));
   const selectionRunRef = useRef<string | null | undefined>(undefined);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
@@ -67,6 +67,8 @@ export function ConsoleShell() {
     followLatestRun,
     selectedAgentMessageLimit
   );
+  useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
+
 
   useEffect(() => {
     // A history expansion belongs to one agent/step selection. Resetting here

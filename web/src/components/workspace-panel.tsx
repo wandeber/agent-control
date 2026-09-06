@@ -286,7 +286,7 @@ function ChatView({
   const visibleBlocks = blocks.slice(visibleStart, visibleStart + MAX_VISIBLE_MESSAGES);
   const hiddenBefore = visibleStart;
   const hiddenAfter = Math.max(0, blocks.length - visibleStart - visibleBlocks.length);
-  const todoItems = compact ? extractTodoItems(blocks) : [];
+  const todoItems = extractTodoItems(blocks);
 
   const scheduleScrollToBottom = (behavior: ScrollBehavior = "auto") => {
     // The message list and the Todo overlay both change height after a new
@@ -528,13 +528,13 @@ function collectTodoRecords(value: unknown, records: TodoItem[], path = "todo"):
   }
 
   const record = value as Record<string, unknown>;
-  const label = firstString(record.content, record.label, record.title, record.text, record.description);
+  const label = firstString(record.step, record.content, record.label, record.title, record.text, record.description);
   if (label) {
     const id = firstString(record.id, record.todo_id, record.todoId) ?? label;
     records.push({ id, label, status: normalizeTodoStatus(record.status, record.completed) });
   }
   for (const [key, nested] of Object.entries(record)) {
-    if (key.toLowerCase().includes("todo") || key === "items" || key === "tasks") {
+    if (key.toLowerCase().includes("todo") || key === "items" || key === "tasks" || key === "plan") {
       collectTodoRecords(nested, records, `${path}-${key}`);
     }
   }

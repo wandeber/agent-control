@@ -1,4 +1,4 @@
-import type { LucideIcon } from "lucide-react";
+import { Check, type LucideIcon } from "lucide-react";
 import { cx, STATUS_STYLE } from "@/lib/format";
 import type { AgentStatus } from "@/lib/types";
 
@@ -42,7 +42,7 @@ export function StatusPill({ status, compact = false }: { status: AgentStatus; c
         style.text
       )}
     >
-      <span className={cx("size-1.5 rounded-full", style.dot)} />
+      {status === "completed" ? <Check className="size-3" /> : <span className={cx("size-1.5 rounded-full", style.dot)} />}
       {compact ? style.label.slice(0, 7) : style.label}
     </span>
   );
@@ -56,7 +56,7 @@ export function StatusDot({ status, className }: { status: AgentStatus; classNam
       className={cx("grid size-4 shrink-0 place-items-center rounded-full", style.bg, className)}
       title={`Status: ${style.label}`}
     >
-      <span className={cx("size-2 rounded-full", style.dot)} />
+      {status === "completed" ? <Check className={cx("size-3", style.text)} /> : <span className={cx("size-2 rounded-full", style.dot)} />}
     </span>
   );
 }

@@ -68,6 +68,9 @@ interface JsonRpcNotification {
 }
 
 interface ThreadItem {
+  arguments?: unknown;
+  result?: unknown;
+  aggregatedOutput?: string;
   command?: string;
   status?: string;
   tool?: string;
@@ -217,7 +220,7 @@ export class CodexThreadAdapter implements AgentAdapter {
 
   async readLatest(handle: AgentHandle, options: ReadLatestOptions): Promise<AgentMessage[]> {
     const data = parseHandle(handle);
-    const thread = await readThread(data);
+    const thread = await readThread(data, true);
     const messages: AgentMessage[] = [];
     for (const turn of thread.turns ?? []) {
       for (const item of turn.items ?? []) {
@@ -228,6 +231,15 @@ export class CodexThreadAdapter implements AgentAdapter {
             text: item.text,
             created_at: timestampFromSeconds(turn.completedAt ?? turn.startedAt),
             metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type }
+          });
+        }
+        if (["commandExecution", "mcpToolCall", "dynamicToolCall", "plan", "fileChange"].includes(item.type)) {
+          messages.push({
+            id: item.id ?? `${turn.id}-${messages.length}`,
+            role: "tool",
+            text: `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item.arguments ?? item)}${item.aggregatedOutput ? `\n${item.aggregatedOutput}` : ""}`,
+            created_at: timestampFromSeconds(turn.completedAt ?? turn.startedAt),
+            metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type, type: "tool" }
           });
         }
         if (item.type === "userMessage") {
@@ -449,7 +461,7 @@ async function startTurnOnLoadedThread(
   }
 }
 
-async function readThread(data: CodexThreadHandleData): Promise<ThreadRecord> {
+async function readThread(data: CodexThreadHandleData, allowHistoryFallback = false): Promise<ThreadRecord> {
   const client = createAppServerClient(data);
   try {
     await client.initialize();
@@ -471,6 +483,18 @@ async function readThread(data: CodexThreadHandleData): Promise<ThreadRecord> {
         fallback.close();
       }
     }
+  } catch (error) {
+    // History recovery never resumes work or reports the archive as a live worker.
+    const url = resolveAppServerUrl(undefined, undefined, data);
+    const local = /^wss?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/.test(url);
+    const command = resolveCompatibilityStdioCommand();
+    if (!allowHistoryFallback || !local || !command || !(error instanceof ControllerError) || error.reason !== "backend_unavailable") throw error;
+    client.close();
+    const archive = new CodexAppServerClient("stdio://", undefined, command);
+    try {
+      await archive.initialize();
+      return await readThreadThroughClient(archive, data);
+    } finally { archive.close(); }
   } finally {
     client.close();
   }
