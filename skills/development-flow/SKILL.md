@@ -74,8 +74,13 @@ contract and current revision; never infer approval from a timeout, a worker's
   this check narrow: it is not another technical expert review. If execution
   is elsewhere, its coordinator waits for this owner's decision.
 - **Exact plan approval:** after strict approval by the same Analysis owner,
-  present the current plan and record the user's decision bound to its current
-  artifact digest. Existing explicit approval of that exact content suffices;
+  ensure its package manifest is registered. Use an empty manifest for inline
+  work. When parallel work helps, provision the declared disjoint worktrees
+  through the native Codex worktree tools before registering their paths; setup
+  is already authorized and adds no user gate. Present the current plan and its
+  package scope together, then record the existing user decision with both
+  `artifact_digest` and `package_manifest_digest` from the current snapshot.
+  Existing explicit approval of that exact content suffices;
   do not ask again. Changed plan content needs analyst review and renewed user
   approval before implementation.
 - **Optional UAT:** apply a preference already stated by the user. Otherwise ask
@@ -120,3 +125,32 @@ impose TDD, duplicate suites, one test per requirement, or additional tests mere
 to create cache entries. Real context loss, missing evidence, or unbounded impact
 requires full review by the same owner; owner loss blocks rather than silently
 substituting a reviewer.
+
+## Managed Work Packages
+
+Use `flow_packages` for the package group declared by `policy.work_packages`.
+The plan-review owner defines it, or the authorized coordinator completes that
+setup at the existing plan-approval gate. Definitions include the required
+packages, literal owned paths, deliverables, dependencies, assigned role, and
+Codex-managed worktree paths. All worktrees must exist and share the approved
+repository/base; do not manufacture them with shell Git commands or reuse dirty
+unrelated checkouts. Preserve the original requester identity.
+
+After exact approval, the implementation owner launches all ready packages in
+one operation, consumes run events, and accepts ready deliveries in a batch.
+The runtime retains each owner and attempt generation, checks required delivery
+coverage, and refuses to advance while a required package is incomplete or a
+launched branch remains active. A package child receives a delivery contract,
+not authority to submit its parent's flow-step report.
+
+For corrections, retry the affected package with its same owner and a new
+attempt; do not treat its old accepted snapshot as the correction. Stop unsafe
+or cancelled work explicitly and preserve its disposition. A material package
+scope change returns to the plan approval path. Normal inline work needs no
+branch launch, delivery, acceptance, or integration calls.
+
+The engine derives integration from external deliveries. The integration owner
+consolidates the exact accepted group, prepares a current result checkpoint,
+and records `flow_packages` operation `integrate`. This receipt binds the group
+and current result before no-edit validation. One external worktree still needs
+consolidation; completion of one child never closes the entire group.

@@ -15,9 +15,9 @@ impact; identical hashes do not establish semantic independence.
 | Analysis intent | Current Analysis and accepted user intent | Recorded content-bound intent decision | Original clarification owner | Narrow intention check; no second technical review |
 | Planning | Intent-approved Analysis | Stable package/section IDs, dependencies, paths, interfaces, affected mechanical gate | Planner | Wrong solution returns to Analysis |
 | Plan intent | Current Plan and Analysis | Strict composed plan-review receipt | Exact analyst | First review full; later changed/dependent sections and findings |
-| Human plan approval | Exact analyst-approved Plan | Recorded user approval bound to current content | Original conversation | Reuse valid explicit approval; changed plan repeats analyst and human gates |
-| Implementation | Exact approved plan/projections and causal corrections | Structured changes, package outcomes, integration need, focused check evidence | Implementer | Broken plan returns to Planning; only scoped changes |
-| Integration | Required package outputs and approved interfaces | One coherent integrated result and package completion | Same implementer / assigned integration owner | Only when multiple outputs require consolidation |
+| Human plan approval | Exact analyst-approved Plan and registered package manifest | One recorded user decision bound to both digests | Original conversation | Reuse valid explicit approval; changed plan repeats analyst and human gates |
+| Implementation | Exact approved plan/projections, registered packages, and causal corrections | All required current deliveries accepted, no active branches, focused check evidence | Implementer | Broken plan returns to Planning; only scoped changes |
+| Integration | Exact accepted delivery group and approved interfaces | Verified binding of the group to the consolidated current result | Same implementer / assigned integration owner | Required for every nonempty external package group; skipped for inline work |
 | Focused validation | Known correction bundle and affected boundaries | Controlled narrow recheck receipts | Validator, no-edit | Only on correction; cannot satisfy complete closure |
 | Complete validation | Current checkpoint and complete affected closure | GREEN controlled/reused receipts with paths, consumers, mandatory gates, risks | Validator, no-edit | Run once per relevant coherent result; failures return as a bundle |
 | Implementation intent | GREEN complete gate and exact approved Plan | Strict conformance receipt and first-approval milestone | Exact planner | Skip after first approval unless explicitly requested again |
@@ -141,10 +141,20 @@ changes apply to future launches unless an explicit revision is accepted.
 ## Current Parallelism And Reuse Boundaries
 
 Controlled validation has a native dependency graph and joins every required
-check outcome. Agent work packages still use explicit ownership, isolated
-worktrees, and the Integration phase; this version does not provide native
-agent fork/join scheduling. Do not present a set of separately launched workers
-as an engine-enforced package join.
+check outcome. Implementation packages have a durable plan-bound group: batch
+launch of ready branches, pinned owner/attempt, immutable deliveries, batch
+acceptance, required-package join, and integration evidence tied to the current
+result. The engine derives integration from the registered external group; a
+worker cannot bypass it with `integration_needed: false`.
+
+The same exact-plan decision binds the package-manifest digest. Provision
+parallel worktrees through Codex before registration; runtime launches only the
+registered disjoint worktrees from the same repository/base. Package children
+report their delivery, never the parent flow step. The original requester
+remains attached. Empty manifests keep inline work simple, with no child
+launch/acceptance/integration ceremony. One external worktree still requires
+consolidation. This is a bounded package group inside a phase, not arbitrary
+parallel flow graphs.
 
 Selective declared-input reuse is eligible only where read restrictions and
 complete input identity can be enforced. Otherwise the evidence service falls

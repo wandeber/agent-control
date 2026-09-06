@@ -129,8 +129,11 @@ Independent checks can run concurrently when their declared dependencies and
 resources allow it; the batch joins all required results. Reuse verifies actual
 execution receipts and their origins. Selective reuse additionally needs an
 enforced input boundary; unsupported or changed identities conservatively miss
-the cache. This does not claim generic reuse across worktrees or native parallel
-flow branches. See [the evidence contract](mcp/agent-control/src/core/evidence/README.md).
+the cache. Managed implementation package groups add batch dispatch, pinned
+owners and attempts, accepted delivery snapshots, a required-package join, and
+verified integration into the current result. Their manifest is approved with
+the existing exact-plan decision; inline work uses an empty group. This does
+not claim arbitrary parallel flow graphs or generic reuse across worktrees. See [the evidence contract](mcp/agent-control/src/core/evidence/README.md).
 
 Requester event delivery and processing are distinct. After handling a complete
 `run_wait` batch, call its returned `run_ack` contract. A subsequent wait without

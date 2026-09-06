@@ -241,6 +241,37 @@ human-readable view only when useful. The bundled development flow's
 [phase contract](../flows/development-flow-v1/README.md) documents ownership,
 omission, and correction policy without adding a worker for every phase.
 
+## Parallel Implementation With A Verified Join
+
+Opt in with `policy.work_packages`, selecting the existing exact-plan decision,
+manifest-producing phase, execution phase, and integration phase. The registered
+manifest binds required packages, owned paths, dependencies, roles, worktrees,
+and deliverables to the same current acceptance and plan content. Approving the
+plan includes its manifest digest; delegation does not add another human gate.
+Use an empty manifest when one inline owner is sufficient.
+
+`flow_packages` launches the ready set in a batch and gives each child a scoped
+delivery contract. Codex-managed worktrees must already exist, share the
+repository/base, and have disjoint write boundaries. Preserve each worker's
+owner and attempt generation. The original conversational requester stays
+attached to the run and the implementation owner consumes the event stream.
+
+The owner inspects immutable deliveries and accepts a batch. No implementation
+exit is valid while a required package is missing an accepted current delivery
+or a launched branch remains active. Retries and cancellations record concrete
+dispositions and invalidate obsolete deliveries. A failed or finished child
+cannot stand in for a successful joined group.
+
+The engine exposes `packages.integration_required`; the worker cannot opt out
+with a report boolean. Consolidate every accepted external delivery, including
+a single external worktree, then record `integrate` against a current result
+checkpoint. Its binding proves which group was consolidated into that result.
+Semantic integration quality is still checked by validation and review.
+
+This is a durable package group within a declared phase. It does not introduce
+arbitrary parallel flow graphs or transfer root-only native bridge authority
+to package children. Use generated runtime actions for required host operations.
+
 ## Role Agent Lifecycle
 
 Roles reuse one persistent Agent Control agent by default. Use that `reuse`

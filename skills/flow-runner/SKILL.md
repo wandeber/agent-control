@@ -578,6 +578,34 @@ marks the step blocked so the coordinator/user can decide what to do. Do not
 start fresh duplicate workers for the same active step as a retry loop unless
 the flow config explicitly defines that retry strategy.
 
+## Managed Package Groups
+
+For a flow declaring `policy.work_packages`, use the generated `flow_packages`
+contract. A content-bound manifest names the complete expected package set
+before the existing exact-plan approval. That same decision includes the
+`package_manifest_digest`; do not add a separate user approval for delegation.
+An empty manifest keeps ordinary inline execution unchanged.
+
+Use batch `launch` for all ready branches and batch `accept` for inspected
+current deliveries. The parent retains its flow-step authority; package children
+receive their own delivery contract and cannot complete the parent's step.
+Consume the same run event stream and preserve the original requester. Respect
+pinned owners, attempt generations, dependencies, and disjoint worktrees. The
+runtime joins all required accepted deliveries and checks no launched branch
+is still active before allowing implementation to finish.
+
+`packages.integration_required` is runtime state, not a worker claim. The
+integration owner consolidates exact accepted deliveries and records `integrate`
+with a verified current result-checkpoint receipt. Missing, stale, failed, or
+unaccepted package results block the join; changing the manifest after approval
+requires the ordinary renewed plan/acceptance decision. Retry/cancellation must
+name the current attempt and a concrete reason.
+
+Native bridge workers must not directly spawn siblings. If a package launch
+requires native worktree or bridge actions, the existing authorized coordinator
+performs the returned actions. Do not bypass this contract with ad hoc launches,
+manual worktree creation, or parent step reports submitted by children.
+
 ## Incremental Evidence And Recovery
 
 Use `flow_evidence` only through its generated operation schema. The current

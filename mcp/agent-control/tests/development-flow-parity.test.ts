@@ -8,8 +8,8 @@ const path = resolve(import.meta.dirname, "../../../flows/development-flow-v1/fl
 const raw = loadFlowConfigFile(path, { env: {} }) as FlowConfig;
 const record = raw as unknown as Record<string, any>;
 
-function route(step: string, result: Record<string, unknown>, state = {}, decisions = {}) {
-  return selectTransition(raw.steps[step]!.on!.reported!, { result, state, decisions });
+function route(step: string, result: Record<string, unknown>, state = {}, decisions = {}, packages = { integration_required: false }) {
+  return selectTransition(raw.steps[step]!.on!.reported!, { result, state, decisions, packages });
 }
 
 // These fixtures exercise the actual declarative router. Receipt verification
@@ -17,7 +17,7 @@ function route(step: string, result: Record<string, unknown>, state = {}, decisi
 describe("development-flow-v1 responsibility and routing parity", () => {
   it("retains strict gates through parsing and starts with factual Context", () => {
     const parsed = parseFlowConfig(raw) as unknown as Record<string, any>;
-    expect(parsed.policy).toMatchObject({ strict: true, plan_artifact: "plan" });
+    expect(parsed.policy).toMatchObject({ strict: true, plan_artifact: "plan", work_packages: { approval_decision: "plan_approval", manifest_step: "plan_review", execution_step: "implementation", integration_step: "integration", success_condition: { equals: { var: "result.conclusion", value: "ready" } } } });
     expect(parsed.initial_step).toBe("context");
     expect(parsed.steps.context.role).toBe(parsed.steps.analysis.role);
     expect(route("context", { conclusion: "ready" })?.to).toBe("analysis");
@@ -45,8 +45,15 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     expect(route("plan_approval", { decision: "changes_required" })?.to).toBe("planning");
   });
 
-  it("integrates only when multiple outputs need consolidation", () => {
-    expect(route("implementation", { conclusion: "ready", integration_needed: true })?.to).toBe("integration");
+  it("derives external integration from the package group instead of a worker claim", () => {
+    expect(route("implementation", { conclusion: "ready", integration_needed: false }, {}, {}, { integration_required: true })?.to).toBe("integration");
+    expect(record.steps.implementation.report.schema.required).toEqual(["conclusion"]);
+    expect(record.steps.implementation.report.schema.properties.integration_needed).toBeUndefined();
+    for (const step of ["validation", "focused_validation", "implementation_review", "uat_decision", "uat_preparation", "uat_review", "final_review", "closure"]) {
+      expect(record.steps[step].requires.all).toContainEqual({ equals: { var: "packages.integrated", value: true } });
+    }
+    expect(record.steps.integration.requires.all).toContainEqual({ equals: { var: "packages.joined", value: true } });
+    expect(route("integration", { conclusion: "needs_package_changes" })?.to).toBe("implementation");
     expect(route("implementation", { conclusion: "ready", integration_needed: false }, { validation_mode: "complete_gate" })?.to).toBe("validation");
     expect(route("implementation", { conclusion: "ready", integration_needed: false }, { validation_mode: "focused_recheck" })?.to).toBe("focused_validation");
   });

@@ -103,7 +103,8 @@ steps:
 - Every input/output artifact reference exists in `artifacts`.
 - Every `to` target exists in `steps`.
 - Required artifacts have stable absolute paths or `{run_dir}` templates.
-- Every transition with conditions has a corresponding `report.schema` field.
+- Conditions on worker result fields have corresponding `report.schema` fields;
+  runtime state and package conditions use their defined contracts.
 - The config can represent orchestrator-driven flows by using `notify` actions.
 - The config can represent automatic flows by using `transitions` and `to`.
 - Repo-authored flow files validate with `agentctl flow validate --config-file
@@ -140,3 +141,23 @@ and relevant references, with a full refresh only when continuity is uncertain.
 Describe optional user testing and single-review preferences explicitly. Normal
 correction loops collect findings in batches; repeated underlying problems
 without progress return to a concrete user decision, never timeout approval.
+
+## Declaring Managed Work Packages
+
+Use `policy.work_packages` to bind the package lifecycle to a flow's existing
+approval decision, manifest step, execution step, and integration step. Define
+required package IDs, roles, disjoint literal paths, deliverables, dependencies,
+and provisioned Codex worktrees through the runtime package contract before the
+same exact-plan decision. An empty manifest represents inline execution.
+
+Require `packages.joined` on the integration entry and `packages.integrated` on
+subsequent gates, including manual entry, so no route can bypass the group.
+Route using runtime `packages.integration_required` and retain the automatic
+join/integration guards for the declared phases. Set `success_condition` to the
+flow's successful completion result so blockers and corrections can return to
+the responsible phase without claiming a verified join. Do not substitute a worker
+boolean or terminal child status for those guards. The package group is a
+bounded parallel execution unit inside a phase, not an arbitrary multi-active
+flow graph. Preserve declaration/review, worktree provisioning, execution,
+delivery acceptance, and consolidation as distinct responsibilities without
+creating unnecessary model turns or new human gates.

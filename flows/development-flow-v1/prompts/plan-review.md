@@ -22,3 +22,19 @@ Route plan defects to Planning, incorrect solution intent to Analysis, and true
 human decisions or blockers to the coordinator. Approval then waits for the
 user's decision on this exact plan revision; it never authorizes implementation
 by itself.
+
+Check that any proposed work packages preserve the reviewed plan's scope,
+interfaces, dependencies, and integration requirements. Register them through
+`flow_packages` operation `define` after the plan artifact is bound and before
+the exact-plan decision. Use `packages: []` for inline work with no useful
+external delegation. Parallel packages require existing, disjoint Codex-managed
+Git worktrees from the same base; do not create user worktrees with shell Git
+commands. If their paths still need provisioning, return the complete package
+requirements for the authorized coordinator to create the worktrees and define
+the same group at the existing plan-approval gate. No extra user permission or
+semantic review is implied by that setup.
+
+The registered manifest is content-bound to the current plan and acceptance.
+Do not add, omit, or replace packages after approval. A changed scope returns to
+Planning and the normal approval path; worker completion cannot redefine the
+set of required deliveries.

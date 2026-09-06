@@ -9,6 +9,15 @@ initial_step: context
 policy:
   strict: true
   plan_artifact: plan
+  work_packages:
+    approval_decision: plan_approval
+    manifest_step: plan_review
+    execution_step: implementation
+    integration_step: integration
+    success_condition:
+      equals:
+        var: result.conclusion
+        value: ready
 preferences:
   review_mode:
     values:
@@ -424,7 +433,8 @@ steps:
   implementation:
     role: implementer
     prompt_ref: step_implementation
-    description: Execute user-approved packages and report whether consolidation is needed.
+    description: Implement inline work or supervise the approved package group; the
+      engine derives whether consolidation is required.
     requires:
       equals:
         var: decisions.plan_approval.value
@@ -444,15 +454,12 @@ steps:
         type: object
         required:
           - conclusion
-          - integration_needed
         properties:
           conclusion:
             enum:
               - ready
               - needs_plan_revision
               - blocked
-          integration_needed:
-            type: boolean
     on:
       reported:
         transitions:
@@ -463,7 +470,7 @@ steps:
                     var: result.conclusion
                     value: ready
                 - equals:
-                    var: result.integration_needed
+                    var: packages.integration_required
                     value: true
             to: integration
           - id: implementation-focused-check
@@ -473,7 +480,7 @@ steps:
                     var: result.conclusion
                     value: ready
                 - equals:
-                    var: result.integration_needed
+                    var: packages.integration_required
                     value: false
                 - equals:
                     var: state.validation_mode
@@ -486,7 +493,7 @@ steps:
                     var: result.conclusion
                     value: ready
                 - equals:
-                    var: result.integration_needed
+                    var: packages.integration_required
                     value: false
                 - equals:
                     var: state.validation_mode
@@ -511,12 +518,16 @@ steps:
   integration:
     role: implementer
     prompt_ref: step_integration
-    description: Consolidate all required package outputs only when multiple outputs
-      need integration.
+    description: Consolidate every accepted package delivery and bind the exact
+      group to one verified current result.
     requires:
-      equals:
-        var: decisions.plan_approval.value
-        value: approved
+      all:
+        - equals:
+            var: packages.joined
+            value: true
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
     inputs:
       plan:
         artifact: plan
@@ -530,6 +541,7 @@ steps:
           conclusion:
             enum:
               - ready
+              - needs_package_changes
               - needs_plan_revision
               - blocked
     on:
@@ -555,6 +567,12 @@ steps:
                     var: state.validation_mode
                     value: complete_gate
             to: validation
+          - id: integration-package-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_package_changes
+            to: implementation
           - id: integration-plan-correction
             when:
               equals:
@@ -570,6 +588,7 @@ steps:
     evidence_operations:
       - read_receipt
       - project_plan
+      - prepare_result
     sandbox: workspace
   focused_validation:
     role: validator
@@ -577,9 +596,13 @@ steps:
     description: No-edit focused recheck of the known correction bundle; never
       sufficient for closure.
     requires:
-      equals:
-        var: decisions.plan_approval.value
-        value: approved
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
     inputs:
       plan:
         artifact: plan
@@ -645,9 +668,13 @@ steps:
     description: No-edit complete affected gate with actual or conservatively reused
       execution receipts.
     requires:
-      equals:
-        var: decisions.plan_approval.value
-        value: approved
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
     inputs:
       plan:
         artifact: plan
@@ -779,9 +806,13 @@ steps:
     prompt_ref: step_implementation_review
     description: The exact planner validates conformance until its first strict approval.
     requires:
-      equals:
-        var: decisions.plan_approval.value
-        value: approved
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
     requires_evidence:
       - receipt: evidence.validation
         kind: validation
@@ -907,9 +938,13 @@ steps:
                 value: blocked
             notify: orchestrator
     requires:
-      equals:
-        var: state.planner_approved
-        value: true
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: state.planner_approved
+            value: true
     description: Apply the recorded user preference, or ask once whether to prepare
       optional UAT or proceed.
     evidence_operations:
@@ -920,9 +955,13 @@ steps:
     description: Prepare the selected UAT experience without editing product code or
       claiming user approval.
     requires:
-      equals:
-        var: decisions.uat_preference.value
-        value: prepare
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: decisions.uat_preference.value
+            value: prepare
     requires_evidence:
       - receipt: evidence.validation
         kind: validation
@@ -1029,9 +1068,13 @@ steps:
                 value: blocked
             notify: orchestrator
     requires:
-      equals:
-        var: decisions.uat_preference.value
-        value: prepare
+      all:
+        - equals:
+            var: packages.integrated
+            value: true
+        - equals:
+            var: decisions.uat_preference.value
+            value: prepare
     description: Wait for the user’s UAT observations; never infer acceptance from
       preparation or elapsed time.
     evidence_operations:
@@ -1044,14 +1087,18 @@ steps:
     requires:
       all:
         - equals:
-            var: decisions.plan_approval.value
-            value: approved
-        - equals:
-            var: state.planner_approved
+            var: packages.integrated
             value: true
-        - equals:
-            var: state.uat_completed
-            value: true
+        - all:
+            - equals:
+                var: decisions.plan_approval.value
+                value: approved
+            - equals:
+                var: state.planner_approved
+                value: true
+            - equals:
+                var: state.uat_completed
+                value: true
     requires_evidence:
       - receipt: evidence.validation
         kind: validation
@@ -1224,14 +1271,18 @@ steps:
     requires:
       all:
         - equals:
-            var: decisions.plan_approval.value
-            value: approved
-        - equals:
-            var: state.planner_approved
+            var: packages.integrated
             value: true
-        - equals:
-            var: state.uat_completed
-            value: true
+        - all:
+            - equals:
+                var: decisions.plan_approval.value
+                value: approved
+            - equals:
+                var: state.planner_approved
+                value: true
+            - equals:
+                var: state.uat_completed
+                value: true
     requires_evidence:
       - receipt: evidence.final_review
         kind: expert_review
