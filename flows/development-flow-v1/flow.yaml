@@ -1,7 +1,7 @@
 # Backend defaults preserve Codex Luna Max; the explicit final-reviewer model is retained.
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
-version: 1.2.0
+version: 1.2.1
 description: Development with durable acceptance, same-owner incremental
   reviews, exact human plan approval, conditional integration, controlled
   validation, optional UAT, and verified closure.

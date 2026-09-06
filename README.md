@@ -103,7 +103,7 @@ so the updated MCP server and skills are loaded together.
 
 ## Development Flow Evidence
 
-The bundled `development-flow-v1` version 1.2.0 records the current accepted
+The bundled `development-flow-v1` version 1.2.1 records the current accepted
 contract before dispatch, preserves Context and Analysis with the same analyst,
 checks intent with the clarification owner, and requires approval of the exact
 plan after the analyst's review. Integration is conditional; mechanical
