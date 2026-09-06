@@ -197,7 +197,7 @@ export class RunObservation {
       return { run_id: run.run_id, observer_agent_id: agent.agent_id, thread_id: threadId, event_types: events,
         delivery, cursor, processed_cursor: cursor,
         delivered_cursor: this.cursors.encode(run.run_id, agent.agent_id, state.delivered_sequence, state),
-        reused: Boolean(previous), wait_contract: conversationWaitContract(run.run_id, agent.agent_id, cursor) };
+        reused: Boolean(previous), wait_contract: conversationWaitContract(run.run_id, agent.agent_id) };
     });
   }
 
@@ -210,7 +210,9 @@ export class RunObservation {
       const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
       const authorized = caller
         ? this.controller.canAgentAccessRun(caller, input.runId) && (caller.agent_id === agent.agent_id || this.observationOwners(agent, input.runId).includes(caller.agent_id))
-        : Boolean(input.adminKey && verifyAdminKey(input.adminKey));
+        : input.adminKey ? verifyAdminKey(input.adminKey)
+          // The local MCP/CLI host supplies this identity; explicit credentials never fall back to it.
+          : process.env.CODEX_THREAD_ID === observer.thread_id;
       if (!authorized) throw new ControllerError("Acknowledgement requires the observing identity or an authorized administrator.", "auth_required");
       const state = this.cursors.state(agent.agent_id, observer.start_sequence);
       const sequence = this.cursors.decode(input.cursor, input.runId, agent.agent_id, state);
@@ -218,7 +220,7 @@ export class RunObservation {
       const advanced = this.cursors.acknowledge(agent.agent_id, sequence, state);
       const cursor = this.cursors.encode(input.runId, agent.agent_id, Math.max(sequence, state.processed_sequence), state);
       return { run_id: input.runId, observer_agent_id: agent.agent_id, cursor, processed_cursor: cursor, advanced,
-        wait_contract: conversationWaitContract(input.runId, agent.agent_id, cursor) };
+        wait_contract: conversationWaitContract(input.runId, agent.agent_id) };
     });
   }
 
@@ -232,7 +234,7 @@ export class RunObservation {
     const started = Date.now();
     const empty = (timedOut: boolean, closed: boolean) => ({ run_id: input.runId, observer_agent_id: input.observerAgentId,
       events: [] as ReturnType<typeof publicEvent>[], cursor: requestedCursor, timed_out: timedOut, closed,
-      wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId, requestedCursor) });
+      wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId) });
     while (true) {
       input.signal?.throwIfAborted();
       const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
@@ -265,7 +267,7 @@ export class RunObservation {
           cursor, processed_cursor: this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state),
           ack_contract: { tool: "run_ack" as const, arguments: { run_id: input.runId, observer_agent_id: agent.agent_id, cursor },
             instruction: "After successfully handling all events through this cursor, acknowledge them explicitly. Fetching or receiving a notification does not acknowledge processing." },
-          timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId, cursor) };
+          timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId) };
       }
       if (run.status === "stopped") return empty(false, true);
       const remaining = input.timeoutMs === undefined ? Infinity : input.timeoutMs - (Date.now() - started);

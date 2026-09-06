@@ -471,25 +471,46 @@ describe("run observation", () => {
   it("resumes after a user interruption with events accumulated while answering another topic", async () => {
     const observation = observe(run().run_id);
     expect(observation.wait_contract).toMatchObject({ turn_policy: "keep_open_while_work_pending", tool: "run_wait",
-      arguments: { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: observation.cursor, timeout_ms: 3_600_000 } });
+      arguments: { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, timeout_ms: 3_600_000 } });
+    expect(observation.wait_contract.arguments).not.toHaveProperty("cursor");
     const firstEvent = emit(observation.run_id, "flow.step_started", { step_id: "analysis" });
-    const first = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
-      cursor: observation.wait_contract.arguments.cursor });
+    const first = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id });
     expect(first.events.map(e => e.event_id)).toEqual([firstEvent.event_id]);
+    await handleTool(controller, "run_ack", { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: first.cursor });
     const cancellation = new AbortController();
     const pending = handleTool(controller, "run_wait", first.wait_contract!.arguments, cancellation.signal);
     cancellation.abort(new Error("new user message on another topic"));
     await expect(pending).rejects.toThrow(/new user message/);
     // The model answers the user while backend events continue to be persisted.
     const duringReply = emit(observation.run_id, "flow.step_started", { step_id: "implementation" });
-    const resumed = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
-      cursor: first.wait_contract!.arguments.cursor, timeoutMs: 3_600_000 });
+    const resumed = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id, timeoutMs: 3_600_000 });
     expect(resumed.events.map(e => e.event_id)).toEqual([duringReply.event_id]);
-    expect(resumed.wait_contract!.arguments.cursor).toBe(resumed.cursor);
+    expect(resumed.wait_contract!.arguments).not.toHaveProperty("cursor");
+    await handleTool(controller, "run_ack", { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: resumed.cursor });
     const timeout = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
-      cursor: resumed.cursor, timeoutMs: 1, intervalMs: 1 });
+      timeoutMs: 1, intervalMs: 1 });
     expect(timeout).toMatchObject({ timed_out: true, closed: false,
-      wait_contract: { arguments: { cursor: resumed.cursor, timeout_ms: 3_600_000 } } });
+      wait_contract: { arguments: { timeout_ms: 3_600_000 } } });
+  });
+
+  it("uses returned MCP launch, wait and ACK contracts without passing credentials or replaying launch events", async () => {
+    adapters.register({ ...adapters.get("fake"), kind: "codex-subagent" });
+    const launched = await handleTool(controller, "flow_launch", { title: "Observe the user's native flow", repo_dir: directory,
+      owner_task_identity: "user-thread", owner_task_path: "/root", config: { id: "mcp-ack-flow", initial_step: "work",
+        roles: { worker: { backend: "codex-subagent" } }, steps: { work: { role: "worker", prompt: "Read the accepted task",
+          on: { reported: { finish: true } } } } } }) as any;
+    const contract = launched.observer.wait_contract;
+    expect(contract.arguments).not.toHaveProperty("cursor");
+    expect(contract.arguments).not.toHaveProperty("agent_token");
+    const batch = await handleTool(controller, contract.tool, { ...contract.arguments, timeout_ms: 1 }) as any;
+    expect(batch.events.length).toBeGreaterThan(0);
+    expect(batch.ack_contract.arguments).not.toHaveProperty("agent_token");
+    const ack = await handleTool(controller, batch.ack_contract.tool, batch.ack_contract.arguments) as any;
+    expect(ack.advanced).toBe(true);
+    const next = await handleTool(controller, ack.wait_contract.tool, { ...ack.wait_contract.arguments, timeout_ms: 1 }) as any;
+    expect(next.events).toEqual([]);
+    const replay = await handleTool(controller, contract.tool, { ...contract.arguments, cursor: launched.observer.cursor, timeout_ms: 1 }) as any;
+    expect(replay.events.map((event: any) => event.event_id)).toEqual(batch.events.map((event: any) => event.event_id));
   });
 
   it("closes only the finished observation and preserves a separate active run's wait contract", async () => {

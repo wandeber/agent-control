@@ -101,10 +101,25 @@ describe("processed observer cursors", () => {
     const delivered = await wait(observer);
     const foreignOwner = controller.orchestratorLogin({ title: "Other owner", adminKey, backend: "codex-thread",
       backendHandle: { thread_id: "other-thread", agent_control_role: "orchestrator" } });
+    vi.stubEnv("CODEX_THREAD_ID", "other-thread");
     expect(() => observations.acknowledge({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor: delivered.cursor })).toThrow(/identity/);
     expect(() => observations.acknowledge({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor: delivered.cursor,
       agentToken: foreignOwner.agent_token })).toThrow(/identity/);
     expect(observe(observer.run_id).cursor).toBe(observer.cursor);
+  });
+
+  it("uses the local observing thread only when explicit credentials are absent", async () => {
+    const observer = observe(); emit(observer.run_id);
+    const batch = await wait(observer);
+    const input = { runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor: batch.cursor };
+    expect(() => observations.acknowledge({ ...input, agentToken: "wrong-explicit-token" })).toThrow();
+    expect(() => observations.acknowledge({ ...input, adminKey: "wrong-explicit-admin" })).toThrow(/identity/);
+    expect(observe(observer.run_id).cursor).toBe(observer.cursor);
+    const acknowledged = observations.acknowledge(input);
+    expect(acknowledged.advanced).toBe(true);
+    expect(acknowledged.wait_contract.arguments).not.toHaveProperty("cursor");
+    expect((await wait(observer)).events).toEqual([]);
+    expect((await wait(observer, { cursor: observer.cursor })).events).toEqual(batch.events);
   });
 
   it("migrates existing subscriptions from their original start without assuming prior processing", async () => {

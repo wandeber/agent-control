@@ -96,7 +96,8 @@ describe("observer launch CLI", () => {
       watcher = launch.watch?.pid;
       expect(launch.next).toBe("worker_dispatched_wait_for_run_events");
       expect(launch.reason).toContain("Keep this turn open");
-      expect(launch.observer.wait_contract.arguments).toMatchObject({ run_id: launch.run_id, cursor: launch.observer.cursor, timeout_ms: 3_600_000 });
+      expect(launch.observer.wait_contract.arguments).toMatchObject({ run_id: launch.run_id, timeout_ms: 3_600_000 });
+      expect(launch.observer.wait_contract.arguments).not.toHaveProperty("cursor");
       const reuse = JSON.parse((await promisify(execFile)(process.execPath, [...args, "--run", launch.run_id], { cwd: resolve("."), env })).stdout);
       expect(reuse.next).toBe("worker_already_running_wait_for_run_events");
       expect(reuse.reason).toContain("resume run_wait");
