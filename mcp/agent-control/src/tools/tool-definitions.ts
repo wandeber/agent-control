@@ -1,6 +1,7 @@
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
 import {
+  flowContextUpdateSchema, flowDecisionSchema, flowEvidenceSchema, runAckSchema,
   workerLaunchSchema,
   flowLaunchSchema,
   agentLinkCreateSchema,
@@ -67,7 +68,13 @@ const requesterProperties = {
   requester_delivery: enumProperty(["wait", "notify"], "Default wait; consume the returned observer cursor through run_wait.")
 };
 
+const flowIdentityProperties = { flow_instance_id: stringProperty("Flow instance id."), agent_token: stringProperty("Authenticated caller token if the local Codex thread identity is unavailable."), admin_key: stringProperty("Local coordinator administration credential; never place it in prompts or artifacts.") };
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
+  { name: "flow_context_update", description: "Replace the complete current acceptance contract with compare-and-swap revision; retain unchanged requirements in the supplied contract. History remains immutable and is not replayed into every prompt. Prior approval evidence becomes stale; route affected work before accepting more reports.", inputSchema: objectSchema({ ...flowIdentityProperties, context: stringProperty("Complete current accepted objective, constraints and acceptance criteria."), expected_revision: numberProperty("Current flow runtime revision.") }, ["flow_instance_id", "context", "expected_revision"]), schema: flowContextUpdateSchema },
+  { name: "flow_decision", description: "Record an explicit human gate decision or configured preference. Artifact gates require the exact current artifact digest; decisions never arise from elapsed time. Completes the active coordinator gate through declared transitions.", inputSchema: objectSchema({ ...flowIdentityProperties, key: stringProperty("Configured decision key."), value: {}, reason: stringProperty("The user's explicit decision and its context."), expected_revision: numberProperty("Current flow runtime revision."), artifact_key: stringProperty("Configured artifact key."), artifact_digest: stringProperty("Exact current artifact SHA-256 reviewed by the user.") }, ["flow_instance_id", "key", "value", "reason", "expected_revision"]), schema: flowDecisionSchema },
+  { name: "flow_evidence", description: "Prepare immutable checkpoints, compose strict incremental reviews, execute or reuse verified validation checks, or verify closure. Identity and acceptance/plan revisions are supplied by the controller; only operations authorized for the active step are accepted. Returns a compact receipt and registers it under key for declarative guards.", inputSchema: objectSchema({ ...flowIdentityProperties, key: stringProperty("Evidence registry key used by flow guards."), step_instance_id: stringProperty("Current step generation."), request: { type: "object", description: "Evidence operation request; use the operation contract in the current flow step." } }, ["flow_instance_id", "key", "request"]), schema: flowEvidenceSchema },
+  { name: "run_ack", description: "Acknowledge a delivered event cursor after handling its events. Persists processed progress for safe reattachment; never acknowledges undelivered events.", inputSchema: objectSchema({ run_id: stringProperty("Run id."), observer_agent_id: stringProperty("Observer identity."), cursor: stringProperty("Delivered observer-bound cursor."), agent_token: stringProperty("Authorized observer or owner token."), admin_key: stringProperty("Local administrator credential.") }, ["run_id", "observer_agent_id", "cursor"]), schema: runAckSchema },
   {
     name: "worker_launch",
     description: "Launch a Codex Luna Max worker in one call. Automatically creates local coordinator/run identity, registers the original user conversation, subscribes it to all events and starts detached supervision. Return observer contains the cursor for run_wait. No separate login, registration or observe call is needed. Keep this turn open while work remains: use the wait_contract for your own thread (coordinator_observer for a separate executor, observer for the requester), answer user messages in commentary even on another topic, then resume run_wait with the latest processed cursor and a one-hour timeout. Do not rely on notify to wake an ended turn.",
@@ -88,7 +95,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "flow_launch",
     description: "Launch and dispatch a flow in one call using config or a catalog flow_id. Automatically establishes local owner identity, registers/subscribes the original user conversation to all events before dispatch and returns its run_wait cursor. Keeps native bridge authority with the coordinator. Keep this turn open while work remains; after responding to any user message, resume run_wait using your own thread's wait_contract (coordinator_observer for a separate executor, observer for the requester) and its latest processed cursor with a one-hour timeout. Notify cannot reliably wake an ended turn.",
     inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Run objective/title."),
-      config: { type: "object", description: "Flow config; choose config or flow_id." }, flow_id: stringProperty("Bundled/user catalog flow id."),
+      config: { type: "object", description: "Flow config; choose config or flow_id." }, acceptance_context: stringProperty("Complete clarified objective, constraints and acceptance criteria; stored atomically before the first worker starts."), flow_id: stringProperty("Bundled/user catalog flow id."),
       repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."), server: stringProperty("Optional explicit backend endpoint."),
       admin_key: stringProperty("Optional explicit admin authorization."), agent_token: stringProperty("Optional existing caller identity."),
       owner_task_identity: stringProperty("Native bridge owner identity."), owner_task_path: stringProperty("Native bridge owner task path.")
@@ -106,7 +113,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "run_wait",
     description: "Wait for subscribed run events. Reuse the returned cursor to avoid repeats. Omit timeout for indefinite wait or use 3600000 for one hour. Tool cancellation ends only this wait. After answering new user input, resume with the last processed cursor unless the user explicitly pauses or cancels supervision. Preserve all active runs. A timeout or unrelated topic is not completion; keep the turn open and reattach. Each response provides the next wait_contract; closed only closes that observation.",
     inputSchema: objectSchema({ run_id: stringProperty("Observed run."), observer_agent_id: stringProperty("Observing participant id."),
-      cursor: stringProperty("Durable cursor from run_observe or run_wait."), timeout_ms: numberProperty("Optional positive timeout; 3600000 is one hour."), limit: numberProperty("Maximum batch size, up to 100.") }, ["run_id", "observer_agent_id", "cursor"]),
+      cursor: stringProperty("Durable cursor from run_observe or run_wait."), timeout_ms: numberProperty("Optional positive timeout; 3600000 is one hour."), limit: numberProperty("Maximum batch size, up to 100.") }, ["run_id", "observer_agent_id"]),
     schema: runWaitSchema
   },
   {
@@ -268,6 +275,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: objectSchema(
       {
         step_instance_id: stringProperty("Active flow step instance id."),
+        agent_token: stringProperty("Assigned worker or coordinator identity, normally resolved from the local Codex thread."),
         status: enumProperty(FLOW_STEP_INSTANCE_STATUSES, "Flow step result status."),
         result: { type: "object", description: "Structured result payload used by transition conditions." },
         artifacts: { type: "object", description: "Output artifact paths by output name or artifact key." },
@@ -287,6 +295,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       {
         flow_instance_id: stringProperty("Flow instance id."),
         step_id: stringProperty("Configured step id to activate."),
+        agent_token: stringProperty("Authenticated coordinator identity."),
+        admin_key: stringProperty("Local administrator credential."),
         from_step_instance_id: stringProperty("Optional previous step instance that led to this manual transition."),
         transition_id: stringProperty("Optional transition id to record."),
         reason: stringProperty(

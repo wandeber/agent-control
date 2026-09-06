@@ -192,6 +192,19 @@ describe("CodexThreadAdapter", () => {
     expect(requests.find((request) => request.method === "turn/start")?.params).not.toHaveProperty("effort");
   });
 
+  it("enforces a per-step sandbox on fresh and resumed turns", async () => {
+    const adapter = new CodexThreadAdapter();
+    const handle = await adapter.start({
+      agent: { repo_dir: "/repo", model: "gpt-5.6-luna", backend_handle: null } as StartAgentInput["agent"],
+      prompt: "Review without edits", server: appServerUrl, metadata: { sandbox: "read_only" }
+    });
+    expect(requests.find(request => request.method === "turn/start")?.params).toMatchObject({ sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" });
+    requests.length = 0;
+    await adapter.start({ agent: { repo_dir: "/repo", backend_handle: handle.data } as StartAgentInput["agent"],
+      prompt: "Write the requested artifacts", server: appServerUrl, metadata: { sandbox: "workspace", flow_writable_root: "/runtime/run-1" } });
+    expect(requests.find(request => request.method === "turn/start")?.params).toMatchObject({ sandboxPolicy: { type: "workspaceWrite", writableRoots: ["/repo", "/runtime/run-1"], networkAccess: true }, approvalPolicy: "never" });
+  });
+
   it("falls back to the registered handle cwd when resume omits cwd", async () => {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));

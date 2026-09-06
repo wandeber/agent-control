@@ -10,6 +10,9 @@ export const flowConfigJsonSchema = {
     version: { type: "string", minLength: 1 },
     description: { type: "string", minLength: 1 },
     initial_step: { type: "string", minLength: 1 },
+    policy: { type: "object", additionalProperties: false, properties: { strict: { type: "boolean" }, plan_artifact: { type: "string" } } },
+    state: { type: "object", additionalProperties: true },
+    preferences: { type: "object", additionalProperties: { type: "object", properties: { values: { type: "array", minItems: 1, items: { type: "string" } }, artifact_key: { type: "string" } }, required: ["values"], additionalProperties: false } },
     prompts: {
       type: "object",
       additionalProperties: { $ref: "#/$defs/promptSource" }
@@ -36,6 +39,13 @@ export const flowConfigJsonSchema = {
         type: "object",
         additionalProperties: false,
         properties: {
+          execution: { enum: ["worker", "coordinator"] },
+          sandbox: { enum: ["read_only", "workspace"] },
+          decision: { type: "object", properties: { key: { type: "string" }, artifact_key: { type: "string" }, authority: { enum: ["user", "coordinator"] } }, required: ["key"], additionalProperties: false },
+          evidence_operations: { type: "array", items: { type: "string" } },
+          evidence_gates: { type: "array", items: { enum: ["planner", "expert"] } },
+          requires: { $ref: "#/$defs/condition" },
+          requires_evidence: { type: "array", items: { $ref: "#/$defs/evidenceRequirement" } },
           role: { type: "string", minLength: 1 },
           agent_id: { type: "string", minLength: 1 },
           prompt: { type: "string", minLength: 1 },
@@ -67,6 +77,7 @@ export const flowConfigJsonSchema = {
     }
   },
   $defs: {
+    evidenceRequirement: { type: "object", additionalProperties: false, required: ["receipt"], properties: { receipt: { type: "string" }, kind: { type: "string" }, require_current: { type: "boolean" }, require_approved: { type: "boolean" }, owner_role: { type: "string" }, validation_mode: { enum: ["focused", "complete_gate"] } } },
     promptSource: {
       type: "object",
       additionalProperties: false,
@@ -135,6 +146,7 @@ export const flowConfigJsonSchema = {
             type: "object",
             additionalProperties: false,
             properties: {
+              type: { enum: ["string", "number", "boolean", "object", "array", "null"] },
               enum: {
                 type: "array",
                 items: {
@@ -214,6 +226,9 @@ export const flowConfigJsonSchema = {
       type: "object",
       additionalProperties: false,
       properties: {
+        requires: { $ref: "#/$defs/condition" },
+        requires_evidence: { type: "array", items: { $ref: "#/$defs/evidenceRequirement" } },
+        set: { type: "object", additionalProperties: true },
         notify: { type: "string", minLength: 1 },
         to: { type: "string", minLength: 1 },
         finish: { type: "boolean" },
@@ -230,6 +245,9 @@ export const flowConfigJsonSchema = {
       properties: {
         id: { type: "string", minLength: 1 },
         when: { $ref: "#/$defs/condition" },
+        requires: { $ref: "#/$defs/condition" },
+        requires_evidence: { type: "array", items: { $ref: "#/$defs/evidenceRequirement" } },
+        set: { type: "object", additionalProperties: true },
         notify: { type: "string", minLength: 1 },
         to: { type: "string", minLength: 1 },
         finish: { type: "boolean" },

@@ -477,6 +477,7 @@ export interface FlowRecord {
 }
 
 export interface FlowInstanceRecord {
+  runtime?: import("./flow-runtime.js").FlowRuntimeState | null;
   flow_instance_id: string;
   flow_record_id: string;
   run_id: string;
@@ -540,6 +541,9 @@ export interface FlowConfig {
   version?: string;
   description?: string;
   initial_step: string;
+  policy?: { strict?: boolean; plan_artifact?: string };
+  preferences?: Record<string, { values: string[]; artifact_key?: string }>;
+  state?: Record<string, unknown>;
   prompts?: Record<string, FlowPromptConfig>;
   artifacts?: Record<string, FlowArtifactConfig>;
   roles?: Record<string, FlowRoleConfig>;
@@ -581,7 +585,23 @@ export interface FlowArtifactConfig {
   description?: string;
 }
 
+export interface FlowEvidenceRequirement {
+  receipt: string;
+  kind?: string;
+  require_current?: boolean;
+  require_approved?: boolean;
+  owner_role?: string;
+  validation_mode?: "focused" | "complete_gate";
+}
+
 export interface FlowStepConfig {
+  execution?: "worker" | "coordinator";
+  sandbox?: "read_only" | "workspace";
+  evidence_operations?: string[];
+  evidence_gates?: Array<"planner" | "expert">;
+  decision?: { key: string; artifact_key?: string; authority?: "user" | "coordinator" };
+  requires?: FlowConditionConfig;
+  requires_evidence?: FlowEvidenceRequirement[];
   role?: string;
   agent_id?: string;
   prompt?: string;
@@ -611,10 +631,14 @@ export interface FlowResultSchemaConfig {
 }
 
 export interface FlowResultPropertyConfig {
+  type?: "string" | "number" | "boolean" | "object" | "array" | "null";
   enum?: Array<string | number | boolean | null>;
 }
 
 export interface FlowStepActionConfig {
+  requires?: FlowConditionConfig;
+  requires_evidence?: FlowEvidenceRequirement[];
+  set?: Record<string, unknown>;
   notify?: string;
   to?: string;
   finish?: boolean;
@@ -646,6 +670,7 @@ export interface FlowStartResult {
 }
 
 export interface FlowSnapshot {
+  runtime?: import("./flow-runtime.js").FlowRuntimeState | null;
   flow: FlowRecord;
   instance: FlowInstanceRecord;
   steps: FlowStepInstanceRecord[];
@@ -655,6 +680,7 @@ export interface FlowSnapshot {
 }
 
 export interface FlowStepReportResult extends FlowSnapshot {
+  replayed?: boolean;
   reported_step: FlowStepInstanceRecord;
   selected_transition: FlowTransitionRecord | null;
   active_step: FlowStepInstanceRecord | null;

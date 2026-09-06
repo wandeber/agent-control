@@ -39,6 +39,8 @@ const CAPABILITIES: AgentCapabilities = {
 interface CodexThreadHandleData {
   thread_id: string;
   reasoning_effort?: string;
+  sandbox?: "read_only" | "workspace";
+  flow_writable_root?: string;
   app_server_url?: string;
   auth_token?: string;
   auth_token_file?: string;
@@ -98,11 +100,14 @@ export class CodexThreadAdapter implements AgentAdapter {
     const appServerUrl = resolveAppServerUrl(input.server, input.metadata, handleData);
     const authToken = resolveAuthToken(input.metadata, handleData);
     const reasoningEffort = stringValue(input.metadata?.reasoning_effort) ?? handleData?.reasoning_effort;
+    const sandbox = input.metadata?.sandbox === "read_only" ? "read_only" : input.metadata?.sandbox === "workspace" ? "workspace" : handleData?.sandbox;
 
     if (handleData?.thread_id) {
       const data: CodexThreadHandleData = {
         ...handleData,
         reasoning_effort: reasoningEffort,
+        sandbox,
+        flow_writable_root: stringValue(input.metadata?.flow_writable_root) ?? handleData?.flow_writable_root,
         app_server_url: appServerUrl,
         auth_token: stringValue(input.metadata?.auth_token) ?? stringValue(input.metadata?.authToken) ?? handleData.auth_token,
         auth_token_file: resolveAuthTokenFile(input.metadata, handleData) ?? handleData.auth_token_file
@@ -129,6 +134,8 @@ export class CodexThreadAdapter implements AgentAdapter {
       const data: CodexThreadHandleData = {
         thread_id: thread.id,
         reasoning_effort: reasoningEffort,
+        sandbox,
+        flow_writable_root: stringValue(input.metadata?.flow_writable_root) ?? handleData?.flow_writable_root,
         app_server_url: appServerUrl,
         auth_token: stringValue(input.metadata?.auth_token) ?? stringValue(input.metadata?.authToken),
         auth_token_file: resolveAuthTokenFile(input.metadata, handleData),
@@ -294,7 +301,8 @@ async function startTurnOnLoadedThread(
     cwd: turnCwd ?? undefined,
     model: model ?? undefined,
     // Retain the explicit effort when this worker receives another turn.
-    effort: data.reasoning_effort ?? undefined
+    effort: data.reasoning_effort ?? undefined,
+    ...(data.sandbox === "read_only" ? { sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" } : data.sandbox === "workspace" ? { sandboxPolicy: { type: "workspaceWrite", writableRoots: [turnCwd, data.flow_writable_root].filter(Boolean), networkAccess: true }, approvalPolicy: "never" } : {})
   });
   const turnResponse = result as { turn?: { id: string } };
   if (turnResponse.turn?.id) {
@@ -745,6 +753,8 @@ function parseOptionalHandle(value: Record<string, unknown> | null): CodexThread
   return {
     thread_id: String(value.thread_id ?? value.threadId ?? value.id ?? ""),
     reasoning_effort: stringValue(value.reasoning_effort),
+    flow_writable_root: stringValue(value.flow_writable_root),
+    sandbox: value.sandbox === "read_only" ? "read_only" : value.sandbox === "workspace" ? "workspace" : undefined,
     app_server_url:
       typeof value.app_server_url === "string"
         ? value.app_server_url
@@ -809,6 +819,8 @@ function compactHandle(data: CodexThreadHandleData): Record<string, unknown> {
   if (data.cwd) {
     handle.cwd = data.cwd;
   }
+  if (data.flow_writable_root) handle.flow_writable_root = data.flow_writable_root;
+  if (data.sandbox) handle.sandbox = data.sandbox;
   if (data.reasoning_effort) {
     handle.reasoning_effort = data.reasoning_effort;
   }

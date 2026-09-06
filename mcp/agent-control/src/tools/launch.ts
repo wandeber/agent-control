@@ -38,7 +38,7 @@ export async function launchFlowTool(controller: AgentController, input: Record<
     adminKey: (input.admin_key as string | undefined) ?? resolveAdminKey(), ...requesterOptions(input) });
   const requester = controller.ensureRequester(owner.runId, { ...requesterOptions(input), agentToken: owner.agentToken });
   const coordinatorObserver = observeLaunchCoordinator(controller, owner, owner.runId, requester);
-  const start = controller.startFlow({ config, runId: owner.runId, runTitle: title,
+  const start = controller.startFlow({ config, runId: owner.runId, runTitle: title, acceptanceContext: input.acceptance_context as string | undefined,
     repoDir: input.repo_dir as string | undefined, agentToken: owner.agentToken,
     adminKey: owner.agentToken ? undefined : (input.admin_key as string | undefined) ?? resolveAdminKey(),
     ownerTaskIdentity: input.owner_task_identity as string | undefined,
