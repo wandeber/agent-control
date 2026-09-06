@@ -1,104 +1,152 @@
-# Backend placeholders use ${VAR:-default}. Model and reasoning placeholders use ${VAR-default}:
-# clear both values when opting into codex-subagent to inherit the root settings.
-
+# Backend defaults preserve Codex Luna Max; the explicit final-reviewer model is retained.
+# Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
-version: 1.1.1
-description: Development workflow with coordinator-owned pre-launch clarification. Normal worker
-  handoffs, downstream intent reviews, corrections, and final review rollbacks are handled by Agent
-  Control transitions; the same visible orchestrator validates analysis intent and handles new
-  clarification, blockers, ambiguous routing, or human confirmation.
-initial_step: analysis
+version: 1.2.0
+description: Development with durable acceptance, same-owner incremental
+  reviews, exact human plan approval, conditional integration, controlled
+  validation, optional UAT, and verified closure.
+initial_step: context
+policy:
+  strict: true
+  plan_artifact: plan
+preferences:
+  review_mode:
+    values:
+      - loop
+      - single_review
+  uat_preference:
+    values:
+      - prepare
+      - skip
+state:
+  planner_approved: false
+  uat_completed: false
+  validation_mode: complete_gate
 prompts:
   role_analyst:
     path: roles/analyst.md
-    description: Stable analyst role behavior for context, analysis, and plan intent review.
   role_planner:
     path: roles/planner.md
-    description: Stable planner role behavior for planning and implementation intent review.
   role_implementer:
     path: roles/implementer.md
-    description: Stable implementer role behavior for edits, integration, and mechanical checks.
+  role_validator:
+    path: roles/validator.md
   role_final_reviewer:
     path: roles/final-reviewer.md
-    description: Stable final external reviewer role behavior.
+  step_context:
+    path: prompts/context.md
   step_analysis:
     path: prompts/analysis.md
-    description: Analysis or correction-focused analysis instructions.
   step_planning:
     path: prompts/planning.md
-    description: Planning instructions.
   step_plan_review:
     path: prompts/plan-review.md
-    description: Analyst review of plan intent preservation.
   step_implementation:
     path: prompts/implementation.md
-    description: Implementation and implementation-owned mechanical validation instructions.
+  step_integration:
+    path: prompts/integration.md
+  step_validation:
+    path: prompts/validation.md
   step_implementation_review:
     path: prompts/implementation-review.md
-    description: Planner review of implementation intent preservation.
+  step_uat_preparation:
+    path: prompts/uat-preparation.md
   step_final_review:
     path: prompts/final-review.md
-    description: Final independent review-loop instructions.
 roles:
   analyst:
     backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
     model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
     reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
+    agent_lifecycle: reuse
     prompt_ref: role_analyst
-    description: Understands the task and repository context, writes analysis, and later checks whether
-      planning preserved analysis intent.
   planner:
     backend: ${DEVFLOW_PLANNER_BACKEND:-codex-thread}
     model: ${DEVFLOW_PLANNER_MODEL-gpt-5.6-luna}
     reasoning_effort: ${DEVFLOW_PLANNER_REASONING_EFFORT-max}
+    agent_lifecycle: reuse
     prompt_ref: role_planner
-    description: Turns analysis into a worker-ready plan and later checks whether implementation
-      preserved plan intent.
   implementer:
     backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-codex-thread}
     model: ${DEVFLOW_IMPLEMENTER_MODEL-gpt-5.6-luna}
     reasoning_effort: ${DEVFLOW_IMPLEMENTER_REASONING_EFFORT-max}
+    agent_lifecycle: reuse
     prompt_ref: role_implementer
-    description: Implements the accepted plan, integrates internal work, runs mechanical checks, and
-      reports one coherent result.
+  validator:
+    backend: ${DEVFLOW_VALIDATOR_BACKEND:-codex-thread}
+    model: ${DEVFLOW_VALIDATOR_MODEL-gpt-5.6-luna}
+    reasoning_effort: ${DEVFLOW_VALIDATOR_REASONING_EFFORT-max}
+    agent_lifecycle: reuse
+    prompt_ref: role_validator
   final_reviewer:
     backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
     model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.5}
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
-    description: Clean-context reviewer created on first entry and reused for every final-review iteration.
   orchestrator:
-    description: Owns pre-launch request clarification, validates analysis against that clarified
-      intent, and handles new clarification, blockers, ambiguous routing, and final human decisions.
+    description: Original clarification owner and recorded human decisions; no
+      delegated worker.
 artifacts:
+  context:
+    path: "{run_dir}/context.md"
   analysis:
     path: "{run_dir}/analysis.md"
-    description: Analysis or correction-focused analysis produced by the analyst.
   plan:
     path: "{run_dir}/plan.md"
-    description: Implementation plan produced by the planner.
-  plan_review:
-    path: "{run_dir}/plan-review.md"
-    description: Analyst review of whether the plan preserves analysis intent.
-  implementation_report:
-    path: "{run_dir}/implementation-report.md"
-    description: Implementer report covering changed files, integration shape, checks, fixes, and blockers.
-  implementation_review:
-    path: "{run_dir}/implementation-review.md"
-    description: Planner review of whether implementation preserves plan intent.
-  final_review:
-    path: "{run_dir}/final-review.md"
-    description: Independent external expert review updated by the same reviewer across iterations.
+  uat_guide:
+    path: "{run_dir}/uat-guide.md"
 steps:
+  context:
+    role: analyst
+    prompt_ref: step_context
+    description: Discover task-relevant repository facts; the same analyst later
+      synthesizes Analysis.
+    outputs:
+      context:
+        artifact: context
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_clarification
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: context-ready
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: analysis
+          - id: context-clarification
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_clarification
+            notify: orchestrator
+          - id: context-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    sandbox: workspace
   analysis:
     role: analyst
     prompt_ref: step_analysis
-    description: Analyze the clarified objective and repository context, then produce durable solution
-      intent for validation by the clarification owner.
+    description: Synthesize solution intent from Context and the current acceptance
+      revision.
     inputs:
-      final_review:
-        artifact: final_review
-        required: false
+      context:
+        artifact: context
+        required: true
     outputs:
       analysis:
         artifact: analysis
@@ -117,13 +165,13 @@ steps:
     on:
       reported:
         transitions:
-          - id: analysis-ready-for-orchestrator-intent-validation
+          - id: analysis-ready
             when:
               equals:
                 var: result.conclusion
                 value: ready
-            notify: orchestrator
-          - id: analysis-needs-clarification
+            to: analysis_intent
+          - id: analysis-clarification
             when:
               equals:
                 var: result.conclusion
@@ -135,20 +183,65 @@ steps:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
-  planning:
-    role: planner
-    prompt_ref: step_planning
-    description: Turn accepted analysis into an implementation-ready plan.
+    sandbox: workspace
+  analysis_intent:
+    role: orchestrator
+    execution: coordinator
+    decision:
+      key: analysis_intent
+      artifact_key: analysis
+      authority: coordinator
+    report:
+      schema:
+        type: object
+        required:
+          - decision
+        properties:
+          decision:
+            enum:
+              - approved
+              - changes_required
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: intent-approved
+            when:
+              equals:
+                var: result.decision
+                value: approved
+            to: planning
+          - id: intent-correction
+            when:
+              equals:
+                var: result.decision
+                value: changes_required
+            to: analysis
+          - id: intent-blocked
+            when:
+              equals:
+                var: result.decision
+                value: blocked
+            notify: orchestrator
     inputs:
       analysis:
         artifact: analysis
         required: true
-      plan_review:
-        artifact: plan_review
-        required: false
-      final_review:
-        artifact: final_review
-        required: false
+    description: The original clarification owner checks Analysis only for
+      preservation of user intent.
+  planning:
+    role: planner
+    prompt_ref: step_planning
+    description: Write stable work packages, dependencies, complete affected checks,
+      and integration boundaries.
+    requires:
+      equals:
+        var: decisions.analysis_intent.value
+        value: approved
+    inputs:
+      analysis:
+        artifact: analysis
+        required: true
     outputs:
       plan:
         artifact: plan
@@ -167,38 +260,36 @@ steps:
     on:
       reported:
         transitions:
-          - id: planning-ready-to-plan-review
+          - id: plan-ready
             when:
               equals:
                 var: result.conclusion
                 value: ready
             to: plan_review
-          - id: planning-needs-analysis-revision
+          - id: plan-analysis-correction
             when:
               equals:
                 var: result.conclusion
                 value: needs_analysis_revision
             to: analysis
-          - id: planning-blocked
+          - id: plan-blocked
             when:
               equals:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
+    sandbox: workspace
   plan_review:
     role: analyst
     prompt_ref: step_plan_review
-    description: Analyst checks whether the plan preserved analysis intent.
+    description: The exact analyst reviews the plan and records a strict incremental
+      receipt.
     inputs:
       analysis:
         artifact: analysis
         required: true
       plan:
         artifact: plan
-        required: true
-    outputs:
-      plan_review:
-        artifact: plan_review
         required: true
     report:
       schema:
@@ -212,50 +303,207 @@ steps:
               - needs_plan_changes
               - analysis_revision_needed
               - blocked
+          evidence_receipt_id:
+            type: string
     on:
       reported:
         transitions:
-          - id: plan-review-approved-to-implementation
+          - id: plan-intent-approved
             when:
               equals:
                 var: result.conclusion
                 value: approved
-            to: implementation
-          - id: plan-review-needs-plan-changes
+            to: plan_approval
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: plan_review
+                require_current: true
+                require_approved: true
+                owner_role: analyst
+          - id: plan-intent-correction
             when:
               equals:
                 var: result.conclusion
                 value: needs_plan_changes
             to: planning
-          - id: plan-review-analysis-revision-needed
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: plan_review
+                require_current: true
+                require_approved: false
+                owner_role: analyst
+          - id: plan-intent-analysis-correction
             when:
               equals:
                 var: result.conclusion
                 value: analysis_revision_needed
             to: analysis
-          - id: plan-review-blocked
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: plan_review
+                require_current: true
+                require_approved: false
+                owner_role: analyst
+          - id: plan-intent-blocked
             when:
               equals:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
-  implementation:
-    role: implementer
-    prompt_ref: step_implementation
-    description: Implement the approved plan, integrate internal work, and run mechanical checks.
+    evidence_operations:
+      - prepare_plan
+      - diff_plan
+      - record_plan_review
+    sandbox: read_only
+  plan_approval:
+    role: orchestrator
+    execution: coordinator
+    decision:
+      key: plan_approval
+      artifact_key: plan
+      authority: user
+    report:
+      schema:
+        type: object
+        required:
+          - decision
+        properties:
+          decision:
+            enum:
+              - approved
+              - changes_required
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: human-plan-approved
+            when:
+              equals:
+                var: result.decision
+                value: approved
+            to: implementation
+          - id: human-plan-correction
+            when:
+              equals:
+                var: result.decision
+                value: changes_required
+            to: planning
+          - id: human-plan-blocked
+            when:
+              equals:
+                var: result.decision
+                value: blocked
+            notify: orchestrator
     inputs:
       plan:
         artifact: plan
         required: true
-      implementation_review:
-        artifact: implementation_review
-        required: false
-      final_review:
-        artifact: final_review
-        required: false
-    outputs:
-      implementation_report:
-        artifact: implementation_report
+    requires_evidence:
+      - receipt: evidence.plan_review
+        kind: plan_review
+        require_current: true
+        require_approved: true
+        owner_role: analyst
+    description: Record explicit user approval of the exact current plan; unchanged
+      valid approval can be reused.
+  implementation:
+    role: implementer
+    prompt_ref: step_implementation
+    description: Execute user-approved packages and report whether consolidation is needed.
+    requires:
+      equals:
+        var: decisions.plan_approval.value
+        value: approved
+    requires_evidence:
+      - receipt: evidence.plan_review
+        kind: plan_review
+        require_current: true
+        require_approved: true
+        owner_role: analyst
+    inputs:
+      plan:
+        artifact: plan
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+          - integration_needed
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - needs_plan_revision
+              - blocked
+          integration_needed:
+            type: boolean
+    on:
+      reported:
+        transitions:
+          - id: implementation-needs-integration
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: result.integration_needed
+                    value: true
+            to: integration
+          - id: implementation-focused-check
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: result.integration_needed
+                    value: false
+                - equals:
+                    var: state.validation_mode
+                    value: focused_recheck
+            to: focused_validation
+          - id: implementation-complete-check
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: result.integration_needed
+                    value: false
+                - equals:
+                    var: state.validation_mode
+                    value: complete_gate
+            to: validation
+          - id: implementation-plan-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: needs_plan_revision
+            to: planning
+          - id: implementation-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    evidence_operations:
+      - project_plan
+    sandbox: workspace
+  integration:
+    role: implementer
+    prompt_ref: step_integration
+    description: Consolidate all required package outputs only when multiple outputs
+      need integration.
+    requires:
+      equals:
+        var: decisions.plan_approval.value
+        value: approved
+    inputs:
+      plan:
+        artifact: plan
         required: true
     report:
       schema:
@@ -271,38 +519,260 @@ steps:
     on:
       reported:
         transitions:
-          - id: implementation-ready-to-implementation-review
+          - id: integration-focused-check
             when:
-              equals:
-                var: result.conclusion
-                value: ready
-            to: implementation_review
-          - id: implementation-needs-plan-revision
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: state.validation_mode
+                    value: focused_recheck
+            to: focused_validation
+          - id: integration-complete-check
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: state.validation_mode
+                    value: complete_gate
+            to: validation
+          - id: integration-plan-correction
             when:
               equals:
                 var: result.conclusion
                 value: needs_plan_revision
             to: planning
-          - id: implementation-blocked
+          - id: integration-blocked
             when:
               equals:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
-  implementation_review:
-    role: planner
-    prompt_ref: step_implementation_review
-    description: Planner checks whether implementation preserved plan intent and required checks.
+    evidence_operations:
+      - project_plan
+    sandbox: workspace
+  focused_validation:
+    role: validator
+    prompt_ref: step_validation
+    description: No-edit focused recheck of the known correction bundle; never
+      sufficient for closure.
+    requires:
+      equals:
+        var: decisions.plan_approval.value
+        value: approved
     inputs:
       plan:
         artifact: plan
         required: true
-      implementation_report:
-        artifact: implementation_report
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - passed
+              - failed
+              - blocked
+          evidence_receipt_id:
+            type: string
+    on:
+      reported:
+        transitions:
+          - id: focused-ready-for-complete
+            when:
+              equals:
+                var: result.conclusion
+                value: passed
+            to: validation
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: focused
+          - id: focused-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: failed
+            to: implementation
+            set:
+              validation_mode: focused_recheck
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: false
+                owner_role: validator
+                validation_mode: focused
+          - id: focused-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    evidence_operations:
+      - prepare_result
+      - validation_run
+    sandbox: read_only
+  validation:
+    role: validator
+    prompt_ref: step_validation
+    description: No-edit complete affected gate with actual or conservatively reused
+      execution receipts.
+    requires:
+      equals:
+        var: decisions.plan_approval.value
+        value: approved
+    inputs:
+      plan:
+        artifact: plan
         required: true
-    outputs:
-      implementation_review:
-        artifact: implementation_review
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - passed
+              - failed
+              - blocked
+          evidence_receipt_id:
+            type: string
+    on:
+      reported:
+        transitions:
+          - id: validated-first-planner
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: passed
+                - equals:
+                    var: state.planner_approved
+                    value: false
+            to: implementation_review
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: complete_gate
+          - id: validated-back-to-expert
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: passed
+                - equals:
+                    var: state.planner_approved
+                    value: true
+                - equals:
+                    var: state.uat_completed
+                    value: true
+            to: final_review
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: complete_gate
+          - id: validated-back-to-uat
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: passed
+                - equals:
+                    var: state.planner_approved
+                    value: true
+                - equals:
+                    var: state.uat_completed
+                    value: false
+                - equals:
+                    var: decisions.uat_preference.value
+                    value: prepare
+            to: uat_preparation
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: complete_gate
+          - id: validated-uat-decision
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: passed
+                - equals:
+                    var: state.planner_approved
+                    value: true
+                - equals:
+                    var: state.uat_completed
+                    value: false
+            to: uat_decision
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: true
+                owner_role: validator
+                validation_mode: complete_gate
+          - id: validation-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: failed
+            to: implementation
+            set:
+              validation_mode: focused_recheck
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: validation
+                require_current: true
+                require_approved: false
+                owner_role: validator
+                validation_mode: complete_gate
+          - id: validation-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    evidence_operations:
+      - prepare_result
+      - validation_run
+    sandbox: read_only
+  implementation_review:
+    role: planner
+    prompt_ref: step_implementation_review
+    description: The exact planner validates conformance until its first strict approval.
+    requires:
+      equals:
+        var: decisions.plan_approval.value
+        value: approved
+    requires_evidence:
+      - receipt: evidence.validation
+        kind: validation
+        require_current: true
+        require_approved: true
+        owner_role: validator
+        validation_mode: complete_gate
+    inputs:
+      plan:
+        artifact: plan
         required: true
     report:
       schema:
@@ -316,44 +786,254 @@ steps:
               - implementation_changes_needed
               - plan_revision_needed
               - blocked
+          evidence_receipt_id:
+            type: string
     on:
       reported:
         transitions:
-          - id: implementation-review-approved-to-final-review
+          - id: planner-first-approval
             when:
               equals:
                 var: result.conclusion
                 value: approved
-            to: final_review
-          - id: implementation-review-needs-implementation-changes
+            to: uat_decision
+            set:
+              planner_approved: true
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: planner_review
+                require_current: true
+                require_approved: true
+                owner_role: planner
+          - id: planner-code-correction
             when:
               equals:
                 var: result.conclusion
                 value: implementation_changes_needed
             to: implementation
-          - id: implementation-review-plan-revision-needed
+            set:
+              validation_mode: focused_recheck
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: planner_review
+                require_current: true
+                require_approved: false
+                owner_role: planner
+          - id: planner-plan-correction
             when:
               equals:
                 var: result.conclusion
                 value: plan_revision_needed
             to: planning
-          - id: implementation-review-blocked
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: planner_review
+                require_current: true
+                require_approved: false
+                owner_role: planner
+          - id: planner-blocked
             when:
               equals:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
-  final_review:
-    role: final_reviewer
-    prompt_ref: step_final_review
-    description: Persistent independent expert review with authority to close or route corrections upstream.
+    evidence_operations:
+      - prepare_result
+      - diff_result
+      - record_review
+      - review_scope
+    evidence_gates:
+      - planner
+    sandbox: read_only
+  uat_decision:
+    role: orchestrator
+    execution: coordinator
+    decision:
+      key: uat_preference
+      authority: user
+    report:
+      schema:
+        type: object
+        required:
+          - decision
+        properties:
+          decision:
+            enum:
+              - prepare
+              - skip
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: uat-selected
+            when:
+              equals:
+                var: result.decision
+                value: prepare
+            to: uat_preparation
+          - id: uat-skipped
+            when:
+              equals:
+                var: result.decision
+                value: skip
+            to: final_review
+            set:
+              uat_completed: true
+          - id: uat-choice-blocked
+            when:
+              equals:
+                var: result.decision
+                value: blocked
+            notify: orchestrator
+    requires:
+      equals:
+        var: state.planner_approved
+        value: true
+    description: Apply the recorded user preference, or ask once whether to prepare
+      optional UAT or proceed.
+  uat_preparation:
+    role: implementer
+    prompt_ref: step_uat_preparation
+    description: Prepare the selected UAT experience without editing product code or
+      claiming user approval.
+    requires:
+      equals:
+        var: decisions.uat_preference.value
+        value: prepare
+    requires_evidence:
+      - receipt: evidence.validation
+        kind: validation
+        require_current: true
+        require_approved: true
+        owner_role: validator
+        validation_mode: complete_gate
     inputs:
       plan:
         artifact: plan
         required: true
     outputs:
-      final_review:
-        artifact: final_review
+      uat_guide:
+        artifact: uat_guide
+        required: true
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - ready
+              - implementation_changes_needed
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: uat-ready
+            when:
+              equals:
+                var: result.conclusion
+                value: ready
+            to: uat_review
+          - id: uat-setup-correction
+            when:
+              equals:
+                var: result.conclusion
+                value: implementation_changes_needed
+            to: implementation
+            set:
+              validation_mode: focused_recheck
+          - id: uat-setup-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    sandbox: workspace
+  uat_review:
+    role: orchestrator
+    execution: coordinator
+    decision:
+      key: uat_result
+      authority: user
+    report:
+      schema:
+        type: object
+        required:
+          - decision
+        properties:
+          decision:
+            enum:
+              - approved
+              - changes_required
+              - skip
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: uat-accepted
+            when:
+              equals:
+                var: result.decision
+                value: approved
+            to: final_review
+            set:
+              uat_completed: true
+          - id: uat-user-skipped
+            when:
+              equals:
+                var: result.decision
+                value: skip
+            to: final_review
+            set:
+              uat_completed: true
+          - id: uat-user-correction
+            when:
+              equals:
+                var: result.decision
+                value: changes_required
+            to: implementation
+            set:
+              validation_mode: focused_recheck
+              uat_completed: false
+          - id: uat-result-blocked
+            when:
+              equals:
+                var: result.decision
+                value: blocked
+            notify: orchestrator
+    requires:
+      equals:
+        var: decisions.uat_preference.value
+        value: prepare
+    description: Wait for the user’s UAT observations; never infer acceptance from
+      preparation or elapsed time.
+  final_review:
+    role: final_reviewer
+    prompt_ref: step_final_review
+    description: One independent expert owns the complete first review and every
+      incremental correction review.
+    requires:
+      all:
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
+        - equals:
+            var: state.planner_approved
+            value: true
+        - equals:
+            var: state.uat_completed
+            value: true
+    requires_evidence:
+      - receipt: evidence.validation
+        kind: validation
+        require_current: true
+        require_approved: true
+        owner_role: validator
+        validation_mode: complete_gate
+    inputs:
+      plan:
+        artifact: plan
         required: true
     report:
       schema:
@@ -375,10 +1055,12 @@ steps:
               - implementation
               - final_review
               - orchestrator
+          evidence_receipt_id:
+            type: string
     on:
       reported:
         transitions:
-          - id: final-review-approved
+          - id: expert-approved
             when:
               all:
                 - equals:
@@ -387,8 +1069,30 @@ steps:
                 - equals:
                     var: result.target_phase
                     value: done
-            finish: true
-          - id: final-review-to-analysis
+            to: closure
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: true
+                owner_role: final_reviewer
+          - id: expert-single-review
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: changes_required
+                - equals:
+                    var: decisions.review_mode.value
+                    value: single_review
+            notify: orchestrator
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-to-analysis
             when:
               all:
                 - equals:
@@ -398,7 +1102,13 @@ steps:
                     var: result.target_phase
                     value: analysis
             to: analysis
-          - id: final-review-to-planning
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-to-planning
             when:
               all:
                 - equals:
@@ -408,7 +1118,13 @@ steps:
                     var: result.target_phase
                     value: planning
             to: planning
-          - id: final-review-to-implementation
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-to-implementation
             when:
               all:
                 - equals:
@@ -418,7 +1134,15 @@ steps:
                     var: result.target_phase
                     value: implementation
             to: implementation
-          - id: final-review-rerun
+            set:
+              validation_mode: focused_recheck
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-to-final_review
             when:
               all:
                 - equals:
@@ -428,7 +1152,13 @@ steps:
                     var: result.target_phase
                     value: final_review
             to: final_review
-          - id: final-review-needs-orchestrator
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-human-decision
             when:
               all:
                 - equals:
@@ -438,9 +1168,82 @@ steps:
                     var: result.target_phase
                     value: orchestrator
             notify: orchestrator
-          - id: final-review-blocked
+            requires_evidence:
+              - receipt: result.evidence_receipt_id
+                kind: expert_review
+                require_current: true
+                require_approved: false
+                owner_role: final_reviewer
+          - id: expert-blocked
             when:
               equals:
                 var: result.conclusion
                 value: blocked
             notify: orchestrator
+    evidence_operations:
+      - prepare_result
+      - diff_result
+      - record_review
+    evidence_gates:
+      - expert
+    sandbox: read_only
+  closure:
+    role: orchestrator
+    execution: coordinator
+    description: Verify strict expert and complete GREEN mechanical evidence against
+      the unchanged current result, then close.
+    requires:
+      all:
+        - equals:
+            var: decisions.plan_approval.value
+            value: approved
+        - equals:
+            var: state.planner_approved
+            value: true
+        - equals:
+            var: state.uat_completed
+            value: true
+    requires_evidence:
+      - receipt: evidence.final_review
+        kind: expert_review
+        require_current: true
+        require_approved: true
+        owner_role: final_reviewer
+      - receipt: evidence.validation
+        kind: validation
+        require_current: true
+        require_approved: true
+        owner_role: validator
+        validation_mode: complete_gate
+    report:
+      schema:
+        type: object
+        required:
+          - conclusion
+        properties:
+          conclusion:
+            enum:
+              - verified
+              - blocked
+    on:
+      reported:
+        transitions:
+          - id: verified-closure
+            when:
+              equals:
+                var: result.conclusion
+                value: verified
+            finish: true
+            requires_evidence:
+              - receipt: evidence.closure
+                kind: closure
+                require_current: true
+                require_approved: true
+          - id: closure-blocked
+            when:
+              equals:
+                var: result.conclusion
+                value: blocked
+            notify: orchestrator
+    evidence_operations:
+      - verify_closure

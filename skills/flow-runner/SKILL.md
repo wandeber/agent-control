@@ -452,10 +452,11 @@ process environment used by Agent Control.
 
 When a step is active, Agent Control exposes ordered `prompt_sources`, a
 generated `runtime_contract`, and a generated `reporting_contract` in the step
-`input_json` and `flow.step_started` event. A manually activated step can also
-contain `coordinator_context`; in that case, `runtime_contract.objective`
-combines the base run title with that latest context and makes the coordinator
-context authoritative wherever the two differ. Compose worker instructions in
+`input_json` and `flow.step_started` event. The runtime contract carries the durable acceptance revision, immutable artifact
+references, and current causal correction. `flow_context_update` persists a
+material clarified objective before dependent dispatch; automatic transitions
+must preserve it. A transition reason explains that transition and must not be
+the only copy of accepted user intent. Compose worker instructions in
 this order:
 
 1. role prompt source;
@@ -503,15 +504,18 @@ result schema, allowed routing values, report artifact payload, and examples.
    step workers, start backend workers, or create terminal-event subscriptions
    when `flow_continue` is available.
 8. When the worker reports with `flow_step_report`, Agent Control validates the
-   result schema, checks required artifacts, records bindings, selects the next
-   transition, and auto-continues by default. This means a normal worker report
+   result schema, author/step identity, required artifacts, and configured
+   evidence guards before recording the report and selecting the next
+   transition. Reuse the returned report receipt for retries; do not fabricate
+   a second delivery after an uncertain response. It auto-continues by default. This means a normal worker report
    can launch the next worker without waking the coordinator.
-9. If Agent Control enters a `notify` state, the coordinator decides the next
-   step and activates it with `flow_step_start`, or gives the requested compact
-   user feedback. When manually returning work or passing newly clarified user
-   intent, put the complete correction or updated intent in `reason`; Agent
-   Control delivers that value to the target worker as coordinator context.
-   Do not use an opaque routing label when the worker needs the decision itself.
+9. A step with `execution: coordinator` does not dispatch a worker. For a
+   configured decision, use `flow_decision` with the current revision and actual
+   authorized decision; its report follows the configured transition. A
+   notification without a decision contract may need `flow_step_start` with a
+   concrete causal correction. Persist changed acceptance with
+   `flow_context_update` before resuming. Neither a manual route nor a worker
+   conclusion bypasses current artifact approvals or evidence requirements.
 10. If Agent Control returns `blocked`, notify the orchestrator/user with a short
     reason and wait for correction instructions.
 11. On `blocked`, stop dependent dispatch, explain the blocker, and stay
@@ -562,14 +566,44 @@ The `result` fields are generic and are generated from the loaded flow config.
 Do not assume meanings such as `approved`, `needs_changes`, `s`, `m`, `l`, or
 `xl` unless they appear in the active step reporting contract.
 
-If a worker cannot use MCP/tooling reliably, ask it to produce the artifact and
-compact report text, then the coordinator may submit `flow_step_report` on its
-behalf only from that explicit worker output. The coordinator may not inspect an
+For a strict flow, worker authorship and evidence must satisfy the generated
+contract; coordinator inference or copied worker prose cannot replace the
+required author capability. If the runtime provides an explicit authenticated
+relay, relay only that original worker report. For a non-strict flow whose
+contract permits a relay, a coordinator may submit the explicit worker output
+on its behalf. The coordinator may not inspect an
 artifact, infer a result, and submit a step report as if the worker had reported
 it. If the worker reaches a terminal status without reporting, Agent Control
 marks the step blocked so the coordinator/user can decide what to do. Do not
 start fresh duplicate workers for the same active step as a retry loop unless
 the flow config explicitly defines that retry strategy.
+
+## Incremental Evidence And Recovery
+
+Use `flow_evidence` only through its generated operation schema. The current
+provider supports plan/result preparation, deltas and review scope, semantic
+review composition, approved plan projection, controlled validation, immutable
+artifact snapshots, and closure verification. The caller supplies the semantic
+draft or intended check; the runtime binds actor, flow, acceptance/plan revision,
+provider version, and evidence identity. A worker-supplied approval boolean is
+not a verified receipt.
+
+A review owner receives a complete first target, then new directives, pending
+scope, changed dependencies, prior findings, and immutable references. Evidence
+composition carries only eligible closed records. Context loss or unbounded
+impact requires full review; missing owner continuity blocks. Do not manually
+reconstruct ledger state from conversation history or switch reviewers silently.
+
+Keep real documents as artifacts and control outcomes as structured reports.
+Use controlled command receipts for expensive validation reuse; only exact,
+intact, non-volatile GREEN evidence is eligible. A focused check cannot satisfy
+a complete closure gate. The model remains responsible for complete declared
+scope; hashing cannot prove semantic independence.
+
+Configuration, prompts, owners, decisions, and accepted evidence belong to the
+run revision. Do not reload changed local prompt files into an existing run or
+resolve evidence from an arbitrary installed cache. Resume recorded state and
+receipt identities; stop dependent dispatch if recovery cannot establish them.
 
 ## Done
 

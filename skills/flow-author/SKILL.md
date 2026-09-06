@@ -18,8 +18,9 @@ available.
 
 - Keep Agent Control generic: do not bake one workflow's result labels into the
   runtime contract.
-- Model artifacts as named resources, then reference them from step `inputs`
-  and `outputs`.
+- Model real documents as named artifacts referenced from step `inputs` and
+  `outputs`. Keep semantic reports, ledgers, decisions, and check receipts as
+  runtime records; do not create Markdown files only to transport structured data.
 - Model reusable prompts as named resources under top-level `prompts`, then
   reference them from roles or steps with `prompt_ref`.
 - Use role `backend` and `model` when the flow should suggest a worker backend
@@ -37,11 +38,18 @@ available.
   relative prompt paths resolvable from the flow config file's directory.
 - Use structured `report.schema` fields only for routing decisions that the
   flow actually needs.
-- Prefer `notify: "orchestrator"` when a human or higher-intelligence
-  coordinator should decide the next step.
+- Use `execution: coordinator` with `decision: { key, authority, artifact_key? }` for
+  explicit human/coordinator gates. These steps notify without dispatching a
+  worker. Use `authority: user` for human decisions and `authority: coordinator` for
+  coordinator judgment. Bind content approvals to their artifact revision. A plain `notify`
+  remains useful for a blocker or ambiguous route.
 - Use `to: "<step-id>"` only for deterministic transitions that the config can
   express safely.
-- Use `finish: true` only when the flow is genuinely complete after that step.
+- Use `finish: true` only with the required current evidence and earlier gates.
+  Under `policy: { strict: true }`, define `requires`, `requires_evidence`, and
+  transition `set` milestones explicitly. Conditions may read durable `state`,
+  current `decisions`, and verified `evidence`; worker result fields alone must
+  not certify human approval, reviewer identity, or mechanical execution.
 - Avoid `waits_for` as workflow state. A step depends on artifacts or on a
   transition, not on a visual wait edge.
 - Do not duplicate runtime details in prompt files. Active steps receive
@@ -103,3 +111,31 @@ steps:
 
 When Agent Control is available, validate the finished config with
 `flow_validate_config` or `agentctl flow validate` before handing it back.
+
+## Efficient Phase Contracts
+
+Define each logical phase's authority, inputs, result, evidence, owner, skip
+condition, and correction destinations. A logical phase does not require a new
+agent: reuse Context/Analysis owners, make Integration conditional, and let
+controlled tools perform mechanical work. Keep no-edit validation separate from
+implementation and semantic review. Do not add an independent reviewer merely
+to duplicate an existing expert gate.
+
+Record acceptance as durable revisioned context and carry every correction's
+source report and concrete outstanding findings. Preserve approved material
+while invalidating what changed or depends on the change. Reuse a historical
+milestone only for its declared meaning; a previous planner approval cannot
+certify a later result's identity.
+
+Use the runtime's evidence provider for immutable snapshots, incremental scope,
+semantic draft composition, plan projections, command receipts, and verified
+closure. Reference receipts through `requires_evidence`; do not invent a
+trusted `evidence_valid` result flag or duplicate the provider in prompt code.
+A flow needing strict authored review must retain the exact owner or block for
+explicit recovery; review-only prose must not be described as a technical sandbox.
+
+Pin effective config and prompts for a run. Continued owners receive changes
+and relevant references, with a full refresh only when continuity is uncertain.
+Describe optional user testing and single-review preferences explicitly. Normal
+correction loops collect findings in batches; repeated underlying problems
+without progress return to a concrete user decision, never timeout approval.

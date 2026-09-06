@@ -82,6 +82,8 @@ For `development-flow-v1`, the current configurable role keys are:
 - `DEVFLOW_PLANNER_MODEL`
 - `DEVFLOW_IMPLEMENTER_BACKEND`
 - `DEVFLOW_IMPLEMENTER_MODEL`
+- `DEVFLOW_VALIDATOR_BACKEND`
+- `DEVFLOW_VALIDATOR_MODEL`
 - `DEVFLOW_FINAL_REVIEWER_BACKEND`
 - `DEVFLOW_FINAL_REVIEWER_MODEL`
 
@@ -111,3 +113,12 @@ The bundled role then uses the safe native default `fork_turns: none`.
 integer string) belongs in a native-only/custom flow role. Do not add dormant
 native options to a role that currently resolves to another backend; Agent
 Control rejects backend-specific options that cannot be applied.
+
+## Active Run Revisions
+
+Configuration and prompt content are pinned when a run starts. Editing overrides
+changes future launches; it must not silently mutate a running workflow. Use the
+runtime's explicit update/recovery path when a running instance needs a revised
+contract, and preserve reviewer continuity and evidence invalidation. Changing a
+model preference does not authorize changing human gates, result schemas, or
+read/write capability requirements.

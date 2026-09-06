@@ -1,40 +1,22 @@
-# Planning Step Prompt
+# Planning
 
-Use for the planner. You own the implementation plan.
+Build an executable plan from the intent-approved Analysis and current acceptance
+revision. Inspect the current correction capsule when reworking. Return an
+incorrect or materially incomplete analysis to its owner; do not silently
+replace its decisions.
 
-Read optional review input artifacts only when the runtime contract provides
-them. When they are present, update the plan for the current correction pass
-instead of preserving outdated plan text.
+Define stable work-package and section IDs, owned paths, interfaces, dependencies,
+consumer impact, ordered steps, integration needs, and acceptance evidence.
+Include only justified tests, documentation, migration, and compatibility work.
+Map every expected changed path to a package and define the complete affected
+mechanical gate: relevant packages, transitive consumers, mandatory repository
+checks, and checks for material risks. Explain omitted independent surfaces.
 
-## Must
+Keep package boundaries usable for safe parallel work and verified projections:
+include cross-cutting constraints and interfaces, not only a task summary.
+Preserve IDs across edits, moves, and insertions. Record dependencies honestly;
+removing edges or semantically remapping scope requires full plan review.
 
-- validate that the analysis artifact is sufficient before planning
-- produce a concrete, worker-ready plan with boundaries, likely files/modules,
-  implementation steps, risks, and check expectations
-- state what the implementer may and may not redesign
-- include tests, docs, migration, compatibility, and mechanical checks that the
-  implementer should own
-- preserve analysis intent unless the plan explicitly routes back to analysis
-
-## Do Not
-
-- leave known decisions for the implementer to invent
-- add compatibility or legacy work without evidence
-- broaden scope beyond the objective and accepted analysis
-- finalize a plan when the analysis is wrong or materially incomplete
-
-## Artifact
-
-Write the required planning output artifact from the runtime contract. Start
-with this header in the first 10 lines:
-
-```md
-# Planning Handoff
-
-conclusion: <use one allowed conclusion from the generated Reporting Contract>
-summary: <one compact sentence>
-```
-
-Then include input validation, implementation intent, ordered work packages,
-safe parallelism if any, integration shape, testing/check expectations, risks,
-and done criteria.
+Write the assigned Plan document with exact done criteria and rationale for
+material choices. A material correction goes through the same analyst's review
+and explicit user approval of the resulting plan before implementation resumes.

@@ -9,7 +9,11 @@ events. Use visual links to explain what happened, not to decide what happens.
 - Flow config: roles, steps, artifacts, report schemas, and transition rules.
 - Flow instance: active step, completed steps, selected transitions, blockers,
   and terminal status.
-- Artifacts: named inputs and outputs referenced by steps.
+- Artifacts: real documents with named current aliases and immutable revisions.
+- Evidence: provider-issued receipts for exact plans/results, semantic reviews,
+  controlled validation, and closure.
+- Decisions and state: revisioned acceptance, content-bound human approval,
+  owner continuity, and declared historical milestones.
 - Events: compact runtime facts such as `flow.step_started`,
   `flow.step_reported`, `flow.transition_selected`, `flow.notification`, and
   `flow.step_blocked`.
@@ -64,7 +68,8 @@ should be asked to write the missing artifact from its own work.
 
 ## Subscriptions And Notifications
 
-Subscriptions wake agents on events. They are useful for:
+Subscriptions deliver events to active observers; delivery alone does not prove
+that an ended Codex turn resumed. They are useful for:
 
 - notifying an orchestrator about `flow.notification` and `flow.step_blocked`;
 - notifying a directly responsible owner after a worker terminal event;
@@ -97,11 +102,10 @@ step with `flow_step_start` or stops for user feedback.
 
 When `flow_step_start` returns work to a worker, put the complete correction,
 newly clarified user answer, or approval context in `reason`. Agent Control
-records that value on the transition and uses it to build the target worker's
-effective runtime objective. The latest coordinator context is explicitly
-authoritative wherever it adds to, clarifies, or conflicts with the original
-run title. Do not use an opaque reason when the worker needs the actual decision
-to proceed correctly.
+records that reason and the source report as the causal handoff. Persist a
+material clarified objective with `flow_context_update` before resuming; its
+durable acceptance revision survives automatic transitions. Do not use an
+opaque routing label when the worker needs a concrete correction.
 
 ## Automatic Routing Pattern
 
@@ -120,16 +124,24 @@ steps:
       reported:
         transitions:
           - when:
-              result.size: s
+              equals:
+                var: result.size
+                value: s
             to: small_worker
           - when:
-              result.size: m
+              equals:
+                var: result.size
+                value: m
             to: medium_worker
           - when:
-              result.size: l
+              equals:
+                var: result.size
+                value: l
             to: large_worker
           - when:
-              result.size: xl
+              equals:
+                var: result.size
+                value: xl
             notify: orchestrator
 ```
 
@@ -152,18 +164,81 @@ steps:
       reported:
         transitions:
           - when:
-              result.conclusion: approved
+              equals:
+                var: result.conclusion
+                value: approved
             to: final_answer
           - when:
-              result.conclusion: needs_correction
+              equals:
+                var: result.conclusion
+                value: needs_correction
             to: implement
           - when:
-              result.conclusion: blocked
+              equals:
+                var: result.conclusion
+                value: blocked
             notify: orchestrator
 ```
 
 The loop is explicit in the config. The coordinator does not infer it from chat
 history or visual edges.
+
+## Strict Evidence And Human Gates
+
+A strict flow separates routing claims from evidence. `policy: { strict: true }`
+enables its declared revision, owner, and receipt checks. Use `requires` on an
+activation and `requires_evidence` on the target or transition. A receipt guard
+names its reference, expected kind, currentness, and approval requirement:
+
+```yaml
+requires_evidence:
+  - receipt: evidence.validation
+    kind: validation
+    require_current: true
+    require_approved: true
+    validation_mode: complete_gate
+    owner_role: validator
+```
+
+The evidence registry is populated by verified `flow_evidence` operations.
+`result.evidence_receipt_id` can reference the reporting worker's receipt when
+selecting a transition; it does not make the receipt valid. The provider checks
+its exact snapshot, actor/gate, provenance, and required evidence. Do not trust
+nested `approved` or `evidence_valid` values supplied by the worker.
+
+Use `execution: coordinator` and `decision: { key: plan_approval,
+authority: user, artifact_key: plan }` for an explicit plan decision. No worker is dispatched. A coordinator-only intention check
+uses `authority: coordinator` so it does not ask the user for a redundant
+decision. `flow_decision` records the authorized value and current revision, then routes
+its generated `result.decision`. Current decisions are filtered by acceptance
+and bound artifact revision; a changed plan cannot inherit its old approval.
+Neither a timeout nor `flow_step_start` is an approval.
+
+Transition `set` records configured milestones only after report validation.
+For example, `planner_approved: true` can preserve a first conformance approval
+so expert corrections bypass an unnecessary planner pass. That history is not
+proof that later code remains identical. Current validation and expert receipts
+still govern closure.
+
+Reviewers submit direct semantic decisions, dependencies, and prior finding
+dispositions. The evidence provider composes complete ledgers with eligible
+unchanged coverage, returning compact receipts. First review is full; changed
+or dependent scope reopens. Context loss or unbounded impact requires full
+review by the same owner. A changed finding ID does not hide a recurring issue.
+
+Keep mechanical modes distinct: focused checks diagnose a correction bundle;
+a complete gate covers all affected packages, transitive consumers, mandatory
+checks, and material risks. Resolve reuse candidates in a batch, run only misses,
+and join all required outcomes before advancing. Reuse requires intact GREEN,
+non-volatile execution evidence with exact declared identity. Parallel commands
+must have disjoint mutable resources. A focused pass never replaces the final
+complete gate.
+
+Only real documents need artifact files. Use structured runtime records for
+control reports, ledgers, decisions, check outcomes, and closure; generate a
+human-readable view only when useful. The bundled development flow's
+[phase contract](../flows/development-flow-v1/README.md) documents ownership,
+omission, and correction policy without adding a worker for every phase.
 
 ## Role Agent Lifecycle
 

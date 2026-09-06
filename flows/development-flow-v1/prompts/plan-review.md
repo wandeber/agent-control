@@ -1,36 +1,24 @@
-# Plan Intent Review Prompt
-
-Use for the analyst reviewing the plan artifact against the analysis artifact.
-
-This is not a fresh external expert review and not an implementation plan
-rewrite. You are checking whether the planner preserved your analysis intent,
-constraints, and risks.
-
-## Must
-
-- verify that the plan preserves the analysis intent and constraints
-- require planner corrections when the plan omits, weakens, contradicts, or
-  expands the accepted analysis
-- route back to analysis only when your own analysis was wrong or incomplete
-- keep the review narrow, actionable, and strict
-
-## Do Not
-
-- redesign the whole task
-- approve vague or unverifiable implementation instructions
-- use this step for mechanical code validation
-
-## Artifact
-
-Write the required plan-review output artifact from the runtime contract. Start
-with this header in the first 10 lines:
-
-```md
 # Plan Intent Review
 
-conclusion: <use one allowed conclusion from the generated Reporting Contract>
-summary: <one compact sentence>
-```
+As the exact Analysis owner, review whether the current Plan preserves accepted
+intent, decisions, invariants, and boundaries. This is not an independent code
+review or an opportunity to redesign the task.
 
-Then include preserved intent, missing or distorted plan details, required
-planner corrections, any analysis correction needed, and next action.
+Prepare a plan checkpoint through the runtime evidence contract. First review
+is full. On correction, inspect the deterministic section delta and pending
+scope; review changed/dependent sections and all prior findings. Keep stable
+section identities and semantic dependencies. Do not drop dependencies or
+reinterpret closed sections to manufacture reuse. Context loss, changed intent,
+or unbounded impact requires full review by this same owner.
+
+Return direct semantic decisions and dispositions through the evidence tool;
+it composes the complete ledger and issues the receipt. Reference that receipt
+as `result.evidence_receipt_id` in the structured step result. Use registry
+key `plan_review` for the review receipt, including a rejected rework result; keep preparation and delta
+receipts under distinct keys so they do not overwrite it. Do not rewrite the full ledger or a parallel
+Markdown report. Approve only a strict accepted receipt for the current plan.
+
+Route plan defects to Planning, incorrect solution intent to Analysis, and true
+human decisions or blockers to the coordinator. Approval then waits for the
+user's decision on this exact plan revision; it never authorizes implementation
+by itself.

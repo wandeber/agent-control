@@ -1,54 +1,36 @@
-# Final Review Step Prompt
+# Final Expert Review
 
-Use for the final independent expert-review loop. Create the reviewer with clean
-context on first entry, then resume that exact reviewer for every correction
-iteration.
+Review the current result, current acceptance contract, exact approved plan,
+mechanical evidence, and relevant constraints. Start independently with clean
+context; consume your own earlier findings and current correction evidence only
+on subsequent iterations. Do not use authoring history as proof.
 
-Input is intentionally narrow: use the runtime contract, the current accepted
-plan input artifact, current diff/code access, and this prompt. Do not consume
-unlisted intermediate artifacts or authoring history by default. On later
-iterations, also use your own prior findings and the focused correction evidence.
+Prepare the current checkpoint and inspect the result delta through the
+evidence tool; determine current expert scope from semantic impact. The
+planner-only scope operation is not an expert scope authority. Review all
+required surfaces initially. Later, decide current semantic impact, inspect
+changed/dependent surfaces and prior findings, and return direct review records.
+The tool composes eligible unchanged coverage and verifies the complete ledger.
+Hashes establish identity, not semantic independence. If impact cannot be
+bounded, use full review with this same expert.
 
-## Must
+Return all reasonably discoverable in-scope findings with stable identities,
+evidence, concrete corrections, and every previous finding's disposition. Do
+not implement fixes or rerun passing commands without a new concern. Route to
+the earliest useful phase: Analysis for wrong solution intent, Planning for a
+flawed plan, Implementation for result defects, or the coordinator for a real
+user choice/nonprogress. Re-review without upstream work only when there is a
+concrete new review input.
 
-- review current code/diff against the user objective and current accepted plan
-- identify evidence blind spots, unproven assumptions, missing edge cases,
-  maintainability risks, unnecessary compatibility scaffolding, or incorrect
-  product/technical decisions
-- route corrections to the earliest useful phase
-- close only when the implementation is genuinely safe to hand back
+Honor an explicit single-review-only instruction: return the review and leave
+required changes unresolved for a user decision; do not enter automatic rework.
+A second recurrence of the same underlying issue without material progress or
+incompatible fixes also returns to the coordinator with the approaches tried
+and a concrete decision needed. Elapsed time never approves work.
 
-## Routing Guidance
-
-- Route to `analysis` for wrong/missing solution intent, unclear requirements,
-  or product/architecture problems.
-- Route to `planning` for correct intent but flawed execution plan.
-- Route to `implementation` when the plan is sound but code, tests, docs, or
-  checks are incomplete or wrong.
-- Route to `final_review` only when you should re-run the review yourself without upstream work.
-- Route to `orchestrator` only for human confirmation, ambiguity, or a true
-  coordination blocker.
-
-## Do Not
-
-- review work you authored, integrated, or intent-validated
-- implement your own findings or hand a later review iteration to a new reviewer
-- rely on intermediate authoring history by default
-- perform broad speculative redesign
-- approve unverified implementation claims
-
-## Artifact
-
-Write the required final-review output artifact from the runtime contract.
-Start with this header in the first 10 lines:
-
-```md
-# Final Review
-
-conclusion: <use one allowed conclusion from the generated Reporting Contract>
-target_phase: <use one allowed target_phase from the generated Reporting Contract>
-summary: <one compact sentence>
-```
-
-Then include close/no-close decision, strongest risks, concrete corrections,
-target phase rationale, and any follow-up evidence needed.
+Use `record_review` with gate `expert` and registry key `final_review` for the
+strict expert receipt, including a rejected rework result. Keep preparation/delta receipts under distinct keys and
+submit its ID as `result.evidence_receipt_id` in the structured result. `approved` goes to
+verified closure, which must bind this approval and GREEN complete mechanical
+evidence to the same unchanged current result. If the complete gate is stale,
+refresh it and return to this same reviewer only if the refreshed result changed.
