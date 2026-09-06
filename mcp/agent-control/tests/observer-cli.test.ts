@@ -16,12 +16,22 @@ describe("observer launch CLI", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-control-accepted-context-cli-"));
     directories.push(directory);
     const contract = "Preserve all existing requirements.\nImplement only the accepted behavior.\nKeep the recorded acceptance criteria.";
-    const result = JSON.parse(execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "flow", command,
+    const env = { ...process.env, AGENT_CONTROL_HOME: directory, AGENT_CONTROL_DB: join(directory, "state.sqlite"),
+      AGENT_CONTROL_ADMIN_KEY: "accepted-context-test-admin", AGENT_CONTROL_TOKEN: "", CODEX_THREAD_ID: "owner-thread" };
+    const args = ["--import", "tsx", "src/cli.ts", "flow", command,
       "--config-file", "tests/fixtures/codex-subagent-flow.yaml", command === "start" ? "--run-title" : "--title", "Short display title",
       "--acceptance-context", contract, "--repo-dir", directory
-    ], { cwd: resolve("."), encoding: "utf8", env: { ...process.env, AGENT_CONTROL_HOME: directory,
-      AGENT_CONTROL_DB: join(directory, "state.sqlite"), AGENT_CONTROL_ADMIN_KEY: "accepted-context-test-admin",
-      AGENT_CONTROL_TOKEN: "", CODEX_THREAD_ID: "owner-thread" } }));
+    ];
+    if (command === "start") {
+      // Direct start uses the existing authenticated owner; launch performs this login itself.
+      const login = JSON.parse(execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "auth", "login",
+        "--title", "Accepted contract owner", "--repo-dir", directory, "--backend", "codex-thread",
+        "--backend-handle-json", JSON.stringify({ thread_id: "owner-thread", agent_control_role: "orchestrator" })
+      ], { cwd: resolve("."), encoding: "utf8", env }));
+      env.AGENT_CONTROL_TOKEN = login.agent_token;
+      args.push("--run", login.run.run_id);
+    }
+    const result = JSON.parse(execFileSync(process.execPath, args, { cwd: resolve("."), encoding: "utf8", env }));
     const store = new SqliteStore(join(directory, "state.sqlite"));
     try {
       const instanceId = result.flow_instance_id ?? result.instance.flow_instance_id;
