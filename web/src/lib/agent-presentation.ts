@@ -1,6 +1,6 @@
 import { STATUS_STYLE } from "./format";
 import { latestAgentFlowStep } from "./flow-steps";
-import type { AgentRecord, DashboardSnapshot } from "./types";
+import type { AgentRecord, DashboardSnapshot, UsageSnapshotRecord } from "./types";
 
 export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecord) {
   const step = latestAgentFlowStep(snapshot, agent.agent_id);
@@ -21,6 +21,7 @@ export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecor
   return {
     title: generatedCoordinatorTitle ? "Orchestrator" : snapshot.flows.some((flow) => agent.title === `${flow.flow_id}: ${agent.role}`) ? humanize(agent.role ?? "worker") : agent.title,
     phase,
+    tokens: agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage),
     activity: (text && activity?.kind === "tool" ? `${toolPrefix} · ${text}` : text) || summary || lastLine((agent.failure_reason ?? "").replaceAll("_", " ")) ||
       (agent.role === "observer" && running ? "Following run events" : agent.status === "planned" ? "Ready for its turn" :
         agent.status === "waiting_for_input" ? "Waiting for input" : `${STATUS_STYLE[agent.status].label} · no activity recorded`),
@@ -40,4 +41,16 @@ function lastLine(text: string) {
 export function agentModelLabel(agent: AgentRecord): string {
   const resolved = agent.backend_handle?.resolved_model;
   return agent.model || (typeof resolved === "string" && resolved.trim() ? resolved : agent.backend);
+}
+
+/** Missing usage is unknown, not zero. Never substitute context size for consumption. */
+export function agentTokenLabel(usage?: UsageSnapshotRecord | null): string | null {
+  if (!usage) return null;
+  const parts = ([['input_tokens', 'in'], ['output_tokens', 'out'], ['total_tokens', 'total']] as const)
+    .flatMap(([key, label]) => {
+      const value = usage[key];
+      return typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? [`${new Intl.NumberFormat("en-US").format(value)} ${label}`] : [];
+    });
+  return parts.length ? `${parts.join(" · ")} tokens` : null;
 }

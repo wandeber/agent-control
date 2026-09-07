@@ -1,11 +1,11 @@
 "use client";
 
-import { agentModelLabel } from "@/lib/agent-presentation";
+import { agentModelLabel, agentTokenLabel } from "@/lib/agent-presentation";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
 import { useConsoleSelection } from "./console-selection";
-import type { AgentRecord, AgentStatus } from "@/lib/types";
+import type { AgentRecord, AgentStatus, DashboardSnapshot } from "@/lib/types";
 import {
   AGENT_MESSAGE_LOAD_STEP,
   INITIAL_AGENT_MESSAGE_LIMIT,
@@ -99,10 +99,10 @@ export function SubagentsShell() {
           </div>
           <div className="subagents-list-scroll">
             {activeSubagents.length > 0 ? (
-              <AgentGroup agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />
+              <AgentGroup snapshot={snapshot} agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />
             ) : null}
             {finishedSubagents.length > 0 ? (
-              <AgentGroup agents={finishedSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Finished" />
+              <AgentGroup snapshot={snapshot} agents={finishedSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Finished" />
             ) : null}
           </div>
         </aside>
@@ -117,6 +117,7 @@ export function SubagentsShell() {
                 <div className="min-w-0">
                   <h2>{selectedAgent.title}</h2>
                   <p>{agentModelLabel(selectedAgent)}</p>
+                  {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage) ? <p>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</p> : null}
                 </div>
                 <StatusPill status={selectedAgent.status} />
               </header>
@@ -143,11 +144,13 @@ export function SubagentsShell() {
 }
 
 function AgentGroup({
+  snapshot,
   agents,
   onSelect,
   selectedAgentId,
   title
 }: {
+  snapshot: DashboardSnapshot;
   agents: AgentRecord[];
   onSelect: (agentId: string) => void;
   selectedAgentId: string | null;
@@ -170,6 +173,7 @@ function AgentGroup({
             <span className="subagent-list-copy">
               <span className="subagent-list-title">{agent.title}</span>
               <span className="subagent-list-detail">{agentModelLabel(agent)}</span>
+              {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage) ? <span className="subagent-list-detail">{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span> : null}
             </span>
             <StatusPill compact status={agent.status} />
           </button>

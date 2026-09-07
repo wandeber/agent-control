@@ -1,5 +1,7 @@
 "use client";
 
+import { agentTokenLabel } from "@/lib/agent-presentation";
+
 import { useQuery } from "@tanstack/react-query";
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
 import rehypeHighlight from "rehype-highlight";
@@ -110,6 +112,7 @@ export function WorkspacePanel({
         <div className="flex min-h-12 items-center justify-between gap-3 border-b border-black/8 bg-white/72 px-3 py-2">
           <div className="min-w-0">
             <div className="truncate text-xs font-semibold text-ink-900">{agent?.title ?? "Select an agent"}</div>
+            {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent?.agent_id)?.latest_usage) ? <div className="text-[11px] text-ink-500">{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent?.agent_id)?.latest_usage)}</div> : null}
             <div className="truncate text-[11px] text-ink-400">
               {agent ? (
                 <>

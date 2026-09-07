@@ -62,6 +62,7 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
         </span>
       </div>
 
+      {data.presentation.tokens ? <div className="mt-1 text-[11px] text-ink-500">{data.presentation.tokens}</div> : null}
       {data.presentation.phase ? (
         <div className="mt-3 truncate text-[11px] font-medium text-teal-800" title={data.presentation.phase}>
           {data.presentation.phase}
