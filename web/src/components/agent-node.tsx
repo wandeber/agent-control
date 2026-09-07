@@ -1,5 +1,6 @@
 "use client";
 
+import { agentModelLabel } from "@/lib/agent-presentation";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { Bot, MessageSquare, Wrench } from "lucide-react";
 import { STATUS_STYLE } from "@/lib/format";
@@ -52,8 +53,8 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-ink-900" title={data.agent.title}>{data.presentation.title}</div>
             {data.presentation.title.toLowerCase() !== data.agent.role?.replaceAll("_", " ").toLowerCase() ? (
-              <div className="truncate text-[11px] text-ink-500">{data.agent.role?.replaceAll("_", " ") ?? "worker"}</div>
-            ) : null}
+              <div className="truncate text-[11px] text-ink-500">{[data.agent.role?.replaceAll("_", " ") ?? "worker", agentModelLabel(data.agent)].filter(Boolean).join(" · ")}</div>
+            ) : <div className="truncate text-[11px] text-ink-500">{agentModelLabel(data.agent)}</div>}
           </div>
         </div>
         <span className={["flex shrink-0 items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold", style.bg, style.text].join(" ")}>

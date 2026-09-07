@@ -1,5 +1,6 @@
 "use client";
 
+import { agentModelLabel } from "@/lib/agent-presentation";
 import { Activity, Bell, Boxes, FileText, GitBranch, Goal, Link2, Server, TimerReset } from "lucide-react";
 import { compactId, formatDateTime, formatDuration, formatNumber, safeJson } from "@/lib/format";
 import { agentFlowSteps, flowStepOptionLabel, flowStepOrdinal } from "@/lib/flow-steps";
@@ -76,7 +77,7 @@ export function AgentInspector({
         <div className="grid grid-cols-2 gap-x-4 gap-y-2 border-t border-black/8 pt-3">
           <Metric label="elapsed" value={formatDuration(computed?.elapsed_ms)} />
           <Metric label="status age" value={formatDuration(computed?.status_age_ms)} />
-          <Metric label="model" value={agent.model ?? "unknown"} />
+          <Metric label="model" value={agentModelLabel(agent)} />
           <Metric label="updated" value={formatDateTime(agent.updated_at)} />
         </div>
 

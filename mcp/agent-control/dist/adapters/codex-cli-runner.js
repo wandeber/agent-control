@@ -13,6 +13,7 @@ export function supervise(dir) {
     let state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
     let stopped = false;
     let completed = false;
+    let failed = false;
     let buffer = "";
     writeFileSync(join(dir, "ready"), "ready", { mode: 0o600 });
     if (existsSync(join(dir, "cancelled"))) {
@@ -33,6 +34,11 @@ export function supervise(dir) {
                 const event = JSON.parse(line);
                 if (event.type === "turn.completed")
                     completed = true;
+                if (event.type === "turn.failed")
+                    failed = true;
+                if (event.type === "error" || event.type === "turn.failed" || event.item?.type === "error") {
+                    appendFileSync(join(dir, "stderr.log"), line + "\n", { mode: 0o600 });
+                }
                 if (event.type === "thread.started" && typeof event.thread_id === "string") {
                     state.thread_id = event.thread_id;
                     persist();
@@ -83,7 +89,8 @@ export function supervise(dir) {
         clearInterval(timer);
         process.off("SIGTERM", terminate);
         process.off("SIGINT", terminate);
-        state.status = stopped ? "stopped" : code === 0 && completed && state.thread_id ? "completed" : "failed";
+        state.status = stopped ? "stopped" : code === 0 && completed && !failed && state.thread_id ? "completed" : "failed";
+        appendFileSync(join(dir, "events.jsonl"), JSON.stringify({ type: "agent_control.turn_finished", status: state.status }) + "\n", { mode: 0o600 });
         state.exit_code = code;
         persist();
         rmSync(join(dir, "active"), { recursive: true, force: true });

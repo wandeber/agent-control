@@ -35,3 +35,9 @@ function humanize(value: string) {
 function lastLine(text: string) {
   return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) ?? "";
 }
+
+/** Resolved profile metadata is display-only and never a launch override. */
+export function agentModelLabel(agent: AgentRecord): string {
+  const resolved = agent.backend_handle?.resolved_model;
+  return agent.model || (typeof resolved === "string" && resolved.trim() ? resolved : agent.backend);
+}

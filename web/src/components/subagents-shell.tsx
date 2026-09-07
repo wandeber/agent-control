@@ -1,5 +1,6 @@
 "use client";
 
+import { agentModelLabel } from "@/lib/agent-presentation";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
@@ -115,7 +116,7 @@ export function SubagentsShell() {
                 </button>
                 <div className="min-w-0">
                   <h2>{selectedAgent.title}</h2>
-                  <p>{selectedAgent.model ?? selectedAgent.backend}</p>
+                  <p>{agentModelLabel(selectedAgent)}</p>
                 </div>
                 <StatusPill status={selectedAgent.status} />
               </header>
@@ -168,7 +169,7 @@ function AgentGroup({
             <StatusDot status={agent.status} />
             <span className="subagent-list-copy">
               <span className="subagent-list-title">{agent.title}</span>
-              <span className="subagent-list-detail">{agent.model ?? agent.backend}</span>
+              <span className="subagent-list-detail">{agentModelLabel(agent)}</span>
             </span>
             <StatusPill compact status={agent.status} />
           </button>

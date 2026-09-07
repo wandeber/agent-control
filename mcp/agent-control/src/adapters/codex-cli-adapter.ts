@@ -1,3 +1,4 @@
+import { parse as parseToml } from "smol-toml";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
@@ -9,7 +10,7 @@ import { agentRuntimeDir } from "../core/paths.js";
 import type { AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatusSnapshot, StartAgentInput, ReadLatestOptions, StopOptions, StopResult } from "../core/types.js";
 import { writeState, type CliJob, type CliState } from "./codex-cli-runner.js";
 
-interface Data { dir: string; cwd: string; profile?: string; model?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; }
+interface Data { dir: string; cwd: string; profile?: string; model?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; resolved_model?: string; logFile?: string; }
 const unsupported = (message: string) => new ControllerError(message, "unsupported_operation");
 export class CodexCliAdapter implements AgentAdapter {
   readonly kind = "codex-cli";
@@ -25,8 +26,22 @@ export class CodexCliAdapter implements AgentAdapter {
     mkdirSync(data.dir, { recursive: true, mode: 0o700 });
     if (existsSync(join(data.dir, "state.json"))) throw unsupported("This CLI worker already has an execution; continue its existing session instead.");
     if (data.profile) data.profile_hash = this.profileHash(data.profile);
+    // Presentation only: never turn the profile's model into a CLI override.
+    data.resolved_model = data.model ?? this.profileModel(data.profile);
+    data.logFile = join(data.dir, "stderr.log");
     await this.launch(data, input.prompt ?? "", undefined, input.agentToken);
     return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
+  }
+  private profileModel(profile?: string): string | undefined {
+    const home = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+    const read = (path: string) => {
+      try { return parseToml(readFileSync(path, "utf8")); } catch { return {}; }
+    };
+    const base = read(join(home, "config.toml"));
+    const selected = profile ? read(join(home, `${profile}.config.toml`)) : {};
+    // Only export the model string; provider/auth configuration stays private.
+    const model = selected.model ?? base.model;
+    return typeof model === "string" && model.trim() ? model : undefined;
   }
   private profileHash(profile: string): string {
     const path = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${profile}.config.toml`);
@@ -96,18 +111,32 @@ export class CodexCliAdapter implements AgentAdapter {
     const messages = new Map<string, AgentMessage>();
     let generation = 0;
     // Persisted chat stays readable even if its supervisor is unavailable.
-    const updatedAt = (JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8")) as CliState).updated_at;
+    const state = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8")) as CliState;
+    const updatedAt = state.updated_at;
+    let failureGeneration = -1;
     for (const [index, line] of readFileSync(join(data.dir, "events.jsonl"), "utf8").split("\n").entries()) { try {
       const event = JSON.parse(line), item = event.item;
       if (event.type === "agent_control.prompt") generation++;
       if (event.type === "agent_control.prompt") messages.set(`prompt-${index}`, { id: `prompt-${index}`, role: "user", text: event.text, created_at: event.created_at });
+      if (event.type === "turn.failed" || (event.type === "agent_control.turn_finished" && event.status === "failed")) {
+        failureGeneration = generation;
+        messages.set(`failure-${generation}`, this.failureMessage(generation, updatedAt));
+      }
       if (!item) continue;
+      // Diagnostics and future unknown events are not tool invocations. Their raw
+      // payload remains in the event journal and diagnostics in the technical log.
+      if (!["agent_message", "todo_list", "command_execution", "mcp_tool_call", "web_search", "file_change", "collab_tool_call"].includes(item.type)) continue;
       const text = item.type === "agent_message" ? item.text : item.type === "todo_list" ? `update_plan\nInput: ${JSON.stringify({plan: item.items?.map((task: {text:string;completed:boolean}) => ({step:task.text,status:task.completed ? "completed" : "pending"}))})}` : `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item)}${item.aggregated_output ? `\n${item.aggregated_output}` : ""}`;
-      if (item.type === "reasoning") continue;
       const id = `${generation}:${item.id ?? `event-${index}`}`;
       messages.set(id, { id, role: item.type === "agent_message" ? "assistant" : "tool", text, created_at: updatedAt, metadata: { type: item.type === "agent_message" ? "text" : "tool", itemType: item.type } });
     } catch { /* Ignore incomplete trailing event while the process is writing. */ } }
+    if (state.status === "failed" && failureGeneration !== generation) {
+      messages.set(`failure-${generation}`, this.failureMessage(generation, updatedAt));
+    }
     return [...messages.values()].slice(-options.limit);
+  }
+  private failureMessage(generation: number, created_at: string): AgentMessage {
+    return { id: `failure-${generation}`, role: "system", text: "The agent could not complete this turn. See Logs for technical details.", created_at, metadata: { type: "text", itemType: "turn.failed" } };
   }
   async stop(handle: AgentHandle, options: StopOptions): Promise<StopResult> {
     const data = handle.data as unknown as Data;

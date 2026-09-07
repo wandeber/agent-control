@@ -30,6 +30,7 @@ it('persists profile-only launch, restores plan/messages and resumes exact sessi
  expect((await restored.readLatest(handle,{limit:10})).map(m=>m.role)).toEqual(['user','tool','assistant']);
  await restored.sendMessage(handle,{message:'continue'});await terminal(restored,handle);
  const calls=readFileSync(join(dir,'calls.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
+ expect(handle.data.resolved_model).toBe('yoda');
  expect(calls).toHaveLength(2);expect(calls[0].args).toContain('softec-yoda');expect(calls[0].args).not.toContain('--model');expect(calls[0].token).toBeUndefined();
  expect(calls[1].args.slice(-3)).toEqual(['resume','11111111-1111-1111-1111-111111111111','-']);
  writeFileSync(join(dir,'softec-yoda.config.toml'),'model="other"');
@@ -75,4 +76,66 @@ it('treats a stale supervisor heartbeat as unavailable rather than a completed/f
  writeFileSync(path,JSON.stringify({status:'running',updated_at:new Date(0).toISOString()}));
  await expect(adapter.getStatus(handle)).rejects.toMatchObject({reason:'backend_unavailable'});
  expect((await adapter.readLatest(handle,{limit:10})).some(message=>message.text==='Poem')).toBe(true);
+});
+
+it('keeps recoverable diagnostics out of chat and available in technical logs',async()=>{
+ const executable=process.env.AGENT_CONTROL_CODEX_CLI_BIN!;
+ const source=readFileSync(executable,'utf8').replace("console.log(JSON.stringify({type:'turn.completed'}));", `
+console.log(JSON.stringify({type:'item.completed',item:{type:'error',id:'warning',message:'Model metadata for yoda not found. Defaulting to fallback metadata'}}));
+console.log(JSON.stringify({type:'item.completed',item:{type:'future_diagnostic',id:'future',message:'Unknown non-tool event'}}));
+console.log(JSON.stringify({type:'item.completed',item:{type:'command_execution',id:'command',command:'echo ok',aggregated_output:'ok'}}));
+console.log(JSON.stringify({type:'turn.completed'}));`);
+ writeFileSync(executable,source,{mode:0o700});
+ const adapter=new CodexCliAdapter(),handle=await adapter.start(input());
+ expect((await terminal(adapter,handle)).status).toBe('completed');
+ const messages=await adapter.readLatest(handle,{limit:20});
+ expect(messages.filter(m=>m.role==='tool').map(m=>m.metadata?.itemType)).toEqual(['todo_list','command_execution']);
+ expect(JSON.stringify(messages)).not.toContain('fallback metadata');
+ expect(messages.some(m=>m.text==='Poem')).toBe(true);
+ expect(readFileSync(String(handle.data.logFile),'utf8')).toContain('fallback metadata');
+ expect(readFileSync(join(String(handle.data.dir),'events.jsonl'),'utf8')).toContain('future_diagnostic');
+});
+it('renders blocking failures as short system messages, even if the CLI exits zero',async()=>{
+ const executable=process.env.AGENT_CONTROL_CODEX_CLI_BIN!;
+ writeFileSync(executable,readFileSync(executable,'utf8').replace("console.log(JSON.stringify({type:'turn.completed'}));", `console.log(JSON.stringify({type:'turn.failed',error:{message:'Technical provider failure'}}));
+console.log(JSON.stringify({type:'turn.completed'}));`),{mode:0o700});
+ const adapter=new CodexCliAdapter(),handle=await adapter.start(input());
+ expect((await terminal(adapter,handle)).status).toBe('failed');
+ const messages=await adapter.readLatest(handle,{limit:20});
+ expect(messages.filter(m=>m.role==='system')).toHaveLength(1);
+ expect(messages.at(-1)?.text).toContain('could not complete');
+ expect(JSON.stringify(messages)).not.toContain('Technical provider failure');
+ expect(readFileSync(String(handle.data.logFile),'utf8')).toContain('Technical provider failure');
+});
+it('resolves arbitrary profile names with TOML semantics without exporting credentials or overriding the profile',async()=>{
+ writeFileSync(join(dir,'custom.config.toml'),`# model = "wrong"
+model = 'yoda' # selected model
+[model_providers.example]
+model = "nested-wrong"
+secret = "private-value"
+`);
+ const adapter=new CodexCliAdapter(),handle=await adapter.start({...input(),metadata:{profile:'custom'}});
+ await terminal(adapter,handle);
+ expect(handle.data.resolved_model).toBe('yoda');
+ expect(handle.data.model).toBeUndefined();
+ expect(JSON.stringify(handle)).not.toContain('private-value');
+ const calls=JSON.parse(readFileSync(join(dir,'calls.jsonl'),'utf8').trim());
+ expect(calls.args).not.toContain('--model');
+ const overridden=await adapter.start({...input(),agent:{...input().agent,agent_id:'override'},model:'other',metadata:{profile:'custom'}});
+ await terminal(adapter,overridden);
+ expect(overridden.data.resolved_model).toBe('other');
+});
+
+it('retains a failed process turn in history after a successful continuation',async()=>{
+ const executable=process.env.AGENT_CONTROL_CODEX_CLI_BIN!;
+ const success=readFileSync(executable,'utf8');
+ writeFileSync(executable,success.replace('process.exit(0)','process.exit(1)'),{mode:0o700});
+ const adapter=new CodexCliAdapter(),handle=await adapter.start(input());
+ expect((await terminal(adapter,handle)).status).toBe('failed');
+ writeFileSync(executable,success,{mode:0o700});
+ await adapter.sendMessage(handle,{message:'continue'});
+ expect((await terminal(adapter,handle)).status).toBe('completed');
+ const messages=await adapter.readLatest(handle,{limit:20});
+ expect(messages.filter(m=>m.role==='system')).toHaveLength(1);
+ expect(messages.at(-1)?.text).toBe('Poem');
 });

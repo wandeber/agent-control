@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentPresentation } from "./agent-presentation";
+import { agentPresentation, agentModelLabel } from "./agent-presentation";
 import { buildRelations, focusedAgentId, initialLayout, primaryAgentRelations, type GraphRelation } from "./graph";
 import { bundleAgentConnections, projectTeamRelations } from "./team-graph";
 import type { AgentRecord, DashboardSnapshot } from "./types";
@@ -95,4 +95,11 @@ describe("agent card activity", () => {
     expect(agentPresentation(snapshot, { ...agents[2]!, status: "stopped" }).activity).toBe("Last tool · Run tests");
   });
 
+});
+
+it("labels CLI profile agents with the resolved model while preserving explicit overrides", () => {
+ const agent = { ...agents[0]!, backend: "codex-cli", model: null, backend_handle: { resolved_model: "yoda" } };
+ expect(agentModelLabel(agent)).toBe("yoda");
+ expect(agentModelLabel({ ...agent, model: "anakin" })).toBe("anakin");
+ expect(agentModelLabel({ ...agent, backend_handle: {} })).toBe("codex-cli");
 });
