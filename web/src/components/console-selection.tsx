@@ -1,9 +1,15 @@
 "use client";
 
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { requestMcpAppTeardown, subscribeMcpConsoleState, type ConsoleSelectionState } from "@/lib/mcp-app";
 
 function useSharedSelection() {
+  const refreshHandler = useRef<(() => void) | null>(null);
+  const registerRefresh = useCallback((handler: () => void) => {
+    refreshHandler.current = handler;
+    return () => { if (refreshHandler.current === handler) refreshHandler.current = null; };
+  }, []);
+  const refreshCurrentScreen = useCallback(() => refreshHandler.current?.(), []);
   const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [followLatestRun, setFollowLatestRun] = useState(true);
@@ -68,7 +74,7 @@ function useSharedSelection() {
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
-  return { connection, setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
+  return { registerRefresh, refreshCurrentScreen, connection, setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
 }
 
 const SelectionContext = createContext<ReturnType<typeof useSharedSelection> | null>(null);

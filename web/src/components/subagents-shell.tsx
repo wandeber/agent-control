@@ -1,7 +1,7 @@
 "use client";
 
 import { agentModelLabel, agentTokenLabel, agentTotalLabel } from "@/lib/agent-presentation";
-import { ArrowLeft, RefreshCw } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
 import { useConsoleSelection } from "./console-selection";
@@ -16,15 +16,16 @@ import { WorkspacePanel } from "./workspace-panel";
 
 /** Worker list and conversation, shown as the default Agent Control screen. */
 export function SubagentsShell() {
-  const { setConnection, selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
+  const { registerRefresh, setConnection, selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
   const [messageLimit, setMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [narrowViewport, setNarrowViewport] = useState<boolean | null>(null);
-  const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
+  const { agentLog, agentError, connection, error, isLoading, refresh, snapshot } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
     followLatestRun,
     messageLimit
   );
+  useEffect(() => registerRefresh(refresh), [registerRefresh, refresh]);
   useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
 
 
@@ -88,15 +89,6 @@ export function SubagentsShell() {
     <main className="subagents-shell" data-agent-selected={selectedAgent ? "true" : "false"}>
       <div className="subagents-layout">
         <aside className="subagents-list" data-mobile-hidden={selectedAgent ? "true" : "false"}>
-          <div className="subagents-list-heading">
-            <div className="min-w-0">
-              <h1>Subagents</h1>
-              <p title={selectedRun?.title ?? undefined}>{selectedRun?.title ?? "Current run"}</p>
-            </div>
-            <button aria-label="Refresh subagents" className="subagents-refresh" onClick={refresh} title="Refresh subagents" type="button">
-              <RefreshCw className="size-4" />
-            </button>
-          </div>
           <div className="subagents-list-scroll">
             {activeSubagents.length > 0 ? (
               <AgentGroup snapshot={snapshot} agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />

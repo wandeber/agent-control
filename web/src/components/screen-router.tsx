@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft, Workflow } from "lucide-react";
+import { Users, Workflow, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ConsoleSelectionProvider, useConsoleSelection } from "./console-selection";
 import { ConsoleShell } from "./console-shell";
@@ -24,16 +24,16 @@ export function ScreenRouter() {
     <ConsoleSelectionProvider>
       <div className="agent-control-app" data-screen={screen}>
         <nav aria-label="Agent Control screens" className="screen-navigation">
-          <span>Agent Control <span aria-hidden="true">/</span> <strong>{fullConsole ? "Full console" : "Subagents"}</strong></span>
+          <strong>{fullConsole ? "Full Console" : "Subagents"}</strong>
           {/* Fragment routes keep the single embedded MCP resource loaded.
               Both shells are eagerly bundled, and only the active one mounts. */}
-          <div className="screen-navigation-actions"><ConnectionIndicator /><button className="screen-navigation-link" onClick={() => {
+          <div className="screen-navigation-actions"><ConnectionIndicator /><RefreshButton /><button className="screen-navigation-link" onClick={() => {
             const next = fullConsole ? "subagents" : "console";
             setScreen(next);
             try { window.location.hash = `/${next}`; } catch { /* Opaque hosts can restrict history. */ }
           }} type="button">
-            {fullConsole ? <ArrowLeft className="size-4" /> : <Workflow className="size-4" />}
-            {fullConsole ? "Back to subagents" : "Full console"}
+            {fullConsole ? <Users className="size-4" /> : <Workflow className="size-4" />}
+            {fullConsole ? "Subagents" : "Full Console"}
           </button></div>
         </nav>
         <div className="agent-control-screen">
@@ -50,4 +50,9 @@ function ConnectionIndicator() {
     <span aria-hidden="true" className="connection-dot" />
     {connection === "live" ? "Live" : connection === "connecting" ? "Connecting" : "Offline"}
   </span>;
+}
+
+function RefreshButton() {
+  const { refreshCurrentScreen } = useConsoleSelection();
+  return <button type="button" className="screen-navigation-link" aria-label="Refresh" title="Refresh" onClick={refreshCurrentScreen}><RefreshCw className="size-4" /></button>;
 }

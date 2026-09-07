@@ -46,7 +46,7 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 };
 
 export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () => void }) {
-  const { setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
+  const { registerRefresh, setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
   const [agentSelectionPinned, setAgentSelectionPinned] = useState(Boolean(selectedAgentId));
   const selectionRunRef = useRef<string | null | undefined>(undefined);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
@@ -67,6 +67,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
     followLatestRun,
     selectedAgentMessageLimit
   );
+  useEffect(() => registerRefresh(refresh), [registerRefresh, refresh]);
   useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
 
 
@@ -302,7 +303,6 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
           inspectorOpen={bottomPanel === "agent"}
           onOpenAgent={() => toggleBottomPanel("agent")}
           onOpenRuns={toggleRunsPanel}
-          onRefresh={refresh}
           run={selectedRun}
           runsOpen={runsOpen}
         />
@@ -325,6 +325,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
               />
             ) : (
               <AgentGraph
+                key={selectedSnapshot.selected_run_id ?? "none"}
                 onSelectAgent={selectAgent}
                 onOpenConversation={(agentId) => { selectAgent(agentId); onOpenConversation(); }}
                 onClearSelection={() => setAgentSelectionPinned(false)}

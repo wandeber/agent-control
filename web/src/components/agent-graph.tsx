@@ -7,18 +7,16 @@ import {
   ReactFlow,
   applyNodeChanges,
   type Edge,
+  type Viewport,
   type NodeChange,
   type ReactFlowInstance
 } from "@xyflow/react";
-import { Check, Crosshair, LayoutGrid, Layers3, LocateFixed, type LucideIcon } from "lucide-react";
+import { Crosshair, LayoutGrid, LocateFixed, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildRelations,
   focusedAgentId,
-  primaryAgentRelations,
-  RELATION_META,
-  RENDERABLE_RELATION_TYPES,
-  type RenderableAgentLinkType
+  primaryAgentRelations
 } from "@/lib/graph";
 import { buildAgentTeam, projectTeamRelations, bundleAgentConnections, teamLayout, teamBounds, keepExternalCardsOutsideTeam } from "@/lib/team-graph";
 import { AgentConnectionOverlay } from "./agent-connection-overlay";
@@ -26,8 +24,10 @@ import { agentPresentation } from "@/lib/agent-presentation";
 import type { DashboardSnapshot } from "@/lib/types";
 import { AgentNode, type AgentFlowNode, type AgentNodeData } from "./agent-node";
 
+// Keep per-run camera state while the router unmounts the console screen.
+const savedCameras = new Map<string, { viewport: Viewport; follow: boolean }>();
+
 const nodeTypes = { agent: AgentNode };
-const ALL_LAYERS: RenderableAgentLinkType[] = RENDERABLE_RELATION_TYPES;
 const GRAPH_MIN_ZOOM = 0.22;
 const GRAPH_MAX_ZOOM = 1.75;
 const SAFE_AREA_MARGIN = 16;
@@ -60,17 +60,25 @@ export function AgentGraph({
   const focusId = focusedAgentId(snapshot, selectedAgentId);
   const team = useMemo(() => buildAgentTeam(snapshot.agents), [snapshot.agents]);
   const projectedRelations = useMemo(() => projectTeamRelations(team, relations, primary), [team, relations, primary]);
-  const [allRelations, setAllRelations] = useState(false);
-  const [layers, setLayers] = useState<Set<RenderableAgentLinkType>>(() => new Set(ALL_LAYERS));
-  const [layersOpen, setLayersOpen] = useState(false);
   const [nodes, setNodes] = useState<AgentFlowNode[]>([]);
-  const [follow, setFollow] = useState(true);
+  const cameraKey = snapshot.selected_run_id ?? "none";
+  const initialCamera = useRef(savedCameras.get(cameraKey));
+  const [follow, setFollow] = useState(initialCamera.current?.follow ?? true);
+  const followRef = useRef(follow);
+  followRef.current = follow;
   const [flowReady, setFlowReady] = useState(false);
   const flowRef = useRef<ReactFlowInstance<AgentFlowNode, RelationFlowEdge> | null>(null);
   const graphRootRef = useRef<HTMLDivElement | null>(null);
   const positionedRunRef = useRef<string | null>(null);
-  const layerPopoverRef = useRef<HTMLDivElement | null>(null);
   const programmaticViewportRef = useRef(false);
+  useEffect(() => {
+    const saved = savedCameras.get(cameraKey);
+    if (saved) savedCameras.set(cameraKey, { ...saved, follow });
+    return () => {
+      const viewport = flowRef.current?.getViewport();
+      if (viewport) savedCameras.set(cameraKey, { viewport, follow: followRef.current });
+    };
+  }, [cameraKey, follow]);
   const storageKey = `agent-control:graph:v3:${snapshot.selected_run_id ?? "none"}`;
 
   useEffect(() => {
@@ -92,8 +100,8 @@ export function AgentGraph({
   }, [primary, focusId, snapshot, storageKey, onSelectAgent, team]);
 
   const connections = useMemo(() => bundleAgentConnections(
-    projectedRelations.filter((relation) => layers.has(relation.type)), focusId, allRelations
-  ), [projectedRelations, layers, focusId, allRelations]);
+    projectedRelations, focusId, false
+  ), [projectedRelations, focusId]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<AgentFlowNode>[]) => {
@@ -111,18 +119,6 @@ export function AgentGraph({
       return;
     }
     setFollow(false);
-  }, []);
-
-  const toggleLayer = useCallback((layer: RenderableAgentLinkType) => {
-    setLayers((current) => {
-      const next = new Set(current);
-      if (next.has(layer)) {
-        next.delete(layer);
-      } else {
-        next.add(layer);
-      }
-      return next;
-    });
   }, []);
 
   const fitGraphToSafeArea = useCallback((duration = 450, focusActive = false) => {
@@ -191,28 +187,6 @@ export function AgentGraph({
   }, [snapshot, primary, storageKey, fitGraphToSafeArea, team]);
 
   useEffect(() => {
-    if (!layersOpen) {
-      return undefined;
-    }
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!layerPopoverRef.current?.contains(event.target as Node)) {
-        setLayersOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setLayersOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [layersOpen]);
-
-  useEffect(() => {
     if (follow && flowReady) {
       const timer = setTimeout(() => fitGraphToSafeArea(450, true), 80);
       return () => clearTimeout(timer);
@@ -237,47 +211,6 @@ export function AgentGraph({
     <div className="relative h-full min-h-0 overflow-hidden" ref={graphRootRef}>
       <div className="agent-graph-toolbar absolute z-20 flex max-w-[calc(100%-112px)] items-center justify-between gap-2">
         {toolbarLeading}
-        <div className="relative" ref={layerPopoverRef}>
-          <button
-            aria-expanded={layersOpen}
-            aria-haspopup="menu"
-            className="inline-flex h-9 items-center gap-2 rounded-lg border border-black/10 bg-white/82 px-3 text-xs font-semibold text-ink-700 shadow-panel backdrop-blur-xl transition hover:border-black/20 hover:bg-white"
-            onClick={() => setLayersOpen((open) => !open)}
-            type="button"
-          >
-            <Layers3 className="size-4 text-ink-400" />
-            Relations
-            <span className="rounded bg-black/6 px-1.5 py-0.5 text-[10px] font-semibold text-ink-400">
-              {allRelations ? "All" : "Focused"}
-            </span>
-          </button>
-
-          {layersOpen ? (
-            <div
-              className="absolute left-0 top-[calc(100%+8px)] z-30 w-80 rounded-lg bg-white/98 p-3 shadow-[0_18px_48px_rgba(15,23,42,0.16)] backdrop-blur-xl"
-              role="menu"
-            >
-              <div className="px-2 pb-2 pt-1">
-                <div className="text-[10px] font-semibold uppercase tracking-[0.1em] text-ink-300">Relationship layers</div>
-                <div className="mt-0.5 text-[11px] leading-4 text-ink-400">One connection per pair. Hover or click a line to see its relationships.</div>
-                <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-ink-700">
-                  <input type="checkbox" checked={allRelations} onChange={(event) => setAllRelations(event.target.checked)} />
-                  Show all relationships
-                </label>
-              </div>
-              <div className="mt-1 space-y-1">
-                {ALL_LAYERS.map((layer) => (
-                  <LayerMenuItem
-                    active={layers.has(layer)}
-                    key={layer}
-                    layer={layer}
-                    onToggle={() => toggleLayer(layer)}
-                  />
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
 
       </div>
 
@@ -297,6 +230,7 @@ export function AgentGraph({
 
       <div className="absolute inset-0">
         <ReactFlow<AgentFlowNode, RelationFlowEdge>
+          defaultViewport={initialCamera.current?.viewport}
           edges={[]}
           maxZoom={GRAPH_MAX_ZOOM}
           minZoom={GRAPH_MIN_ZOOM}
@@ -306,7 +240,8 @@ export function AgentGraph({
             flowRef.current = instance;
             setFlowReady(true);
           }}
-          onMoveStart={disableFollow}
+          onMoveStart={(event) => { if (event) setFollow(false); else disableFollow(); }}
+          onMove={(_, viewport) => savedCameras.set(cameraKey, { viewport, follow: followRef.current })}
           onNodeClick={(_, node) => onSelectAgent(node.id)}
           onNodeDoubleClick={(_, node) => onOpenConversation?.(node.id)}
           zoomOnDoubleClick={false}
@@ -371,39 +306,6 @@ function GraphActionButton({
       type="button"
     >
       <Icon className="size-4" strokeWidth={1.8} />
-    </button>
-  );
-}
-
-function LayerMenuItem({
-  active,
-  layer,
-  onToggle
-}: {
-  active: boolean;
-  layer: RenderableAgentLinkType;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      aria-checked={active}
-      className={[
-        "grid w-full grid-cols-[18px_minmax(0,1fr)] items-center gap-3 px-2.5 py-2 text-left text-xs font-medium transition",
-        active ? "text-ink-900" : "text-ink-500 hover:text-ink-900"
-      ].join(" ")}
-      onClick={onToggle}
-      role="menuitemcheckbox"
-      type="button"
-    >
-      <span
-        className={[
-          "grid size-[18px] place-items-center transition",
-          active ? "text-teal-600" : "text-transparent"
-        ].join(" ")}
-      >
-        <Check className="size-3" strokeWidth={2.4} />
-      </span>
-      <span className="min-w-0 truncate">{RELATION_META[layer].label}</span>
     </button>
   );
 }
