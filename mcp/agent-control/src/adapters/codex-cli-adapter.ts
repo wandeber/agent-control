@@ -110,7 +110,7 @@ export class CodexCliAdapter implements AgentAdapter {
     const data = handle.data as unknown as Data;
     const journal = join(data.dir, "events.jsonl");
     try {
-      const turns = new Map<number, { input: number | null; output: number | null }>();
+      const turns = new Map<number, { input: number | null; output: number | null; cached: number | null; writes: number | null; reasoning: number | null }>();
       let generation = 0;
       const validCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
       for (const line of readFileSync(journal, "utf8").split("\n")) {
@@ -122,12 +122,15 @@ export class CodexCliAdapter implements AgentAdapter {
             // One CLI invocation owns one turn. Repeated completion records must
             // replace that turn, not charge it again. Cached input and reasoning
             // output are breakdowns of the reported input/output totals, not extras.
-            turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null });
+            turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null,
+              writes: validCount(usage?.cache_write_input_tokens) && validCount(usage?.input_tokens) && usage.cache_write_input_tokens <= usage.input_tokens ? usage.cache_write_input_tokens : null,
+              cached: validCount(usage?.cached_input_tokens) && validCount(usage?.input_tokens) && usage.cached_input_tokens <= usage.input_tokens ? usage.cached_input_tokens : null,
+              reasoning: validCount(usage?.reasoning_output_tokens) && validCount(usage?.output_tokens) && usage.reasoning_output_tokens <= usage.output_tokens ? usage.reasoning_output_tokens : null });
           }
         } catch { /* A partial trailing line is retried on the next observation. */ }
       }
       if (!turns.size) return null;
-      const sum = (field: "input" | "output"): number | null => {
+      const sum = (field: "input" | "output" | "cached" | "reasoning" | "writes"): number | null => {
         let total = 0;
         for (const turn of turns.values()) {
           const value = turn[field];
@@ -140,6 +143,7 @@ export class CodexCliAdapter implements AgentAdapter {
       if (input === null && output === null) return null;
       const total = input !== null && output !== null && validCount(input + output) ? input + output : null;
       return { input_tokens: input, output_tokens: output, total_tokens: total,
+        cached_input_tokens: sum("cached"), cache_write_input_tokens: sum("writes"), reasoning_output_tokens: sum("reasoning"),
         context_used: null, context_limit: null, source: "codex-cli.turn.completed",
         model: data.resolved_model ?? data.model ?? null, captured_at: statSync(journal).mtime.toISOString() };
     } catch { return null; } // Missing historical journals remain unknown.

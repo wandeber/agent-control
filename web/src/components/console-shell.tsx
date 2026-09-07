@@ -20,7 +20,6 @@ import { RunSidebar } from "./run-sidebar";
 import { Timeline } from "./timeline";
 import { TopBar } from "./top-bar";
 import { EmptyState, Panel } from "./ui";
-import { WorkspacePanel } from "./workspace-panel";
 
 type BottomPanel = "agent" | "run" | "timeline";
 type GraphMode = "agents" | "flow";
@@ -46,7 +45,7 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
   threadPanelWidth: 520
 };
 
-export function ConsoleShell() {
+export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () => void }) {
   const { setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
   const [agentSelectionPinned, setAgentSelectionPinned] = useState(Boolean(selectedAgentId));
   const selectionRunRef = useRef<string | null | undefined>(undefined);
@@ -60,7 +59,8 @@ export function ConsoleShell() {
   const [renderedBottomPanel, setRenderedBottomPanel] = useState<BottomPanel>("agent");
   const [resizing, setResizing] = useState<ResizeTarget | null>(null);
   const latestStepByAgentRef = useRef<Map<string, string | null>>(new Map());
-  const { bottomPanel, runsOpen, threadOpen } = layout;
+  const { bottomPanel, runsOpen } = layout;
+  const threadOpen = false;
   const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
@@ -232,13 +232,6 @@ export function ConsoleShell() {
     });
   };
 
-  const toggleThreadPanel = () => {
-    setLayout((current) => {
-      const threadOpen = !current.threadOpen;
-      return narrowViewport ? { ...current, bottomPanel: null, runsOpen: false, threadOpen } : { ...current, threadOpen };
-    });
-  };
-
   const toggleBottomPanel = (panel: BottomPanel) => {
     setLayout((current) => {
       const bottomPanel = current.bottomPanel === panel ? null : panel;
@@ -309,11 +302,9 @@ export function ConsoleShell() {
           inspectorOpen={bottomPanel === "agent"}
           onOpenAgent={() => toggleBottomPanel("agent")}
           onOpenRuns={toggleRunsPanel}
-          onOpenThread={toggleThreadPanel}
           onRefresh={refresh}
           run={selectedRun}
           runsOpen={runsOpen}
-          threadOpen={threadOpen}
         />
       </div>
 
@@ -335,6 +326,7 @@ export function ConsoleShell() {
             ) : (
               <AgentGraph
                 onSelectAgent={selectAgent}
+                onOpenConversation={(agentId) => { selectAgent(agentId); onOpenConversation(); }}
                 onClearSelection={() => setAgentSelectionPinned(false)}
                 selectedAgentId={agentSelectionPinned ? selectedAgentId : null}
                 snapshot={selectedSnapshot}
@@ -370,33 +362,6 @@ export function ConsoleShell() {
                 patchLayout({ runsOpen: false });
               }}
               selectedRunId={selectedRunId ?? selectedSnapshot.selected_run_id ?? null}
-              snapshot={selectedSnapshot}
-            />
-          </div>
-        </aside>
-      ) : null}
-
-      {selectedSnapshot ? (
-        <aside
-          aria-hidden={threadOpen ? undefined : true}
-          aria-label="Thread"
-          className="console-side-panel console-thread-panel"
-          data-open={threadOpen ? "true" : "false"}
-        >
-          <ResizeHandle label="Resize thread panel" onPointerDown={startResize("thread")} orientation="vertical" />
-          <PanelHeader detail={selectedRun?.title ?? "Agent Control"} onClose={() => patchLayout({ threadOpen: false })} title="Thread" />
-          <div className="console-panel-body">
-            <WorkspacePanel
-              liveLog={agentLog}
-              connectionError={agentError}
-              messageLimit={selectedAgentMessageLimit}
-              onRequestOlderMessages={() =>
-                setSelectedAgentMessageLimit((value) =>
-                  Math.min(MAX_AGENT_MESSAGE_LIMIT, value + AGENT_MESSAGE_LOAD_STEP)
-                )
-              }
-              selectedAgentId={selectedAgentId}
-              selectedStepInstanceId={selectedStepInstanceId}
               snapshot={selectedSnapshot}
             />
           </div>
@@ -614,7 +579,7 @@ function readStoredConsoleLayout(): ConsoleLayoutState {
       bottomPanelHeight: boundedNumber(parsed.bottomPanelHeight, DEFAULT_LAYOUT.bottomPanelHeight, 240, 900),
       runsOpen: typeof parsed.runsOpen === "boolean" ? parsed.runsOpen : DEFAULT_LAYOUT.runsOpen,
       runsPanelWidth: boundedNumber(parsed.runsPanelWidth, DEFAULT_LAYOUT.runsPanelWidth, 260, 900),
-      threadOpen: typeof parsed.threadOpen === "boolean" ? parsed.threadOpen : DEFAULT_LAYOUT.threadOpen,
+      threadOpen: false,
       threadPanelWidth: boundedNumber(parsed.threadPanelWidth, DEFAULT_LAYOUT.threadPanelWidth, 320, 1000)
     };
   } catch {

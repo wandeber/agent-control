@@ -1,6 +1,6 @@
 "use client";
 
-import { GitBranch, Maximize2, MessageSquareText, PanelBottom, RefreshCw, type LucideIcon } from "lucide-react";
+import { GitBranch, Maximize2, PanelBottom, RefreshCw, type LucideIcon } from "lucide-react";
 import type { ConnectionState } from "@/lib/api";
 import type { RunRecord } from "@/lib/types";
 import { IconButton } from "./ui";
@@ -9,22 +9,18 @@ export function TopBar({
   run,
   inspectorOpen,
   runsOpen,
-  threadOpen,
   onFit,
   onOpenAgent,
   onOpenRuns,
-  onOpenThread,
   onRefresh
 }: {
   run: RunRecord | null;
   connection: ConnectionState;
   inspectorOpen?: boolean;
   runsOpen?: boolean;
-  threadOpen?: boolean;
   onFit?: () => void;
   onOpenAgent?: () => void;
   onOpenRuns?: () => void;
-  onOpenThread?: () => void;
   onRefresh?: () => void;
 }) {
   const runPath = run?.repo_dir ?? run?.run_id ?? "Waiting for Agent Control data";
@@ -43,7 +39,6 @@ export function TopBar({
 
       <div className="top-bar-button-group shrink-0" role="group" aria-label="Console view controls">
         <TopBarGroupButton active={inspectorOpen} icon={PanelBottom} label="Open inspector" onClick={onOpenAgent} />
-        <TopBarGroupButton active={threadOpen} icon={MessageSquareText} label="Open thread" onClick={onOpenThread} />
         <TopBarGroupButton icon={RefreshCw} label="Refresh snapshot" onClick={onRefresh} />
         {onFit ? <TopBarGroupButton icon={Maximize2} label="Fit graph" onClick={onFit} /> : null}
       </div>

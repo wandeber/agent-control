@@ -1,8 +1,10 @@
 "use client";
 
+import { AgentChatPreview } from "./agent-chat-preview";
+import { AgentUsageIcon } from "./agent-usage-icon";
 import { agentModelLabel } from "@/lib/agent-presentation";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Bot, MessageSquare, Wrench } from "lucide-react";
+import { MessageSquare, Wrench } from "lucide-react";
 import { STATUS_STYLE } from "@/lib/format";
 import type { AgentRecord } from "@/lib/types";
 import type { agentPresentation } from "@/lib/agent-presentation";
@@ -47,9 +49,7 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
       <FloatingHandles type="target" />
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <div className={["grid size-8 shrink-0 place-items-center rounded-md", style.bg, style.text].join(" ")}>
-            <Bot className="size-4" strokeWidth={1.9} />
-          </div>
+          <AgentUsageIcon usage={data.presentation.usage} className={style.bg + " " + style.text} />
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-ink-900" title={data.agent.title}>{data.presentation.title}</div>
             {data.presentation.title.toLowerCase() !== data.agent.role?.replaceAll("_", " ").toLowerCase() ? (
@@ -62,17 +62,16 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
         </span>
       </div>
 
-      {data.presentation.tokens ? <div className="mt-1 text-[11px] text-ink-500">{data.presentation.tokens}</div> : null}
       {data.presentation.phase ? (
         <div className="mt-3 truncate text-[11px] font-medium text-teal-800" title={data.presentation.phase}>
           {data.presentation.phase}
         </div>
       ) : null}
-      <div className="mt-2.5 flex min-w-0 items-center gap-2 border-t border-black/5 pt-2.5 text-xs text-ink-600"
-        data-agent-activity={data.presentation.kind} title={data.presentation.activity}>
+      <AgentChatPreview agentId={data.agent.agent_id}><div className="mt-2.5 flex min-w-0 items-center gap-2 border-t border-black/5 pt-2.5 text-xs text-ink-600"
+        data-agent-activity={data.presentation.kind}>
         <ActivityIcon className="size-3.5 shrink-0 text-ink-400" />
         <span className="truncate">{data.presentation.activity}</span>
-      </div>
+      </div></AgentChatPreview>
     </div>
   );
 }

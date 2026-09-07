@@ -37,7 +37,7 @@ export function ScreenRouter() {
           </button></div>
         </nav>
         <div className="agent-control-screen">
-          {fullConsole ? <ConsoleShell /> : <SubagentsShell />}
+          {fullConsole ? <ConsoleShell onOpenConversation={() => { setScreen("subagents"); try { window.location.hash = "/subagents"; } catch { /* Keep in-memory navigation in opaque hosts. */ } }} /> : <SubagentsShell />}
         </div>
       </div>
     </ConsoleSelectionProvider>

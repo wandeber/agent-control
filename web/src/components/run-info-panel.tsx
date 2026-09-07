@@ -1,7 +1,6 @@
 "use client";
 
-import { ChevronDown } from "lucide-react";
-import { useState } from "react";
+import { modelUsage } from "@/lib/agent-presentation";
 import { compactId, cx, elapsedFrom, formatDateTime, formatDuration, formatNumber, STATUS_STYLE } from "@/lib/format";
 import type { DashboardSnapshot, RunRecord } from "@/lib/types";
 
@@ -14,68 +13,41 @@ export function RunInfoPanel({
   selectedStepInstanceId: string | null;
   snapshot: DashboardSnapshot;
 }) {
-  const [infoOpen, setInfoOpen] = useState(true);
   const elapsed = run ? formatDuration(elapsedFrom(run.created_at, run.status === "active" ? null : run.updated_at)) : "0s";
   const running = snapshot.status_counts.running ?? 0;
   const waiting = snapshot.status_counts.waiting_for_input ?? 0;
-  const context = snapshot.usage_totals.context_limit
-    ? `${formatNumber(snapshot.usage_totals.context_used)} / ${formatNumber(snapshot.usage_totals.context_limit)}`
-    : "unknown";
-  const statusEntries = Object.entries(snapshot.status_counts).filter(([, count]) => count > 0) as Array<
-    [keyof typeof STATUS_STYLE, number]
-  >;
+  const consumption = modelUsage(snapshot);
+
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-white">
       <div className="flex min-h-14 items-start justify-between gap-4 border-b border-black/8 px-4 py-3">
         <div className="min-w-0">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.1em] text-ink-400">Selected run info</div>
           <div className="truncate text-base font-semibold text-ink-900">{run?.title ?? "No run selected"}</div>
           <div className="mt-0.5 truncate text-xs text-ink-400">{run?.repo_dir ?? run?.run_id ?? "Waiting for Agent Control data"}</div>
         </div>
-        <button
-          aria-expanded={infoOpen}
-          aria-label={infoOpen ? "Collapse run info" : "Expand run info"}
-          className="grid size-8 shrink-0 place-items-center rounded-md border border-transparent text-ink-400 transition hover:border-black/10 hover:bg-black/5 hover:text-ink-800"
-          onClick={() => setInfoOpen((open) => !open)}
-          title={infoOpen ? "Collapse run info" : "Expand run info"}
-          type="button"
-        >
-          <ChevronDown className={cx("size-4 transition-transform", infoOpen && "rotate-180")} />
-        </button>
       </div>
 
-      {infoOpen ? (
         <div className="agent-scroll min-h-0 flex-1 overflow-auto p-4">
-          <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
-            <InfoMetric label="Run elapsed" value={elapsed} />
-            <InfoMetric label="Agents" value={String(snapshot.agents.length)} />
-            <InfoMetric label="Flows" value={String(snapshot.flow_instances.length)} />
-            <InfoMetric label="Flow steps" value={String(snapshot.flow_steps.length)} />
-            <InfoMetric label="Running" tone="teal" value={String(running)} />
-            <InfoMetric label="Waiting" tone="amber" value={String(waiting)} />
-            <InfoMetric label="Tokens" value={formatNumber(snapshot.usage_totals.total_tokens)} />
-            <InfoMetric label="Context" value={context} />
+          <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-ink-500">
+            <span>{snapshot.agents.length} agents</span><span>{running} running</span><span>{waiting} waiting</span><span>{elapsed} elapsed</span>
           </div>
+          {consumption.rows.length ? <div className="mt-5">
+            <h3 className="text-sm font-semibold text-ink-900">Token consumption</h3>
+            <p className="mt-1 text-xs text-ink-400">Reported usage · input includes cached tokens; output includes reported reasoning. Missing usage is excluded; + marks a partial sum.</p>
+            <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs tabular-nums">
+              <thead className="text-ink-400"><tr><th className="py-2 font-medium">Model</th><th className="px-3 py-2 text-right font-medium">Input</th><th className="px-3 py-2 text-right font-medium">Cached input</th><th className="px-3 py-2 text-right font-medium">Uncached input</th><th className="px-3 py-2 text-right font-medium">Output</th><th className="py-2 text-right font-medium">Total</th></tr></thead>
+              <tbody>{consumption.rows.map((row) => <tr key={row.model} className="border-t border-black/5"><th className="py-2 font-medium text-ink-700">{row.model}</th><UsageCells values={row} /></tr>)}</tbody>
+              <tfoot className="border-t border-black/10 font-semibold text-ink-900"><tr><th className="py-3">All models</th><UsageCells values={consumption.totals} /></tr></tfoot>
+            </table></div>
+          </div> : null}
 
           {snapshot.flow_instances.length > 0 ? (
             <FlowOverview selectedStepInstanceId={selectedStepInstanceId} snapshot={snapshot} />
           ) : null}
 
-          {statusEntries.length > 0 ? (
-            <div className="mt-5">
-              <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-ink-300">Status counts</div>
-              <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(130px,1fr))] gap-3">
-                {statusEntries.map(([status, count]) => (
-                  <InfoMetric key={status} label={STATUS_STYLE[status].label} value={String(count)} />
-                ))}
-              </div>
-            </div>
-          ) : null}
+
         </div>
-      ) : (
-        <div className="p-4 text-sm text-ink-400">Run info hidden.</div>
-      )}
     </section>
   );
 }
@@ -206,4 +178,9 @@ function flowStepStatusClass(status: string): string {
     return "bg-red-50 text-red-700";
   }
   return "bg-zinc-50 text-zinc-600";
+}
+
+function UsageCells({ values }: { values: ReturnType<typeof modelUsage>["totals"] }) {
+  const label = (value: typeof values.input) => value.value === null ? "—" : `${new Intl.NumberFormat("en-US").format(value.value)}${value.partial ? "+" : ""}`;
+  return <>{(["input", "cached", "uncached", "output", "total"] as const).map((key) => <td key={key} className={key === "total" ? "py-2 text-right align-top" : "px-3 py-2 text-right align-top"}>{label(values[key])}</td>)}</>;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { agentTokenLabel } from "@/lib/agent-presentation";
+import { agentTokenLabel, agentModelLabel } from "@/lib/agent-presentation";
 
 import { useQuery } from "@tanstack/react-query";
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
@@ -112,7 +112,7 @@ export function WorkspacePanel({
         <div className="flex min-h-12 items-center justify-between gap-3 border-b border-black/8 bg-white/72 px-3 py-2">
           <div className="min-w-0">
             <div className="truncate text-xs font-semibold text-ink-900">{agent?.title ?? "Select an agent"}</div>
-            {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent?.agent_id)?.latest_usage) ? <div className="text-[11px] text-ink-500">{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent?.agent_id)?.latest_usage)}</div> : null}
+            {agent ? <div className="flex flex-wrap items-baseline gap-x-3 text-[11px] text-ink-500"><span>{agentModelLabel(agent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span></div> : null}
             <div className="truncate text-[11px] text-ink-400">
               {agent ? (
                 <>
@@ -242,7 +242,7 @@ function unknownRecordContainsStep(value: unknown, stepInstanceId: string): bool
   return false;
 }
 
-function ChatView({
+export function ChatView({
   agentId,
   artifacts,
   events,
@@ -262,7 +262,7 @@ function ChatView({
   log: AgentLogTail | null;
   selectedStep: FlowStepInstanceRecord | null;
   messages: AgentMessage[];
-  onRequestOlder: () => void;
+  onRequestOlder?: () => void;
   requestedLimit: number;
   compact: boolean;
   error: Error | null;
@@ -284,7 +284,7 @@ function ChatView({
   const agentArtifacts = artifacts;
   const agentEvents = events.slice(0, 6);
   const maxWindowStart = Math.max(0, blocks.length - MAX_VISIBLE_MESSAGES);
-  const hasMoreServerHistory = messages.length >= requestedLimit && requestedLimit < MAX_AGENT_MESSAGE_LIMIT;
+  const hasMoreServerHistory = Boolean(onRequestOlder) && messages.length >= requestedLimit && requestedLimit < MAX_AGENT_MESSAGE_LIMIT;
   const visibleStart = Math.min(windowStart, maxWindowStart);
   const visibleBlocks = blocks.slice(visibleStart, visibleStart + MAX_VISIBLE_MESSAGES);
   const hiddenBefore = visibleStart;
@@ -350,7 +350,7 @@ function ChatView({
       return;
     }
     if (hasMoreServerHistory) {
-      onRequestOlder();
+      onRequestOlder?.();
     }
   };
 

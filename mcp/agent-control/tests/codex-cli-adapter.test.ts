@@ -142,16 +142,16 @@ it('retains a failed process turn in history after a successful continuation',as
 
 it('collects cumulative CLI usage across resumed turns without charging cached input or duplicate completions',async()=>{
  const executable=process.env.AGENT_CONTROL_CODEX_CLI_BIN!;
- writeFileSync(executable,readFileSync(executable,'utf8').replace("console.log(JSON.stringify({type:'turn.completed'}));", `console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,output_tokens:25,cached_input_tokens:80,reasoning_output_tokens:10}}));`),{mode:0o700});
+ writeFileSync(executable,readFileSync(executable,'utf8').replace("console.log(JSON.stringify({type:'turn.completed'}));", `console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,output_tokens:25,cached_input_tokens:80,cache_write_input_tokens:0,reasoning_output_tokens:10}}));`),{mode:0o700});
  const adapter=new CodexCliAdapter(),handle=await adapter.start(input());
  await terminal(adapter,handle);
  const once=adapter.readUsage(handle);
- expect(once).toMatchObject({input_tokens:100,output_tokens:25,total_tokens:125,context_used:null,context_limit:null,model:'yoda'});
+ expect(once).toMatchObject({input_tokens:100,output_tokens:25,total_tokens:125,cached_input_tokens:80,cache_write_input_tokens:0,reasoning_output_tokens:10,context_used:null,context_limit:null,model:'yoda'});
  expect(adapter.readUsage(handle)).toEqual(once);
- appendFileSync(join(String(handle.data.dir),'events.jsonl'),JSON.stringify({type:'turn.completed',usage:{input_tokens:100,output_tokens:25,cached_input_tokens:80,reasoning_output_tokens:10}})+'\n');
+ appendFileSync(join(String(handle.data.dir),'events.jsonl'),JSON.stringify({type:'turn.completed',usage:{input_tokens:100,output_tokens:25,cached_input_tokens:80,cache_write_input_tokens:0,reasoning_output_tokens:10}})+'\n');
  expect(adapter.readUsage(handle)?.total_tokens).toBe(125);
  await adapter.sendMessage(handle,{message:'continue'});await terminal(adapter,handle);
- expect(new CodexCliAdapter().readUsage(handle)).toMatchObject({input_tokens:200,output_tokens:50,total_tokens:250});
+ expect(new CodexCliAdapter().readUsage(handle)).toMatchObject({input_tokens:200,output_tokens:50,total_tokens:250,cached_input_tokens:160,cache_write_input_tokens:0,reasoning_output_tokens:20});
 });
 it('keeps absent or malformed usage unknown and tolerates partial journal writes',()=>{
  const handle={backend:'codex-cli',id:'old',data:{dir}};

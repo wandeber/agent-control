@@ -149,7 +149,10 @@ export class CodexCliAdapter {
                         // One CLI invocation owns one turn. Repeated completion records must
                         // replace that turn, not charge it again. Cached input and reasoning
                         // output are breakdowns of the reported input/output totals, not extras.
-                        turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null });
+                        turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null,
+                            writes: validCount(usage?.cache_write_input_tokens) && validCount(usage?.input_tokens) && usage.cache_write_input_tokens <= usage.input_tokens ? usage.cache_write_input_tokens : null,
+                            cached: validCount(usage?.cached_input_tokens) && validCount(usage?.input_tokens) && usage.cached_input_tokens <= usage.input_tokens ? usage.cached_input_tokens : null,
+                            reasoning: validCount(usage?.reasoning_output_tokens) && validCount(usage?.output_tokens) && usage.reasoning_output_tokens <= usage.output_tokens ? usage.reasoning_output_tokens : null });
                     }
                 }
                 catch { /* A partial trailing line is retried on the next observation. */ }
@@ -171,6 +174,7 @@ export class CodexCliAdapter {
                 return null;
             const total = input !== null && output !== null && validCount(input + output) ? input + output : null;
             return { input_tokens: input, output_tokens: output, total_tokens: total,
+                cached_input_tokens: sum("cached"), cache_write_input_tokens: sum("writes"), reasoning_output_tokens: sum("reasoning"),
                 context_used: null, context_limit: null, source: "codex-cli.turn.completed",
                 model: data.resolved_model ?? data.model ?? null, captured_at: statSync(journal).mtime.toISOString() };
         }

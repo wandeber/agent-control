@@ -45,12 +45,14 @@ export function AgentGraph({
   selectedAgentId,
   onSelectAgent,
   onClearSelection,
+  onOpenConversation,
   toolbarLeading
 }: {
   snapshot: DashboardSnapshot;
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string) => void;
   onClearSelection?: () => void;
+  onOpenConversation?: (agentId: string) => void;
   toolbarLeading?: React.ReactNode;
 }) {
   const relations = useMemo(() => buildRelations(snapshot), [snapshot]);
@@ -306,6 +308,8 @@ export function AgentGraph({
           }}
           onMoveStart={disableFollow}
           onNodeClick={(_, node) => onSelectAgent(node.id)}
+          onNodeDoubleClick={(_, node) => onOpenConversation?.(node.id)}
+          zoomOnDoubleClick={false}
           onPaneClick={onClearSelection}
           onNodeDragStart={disableFollow}
           onNodesChange={onNodesChange}

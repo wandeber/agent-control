@@ -1,6 +1,6 @@
 "use client";
 
-import { agentModelLabel, agentTokenLabel } from "@/lib/agent-presentation";
+import { agentModelLabel, agentTokenLabel, agentTotalLabel } from "@/lib/agent-presentation";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
@@ -50,7 +50,7 @@ export function SubagentsShell() {
   const activeSubagents = useMemo(() => subagents.filter((agent) => !isTerminalStatus(agent.status)), [subagents]);
   const finishedSubagents = useMemo(() => subagents.filter((agent) => isTerminalStatus(agent.status)), [subagents]);
   const selectedAgent = selectedAgentId
-    ? subagents.find((agent) => agent.agent_id === selectedAgentId) ?? null
+    ? snapshot?.agents.find((agent) => agent.agent_id === selectedAgentId) ?? null
     : null;
 
   useEffect(() => {
@@ -59,7 +59,7 @@ export function SubagentsShell() {
       setSelectedAgentId(subagents[0].agent_id);
       return;
     }
-    if (selectedAgentId && !subagents.some((agent) => agent.agent_id === selectedAgentId)) {
+    if (selectedAgentId && !snapshot.agents.some((agent) => agent.agent_id === selectedAgentId)) {
       setSelectedAgentId(subagents[0]?.agent_id ?? null);
     }
   }, [narrowViewport, selectedAgentId, subagents, snapshot, followLatestRun, selectedRunId]);
@@ -116,8 +116,7 @@ export function SubagentsShell() {
                 </button>
                 <div className="min-w-0">
                   <h2>{selectedAgent.title}</h2>
-                  <p>{agentModelLabel(selectedAgent)}</p>
-                  {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage) ? <p>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</p> : null}
+                  <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span></p>
                 </div>
                 <StatusPill status={selectedAgent.status} />
               </header>
@@ -172,8 +171,7 @@ function AgentGroup({
             <StatusDot status={agent.status} />
             <span className="subagent-list-copy">
               <span className="subagent-list-title">{agent.title}</span>
-              <span className="subagent-list-detail">{agentModelLabel(agent)}</span>
-              {agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage) ? <span className="subagent-list-detail">{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span> : null}
+              <span className="subagent-list-detail flex items-baseline gap-2"><span>{agentModelLabel(agent)}</span><span>{agentTotalLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span></span>
             </span>
             <StatusPill compact status={agent.status} />
           </button>
