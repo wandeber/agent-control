@@ -2,7 +2,7 @@ import { parse as parseToml } from "smol-toml";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError } from "../core/errors.js";
@@ -132,6 +132,52 @@ export class CodexCliAdapter {
         return state;
     }
     async getStatus(handle) { const state = this.state(handle.data); return { status: state.status, updatedAt: state.updated_at, data: { thread_id: state.thread_id, exit_code: state.exit_code } }; }
+    readUsage(handle) {
+        const data = handle.data;
+        const journal = join(data.dir, "events.jsonl");
+        try {
+            const turns = new Map();
+            let generation = 0;
+            const validCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+            for (const line of readFileSync(journal, "utf8").split("\n")) {
+                try {
+                    const event = JSON.parse(line);
+                    if (event.type === "agent_control.prompt")
+                        generation++;
+                    const usage = event.type === "turn.completed" ? event.usage : undefined;
+                    if (event.type === "turn.completed") {
+                        // One CLI invocation owns one turn. Repeated completion records must
+                        // replace that turn, not charge it again. Cached input and reasoning
+                        // output are breakdowns of the reported input/output totals, not extras.
+                        turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null });
+                    }
+                }
+                catch { /* A partial trailing line is retried on the next observation. */ }
+            }
+            if (!turns.size)
+                return null;
+            const sum = (field) => {
+                let total = 0;
+                for (const turn of turns.values()) {
+                    const value = turn[field];
+                    if (value === null)
+                        return null; // Never present a partial history as a complete total.
+                    total += value;
+                }
+                return validCount(total) ? total : null;
+            };
+            const input = sum("input"), output = sum("output");
+            if (input === null && output === null)
+                return null;
+            const total = input !== null && output !== null && validCount(input + output) ? input + output : null;
+            return { input_tokens: input, output_tokens: output, total_tokens: total,
+                context_used: null, context_limit: null, source: "codex-cli.turn.completed",
+                model: data.resolved_model ?? data.model ?? null, captured_at: statSync(journal).mtime.toISOString() };
+        }
+        catch {
+            return null;
+        } // Missing historical journals remain unknown.
+    }
     async readLatest(handle, options) {
         const data = handle.data;
         const messages = new Map();

@@ -877,7 +877,11 @@ export interface UnregisterOptions {
   archiveRecord: boolean;
 }
 
+export type AgentUsageObservation = Omit<UsageSnapshotRecord, "usage_id" | "run_id" | "agent_id">;
+
 export interface AgentAdapter {
+  /** Read cumulative observed usage from durable local state; must not launch work. */
+  readUsage?(handle: AgentHandle): AgentUsageObservation | null;
   /** Append an observation without creating a competing turn. No fallback is allowed. */
   stageNotification?(handle: AgentHandle, message: AgentMessageInput): Promise<void>;
   kind: string;

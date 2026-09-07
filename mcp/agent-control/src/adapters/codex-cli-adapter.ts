@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError } from "../core/errors.js";
 import { agentRuntimeDir } from "../core/paths.js";
-import type { AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatusSnapshot, StartAgentInput, ReadLatestOptions, StopOptions, StopResult } from "../core/types.js";
+import type { AgentUsageObservation, AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatusSnapshot, StartAgentInput, ReadLatestOptions, StopOptions, StopResult } from "../core/types.js";
 import { writeState, type CliJob, type CliState } from "./codex-cli-runner.js";
 
 interface Data { dir: string; cwd: string; profile?: string; model?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; resolved_model?: string; logFile?: string; }
@@ -106,6 +106,44 @@ export class CodexCliAdapter implements AgentAdapter {
     return state;
   }
   async getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot> { const state = this.state(handle.data as unknown as Data); return { status: state.status, updatedAt: state.updated_at, data: { thread_id: state.thread_id, exit_code: state.exit_code } }; }
+  readUsage(handle: AgentHandle): AgentUsageObservation | null {
+    const data = handle.data as unknown as Data;
+    const journal = join(data.dir, "events.jsonl");
+    try {
+      const turns = new Map<number, { input: number | null; output: number | null }>();
+      let generation = 0;
+      const validCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+      for (const line of readFileSync(journal, "utf8").split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "agent_control.prompt") generation++;
+          const usage = event.type === "turn.completed" ? event.usage : undefined;
+          if (event.type === "turn.completed") {
+            // One CLI invocation owns one turn. Repeated completion records must
+            // replace that turn, not charge it again. Cached input and reasoning
+            // output are breakdowns of the reported input/output totals, not extras.
+            turns.set(generation, { input: validCount(usage?.input_tokens) ? usage.input_tokens : null, output: validCount(usage?.output_tokens) ? usage.output_tokens : null });
+          }
+        } catch { /* A partial trailing line is retried on the next observation. */ }
+      }
+      if (!turns.size) return null;
+      const sum = (field: "input" | "output"): number | null => {
+        let total = 0;
+        for (const turn of turns.values()) {
+          const value = turn[field];
+          if (value === null) return null; // Never present a partial history as a complete total.
+          total += value;
+        }
+        return validCount(total) ? total : null;
+      };
+      const input = sum("input"), output = sum("output");
+      if (input === null && output === null) return null;
+      const total = input !== null && output !== null && validCount(input + output) ? input + output : null;
+      return { input_tokens: input, output_tokens: output, total_tokens: total,
+        context_used: null, context_limit: null, source: "codex-cli.turn.completed",
+        model: data.resolved_model ?? data.model ?? null, captured_at: statSync(journal).mtime.toISOString() };
+    } catch { return null; } // Missing historical journals remain unknown.
+  }
   async readLatest(handle: AgentHandle, options: ReadLatestOptions): Promise<AgentMessage[]> {
     const data = handle.data as unknown as Data;
     const messages = new Map<string, AgentMessage>();

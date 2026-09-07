@@ -6272,6 +6272,18 @@ export class AgentController {
         const latestEvents = selectedRunId ? this.listEvents({ runId: selectedRunId, limit: 100 }) : [];
         const usageSnapshots = selectedRunId ? this.listUsageSnapshots({ runId: selectedRunId, limit: 1000 }) : [];
         const latestUsageByAgent = latestUsageSnapshotsByAgent(usageSnapshots);
+        for (const agent of agents) {
+            if (!agent.backend_handle)
+                continue;
+            try {
+                const observation = this.adapters.get(agent.backend).readUsage?.(this.requireHandle(agent));
+                if (observation)
+                    latestUsageByAgent.set(agent.agent_id, {
+                        ...observation, usage_id: `adapter:${agent.agent_id}`, agent_id: agent.agent_id, run_id: agent.run_id
+                    });
+            }
+            catch { /* Usage is optional; retain stored observations if the backend is unavailable. */ }
+        }
         const statusCounts = emptyStatusCounts();
         for (const agent of agents) {
             statusCounts[agent.status] += 1;

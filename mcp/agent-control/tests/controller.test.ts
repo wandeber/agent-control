@@ -5,6 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexSubagentAdapter } from "../src/adapters/codex-subagent-adapter.js";
+import { CodexCliAdapter } from "../src/adapters/codex-cli-adapter.js";
 import { ManualAdapter } from "../src/adapters/manual-adapter.js";
 import { OpenCodeServerAdapter } from "../src/adapters/opencode-server-adapter.js";
 import { AdapterRegistry } from "../src/adapters/registry.js";
@@ -3700,6 +3701,25 @@ describe("AgentController", () => {
     expect(adapter.starts.at(-1)?.prompt).toContain(
       "Latest coordinator context (authoritative wherever it adds, clarifies, or conflicts):\norchestrator approved planning"
     );
+  });
+
+  it("projects historical CLI journal usage into dashboard totals without inserting duplicate snapshots", () => {
+    registry.register(new CodexCliAdapter());
+    const run = controller.createRun({ title: "CLI usage" });
+    const agent = controller.registerAgent({runId:run.run_id,backend:"codex-cli",title:"Yoda",status:"completed",backendHandle:{dir:tmp,resolved_model:"yoda"}});
+    const journal=join(tmp,"events.jsonl");
+    const first=JSON.stringify({type:"agent_control.prompt"}) + "\n" + JSON.stringify({type:"turn.completed",usage:{input_tokens:100,output_tokens:25,cached_input_tokens:90}}) + "\n";
+    writeFileSync(journal,first);
+    for (let i=0;i<2;i++) {
+      const snapshot=controller.getDashboardSnapshot(run.run_id);
+      expect(snapshot.computed_agents.find(a=>a.agent_id===agent.agent_id)?.latest_usage).toMatchObject({total_tokens:125,model:"yoda"});
+      expect(snapshot.usage_totals.total_tokens).toBe(125);
+    }
+    writeFileSync(journal,first+first);
+    expect(controller.getDashboardSnapshot(run.run_id).usage_totals.total_tokens).toBe(250);
+    expect(controller.listUsageSnapshots({agentId:agent.agent_id})).toEqual([]);
+    rmSync(journal);
+    expect(controller.getDashboardSnapshot(run.run_id).computed_agents[0]?.latest_usage).toBeNull();
   });
 
   it("records visual links, usage snapshots, and dashboard aggregates", () => {
