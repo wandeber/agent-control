@@ -112,8 +112,9 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     expect(record.steps.context.role).toBe("context");
     expect(record.steps.analysis.role).toBe("analyst");
     expect(record.steps.plan_review.role).toBe("analyst");
-    for (const name of ["context", "planner", "implementer", "validator"]) {
-      expect(raw.roles?.[name]).toMatchObject({ backend: "codex-thread", model: "gpt-5.6-luna", reasoning_effort: "max", agent_lifecycle: "reuse" });
-    }
+    expect(raw.roles?.context).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
+    expect(raw.roles?.validator).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "high" });
+    for (const name of ["planner", "implementer", "integrator"]) expect(raw.roles?.[name]).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
+    expect(record.steps.integration.role).toBe("integrator");
   });
 });

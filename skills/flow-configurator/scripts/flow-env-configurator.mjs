@@ -47,6 +47,7 @@ function main() {
 
   if (command === "set") {
     const sets = parseSetArgs(args.set ?? []);
+    if (Object.keys(sets).some(key => /_(MODEL|REASONING_EFFORT)$/.test(key))) throw new Error("Model overrides belong in .agents/models.toml; use flow-model-configurator.mjs.");
     const allowUnknown = Boolean(args["allow-unknown"]);
     validateSetKeys(sets, variables, allowUnknown);
     const dryRun = Boolean(args["dry-run"]);

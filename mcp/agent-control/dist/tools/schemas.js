@@ -227,9 +227,11 @@ export const flowValidateConfigSchema = z.object({
     config: z.record(z.unknown())
 });
 export const flowCatalogListSchema = z.object({
+    repo_dir: z.string().optional(),
     query: z.string().min(1).optional()
 });
 export const flowCatalogGetSchema = z.object({
+    repo_dir: z.string().optional(),
     flow_id: z.string().min(1)
 });
 export const flowStartSchema = z.object({

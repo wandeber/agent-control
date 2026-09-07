@@ -1,4 +1,4 @@
-# Backend defaults preserve Codex Luna Max; the explicit final-reviewer model is retained.
+# Role model defaults match HDT; project preferences are resolved from .agents/models.toml.
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
 version: 1.2.2
@@ -42,6 +42,8 @@ prompts:
     path: roles/planner.md
   role_implementer:
     path: roles/implementer.md
+  role_integrator:
+    path: roles/integrator.md
   role_validator:
     path: roles/validator.md
   role_final_reviewer:
@@ -69,38 +71,44 @@ prompts:
 roles:
   context:
     backend: ${DEVFLOW_CONTEXT_BACKEND:-codex-thread}
-    model: ${DEVFLOW_CONTEXT_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_CONTEXT_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     agent_lifecycle: reuse
     prompt_ref: role_context
   analyst:
     backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
-    model: ${DEVFLOW_ANALYST_MODEL-gpt-6-astra}
-    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-xhigh}
+    model: gpt-6-astra
+    reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_analyst
   planner:
     backend: ${DEVFLOW_PLANNER_BACKEND:-codex-thread}
-    model: ${DEVFLOW_PLANNER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_PLANNER_REASONING_EFFORT-max}
+    model: gpt-5.6-sol
+    reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_planner
   implementer:
     backend: ${DEVFLOW_IMPLEMENTER_BACKEND:-codex-thread}
-    model: ${DEVFLOW_IMPLEMENTER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_IMPLEMENTER_REASONING_EFFORT-max}
+    model: gpt-5.6-sol
+    reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_implementer
+  integrator:
+    backend: ${DEVFLOW_INTEGRATOR_BACKEND:-codex-thread}
+    model: gpt-5.6-sol
+    reasoning_effort: xhigh
+    agent_lifecycle: reuse
+    prompt_ref: role_integrator
   validator:
     backend: ${DEVFLOW_VALIDATOR_BACKEND:-codex-thread}
-    model: ${DEVFLOW_VALIDATOR_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_VALIDATOR_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: high
     agent_lifecycle: reuse
     prompt_ref: role_validator
   final_reviewer:
     backend: ${DEVFLOW_FINAL_REVIEWER_BACKEND:-codex-thread}
-    model: ${DEVFLOW_FINAL_REVIEWER_MODEL-gpt-5.6-sol}
-    reasoning_effort: ${DEVFLOW_FINAL_REVIEWER_REASONING_EFFORT-xhigh}
+    model: gpt-5.6-sol
+    reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
   orchestrator:
@@ -525,7 +533,7 @@ steps:
       - project_plan
     sandbox: workspace
   integration:
-    role: implementer
+    role: integrator
     prompt_ref: step_integration
     description: Consolidate every accepted package delivery and bind the exact
       group to one verified current result.

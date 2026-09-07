@@ -427,11 +427,9 @@ Flow config files support shell-style environment placeholders in string values:
 - `${VAR-default}` uses `default` only when `VAR` is unset.
 - `${VAR:-default}` uses `default` when `VAR` is unset or empty.
 
-Use `${VAR:-default}` for most settings. When the same role can opt into
-`codex-subagent`, use `${MODEL_VAR-default}` for its model so an explicitly
-empty environment value survives expansion and tells the native backend to
-inherit the root model. Agent Control reads the process environment only; it
-does not source `.env` files.
+Use `${VAR:-default}` for backend and connection settings. Model and reasoning
+fields are literal defaults; project overrides belong in `.agents/models.toml`.
+Agent Control does not source `.env` files.
 When validation receives `--config-file`, prompt file references are checked
 relative to the flow config file.
 
@@ -911,3 +909,22 @@ Agent cards show state, current or last phase, and the latest public text or
 tool use. The agents view highlights the selected agent's relationships (or the
 active phase worker), keeps other main connections visible, and routes arrows
 around cards. Use **Relations > Show all relationships** for the full graph.
+
+## Project Flows and Model Preferences
+
+Pass the task project explicitly as `repo_dir` (CLI `--repo-dir`). The runtime
+resolves the Git root from a subdirectory, adds `.agents/flows/<name>/flow.yaml`
+to the existing catalogs, and lets a local flow ID replace its installed version.
+It then applies `.agents/models.toml` and pins the effective flow for the run.
+Relative prompt files resolve from their selected package. No MCP restart is needed.
+
+```toml
+[flows.development-flow-v1.planner]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+```
+
+Only model and reasoning effort are overridable here. Model fields do not expand
+environment variables; backend/authentication settings remain separate. Use
+`flow-configurator` for deterministic inspection and editing of project model
+preferences in `.agents/models.toml`.

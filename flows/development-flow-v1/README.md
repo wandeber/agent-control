@@ -20,7 +20,7 @@ impact; identical hashes do not establish semantic independence.
 | Plan intent | Current Plan and Analysis | Strict composed plan-review receipt | Exact analyst | First review full; later changed/dependent sections and findings |
 | Human plan approval | Exact analyst-approved Plan and registered package manifest | One recorded user decision bound to both digests | Original conversation | Reuse valid explicit approval; changed plan repeats analyst and human gates |
 | Implementation | Exact approved plan/projections, registered packages, and causal corrections | All required current deliveries accepted, no active branches, focused check evidence | Implementer | Broken plan returns to Planning; only scoped changes |
-| Integration | Exact accepted delivery group and approved interfaces | Verified binding of the group to the consolidated current result | Same implementer / assigned integration owner | Required for every nonempty external package group; skipped for inline work |
+| Integration | Exact accepted delivery group and approved interfaces | Verified binding of the group to the consolidated current result | Dedicated integrator | Required for every nonempty external package group; skipped for inline work |
 | Focused validation | Known correction bundle and affected boundaries | Controlled narrow recheck receipts | Validator, no-edit | Only on correction; cannot satisfy complete closure |
 | Complete validation | Current checkpoint and complete affected closure | GREEN controlled/reused receipts with paths, consumers, mandatory gates, risks | Validator, no-edit | Run once per relevant coherent result; failures return as a bundle |
 | Implementation intent | GREEN complete gate and exact approved Plan | Strict conformance receipt and first-approval milestone | Exact planner | Skip after first approval unless explicitly requested again |
@@ -153,13 +153,11 @@ Decision `owner: requester` preserves the original conversation separately
 from the executing coordinator. `authority` distinguishes coordinator judgment
 from an actual user decision; ownership determines which thread may record it.
 
-Model defaults are Luna `max` for Context, Astra `xhigh` for Analysis and its
-same-owner plan-intent review, and Sol `xhigh` for independent final review.
-Planner, implementer, and validator retain Luna `max`. The `DEVFLOW_CONTEXT_*`
-settings configure discovery independently of `DEVFLOW_ANALYST_*`;
-`DEVFLOW_FINAL_REVIEWER_REASONING_EFFORT` controls the review effort.
-Effective config/prompts are pinned for each run; override
-changes apply to future launches unless an explicit revision is accepted.
+Model defaults align with HDT: Context Luna `max`, Analyst Astra `xhigh`,
+Planner/Implementer/Integrator/Final reviewer Sol `xhigh`, Validator Luna `high`.
+Override only model/effort per role through `.agents/models.toml` using
+`[flows.development-flow-v1.<role>]`. Environment model variables are not used.
+
 
 ## Current Parallelism And Reuse Boundaries
 

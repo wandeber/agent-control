@@ -576,3 +576,13 @@ its completion condition and required flow gates are satisfied. A blocker is
 an update, not successful completion. Report the outcome and useful artifact
 or run links concisely; end this turn only under the Turn Boundary Contract
 for all supervised work.
+
+## Deterministic Project Resolution
+
+Pass the task repository's absolute `repo_dir` to catalog and launch tools (CLI:
+`--repo-dir`). Catalog loading adds `.agents/flows` after bundled/user catalogs; a
+project package with the same flow ID replaces the base. The runtime applies
+`.agents/models.toml` role model/effort overrides and pins the effective config at
+launch. Do not inspect files to calculate precedence or manually merge roles.
+Model/effort environment overrides are unsupported; use flow-configurator to
+migrate old `.agents.env` preferences. Backend/auth environment remains separate.

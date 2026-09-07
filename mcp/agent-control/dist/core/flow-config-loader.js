@@ -12,6 +12,17 @@ export function loadFlowConfigFile(path, options = {}) {
 }
 export function parseFlowConfigText(text, options = {}) {
     const parsed = parseConfigText(text, resolveFormat(options.format ?? "auto", options.sourcePath));
+    if (isRecord(parsed) && isRecord(parsed.roles)) {
+        for (const [roleId, role] of Object.entries(parsed.roles)) {
+            if (!isRecord(role))
+                continue;
+            for (const field of ["model", "reasoning_effort"]) {
+                if (typeof role[field] === "string" && role[field].includes("${")) {
+                    throw new Error(`roles.${roleId}.${field} cannot use environment interpolation; use .agents/models.toml.`);
+                }
+            }
+        }
+    }
     const expanded = expandEnvironmentReferences(parsed, options.env ?? process.env);
     if (!expanded || typeof expanded !== "object" || Array.isArray(expanded)) {
         throw new Error("Expected a flow config object.");

@@ -31,12 +31,13 @@ export async function launchWorkerTool(controller: AgentController, input: Recor
 }
 
 export async function launchFlowTool(controller: AgentController, input: Record<string, unknown>) {
-  const config = input.config ?? controller.getFlowFromCatalog({ flowId: String(input.flow_id) }).config;
-  controller.validateFlowConfig(config);
   const title = String(input.title);
   const owner = prepareLaunchOwner(controller, { title, repoDir: input.repo_dir as string | undefined,
     runId: input.run_id as string | undefined, agentToken: input.agent_token as string | undefined,
     adminKey: (input.admin_key as string | undefined) ?? resolveAdminKey(), ...requesterOptions(input) });
+  const projectDir = controller.getRun(owner.runId, { agentToken: owner.agentToken }).repo_dir;
+  const config = input.config ?? controller.getFlowFromCatalog({ flowId: String(input.flow_id), projectDir }).config;
+  controller.validateFlowConfig(config);
   const requester = controller.ensureRequester(owner.runId, { ...requesterOptions(input), agentToken: owner.agentToken });
   const coordinatorObserver = observeLaunchCoordinator(controller, owner, owner.runId, requester);
   const start = controller.startFlow({ config, runId: owner.runId, runTitle: title, acceptanceContext: input.acceptance_context as string | undefined,

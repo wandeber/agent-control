@@ -23,12 +23,9 @@ available.
   runtime records; do not create Markdown files only to transport structured data.
 - Model reusable prompts as named resources under top-level `prompts`, then
   reference them from roles or steps with `prompt_ref`.
-- Use role `backend` and `model` when the flow should suggest a worker backend
-  or model. Prefer environment placeholders with defaults for repo-authored
-  flows, for example `${DEVFLOW_ANALYST_BACKEND:-codex-thread}` and
-  `${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}`. Set `reasoning_effort` to
-  `${DEVFLOW_ANALYST_REASONING_EFFORT-max}` for Codex Luna Max. Preserve explicit
-  Codex choices; use OpenCode only when requested with an explicit provider/model.
+- Use literal role `model` and `reasoning_effort` defaults. Project overrides
+  belong in `.agents/models.toml`; model fields reject environment interpolation.
+  Backend/connection environment placeholders remain supported.
 - Prefer Markdown prompt files for stable instructions:
   - role prompts define stable worker behavior;
   - step prompts define the current phase/action;
@@ -55,7 +52,9 @@ available.
   transition, not on a visual wait edge.
 - Do not duplicate runtime details in prompt files. Active steps receive
   generated runtime and reporting contracts from Agent Control.
-- Put user-authored flow packages under the user flow catalog unless the user
+- Put project-authored flow packages under `.agents/flows/<flow-id>/flow.yaml`.
+  Local IDs replace matching installed IDs; prompts resolve relative to the local package.
+- Put shared user-authored flow packages under the user flow catalog unless the user
   explicitly asks to edit bundled repository flows. The default user catalog is
   `${AGENT_CONTROL_USER_DIR:-$HOME/.agent-control}/flows`, and it can be
   overridden with `AGENT_CONTROL_USER_FLOW_CATALOG_DIR`. Create the directory
@@ -76,8 +75,8 @@ prompts:
 roles:
   analyst:
     backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
-    model: ${DEVFLOW_ANALYST_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEVFLOW_ANALYST_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: analyst_role
 artifacts:
   analysis:

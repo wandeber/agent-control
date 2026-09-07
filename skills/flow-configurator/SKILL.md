@@ -1,124 +1,48 @@
 ---
 name: flow-configurator
-description: Use when the user wants to inspect or configure backend, model, or other environment-variable overrides for an Agent Control flow such as development-flow-v1 without editing the flow YAML.
+description: Configure or inspect project-local model and reasoning overrides for Agent Control flows without editing their instructions or base flow definitions.
 ---
 
 # Flow Configurator
 
-Use this skill to configure a declarative Agent Control flow through
-project-local environment overrides. The flow config remains the source of
-truth; this skill writes or updates `.agents.env` in the current project so a
-user can change role backends, models, or other `${VAR:-default}` placeholders
-without editing `flow.yaml`.
-
-## Rules
-
-- Discover named flows through Agent Control first: use `flow_catalog_list` and
-  `flow_catalog_get` when MCP tools are available, or `agentctl flow catalog
-  list` / `agentctl flow catalog get --flow <flow-id>` as CLI fallback.
-- Do not modify the flow config unless the user explicitly asks to author or
-  change a flow. Configuration means editing `.agents.env`.
-- Preserve unrelated `.agents.env` lines, comments, and keys.
-- Configure only variables used by the selected flow unless the user explicitly
-  asks for an extra environment key.
-- If the user asks to configure a named flow but does not provide values, list
-  the flow's configurable variables and their defaults, then ask for the
-  desired backend/model choices.
-- Treat explicit user choices as higher priority than existing `.agents.env`
-  values or flow defaults.
-
-## Deterministic Helper
-
-Use `scripts/flow-env-configurator.mjs` for the fragile parts: resolving a flow,
-extracting environment placeholders, and editing `.agents.env`.
-Resolve the script path relative to this skill directory.
-
-List configurable variables:
+Use the deterministic runtime helper, relative to this skill directory:
 
 ```bash
-node "$SKILL_DIR/scripts/flow-env-configurator.mjs" list \
-  --flow development-flow-v1 \
-  --agents-env .agents.env
+node "$SKILL_DIR/scripts/flow-model-configurator.mjs" list --project /absolute/project --flow development-flow-v1
+node "$SKILL_DIR/scripts/flow-model-configurator.mjs" set --project /absolute/project --flow development-flow-v1 --set planner.model=gpt-5.6-sol --set planner.reasoning_effort=xhigh
 ```
 
-Generate a commented template:
+The helper uses the same catalog and TOML resolver as launches. It writes only model
+and reasoning preferences into `.agents/models.toml`, preserving other tables.
+Do not duplicate defaults or instructions. Ask only for missing desired choices.
+The project is the task's explicit repository directory, not the MCP process cwd.
+Git subdirectories resolve to the repository root; non-git projects use the nearest
+ancestor `.agents` directory, or the provided directory.
 
-```bash
-node "$SKILL_DIR/scripts/flow-env-configurator.mjs" template \
-  --flow development-flow-v1 \
-  --agents-env .agents.env
+```toml
+[flows.development-flow-v1.planner]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
 ```
 
-Set concrete overrides:
+Resolution loads existing catalogs, replaces matching IDs with project packages
+under `.agents/flows/<name>/flow.yaml`, then applies model overrides. Local prompt
+paths resolve relative to their flow. Effective configuration is pinned at launch;
+edits affect future runs, not running workers. Unknown roles, fields, invalid effort,
+and environment interpolation in model fields fail explicitly.
 
-```bash
-node "$SKILL_DIR/scripts/flow-env-configurator.mjs" set \
-  --flow development-flow-v1 \
-  --agents-env .agents.env \
-  --set DEVFLOW_ANALYST_BACKEND=codex-thread \
-  --set DEVFLOW_ANALYST_MODEL=gpt-5.6-luna \
-  --set DEVFLOW_ANALYST_REASONING_EFFORT=max
-```
+## Configuration Procedure
 
-The helper validates that `--set` keys exist in the selected flow. Use
-`--allow-unknown` only when the user explicitly asks for an extra key.
+1. Resolve the task's project directory and requested flow. Use `list` to obtain
+   the effective models and role identifiers, including project-defined flows.
+2. If model or reasoning choices are missing, present those effective settings
+   and ask only for the desired changes. Do not infer model choices.
+3. Apply the explicitly requested role fields with `set`. Omitted fields retain
+   their current values. Preserve HDT tables and unrelated project preferences.
+4. Report the effective role settings returned by the helper and the project
+   TOML path. The helper validates against the same resolver used by launches.
 
-## Environment Loading
-
-`.agents.env` is a project-local override file. Do not source it inside the
-skill or print secret-like values. When launching a flow, ensure the runner or
-shell environment loads these values before Agent Control expands placeholders.
-If the current runner does not auto-load `.agents.env`, launch from a shell that
-exports it first or tell the user that the file has been written and must be
-loaded by the process that runs `agentctl`.
-
-## Common Development Flow Keys
-
-For `development-flow-v1`, the current configurable role keys are:
-
-- `DEVFLOW_ANALYST_BACKEND`
-- `DEVFLOW_ANALYST_MODEL`
-- `DEVFLOW_PLANNER_BACKEND`
-- `DEVFLOW_PLANNER_MODEL`
-- `DEVFLOW_IMPLEMENTER_BACKEND`
-- `DEVFLOW_IMPLEMENTER_MODEL`
-- `DEVFLOW_VALIDATOR_BACKEND`
-- `DEVFLOW_VALIDATOR_MODEL`
-- `DEVFLOW_FINAL_REVIEWER_BACKEND`
-- `DEVFLOW_FINAL_REVIEWER_MODEL`
-
-Prefer flow discovery over hard-coding this list, because future flows can add
-different variables.
-
-## Opting Into Native Codex Subagents
-
-Bundled roles default to Codex Luna Max, while existing explicit Codex choices
-remain intact. Roles with a reasoning default also expose a matching
-`*_REASONING_EFFORT` variable; discover the exact keys with the helper.
-To opt one configurable role into the native bridge, set its backend to
-`codex-subagent` and clear its model and reasoning-effort variables so the
-worker inherits the root settings:
-
-```bash
-node "$SKILL_DIR/scripts/flow-env-configurator.mjs" set \
-  --flow development-flow-v1 \
-  --agents-env .agents.env \
-  --set DEVFLOW_ANALYST_BACKEND=codex-subagent \
-  --set DEVFLOW_ANALYST_MODEL= \
-  --set DEVFLOW_ANALYST_REASONING_EFFORT=
-```
-
-The bundled role then uses the safe native default `fork_turns: none`.
-`backend_options.codex_subagent.fork_turns` (`none`, `all`, or a positive
-integer string) belongs in a native-only/custom flow role. Do not add dormant
-native options to a role that currently resolves to another backend; Agent
-Control rejects backend-specific options that cannot be applied.
-
-## Active Run Revisions
-
-Configuration and prompt content are pinned when a run starts. Editing overrides
-changes future launches; it must not silently mutate a running workflow. Use the
-runtime's explicit update/recovery path when a running instance needs a revised
-contract, and preserve reviewer continuity and evidence invalidation. Changing a
-model preference does not authorize changing human gates, result schemas, or
-read/write capability requirements.
+Model configuration uses `.agents/models.toml` exclusively. Do not read, import,
+rewrite or clean up `.env` or `.agents.env` to configure models. Environment
+variables are not model/reasoning overrides. Backend and connection/authentication
+settings remain separate from this skill's model configuration procedure.

@@ -87,7 +87,7 @@ run
     }
     output(controller.createRun({
         title: options.title,
-        repoDir: options.repoDir,
+        repoDir: options.repoDir ?? process.cwd(),
         adminKey: auth.adminKey,
         agentToken: auth.agentToken
     }));
@@ -127,12 +127,14 @@ flowCatalog
     .command("list")
     .description("List flow configs from the default repository flow catalog.")
     .option("--query <query>", "Case-insensitive filter over flow id, directory, description, version, or path.")
-    .action((options) => output(controller.listFlowCatalog({ query: options.query })));
+    .option("--repo-dir <path>", "Project directory for project flows and model overrides.", process.cwd())
+    .action((options) => output(controller.listFlowCatalog({ query: options.query, projectDir: options.repoDir })));
 flowCatalog
     .command("get")
     .description("Resolve one catalog flow by flow id or directory name.")
     .requiredOption("--flow <flowId>", "Flow id or flow directory name.")
-    .action((options) => output(controller.getFlowFromCatalog({ flowId: options.flow })));
+    .option("--repo-dir <path>", "Project directory for project flows and model overrides.", process.cwd())
+    .action((options) => output(controller.getFlowFromCatalog({ flowId: options.flow, projectDir: options.repoDir })));
 flow
     .command("validate")
     .description("Validate a JSON or YAML flow config without creating a run or flow instance.")
@@ -150,6 +152,7 @@ flow
 addRequesterOptions(flow
     .command("start"))
     .description("Create a flow instance and activate its initial step.")
+    .option("--flow <id>", "Resolve a named flow including project packages.")
     .option("--config-file <path>", "Read flow config JSON/YAML from this file.")
     .option("--config-json <json>", "Flow config JSON object.")
     .option("--config-yaml <yaml>", "Flow config YAML object.")
@@ -168,12 +171,12 @@ addRequesterOptions(flow
     }
     credentialStore.assertReady();
     const result = controller.startFlow({
-        config: await readConfigOption(options),
+        config: await readConfigOption({ ...options, repoDir: options.run ? controller.getRun(options.run, { agentToken: auth.agentToken }).repo_dir ?? options.repoDir ?? process.cwd() : options.repoDir ?? process.cwd() }),
         requesterThreadId: options.requesterThreadId, requesterEventTypes: options.requesterEvent?.length ? options.requesterEvent : undefined, requesterDelivery: options.requesterDelivery,
         runId: options.run,
         runTitle: options.runTitle,
         ...{ acceptanceContext: options.acceptanceContext },
-        repoDir: options.repoDir,
+        repoDir: options.repoDir ?? process.cwd(),
         adminKey: auth.adminKey,
         agentToken: auth.agentToken,
         ownerTaskIdentity: resolveOwnerTaskIdentity(options.ownerTaskIdentity),
@@ -188,7 +191,8 @@ addRequesterOptions(flow
 addRequesterOptions(flow
     .command("launch"))
     .description("Authenticate a local orchestrator, start or resume a flow, dispatch the active step, and return.")
-    .requiredOption("--config-file <path>", "Read flow config JSON/YAML from this file.")
+    .option("--config-file <path>", "Read flow config JSON/YAML from this file.")
+    .option("--flow <id>", "Resolve a named flow including project packages.")
     .requiredOption("--title <title>", "Run title/objective. This is passed to workers through the runtime contract.")
     .option("--acceptance-context <text>", "Complete accepted task contract, persisted before the first step is activated or dispatched.")
     .option("--run <runId>", "Existing run id to resume.")
@@ -210,9 +214,10 @@ addRequesterOptions(flow
         throw new Error("flow launch requires --admin-key, AGENT_CONTROL_ADMIN_KEY, or a local stored admin key.");
     }
     credentialStore.assertReady();
-    const repoDir = options.repoDir ?? process.cwd();
+    const effectiveRunId = options.run ?? (launchAuth.agentToken ? controller.requireAgentToken(launchAuth.agentToken).run_id : undefined);
+    const repoDir = effectiveRunId ? controller.getRun(effectiveRunId, { agentToken: launchAuth.agentToken }).repo_dir ?? options.repoDir ?? process.cwd() : options.repoDir ?? process.cwd();
     const backendHandle = resolveLaunchOrchestratorBackendHandle({ ...options, repoDir });
-    const config = await readConfigOption({ configFile: options.configFile });
+    const config = await readConfigOption({ configFile: options.configFile, flow: options.flow, repoDir });
     controller.validateFlowConfig(config);
     const explicitCoordinator = options.orchestratorThreadId || options.orchestratorBackendHandleJson || options.orchestratorBackend !== "codex-thread";
     const automatic = explicitCoordinator ? null : prepareLaunchOwner(controller, { title: options.title, repoDir,
@@ -1082,9 +1087,11 @@ function resolveLaunchOrchestratorBackendHandle(options) {
         : undefined;
 }
 async function readConfigOption(options) {
-    if ([options.configFile, options.configJson, options.configYaml, options.configStdin].filter(Boolean).length !== 1) {
-        throw new Error("Use exactly one config source: --config-file, --config-json, --config-yaml, or --config-stdin.");
+    if ([options.flow, options.configFile, options.configJson, options.configYaml, options.configStdin].filter(Boolean).length !== 1) {
+        throw new Error("Use exactly one config source: --flow, --config-file, --config-json, --config-yaml, or --config-stdin.");
     }
+    if (options.flow)
+        return controller.getFlowFromCatalog({ flowId: options.flow, projectDir: options.repoDir ?? process.cwd() }).config;
     if (options.configFile) {
         return loadFlowConfigFile(options.configFile);
     }

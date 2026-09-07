@@ -53,44 +53,44 @@ prompts:
 roles:
   date_resolver:
     backend: ${DEMO_AGE_DATE_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_DATE_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_DATE_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_date_resolver
     description: Extracts the birth date from the run objective and records the current date.
   millisecond_calculator:
     backend: ${DEMO_AGE_CALCULATOR_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_CALCULATOR_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_CALCULATOR_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_millisecond_calculator
     description: Calculates the elapsed lifetime in milliseconds.
   millisecond_checker:
     backend: ${DEMO_AGE_MS_CHECKER_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_MS_CHECKER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_MS_CHECKER_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_millisecond_checker
     description: Independently checks the millisecond calculation, optionally with a script.
   duration_formatter:
     backend: ${DEMO_AGE_FORMATTER_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_FORMATTER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_FORMATTER_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_duration_formatter
     description: Converts milliseconds into days, hours, minutes, and seconds.
   format_checker:
     backend: ${DEMO_AGE_FORMAT_CHECKER_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_FORMAT_CHECKER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_FORMAT_CHECKER_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_format_checker
     description: Independently checks the human-readable duration, optionally with a script.
   answer_writer:
     backend: ${DEMO_AGE_WRITER_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_WRITER_MODEL-gpt-5.6-luna}
-    reasoning_effort: ${DEMO_AGE_WRITER_REASONING_EFFORT-max}
+    model: gpt-5.6-luna
+    reasoning_effort: max
     prompt_ref: role_answer_writer
     description: Turns the verified duration into a compact answer for the user.
   final_reviewer:
     backend: ${DEMO_AGE_FINAL_REVIEW_BACKEND:-codex-thread}
-    model: ${DEMO_AGE_FINAL_REVIEW_MODEL-gpt-5.6-sol}
-    reasoning_effort: ${DEMO_AGE_FINAL_REVIEW_REASONING_EFFORT-xhigh}
+    model: gpt-5.6-sol
+    reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
     description: Clean-context reviewer created once and reused for every final-answer review iteration.

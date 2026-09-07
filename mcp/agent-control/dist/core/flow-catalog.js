@@ -3,12 +3,15 @@ import { homedir } from "node:os";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadFlowConfigFile } from "./flow-config-loader.js";
+import { applyProjectModels, resolveProjectRoot } from "./project-models.js";
 import { parseFlowConfig } from "./flow.js";
 const FLOW_CONFIG_FILENAMES = ["flow.yaml", "flow.yml", "flow.json"];
 export function listFlowCatalog(options = {}) {
-    const catalogs = options.catalogs ?? defaultFlowCatalogs();
+    const catalogs = options.catalogs ?? defaultFlowCatalogs(options.projectDir);
     const query = options.query?.trim().toLowerCase();
-    const flows = catalogs.flatMap((catalog) => listCatalogFlows(catalog));
+    const candidates = catalogs.flatMap((catalog) => listCatalogFlows(catalog));
+    const localIds = new Set(candidates.filter((flow) => flow.catalog_id === "project-flows").map((flow) => flow.flow_id ?? flow.directory_name));
+    const flows = candidates.filter((flow) => flow.catalog_id === "project-flows" || !localIds.has(flow.flow_id ?? flow.directory_name));
     return {
         catalogs,
         flows: query ? flows.filter((flow) => matchesFlowQuery(flow, query)) : flows
@@ -16,7 +19,7 @@ export function listFlowCatalog(options = {}) {
 }
 export function getFlowFromCatalog(input) {
     const flowId = input.flowId.trim();
-    const result = listFlowCatalog({ catalogs: input.catalogs });
+    const result = listFlowCatalog({ catalogs: input.catalogs, projectDir: input.projectDir });
     const matches = result.flows.filter((flow) => flow.flow_id === flowId || flow.directory_name === flowId);
     if (matches.length === 0) {
         throw new Error(`Flow not found in catalog: ${flowId}`);
@@ -25,7 +28,7 @@ export function getFlowFromCatalog(input) {
         throw new Error(`Flow id is ambiguous: ${flowId}. Matching config paths:\n${matches.map((flow) => flow.config_path).join("\n")}`);
     }
     const match = matches[0];
-    const loaded = loadFlowConfigFile(match.config_path);
+    const loaded = applyProjectModels(loadFlowConfigFile(match.config_path), input.projectDir);
     const parsed = parseFlowConfig(loaded);
     return {
         ...match,
@@ -37,9 +40,10 @@ export function getFlowFromCatalog(input) {
         config: loaded
     };
 }
-export function defaultFlowCatalogs() {
+export function defaultFlowCatalogs(projectDir) {
     const rootPath = resolveDefaultFlowCatalogRoot();
     const userRootPath = resolveUserFlowCatalogRoot();
+    const projectRoot = resolveProjectRoot(projectDir);
     return [
         {
             catalog_id: "repo-flows",
@@ -52,7 +56,8 @@ export function defaultFlowCatalogs() {
             name: "User flows",
             root_path: userRootPath,
             exists: existsSync(userRootPath)
-        }
+        },
+        ...(projectRoot ? [{ catalog_id: "project-flows", name: "Project flows", root_path: join(projectRoot, ".agents", "flows"), exists: existsSync(join(projectRoot, ".agents", "flows")) }] : [])
     ];
 }
 export function resolveDefaultFlowCatalogRoot(options = {}) {

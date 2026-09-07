@@ -17,7 +17,7 @@ describe("flow config loader", () => {
       for (const [role, settings] of Object.entries(config.roles ?? {})) {
         if (role === "orchestrator") continue;
         expect(settings.backend).toBe("codex-thread");
-        if (role === "final_reviewer") {
+        if (role === "final_reviewer" || (name === "development-flow-v1" && ["planner", "implementer", "integrator"].includes(role))) {
           expect(settings.model).toBe("gpt-5.6-sol");
           expect(settings.reasoning_effort).toBe("xhigh");
         } else if (name === "development-flow-v1" && role === "analyst") {
@@ -25,17 +25,15 @@ describe("flow config loader", () => {
           expect(settings.reasoning_effort).toBe("xhigh");
         } else {
           expect(settings.model).toBe("gpt-5.6-luna");
-          expect(settings.reasoning_effort).toBe("max");
+          expect(settings.reasoning_effort).toBe(name === "development-flow-v1" && role === "validator" ? "high" : "max");
         }
       }
     }
   });
 
-  it("keeps native inheritance available by clearing both Codex overrides", () => {
+  it("ignores legacy model environment overrides", () => {
     const path = resolve(import.meta.dirname, "../../../flows/development-flow-v1/flow.yaml");
-    const env = { DEVFLOW_ANALYST_BACKEND: "codex-subagent", DEVFLOW_ANALYST_MODEL: "", DEVFLOW_ANALYST_REASONING_EFFORT: "" };
-    expect(parseFlowConfig(loadFlowConfigFile(path, { env })).roles?.analyst).toMatchObject({ backend: "codex-subagent", model: undefined, reasoning_effort: "" });
-    expect(() => parseFlowConfig(loadFlowConfigFile(path, { env: { ...env, DEVFLOW_ANALYST_REASONING_EFFORT: "max" } }))).toThrow(/reasoning_effort is only supported/);
+    expect(parseFlowConfig(loadFlowConfigFile(path, { env: { DEVFLOW_ANALYST_MODEL: "wrong", DEVFLOW_ANALYST_REASONING_EFFORT: "low" } })).roles?.analyst).toMatchObject({ model: "gpt-6-astra", reasoning_effort: "xhigh" });
   });
 
   let tmp: string;
@@ -56,7 +54,7 @@ initial_step: analysis
 roles:
   analyst:
     backend: \${DEVFLOW_ANALYST_BACKEND:-opencode-server}
-    model: \${DEVFLOW_ANALYST_MODEL:-opencode-go/deepseek-v4-pro}
+    model: custom/model
 steps:
   analysis:
     role: analyst

@@ -33,9 +33,9 @@ export async function handleTool(
     case "flow_validate_config":
       return controller.validateFlowConfig(maybeObject(input.config) ?? {});
     case "flow_catalog_list":
-      return controller.listFlowCatalog({ query: maybeString(input.query) });
+      return controller.listFlowCatalog({ query: maybeString(input.query), projectDir: maybeString(input.repo_dir) });
     case "flow_catalog_get":
-      return controller.getFlowFromCatalog({ flowId: String(input.flow_id) });
+      return controller.getFlowFromCatalog({ flowId: String(input.flow_id), projectDir: input.repo_dir as string | undefined });
     case "flow_start":
       if (!maybeString(input.admin_key) && !maybeString(input.agent_token)) {
         throw new ControllerError("flow_start requires admin_key or agent_token.", "auth_required");

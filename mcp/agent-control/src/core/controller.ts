@@ -1,3 +1,4 @@
+import { applyProjectModels } from "./project-models.js";
 import { CodexSessionAdapter } from "../adapters/codex-session.js";
 import { FlowPackages, flowPackagesRequestSchema, type FlowPackagesRequest, type FlowPackagesToolRequest, type PackageGroup, type PackageContext } from "./flow-packages.js";
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
@@ -371,12 +372,12 @@ export class AgentController {
     return { valid: true, config: parseFlowConfig(config) };
   }
 
-  listFlowCatalog(input: { query?: string | null } = {}): FlowCatalogListResult {
-    return listFlowCatalog({ query: input.query });
+  listFlowCatalog(input: { query?: string | null; projectDir?: string | null } = {}): FlowCatalogListResult {
+    return listFlowCatalog({ query: input.query, projectDir: input.projectDir });
   }
 
-  getFlowFromCatalog(input: { flowId: string }): FlowCatalogGetResult {
-    return getFlowFromCatalog({ flowId: input.flowId });
+  getFlowFromCatalog(input: { flowId: string; projectDir?: string | null }): FlowCatalogGetResult {
+    return getFlowFromCatalog({ flowId: input.flowId, projectDir: input.projectDir });
   }
 
   /** Stop local supervision without stopping durable workers or detaching observers. */
@@ -458,7 +459,8 @@ export class AgentController {
      */
     bridgeCredentialDelivery?: "raw" | "local";
   }): FlowStartResult {
-    const config = pinFlowConfig(parseFlowConfig(input.config));
+    const projectDir = input.runId ? this.getRun(input.runId, { agentToken: input.agentToken ?? undefined }).repo_dir : input.repoDir;
+    const config = pinFlowConfig(parseFlowConfig(applyProjectModels(input.config as Record<string, unknown>, projectDir)));
     const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : null;
     const requiresNativeBridge = flowUsesCodexSubagents(config);
     const persistBridgeCredentialLocally = input.bridgeCredentialDelivery === "local";

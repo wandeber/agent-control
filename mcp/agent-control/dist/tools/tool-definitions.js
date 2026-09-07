@@ -82,16 +82,17 @@ export const TOOL_DEFINITIONS = [
     },
     {
         name: "flow_catalog_list",
-        description: "List flow configs from Agent Control's bundled and user flow catalogs. Bundled flows come from the repository flows directory; user flows default to ~/.agent-control/flows.",
+        description: "List bundled and user flow catalogs plus .agents/flows from explicit repo_dir. Project flow IDs replace matching installed IDs.",
         inputSchema: objectSchema({
+            repo_dir: stringProperty("Absolute project directory; discovers .agents/flows and .agents/models.toml."),
             query: stringProperty("Optional case-insensitive filter over flow id, directory, description, version, or path.")
         }),
         schema: flowCatalogListSchema
     },
     {
         name: "flow_catalog_get",
-        description: "Resolve one flow from Agent Control's default catalog by flow id or directory name and return its config path plus loaded config.",
-        inputSchema: objectSchema({ flow_id: stringProperty("Flow id or flow directory name.") }, ["flow_id"]),
+        description: "Resolve a flow by ID or directory name, with project-local shadowing and deterministic .agents/models.toml overrides when repo_dir is supplied.",
+        inputSchema: objectSchema({ repo_dir: stringProperty("Absolute project directory for local catalog and model overrides."), flow_id: stringProperty("Flow id or flow directory name.") }, ["flow_id"]),
         schema: flowCatalogGetSchema
     },
     {
