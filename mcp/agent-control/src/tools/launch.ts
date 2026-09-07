@@ -11,10 +11,11 @@ export function requesterOptions(input: Record<string, unknown>) {
 }
 
 export async function launchWorkerTool(controller: AgentController, input: Record<string, unknown>) {
-  return launchWorker({ backend: String(input.backend ?? "codex-thread"), title: String(input.title),
+  return launchWorker({ backend: String(input.backend ?? (input.profile ? "codex-cli" : "codex-thread")), title: String(input.title),
     prompt: input.prompt as string | undefined, promptFile: input.prompt_file as string | undefined,
     phase: String(input.phase ?? "task"), role: input.role as string | undefined,
     repo: (input.repo_dir as string | undefined) ?? process.cwd(), runId: input.run_id as string | undefined,
+    profile: input.profile as string | undefined, sandbox: input.sandbox as "read_only" | "workspace" | undefined,
     model: input.model as string | undefined, reasoningEffort: input.reasoning_effort as string | undefined,
     server: input.server as string | undefined, objective: input.objective as string | undefined,
     outputArtifact: input.output_artifact as string | undefined,

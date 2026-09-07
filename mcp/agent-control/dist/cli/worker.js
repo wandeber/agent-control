@@ -15,7 +15,9 @@ export function registerWorkerCommands(program, deps) {
     addRequesterOptions(worker
         .command("launch"))
         .description("Register/start a worker, wire optional subscriptions, and optionally arm a detached watcher.")
-        .option("--backend <backend>", "Backend kind.", "codex-thread")
+        .option("--backend <backend>", "Backend kind; defaults to codex-cli with profile, otherwise codex-thread.")
+        .option("--profile <profile>", "Codex CLI profile for any configured provider/model.")
+        .option("--sandbox <sandbox>", "read_only or workspace.")
         .option("--server <url>", "Backend server URL.")
         .option("--repo <dir>", "Repository directory.")
         .option("--repo-dir <dir>", "Repository directory.")
@@ -89,11 +91,16 @@ export function registerWatchCommands(program, deps) {
         .action(async (options) => deps.output(await runDetachedWatch(options, deps)));
 }
 export async function launchWorker(options, deps) {
+    options.backend ??= options.profile ? "codex-cli" : "codex-thread";
+    if (options.profile && options.backend !== "codex-cli")
+        throw new Error("--profile requires codex-cli.");
+    if (options.sandbox && !["codex-cli", "codex-thread"].includes(options.backend))
+        throw new Error("--sandbox requires a Codex backend.");
     // Validate the complete handoff envelope before authentication can lead to
     // run/agent registration. Invalid workflow state must never reach a backend.
     const normalizedInputHandoffsJson = parseWorkerInputHandoffs(options.inputHandoffsJson);
-    if (options.reasoningEffort && options.backend !== "codex-thread") {
-        throw new Error("--reasoning-effort is only supported by codex-thread.");
+    if (options.reasoningEffort && !["codex-thread", "codex-cli"].includes(options.backend)) {
+        throw new Error("--reasoning-effort is only supported by codex-thread or codex-cli.");
     }
     const auth = deps.authOptions({ allowStoredAdminKey: true });
     if (Boolean(options.promptFile) === Boolean(options.prompt))
@@ -110,7 +117,7 @@ export async function launchWorker(options, deps) {
     assertReadableFiles([...inputArtifacts.map((artifact) => artifact.path), ...attachments]);
     const agentId = options.agentId ?? options.agent;
     const model = options.model ?? (!agentId && options.backend === "codex-thread" ? "gpt-5.6-luna" : undefined);
-    const reasoningEffort = options.reasoningEffort ?? (model === "gpt-5.6-luna" ? "max" : undefined);
+    const reasoningEffort = options.reasoningEffort ?? (options.backend === "codex-thread" && model === "gpt-5.6-luna" ? "max" : undefined);
     const owner = prepareLaunchOwner(deps.controller, { title: options.runTitle ?? options.title, repoDir,
         runId: options.runId ?? options.run ?? (agentId ? deps.controller.getAgent(agentId).run_id : undefined),
         agentToken: options.agentToken ?? auth.agentToken, adminKey: auth.adminKey, requesterThreadId: options.requesterThreadId });
@@ -228,7 +235,7 @@ export async function launchWorker(options, deps) {
             prompt,
             server: options.server ?? (options.backend === "opencode-server" ? DEFAULT_OPENCODE_SERVER : undefined),
             model,
-            metadata: reasoningEffort ? { reasoning_effort: reasoningEffort } : undefined,
+            metadata: { ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) },
             expectedArtifacts,
             attachments,
             agentToken

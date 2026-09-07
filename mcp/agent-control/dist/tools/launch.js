@@ -7,10 +7,11 @@ export function requesterOptions(input) {
         requesterDelivery: input.requester_delivery };
 }
 export async function launchWorkerTool(controller, input) {
-    return launchWorker({ backend: String(input.backend ?? "codex-thread"), title: String(input.title),
+    return launchWorker({ backend: String(input.backend ?? (input.profile ? "codex-cli" : "codex-thread")), title: String(input.title),
         prompt: input.prompt, promptFile: input.prompt_file,
         phase: String(input.phase ?? "task"), role: input.role,
         repo: input.repo_dir ?? process.cwd(), runId: input.run_id,
+        profile: input.profile, sandbox: input.sandbox,
         model: input.model, reasoningEffort: input.reasoning_effort,
         server: input.server, objective: input.objective,
         outputArtifact: input.output_artifact,

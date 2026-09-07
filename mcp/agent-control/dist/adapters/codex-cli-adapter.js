@@ -1,0 +1,169 @@
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { ControllerError } from "../core/errors.js";
+import { agentRuntimeDir } from "../core/paths.js";
+import { writeState } from "./codex-cli-runner.js";
+const unsupported = (message) => new ControllerError(message, "unsupported_operation");
+export class CodexCliAdapter {
+    kind = "codex-cli";
+    capabilities() { return { canStart: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: false }; }
+    async start(input) {
+        if (input.attachments?.length || input.server)
+            throw unsupported("codex-cli does not support attachments or server overrides; configure a Codex profile instead.");
+        const profile = input.metadata?.profile;
+        if (profile !== undefined && (typeof profile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(profile)))
+            throw unsupported("Invalid Codex profile name.");
+        const sandbox = input.metadata?.sandbox ?? "workspace";
+        if (!["workspace", "read_only"].includes(String(sandbox)))
+            throw unsupported("codex-cli sandbox must be read_only or workspace.");
+        const data = { dir: join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "codex-cli"), cwd: input.agent.repo_dir ?? process.cwd(), profile: profile,
+            model: input.model ?? input.agent.model ?? undefined, sandbox: sandbox === "read_only" ? "read-only" : "workspace-write", reasoning_effort: input.metadata?.reasoning_effort };
+        mkdirSync(data.dir, { recursive: true, mode: 0o700 });
+        if (existsSync(join(data.dir, "state.json")))
+            throw unsupported("This CLI worker already has an execution; continue its existing session instead.");
+        if (data.profile)
+            data.profile_hash = this.profileHash(data.profile);
+        await this.launch(data, input.prompt ?? "", undefined, input.agentToken);
+        return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
+    }
+    profileHash(profile) {
+        const path = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${profile}.config.toml`);
+        if (!existsSync(path))
+            throw unsupported("A persisted Codex profile file is required for managed CLI continuity.");
+        return createHash("sha256").update(readFileSync(path)).digest("hex");
+    }
+    async launch(data, prompt, session, agentToken) {
+        if (data.profile && this.profileHash(data.profile) !== data.profile_hash)
+            throw unsupported("Codex profile changed since launch; review its model/provider before continuing.");
+        try {
+            mkdirSync(join(data.dir, "active"));
+        }
+        catch {
+            throw unsupported("CLI worker already has an active turn. Wait before continuing.");
+        }
+        const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", data.sandbox, "-c", 'approval_policy="never"'];
+        if (data.profile)
+            args.push("--profile", data.profile);
+        if (data.model)
+            args.push("--model", data.model);
+        if (data.reasoning_effort)
+            args.push("-c", `model_reasoning_effort=${JSON.stringify(data.reasoning_effort)}`);
+        if (session)
+            args.push("resume", session);
+        args.push("-");
+        if (agentToken)
+            writeFileSync(join(data.dir, "credential"), agentToken, { mode: 0o600 });
+        rmSync(join(data.dir, "ready"), { force: true });
+        rmSync(join(data.dir, "cancelled"), { force: true });
+        rmSync(join(data.dir, "stop.json"), { force: true });
+        const job = { executable: process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex", args, cwd: data.cwd, prompt };
+        writeState(data.dir, { status: "running", thread_id: session, updated_at: new Date().toISOString() });
+        writeFileSync(join(data.dir, "job.json"), JSON.stringify(job), { mode: 0o600 });
+        appendFileSync(join(data.dir, "events.jsonl"), JSON.stringify({ type: "agent_control.prompt", text: prompt, created_at: new Date().toISOString() }) + "\n", { mode: 0o600 });
+        // A separate Node supervisor survives disposal/reload of the MCP process.
+        const bundledRunner = fileURLToPath(new URL("./codex-cli-runner.js", import.meta.url));
+        const runner = existsSync(bundledRunner) ? bundledRunner : fileURLToPath(new URL("../../dist/adapters/codex-cli-runner.js", import.meta.url));
+        const env = { ...process.env };
+        delete env.AGENT_CONTROL_TOKEN;
+        delete env.AGENT_CONTROL_ADMIN_KEY;
+        if (existsSync(join(data.dir, "credential")))
+            env.AGENT_CONTROL_TOKEN = readFileSync(join(data.dir, "credential"), "utf8");
+        const child = spawn(process.execPath, [runner, "--supervise", data.dir], { detached: true, stdio: "ignore", env });
+        try {
+            await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+            child.unref();
+            for (let i = 0; i < 100; i++) {
+                if (existsSync(join(data.dir, "ready")))
+                    return;
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            throw unsupported("CLI supervisor did not acknowledge startup.");
+        }
+        catch (error) {
+            // Cancellation is fenced on disk before signaling our owned supervisor.
+            // Keep the active lock until it acknowledges exit, preventing late starts.
+            writeFileSync(join(data.dir, "cancelled"), "cancelled", { mode: 0o600 });
+            if (child.pid && child.exitCode === null && child.signalCode === null) {
+                const exited = new Promise(resolve => child.once("exit", () => resolve()));
+                child.kill("SIGTERM");
+                await exited;
+            }
+            writeState(data.dir, { status: "failed", thread_id: session, updated_at: new Date().toISOString() });
+            rmSync(join(data.dir, "active"), { recursive: true, force: true });
+            throw error;
+        }
+    }
+    async sendMessage(handle, message) {
+        const data = handle.data, state = this.state(data);
+        if (state.status === "running")
+            throw unsupported("CLI worker is busy; wait for its current turn before continuing.");
+        if (!state.thread_id || !/^[a-zA-Z0-9-]+$/.test(state.thread_id))
+            throw unsupported("CLI worker has no persisted session ID to resume.");
+        await this.launch(data, message.message, state.thread_id);
+    }
+    state(data) {
+        const state = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8"));
+        if (state.status === "running" && Date.now() - Date.parse(state.updated_at) > 30_000)
+            throw new ControllerError("CLI supervisor heartbeat is temporarily unavailable.", "backend_unavailable");
+        return state;
+    }
+    async getStatus(handle) { const state = this.state(handle.data); return { status: state.status, updatedAt: state.updated_at, data: { thread_id: state.thread_id, exit_code: state.exit_code } }; }
+    async readLatest(handle, options) {
+        const data = handle.data;
+        const messages = new Map();
+        let generation = 0;
+        // Persisted chat stays readable even if its supervisor is unavailable.
+        const updatedAt = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8")).updated_at;
+        for (const [index, line] of readFileSync(join(data.dir, "events.jsonl"), "utf8").split("\n").entries()) {
+            try {
+                const event = JSON.parse(line), item = event.item;
+                if (event.type === "agent_control.prompt")
+                    generation++;
+                if (event.type === "agent_control.prompt")
+                    messages.set(`prompt-${index}`, { id: `prompt-${index}`, role: "user", text: event.text, created_at: event.created_at });
+                if (!item)
+                    continue;
+                const text = item.type === "agent_message" ? item.text : item.type === "todo_list" ? `update_plan\nInput: ${JSON.stringify({ plan: item.items?.map((task) => ({ step: task.text, status: task.completed ? "completed" : "pending" })) })}` : `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item)}${item.aggregated_output ? `\n${item.aggregated_output}` : ""}`;
+                if (item.type === "reasoning")
+                    continue;
+                const id = `${generation}:${item.id ?? `event-${index}`}`;
+                messages.set(id, { id, role: item.type === "agent_message" ? "assistant" : "tool", text, created_at: updatedAt, metadata: { type: item.type === "agent_message" ? "text" : "tool", itemType: item.type } });
+            }
+            catch { /* Ignore incomplete trailing event while the process is writing. */ }
+        }
+        return [...messages.values()].slice(-options.limit);
+    }
+    async stop(handle, options) {
+        const data = handle.data;
+        if (this.state(data).status !== "running")
+            return { status: this.state(data).status };
+        writeFileSync(join(data.dir, "stop.json"), JSON.stringify(options), { mode: 0o600 });
+        for (let i = 0; i < 50; i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            if (this.state(data).status !== "running")
+                return { status: this.state(data).status };
+        }
+        throw unsupported("CLI stop is still pending; inspect status or explicitly request kill.");
+    }
+    watchStatus(handle, onChange) {
+        let previous = "", busy = false;
+        const timer = setInterval(async () => { if (busy)
+            return; busy = true; try {
+            const snapshot = await this.getStatus(handle), signature = JSON.stringify({ status: snapshot.status, data: snapshot.data });
+            if (signature !== previous) {
+                previous = signature;
+                await onChange(snapshot);
+            }
+        }
+        catch { /* Runtime may have been purged; controller owns diagnostics. */ }
+        finally {
+            busy = false;
+        } }, 1000);
+        timer.unref();
+        return () => clearInterval(timer);
+    }
+}

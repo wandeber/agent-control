@@ -9,6 +9,23 @@ Default workers and bundled flow roles use Codex (`codex-thread`) with
 the development-v1 final reviewer, are preserved. OpenCode is an optional backend
 that requires an explicit backend and provider/model choice.
 
+Standalone workers do not require a flow or a predefined flow agent. Use
+`worker_launch` with `backend: "codex-cli"` and an explicit model, or a configured
+Codex `profile` such as `softec-yoda`. A profile selects `codex-cli` when backend
+is omitted, and its model is preserved unless the caller explicitly overrides it.
+The CLI equivalent is `agentctl worker launch --profile softec-yoda --sandbox
+read_only --title "Review" --phase review --prompt "Review the requested change"`.
+
+The managed CLI backend requires a local Codex installation and persistent
+`$CODEX_HOME/<profile>.config.toml` profiles. It uses detached supervision,
+private durable JSONL/state files, exact-session continuation and the same
+requester subscriptions and wait contract as other workers. Changing a profile
+requires reviewing its identity before continuation; it cannot silently switch
+models mid-session. Attachments and server overrides are not supported by this
+backend. Configure provider endpoints and credentials through the Codex profile
+setup in Agent Settings. A sleeping/unreachable supervisor reports unavailable
+rather than falsely completing the task; reads never replay a task.
+
 The plugin also ships Agent Control skills:
 
 - `development-flow` for clarifying and running the bundled development workflow

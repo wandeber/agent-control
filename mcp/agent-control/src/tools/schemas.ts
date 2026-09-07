@@ -12,6 +12,7 @@ const requesterFields = {
 export const workerLaunchSchema = z.object({
   ...requesterFields, title: z.string().min(1), prompt: z.string().min(1).optional(), prompt_file: z.string().min(1).optional(),
   repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), backend: z.string().min(1).optional(),
+  profile: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/).optional(), sandbox: z.enum(["read_only", "workspace"]).optional(),
   model: z.string().min(1).optional(), reasoning_effort: z.string().min(1).optional(), server: z.string().min(1).optional(),
   phase: z.string().min(1).optional(), role: z.string().min(1).optional(), objective: z.string().min(1).optional(),
   output_artifact: z.string().min(1).optional(), input_handoffs: z.array(z.unknown()).optional(),
