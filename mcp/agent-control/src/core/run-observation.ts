@@ -1,4 +1,5 @@
 import { currentCodexThreadId } from "./caller-context.js";
+import { readCodexSession, sessionBaseline } from "../adapters/codex-session.js";
 import { conversationWaitContract } from "./conversation-wait.js";
 import { compactFlowEvent } from "./flow-event-summary.js";
 import type { AgentController } from "./controller.js";
@@ -147,14 +148,21 @@ export class RunObservation {
 
   observe(input: ObserveRunInput) {
     const caller = input.agentToken ? this.controller.requireAgentToken(input.agentToken) : null;
-    if (caller ? !this.controller.canAgentAccessRun(caller, input.runId) : !input.adminKey || !verifyAdminKey(input.adminKey)) {
-      throw new ControllerError("Run observation requires an authorized run identity.", "auth_required");
-    }
-    const run = this.controller.getRun(input.runId);
     const threadId = (input.threadId ?? currentCodexThreadId())?.trim();
     if (!threadId || threadId.length > 256 || /[\r\n\0]/.test(threadId)) {
       throw new ControllerError("Run observation requires the actual Codex thread id.", "tool_error");
     }
+    // Launch already attached this conversation. Its authenticated local caller
+    // identity can reattach its own cursor without exposing an administrator key.
+    // Explicit invalid credentials and foreign identities never use this path.
+    const ownObservation = !caller && !input.adminKey && threadId === currentCodexThreadId()
+      ? this.store.db.prepare(`select 1 from run_observers o join agents a on a.agent_id = o.observer_agent_id
+          where o.run_id = ? and o.thread_id = ? and a.unregistered_at is null`).get(input.runId, threadId)
+      : null;
+    const authorized = caller ? this.controller.canAgentAccessRun(caller, input.runId)
+      : input.adminKey ? verifyAdminKey(input.adminKey) : Boolean(ownObservation);
+    if (!authorized) throw new ControllerError("Run observation requires an authorized run identity.", "auth_required");
+    const run = this.controller.getRun(input.runId);
     const previousObservation = this.store.db.prepare("select * from run_observers where run_id = ? and thread_id = ?").get(run.run_id, threadId) as ObserverRow | undefined;
     const events = [...new Set(input.eventTypes ?? (previousObservation ? JSON.parse(previousObservation.events_json) as EventType[] : DEFAULT_OBSERVER_EVENTS))];
     if (!events.length || events.some((type) => !(EVENT_TYPES as readonly string[]).includes(type))) {
@@ -172,8 +180,14 @@ export class RunObservation {
       if (agent?.unregistered_at) throw new ControllerError("The observing participant has been detached.", "tool_error");
       if (!agent) {
         agent = this.store.createAgent({ runId: run.run_id, backend: "codex-thread", title: input.title ?? "User conversation",
-          role: "observer", status: "waiting_for_input", repoDir: run.repo_dir,
+          role: "observer", status: "waiting_for_input", repoDir: run.repo_dir, model: readCodexSession(threadId)?.model ?? null,
           backendHandle: { thread_id: threadId, agent_control_role: "observer", cwd: run.repo_dir } });
+      }
+      if (!previous && !agent.backend_handle?.usage_baseline) {
+        const baseline = sessionBaseline(threadId);
+        if (baseline) agent = this.store.updateAgent(agent.agent_id, {
+          backendHandle: { ...agent.backend_handle, usage_baseline: baseline }
+        });
       }
       this.store.db.prepare("insert or ignore into run_requesters(run_id, thread_id) values (?, ?)").run(run.run_id, threadId);
       const start = previous?.start_sequence ?? this.currentSequence();

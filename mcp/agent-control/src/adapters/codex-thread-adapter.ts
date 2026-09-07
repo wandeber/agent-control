@@ -1,4 +1,5 @@
 import { ConnectionRecovery, connectWithStartup } from "./connection-recovery.js";
+import { sessionUsage } from "./codex-session.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -98,6 +99,7 @@ interface ThreadRecord {
 
 export class CodexThreadAdapter implements AgentAdapter {
   readonly kind = "codex-thread";
+  readUsage(handle: AgentHandle) { return sessionUsage(handle); }
 
   capabilities(): AgentCapabilities {
     return CAPABILITIES;
@@ -606,7 +608,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class CodexAppServerClient {
+export class CodexAppServerClient {
   private socket: WebSocket | null = null;
   private process: ChildProcessWithoutNullStreams | null = null;
   private processBuffer = "";

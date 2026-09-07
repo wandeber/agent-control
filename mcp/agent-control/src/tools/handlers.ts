@@ -1,4 +1,5 @@
 import { launchFlowTool, launchWorkerTool, requesterOptions } from "./launch.js";
+import { attachWorkerTool } from "./attach.js";
 import type { AgentController } from "../core/controller.js";
 import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
@@ -18,6 +19,7 @@ export async function handleTool(
     case "flow_evidence": return controller.executeFlowEvidence({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), request: input.request as import("../core/evidence/service.js").EvidenceRequest, stepInstanceId: maybeString(input.step_instance_id), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "run_ack": return controller.acknowledgeRunEvents({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id), cursor: String(input.cursor), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "worker_launch": return launchWorkerTool(controller, input);
+    case "worker_attach": return attachWorkerTool(controller, input);
     case "flow_launch": return launchFlowTool(controller, input);
     case "run_observe":
       return controller.observeRun({ runId: String(input.run_id), threadId: maybeString(input.thread_id),

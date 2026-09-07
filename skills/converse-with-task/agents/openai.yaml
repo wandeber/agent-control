@@ -1,0 +1,4 @@
+interface:
+  display_name: "Converse with a task"
+  short_description: "Find a task and exchange messages with it"
+  default_prompt: "Use $converse-with-task to find the relevant existing task and exchange the requested message."

@@ -10,6 +10,7 @@ import type { AgentAdapter, AgentStatusSnapshot, EventRecord, EventType } from "
 import { handleTool } from "../src/tools/handlers.js";
 import { launchWorker, type WorkerLaunchOptions } from "../src/cli/worker.js";
 import { resolve } from "node:path";
+import { withMcpCaller } from "../src/core/caller-context.js";
 
 describe("run observation", () => {
   let directory: string;
@@ -96,6 +97,33 @@ describe("run observation", () => {
     expect(again).toMatchObject({ observer_agent_id: first.observer_agent_id, cursor: first.cursor, reused: true });
     expect(controller.listAgents({ runId: id })).toHaveLength(1);
     expect(controller.listSubscriptions({ runId: id })).toHaveLength(first.event_types.length);
+  });
+
+  it("lets an attached MCP requester reattach its own subscription without credentials", async () => {
+    const id = run().run_id;
+    const original = observe(id);
+    const result = await withMcpCaller({ threadId: "user-thread" }, () => handleTool(controller, "run_observe", {
+      run_id: id, event_types: ["agent.completed", "agent.blocked"]
+    }));
+    expect(result).toMatchObject({ observer_agent_id: original.observer_agent_id, reused: true,
+      cursor: original.cursor, event_types: ["agent.completed", "agent.blocked"] });
+    expect(controller.listAgents({ runId: id })).toHaveLength(1);
+  });
+
+  it("does not let caller convenience attach a foreign identity, run or missing MCP identity", async () => {
+    const id = run().run_id;
+    observe(id);
+    const other = run().run_id;
+    for (const [meta, input] of [
+      [{ threadId: "foreign-thread" }, { run_id: id, thread_id: "user-thread" }],
+      [{ threadId: "user-thread" }, { run_id: id, thread_id: "foreign-thread" }],
+      [{ threadId: "user-thread" }, { run_id: other }],
+      [undefined, { run_id: id, thread_id: "user-thread" }],
+      [{ threadId: "user-thread" }, { run_id: id, admin_key: "invalid" }]
+    ] as const) {
+      await expect(withMcpCaller(meta, () => handleTool(controller, "run_observe", input)))
+        .rejects.toMatchObject({ reason: "auth_required" });
+    }
   });
 
   it("keeps same-thread owner identity and authority without duplicate delivery", async () => {

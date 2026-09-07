@@ -259,6 +259,18 @@ or intentionally changing filters/delivery. Reattachment preserves the current
 filters and does not duplicate the agent. Retain the last acknowledged cursor;
 an idempotent launch response must not reset a cursor already being consumed.
 
+For existing Codex sessions, use `worker_attach` with the verified `thread_id`
+and optional `run_id`. Use `server` for the owning local or remote app-server.
+It registers/subscribes the requester and returns current control capabilities.
+Use `agent_send_message` to steer active work or continue the same idle session;
+use `agent_stop` for explicit interruption. Independent local CLI messages can
+be queued behind their active turn and resumed with the original profile. A
+queued receipt is not delivery or completion: keep waiting for that reply.
+Stopping cancels pending messages and interrupts the verified writer. Reattach with the owning endpoint
+when disconnected. Never create a replacement session or second active writer.
+Native work keeps native waits unless Agent Control was selected. Do not infer
+independent CLI liveness from desktop `wait_threads`; use `run_wait`.
+
 While any supervised Agent Control work is pending, keep the launching Codex
 turn open. Do not send a final response or rely on a notification to reactivate
 it. This applies to the conversational requester and to a separate Codex

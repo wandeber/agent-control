@@ -1,6 +1,7 @@
 import { ControllerError } from "./errors.js";
 import { verifyAdminKey } from "./identity.js";
 import { currentCodexThreadId } from "./caller-context.js";
+import { readCodexSession } from "../adapters/codex-session.js";
 /** Bootstrap local launches without exposing a coordinator token in task text. */
 export function prepareLaunchOwner(controller, input) {
     if (input.agentToken) {
@@ -26,6 +27,7 @@ export function prepareLaunchOwner(controller, input) {
     // headless coordinator must never acquire that conversation's native authority.
     const login = controller.orchestratorLogin({ adminKey: input.adminKey, title: `${input.title} coordinator`,
         runTitle: input.title, runId: input.runId, repoDir: input.repoDir, backend: threadId ? "codex-thread" : "manual", objective: input.title,
+        model: threadId ? readCodexSession(threadId)?.model ?? undefined : undefined,
         backendHandle: threadId ? { thread_id: threadId, agent_control_role: "orchestrator", cwd: input.repoDir } : undefined });
     return { agent: login.agent, runId: login.run.run_id, agentToken: login.agent_token };
 }

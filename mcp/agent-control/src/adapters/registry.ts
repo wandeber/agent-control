@@ -1,6 +1,7 @@
 import { ControllerError } from "../core/errors.js";
 import type { AgentAdapter } from "../core/types.js";
 import { CodexCliAdapter } from "./codex-cli-adapter.js";
+import { CodexSessionAdapter } from "./codex-session.js";
 import { CodexThreadAdapter } from "./codex-thread-adapter.js";
 import { CodexSubagentAdapter } from "./codex-subagent-adapter.js";
 import { ManualAdapter } from "./manual-adapter.js";
@@ -34,6 +35,7 @@ export function createDefaultAdapterRegistry(): AdapterRegistry {
   registry.register(new OpenCodeServerAdapter());
   registry.register(new CodexThreadAdapter());
   registry.register(new CodexCliAdapter());
+  registry.register(new CodexSessionAdapter());
   registry.register(new CodexSubagentAdapter());
   registry.register(new ManualAdapter());
   return registry;

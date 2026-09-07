@@ -443,6 +443,8 @@ export type AgentSendResult =
   | {
       agent: AgentRecord;
       delivered: false;
+      queued?: boolean;
+      message_id?: string;
       orchestrator_action: OrchestratorActionRef | null;
     };
 

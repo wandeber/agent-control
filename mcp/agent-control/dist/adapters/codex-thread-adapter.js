@@ -1,4 +1,5 @@
 import { ConnectionRecovery, connectWithStartup } from "./connection-recovery.js";
+import { sessionUsage } from "./codex-session.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -26,6 +27,7 @@ const CAPABILITIES = {
 };
 export class CodexThreadAdapter {
     kind = "codex-thread";
+    readUsage(handle) { return sessionUsage(handle); }
     capabilities() {
         return CAPABILITIES;
     }
@@ -508,7 +510,7 @@ function turnIdFromActivationNotification(notification, threadId) {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-class CodexAppServerClient {
+export class CodexAppServerClient {
     url;
     authToken;
     stdioCommand;

@@ -8,6 +8,10 @@ const requesterFields = {
     requester_event_types: z.array(z.enum(EVENT_TYPES)).min(1).optional(),
     requester_delivery: z.enum(["wait", "notify"]).optional()
 };
+export const workerAttachSchema = z.object({
+    ...requesterFields, profile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/).optional(), server: z.string().min(1).optional(), auth_token_file: z.string().min(1).optional(), thread_id: z.string().uuid(), title: z.string().min(1).optional(), run_id: z.string().min(1).optional(),
+    admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
+});
 export const workerLaunchSchema = z.object({
     ...requesterFields, title: z.string().min(1), prompt: z.string().min(1).optional(), prompt_file: z.string().min(1).optional(),
     repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), backend: z.string().min(1).optional(),

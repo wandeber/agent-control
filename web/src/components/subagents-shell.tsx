@@ -44,7 +44,6 @@ export function SubagentsShell() {
   const subagents = useMemo(
     () =>
       [...(snapshot?.agents ?? [])]
-        .filter((agent) => agent.role !== "orchestrator")
         .sort(compareAgents),
     [snapshot?.agents]
   );

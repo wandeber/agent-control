@@ -32,6 +32,7 @@ The plugin also ships Agent Control skills:
 - `flow-author` for designing declarative flow packages
 - `flow-configurator` for setting backend/model environment overrides
 - `flow-runner` for launching, resuming, and inspecting flows
+- `converse-with-task` for finding an existing project task, exchanging a requested message, and following its response through Agent Control or native Codex
 
 The controller does not plan, review, or decide semantic quality. It registers
 agents, starts work, sends messages, reads compact status, stops agents,
@@ -724,6 +725,48 @@ detached supervision. Keep the returned `observer` and use `run_wait` with its
 cursor. A report file is optional for ad hoc work. Declared flows have the
 corresponding `flow_launch` tool, accepting `title`, `repo_dir`, and either
 `flow_id` or `config`.
+
+Use `worker_attach` with an actual `thread_id` to incorporate an existing Codex
+session, including external-provider CLI sessions. Optional `run_id` groups
+sessions and `server` selects the owning local or remote app-server endpoint;
+`auth_token_file` references credentials without putting secrets in prompts.
+Attachment registers/subscribes the requesting conversation and discovers current
+control capabilities without starting a turn. Reattaching can reconnect the same
+card to its endpoint without resetting its usage baseline or observer cursor.
+
+`agent_send_message` steers a loaded active turn or starts another turn on the
+same idle identity; `agent_stop` interrupts through its owning app-server.
+Persisted terminal local sessions can resume on that endpoint with their model,
+provider and directory retained. Independently started local `codex exec` writers
+also support a CLI bridge: messages are persisted and queued behind the current
+turn, then resume the same UUID with the original profile, model, effort and
+sandbox settings. A queued receipt is not delivery or a worker reply. Profile
+and base configuration fingerprints prevent unnoticed configuration changes.
+Pass `profile` only when the original matching profile cannot be discovered.
+
+CLI interruption requires an exclusive writable rollout descriptor, standalone
+`codex exec` executable, PID and matching process birth time, all rechecked
+before SIGINT. Shared app-server/UI processes are never signalled. `agent_stop`
+also cancels pending messages. A detached supervisor keeps queued work alive
+across MCP reloads; a persisted dispatch fence prevents replay after uncertain
+supervisor failure and exposes it for reconciliation. No second writer or
+replacement session is created. Windows and remote control use the owning
+app-server connection. Run shutdown does not stop attached user work; explicit
+`agent_stop` does.
+
+Public rollout events (including completions between reads) and remote
+app-server status support `run_wait`/`run_ack`; observation is restored after
+restart. Native work retains native waits unless Agent Control was selected.
+Do not use desktop `wait_threads` as proof that an independent CLI writer has
+finished.
+
+Subagents includes the user conversation and orchestrators. Where local Codex
+usage records exist, attached participants contribute reported token increments
+since attachment; earlier history is excluded. Repeated identities for one
+thread are counted once per run. Unavailable counters stay unknown, and an
+interval spanning several models is labeled `Mixed models` rather than charged
+to the last model. These are reported increments, not exact time-based billing
+attribution for requests already in flight when attached.
 
 The equivalent CLI supports `--prompt` for inline task text or `--prompt-file`
 for an existing canonical prompt. Workflow callers can still require a report:

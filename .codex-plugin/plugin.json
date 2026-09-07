@@ -1,6 +1,6 @@
 {
   "name": "agent-control",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "Local agent control plane for declarative flows, native Codex subagent orchestration, supervision, and live inspection through MCP, CLI, and a native console.",
   "author": {
     "name": "wandeber",
@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "Agent Control",
     "shortDescription": "Declarative flows, native Codex subagents, CLI, and live console",
-    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering durable event subscriptions with renewable waits and explicit acknowledgement.",
+    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering durable event subscriptions with renewable waits and explicit acknowledgement. Find and converse with existing project tasks, attach their sessions and the requester to a shared run, and use native Codex communication when Agent Control is unavailable.",
     "developerName": "wandeber",
     "category": "Developer Tools",
     "capabilities": [

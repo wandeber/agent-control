@@ -110,6 +110,10 @@ export class AgentController {
                 // The durable unknown state remains visible for an explicit refresh.
             }
         }
+        for (const agent of this.store.listAgents()) {
+            if (agent.backend === "codex-session" && !agent.unregistered_at && agent.backend_handle)
+                this.armStatusWatcher(agent);
+        }
         this.redrivePendingNativeActionOwnerWakeups();
     }
     /**
@@ -210,8 +214,16 @@ export class AgentController {
     waitForRun(input) {
         return this.observations.wait(input);
     }
+    reconnectAttachedSession(agentId, connection) {
+        const agent = this.getAgent(agentId);
+        if (agent.backend !== "codex-session")
+            return agent;
+        const updated = this.store.updateAgent(agentId, { backendHandle: { ...agent.backend_handle, ...connection } });
+        this.armStatusWatcher(updated);
+        return updated;
+    }
     isAttachedParticipant(agent) {
-        return isPassiveObserver(agent) || this.observations.isAttached(agent.agent_id);
+        return agent.backend === "codex-session" || isPassiveObserver(agent) || this.observations.isAttached(agent.agent_id);
     }
     samePublicActivity(previous, value) {
         const activity = parseActivity(value);
@@ -2437,6 +2449,8 @@ export class AgentController {
                 label: input.role ?? null
             });
         }
+        if (agent.backend === "codex-session" && agent.backend_handle)
+            this.armStatusWatcher(agent);
         return { ...agent, agent_token: agentToken };
     }
     listAgents(input = {}) {
@@ -4846,6 +4860,11 @@ export class AgentController {
         const agent = this.getAgent(agentId);
         if (this.isAttachedParticipant(agent)) {
             const adapter = this.adapters.get(agent.backend);
+            if (agent.backend === "codex-session") {
+                const receipt = await adapter.sendMessageWithReceipt(this.requireHandle(agent), message);
+                this.armStatusWatcher(agent);
+                return { agent: await this.refreshAgentStatus(agentId), ...receipt };
+            }
             if (!adapter.stageNotification)
                 throw new ControllerError("Safe notification staging is unavailable.", "unsupported_operation");
             await adapter.stageNotification(this.requireHandle(agent), { message });
@@ -5019,7 +5038,7 @@ export class AgentController {
     }
     async refreshAgentStatus(agentId) {
         const agent = this.getAgent(agentId);
-        if (agent.unregistered_at || TERMINAL_STATUSES.has(agent.status)) {
+        if (agent.unregistered_at || (agent.backend !== "codex-session" && TERMINAL_STATUSES.has(agent.status))) {
             return agent;
         }
         if (!agent.backend_handle &&
@@ -5051,7 +5070,7 @@ export class AgentController {
             const projection = this.store.immediateTransaction(() => {
                 let current = this.getAgent(agent.agent_id);
                 if (current.unregistered_at ||
-                    TERMINAL_STATUSES.has(current.status) ||
+                    (current.backend !== "codex-session" && TERMINAL_STATUSES.has(current.status)) ||
                     current.work_generation !== observedWorkGeneration ||
                     current.work_revision !== observedWorkRevision ||
                     !stableJsonEquals(current.backend_handle, observedBackendHandle)) {
@@ -5158,7 +5177,7 @@ export class AgentController {
         const projection = this.store.immediateTransaction(() => {
             let current = this.getAgent(agent.agent_id);
             if (current.unregistered_at ||
-                TERMINAL_STATUSES.has(current.status) ||
+                (current.backend !== "codex-session" && TERMINAL_STATUSES.has(current.status)) ||
                 current.work_generation !== observedWorkGeneration ||
                 current.work_revision !== observedWorkRevision ||
                 !stableJsonEquals(current.backend_handle, observedBackendHandle)) {
@@ -5215,13 +5234,20 @@ export class AgentController {
             }
             const changed = snapshot.status !== current.status ||
                 snapshotFailureReason !== current.failure_reason;
-            const updated = changed
+            let updated = changed
                 ? this.store.updateAgent(current.agent_id, {
                     status: snapshot.status,
                     failureReason: snapshotFailureReason
                 })
                 : this.store.updateAgent(current.agent_id, {});
-            if (changed) {
+            if (current.backend === "codex-session" && typeof snapshot.data?.observed_event_index === "number") {
+                const events = snapshot.data.observed_events;
+                for (const event of events ?? [])
+                    pendingEvents.push(this.store.createEvent({ runId: current.run_id, agentId: current.agent_id,
+                        type: event.type, payload: { turn_id: event.turn_id, text: event.text, source: "codex.rollout" } }));
+                updated = this.store.updateAgent(current.agent_id, { backendHandle: { ...current.backend_handle, observed_event_index: snapshot.data.observed_event_index } });
+            }
+            if (changed && (current.backend !== "codex-session" || current.backend_handle?.remote_session || snapshot.status === "blocked" || current.status === "blocked")) {
                 pendingEvents.push(this.store.createEvent({
                     runId: updated.run_id,
                     agentId: updated.agent_id,
@@ -5247,7 +5273,7 @@ export class AgentController {
         for (const event of pendingEvents) {
             this.scheduleEventDelivery(event);
         }
-        if (projection.projectedTerminal) {
+        if (projection.projectedTerminal && projection.agent.backend !== "codex-session") {
             this.disarmStatusWatcher(projection.agent.agent_id);
         }
         else if (projection.deferredInvoking &&
@@ -5534,6 +5560,11 @@ export class AgentController {
     }
     async stopAgent(agentId, mode = "graceful") {
         let agent = this.getAgent(agentId);
+        if (agent.backend === "codex-session") {
+            const adapter = this.adapters.get(agent.backend);
+            await adapter.stop(this.requireHandle(agent), { mode });
+            return this.refreshAgentStatus(agentId);
+        }
         if (this.isAttachedParticipant(agent))
             return agent;
         // Capture intent before this call writes its own transient `stopping`
@@ -6283,6 +6314,17 @@ export class AgentController {
                     });
             }
             catch { /* Usage is optional; retain stored observations if the backend is unavailable. */ }
+        }
+        // Multiple identities may refer to one physical thread; count its usage only once per run.
+        const usageThreads = new Set();
+        for (const agent of agents) {
+            const threadId = agent.backend_handle?.thread_id;
+            if (typeof threadId !== "string" || !latestUsageByAgent.has(agent.agent_id))
+                continue;
+            if (usageThreads.has(threadId))
+                latestUsageByAgent.delete(agent.agent_id);
+            else
+                usageThreads.add(threadId);
         }
         const statusCounts = emptyStatusCounts();
         for (const agent of agents) {
