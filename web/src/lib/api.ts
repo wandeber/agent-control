@@ -13,6 +13,7 @@ import {
 } from "./mcp-app";
 import { SerialRefreshCoordinator } from "./refresh-coordinator";
 import { snapshotStreamIsLoading } from "./snapshot-stream-state";
+import { combineRunSnapshots } from "./run-snapshots";
 import type { AgentLogTail, AgentMessage, DashboardSnapshot, SocketPayload } from "./types";
 import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
 
@@ -116,6 +117,7 @@ export async function fetchSnapshot(runId?: string | null): Promise<DashboardSna
     return result.snapshot;
   }
 
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
   const url = new URL(`${controlApiBase()}/api/control/snapshot`);
   if (runId) {
     url.searchParams.set("run_id", runId);
@@ -125,6 +127,15 @@ export async function fetchSnapshot(runId?: string | null): Promise<DashboardSna
     throw new Error(`Snapshot request failed: ${response.status}`);
   }
   return (await response.json()) as DashboardSnapshot;
+}
+
+async function fetchBrowserSnapshots(runIds: string[]): Promise<DashboardSnapshot[]> {
+  if (shouldTryMcpApp()) throw new Error("Multiple runs are only available in the browser console.");
+  const url = new URL(`${controlApiBase()}/api/control/snapshots`);
+  for (const id of runIds) url.searchParams.append("run_id", id);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Snapshot request failed: ${response.status}`);
+  return await response.json() as DashboardSnapshot[];
 }
 
 export async function fetchAgentMessages(agentId: string, limit = 12): Promise<AgentMessage[]> {
@@ -137,6 +148,7 @@ export async function fetchAgentMessages(agentId: string, limit = 12): Promise<A
     return result.messages;
   }
 
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
   const url = new URL(`${controlApiBase()}/api/control/agents/${encodeURIComponent(agentId)}/messages`);
   url.searchParams.set("limit", String(limit));
   const response = await fetch(url);
@@ -156,6 +168,7 @@ export async function fetchAgentLog(agentId: string, maxChars = 16000): Promise<
     return result.log;
   }
 
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
   const url = new URL(`${controlApiBase()}/api/control/agents/${encodeURIComponent(agentId)}/log`);
   url.searchParams.set("max_chars", String(maxChars));
   const response = await fetch(url);
@@ -176,11 +189,17 @@ export function useSnapshotStream(
   selectedRunId: string | null,
   selectedAgentId: string | null,
   followLatestRun = false,
-  selectedAgentMessageLimit = 48
+  selectedAgentMessageLimit = 48,
+  selectedRunIds: string[] = []
 ) {
   const queryClient = useQueryClient();
   const mcpMode = shouldTryMcpApp();
-  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(() => getCachedMcpConsoleState().snapshot);
+  const [runSnapshots, setRunSnapshots] = useState<DashboardSnapshot[]>(() => {
+    const cached = getCachedMcpConsoleState().snapshot;
+    return cached ? [cached] : [];
+  });
+  const snapshot = useMemo(() => combineRunSnapshots(runSnapshots), [runSnapshots]);
+  const setSnapshot = useCallback((value: DashboardSnapshot) => setRunSnapshots([value]), []);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [agentLog, setAgentLog] = useState<AgentLogTail | null>(null);
   const [agentError, setAgentError] = useState<Error | null>(null);
@@ -190,6 +209,7 @@ export function useSnapshotStream(
   const refreshCoordinator = useRef<SerialRefreshCoordinator<McpRefreshPayload> | null>(null);
   refreshCoordinator.current ??= new SerialRefreshCoordinator<McpRefreshPayload>(1400);
   const requestedRunId = followLatestRun ? null : selectedRunId;
+  const requestedIdsKey = JSON.stringify(mcpMode || followLatestRun ? [] : selectedRunIds.length ? selectedRunIds : requestedRunId ? [requestedRunId] : []);
   const requestedMessageLimit = Math.max(1, Math.trunc(selectedAgentMessageLimit));
   // Keep browser/WebSocket effect dependencies stable when only its separate
   // React Query history limit changes. The serial coordinator is the sole
@@ -197,8 +217,8 @@ export function useSnapshotStream(
   const mcpMessageLimit = mcpMode ? requestedMessageLimit : 0;
 
   const query = useQuery({
-    queryKey: ["snapshot", requestedRunId],
-    queryFn: () => fetchSnapshot(requestedRunId),
+    queryKey: ["snapshots", requestedIdsKey],
+    queryFn: () => fetchBrowserSnapshots(JSON.parse(requestedIdsKey) as string[]),
     // MCP mode has its own serial coordinator. Enabling this query there would
     // create a second polling loop whose tool calls can overlap and return in
     // the wrong selection order.
@@ -208,7 +228,7 @@ export function useSnapshotStream(
 
   useEffect(() => {
     if (!mcpMode && query.data) {
-      setSnapshot(query.data);
+      setRunSnapshots(query.data);
     }
   }, [mcpMode, query.data]);
 
@@ -296,17 +316,19 @@ export function useSnapshotStream(
       socket = new WebSocket(controlWsUrl());
       socket.addEventListener("open", () => {
         setConnection("live");
-        socket?.send(JSON.stringify({ type: "select", run_id: requestedRunId, agent_id: selectedAgentId }));
+        socket?.send(JSON.stringify({ type: "select", run_ids: JSON.parse(requestedIdsKey), agent_id: selectedAgentId }));
       });
       socket.addEventListener("message", (event) => {
+        if (closed) return;
         setConnection("live");
         const payload = JSON.parse(String(event.data)) as SocketPayload;
         if (payload.type === "snapshot") {
-          if (requestedRunId && payload.snapshot.selected_run_id !== requestedRunId) {
+          const values = payload.snapshots ?? [payload.snapshot];
+          if (requestedIdsKey !== "[]" && JSON.stringify(values.map(value => value.selected_run_id)) !== requestedIdsKey) {
             return;
           }
-          setSnapshot(payload.snapshot);
-          for (const item of payload.snapshot.latest_events) {
+          setRunSnapshots(values);
+          for (const item of values.flatMap(value => value.latest_events)) {
             lastEventIds.current.add(item.event_id);
           }
         } else if (payload.type === "event") {
@@ -339,7 +361,7 @@ export function useSnapshotStream(
       }
       socket?.close();
     };
-  }, [mcpMessageLimit, mcpMode, queryClient, requestedRunId, selectedAgentId]);
+  }, [mcpMessageLimit, mcpMode, queryClient, requestedRunId, requestedIdsKey, selectedAgentId, setSnapshot]);
 
   const refresh = useCallback(() => {
     if (mcpMode) {
@@ -356,6 +378,7 @@ export function useSnapshotStream(
 
   return {
     snapshot,
+    runSnapshots,
     selectedRun,
     connection,
     agentLog,

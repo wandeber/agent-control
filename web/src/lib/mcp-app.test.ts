@@ -3,6 +3,20 @@ import { McpConsoleNotificationStore } from "./mcp-app";
 import type { DashboardSnapshot } from "./types";
 
 describe("McpConsoleNotificationStore", () => {
+  it("retains the opener id across input notifications and ignores late results from retired panels", () => {
+    const store = new McpConsoleNotificationStore();
+    const result = (panel_id: string, action?: string) => ({ structuredContent: {
+      snapshot: dashboardSnapshot(panel_id), console: { panel_id, requested_run_id: null, follow_latest: true, ...(action ? { action, command_id: "late-command" } : {}) }
+    } });
+    store.applyToolResult(result("first"));
+    store.applyToolInput({ arguments: { run_id: "selected" } });
+    expect(store.current().console?.panel_id).toBe("first");
+    store.applyToolResult(result("second"));
+    store.applyToolResult(result("first", "close"));
+    expect(store.current().console?.panel_id).toBe("second");
+    expect(store.current().console?.action).toBeUndefined();
+    expect(store.current().snapshot?.selected_run_id).toBe("second");
+  });
   it("rejects notifications from any source other than the parent host", () => {
     const host = {} as MessageEventSource;
     const foreign = {} as MessageEventSource;

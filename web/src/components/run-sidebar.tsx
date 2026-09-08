@@ -1,8 +1,9 @@
 "use client";
 
-import { Search } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ChevronRight, Folder, Search } from "lucide-react";
+import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { elapsedFrom, formatDuration } from "@/lib/format";
+import { shouldTryMcpApp } from "@/lib/mcp-app";
 import type { DashboardSnapshot, RunRecord } from "@/lib/types";
 import { EmptyState } from "./ui";
 
@@ -14,33 +15,61 @@ interface RunTreeRow {
 export function RunSidebar({
   snapshot,
   selectedRunId,
+  selectedRunIds = [],
   onSelectRun
 }: {
   snapshot: DashboardSnapshot | null;
   selectedRunId: string | null;
-  onSelectRun: (runId: string) => void;
+  selectedRunIds?: string[];
+  onSelectRun: (runId: string, additive: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [groupByDirectory, setGroupByDirectory] = useState(false);
+  const [collapsed, setCollapsed] = useState<Set<string | null>>(() => new Set());
+  useEffect(() => setGroupByDirectory(!shouldTryMcpApp()), []);
   const runs = useMemo(() => {
     const values = snapshot?.runs ?? [];
     const needle = query.trim().toLowerCase();
     return buildRunRows(values, needle);
   }, [query, snapshot?.runs]);
+  const groups = useMemo(() => {
+    if (!groupByDirectory) return [];
+    const directories = new Map<string | null, RunRecord[]>();
+    for (const run of snapshot?.runs ?? []) {
+      const directory = run.repo_dir || null;
+      const entries = directories.get(directory) ?? [];
+      entries.push(run);
+      directories.set(directory, entries);
+    }
+    return [...directories].map(([directory, entries]) => ({
+      directory,
+      rows: buildRunRows(entries, query.trim().toLowerCase())
+    })).filter(group => group.rows.length > 0);
+  }, [groupByDirectory, query, snapshot?.runs]);
+
+  const renderRows = (rows: RunTreeRow[]) => (
+    <div className="flex flex-col divide-y divide-[var(--line)]">
+      {rows.map(({ run, depth }) => (
+        <div key={run.run_id} style={{ paddingLeft: `${depth * 12}px` }}>
+          <RunRow depth={depth} run={run} selected={selectedRunIds.includes(run.run_id) || run.run_id === selectedRunId}
+            onClick={(event) => onSelectRun(run.run_id, groupByDirectory && (event.ctrlKey || event.metaKey))} />
+        </div>
+      ))}
+    </div>
+  );
 
   return (
     <aside className="flex h-full min-w-0 flex-col border-r border-black/10 bg-white/72 backdrop-blur-xl">
       <div className="border-b border-black/10 p-3">
-        <div className="flex items-center gap-2">
-          <div>
-            <h1 className="text-sm font-semibold text-ink-900">Agent Control</h1>
-            <p className="text-[11px] text-ink-400">Realtime worker console</p>
-          </div>
-        </div>
-        <label className="mt-3 flex items-center gap-2 rounded-lg border border-black/10 bg-white px-2.5 py-2 text-xs text-ink-400 shadow-hairline">
+        <label className="flex items-center gap-2 rounded-lg border border-black/10 bg-white px-2.5 py-2 text-xs text-ink-400 shadow-hairline">
           <Search className="size-3.5" />
           <input
             className="min-w-0 flex-1 bg-transparent text-xs text-ink-900 outline-none placeholder:text-ink-300"
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              // Search results must not remain hidden inside a collapsed directory.
+              if (event.target.value.trim()) setCollapsed(new Set());
+            }}
             placeholder="Search runs, repos, ids"
             value={query}
           />
@@ -50,20 +79,34 @@ export function RunSidebar({
       <div className="agent-scroll min-h-0 flex-1 overflow-auto p-2">
         {runs.length === 0 ? (
           <EmptyState detail="Create an Agent Control run and it will appear here automatically." title="No runs yet" />
-        ) : (
-          <div className="flex flex-col gap-1.5">
-            {runs.map(({ run, depth }) => (
-              <div key={run.run_id} style={{ paddingLeft: `${depth * 12}px` }}>
-                <RunRow
-                  depth={depth}
-                  run={run}
-                  selected={run.run_id === selectedRunId}
-                  onClick={() => onSelectRun(run.run_id)}
-                />
-              </div>
-            ))}
+        ) : groupByDirectory ? (
+          <div className="flex flex-col gap-3">
+            {groups.map(({ directory, rows }) => {
+              const expanded = !collapsed.has(directory);
+              const label = directory?.split(/[\\/]/).filter(Boolean).at(-1) ?? directory ?? "No directory";
+              return (
+                <section key={directory ?? ""} aria-label={directory ?? "No directory"}>
+                  <button type="button" aria-expanded={expanded} title={directory ?? "No directory"}
+                    className="mb-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-[var(--raised)]"
+                    onClick={() => setCollapsed(current => {
+                      const next = new Set(current);
+                      if (next.has(directory)) next.delete(directory); else next.add(directory);
+                      return next;
+                    })}>
+                    <ChevronRight aria-hidden="true" className={`size-3.5 shrink-0 text-ink-400 transition-transform ${expanded ? "rotate-90" : ""}`} />
+                    <Folder aria-hidden="true" className="size-4 shrink-0 text-ink-400" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-semibold text-ink-900">{label}</span>
+                      {directory && directory !== label ? <span className="truncate-start block text-[10px] text-ink-400">{directory}</span> : null}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-ink-400">{rows.length} {rows.length === 1 ? "run" : "runs"}</span>
+                  </button>
+                  {expanded ? renderRows(rows) : null}
+                </section>
+              );
+            })}
           </div>
-        )}
+        ) : renderRows(runs)}
       </div>
     </aside>
   );
@@ -78,24 +121,25 @@ function RunRow({
   depth: number;
   run: RunRecord;
   selected: boolean;
-  onClick: () => void;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
 }) {
   const elapsed = formatDuration(elapsedFrom(run.created_at, run.status === "active" ? null : run.updated_at));
   const runPath = run.repo_dir ?? run.run_id;
   return (
     <button
+      aria-current={selected ? "true" : undefined}
       className={[
-        "w-full rounded-lg border px-2.5 py-2 text-left transition",
+        "w-full px-2.5 py-2.5 text-left transition-colors",
         selected
-          ? "border-teal-300 bg-teal-50/80 shadow-hairline"
-          : "border-transparent bg-white/46 hover:border-black/10 hover:bg-white/80"
+          ? "bg-[var(--raised)]"
+          : "bg-transparent hover:bg-[var(--raised)]"
       ].join(" ")}
       onClick={onClick}
       type="button"
     >
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0 truncate text-xs font-semibold text-ink-900">{run.title}</div>
-        <span className="shrink-0 whitespace-nowrap rounded bg-black/5 px-1.5 py-0.5 text-[10px] font-medium text-ink-500">{elapsed}</span>
+        <span className="shrink-0 whitespace-nowrap text-[10px] font-medium text-ink-500">{elapsed}</span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2">
         <div className="truncate-start min-w-0 text-[11px] text-ink-400" title={runPath}>

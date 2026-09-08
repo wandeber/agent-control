@@ -1,6 +1,6 @@
 export interface ConsoleSnapshotProvider<TSnapshot> {
   pollActiveAgents(runId?: string): Promise<unknown>;
-  getDashboardSnapshot(runId?: string | null): TSnapshot;
+  getDashboardSnapshot(runId?: string | null, scope?: { threadId: string | null }): TSnapshot;
 }
 
 export type ConsoleSnapshotContent<TSnapshot> = Record<string, unknown> & {
@@ -19,11 +19,12 @@ const refreshes = new WeakMap<object, Set<string>>();
 
 export async function loadConsoleSnapshot<TSnapshot>(
   controller: ConsoleSnapshotProvider<TSnapshot>,
-  runId?: string
+  runId?: string,
+  scope?: { threadId: string | null }
 ): Promise<ConsoleSnapshotContent<TSnapshot>> {
   // Following the latest run must not poll every historical backend. Apart
   // from wasting CPU, unavailable old endpoints delay the selected chat.
-  const initial = runId ? null : controller.getDashboardSnapshot();
+  const initial = controller.getDashboardSnapshot(runId, scope);
   const latestRunId = initial && typeof initial === "object" && "selected_run_id" in initial
     ? initial.selected_run_id : null;
   const effectiveRunId = runId ?? (typeof latestRunId === "string" ? latestRunId : undefined);
@@ -38,7 +39,7 @@ export async function loadConsoleSnapshot<TSnapshot>(
     }
   }
   return {
-    snapshot: controller.getDashboardSnapshot(runId),
+    snapshot: initial,
     console: {
       requested_run_id: runId ?? null,
       follow_latest: !runId

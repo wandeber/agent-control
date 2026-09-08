@@ -387,7 +387,7 @@ export interface AgentMessage {
 }
 
 export type SocketPayload =
-  | { type: "snapshot"; snapshot: DashboardSnapshot }
+  | { type: "snapshot"; snapshot: DashboardSnapshot; snapshots?: DashboardSnapshot[] }
   | { type: "event"; event: EventRecord }
   | { type: "agent_messages"; agent_id: string; messages: AgentMessage[] }
   | { type: "agent_log"; log: AgentLogTail }

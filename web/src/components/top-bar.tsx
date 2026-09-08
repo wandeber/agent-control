@@ -7,6 +7,7 @@ import { IconButton } from "./ui";
 
 export function TopBar({
   run,
+  selectionTitle,
   inspectorOpen,
   runsOpen,
   onFit,
@@ -14,6 +15,7 @@ export function TopBar({
   onOpenRuns,
 }: {
   run: RunRecord | null;
+  selectionTitle?: string;
   connection: ConnectionState;
   inspectorOpen?: boolean;
   runsOpen?: boolean;
@@ -27,10 +29,10 @@ export function TopBar({
       <div className="flex min-w-0 items-center gap-3">
         <IconButton active={runsOpen} icon={GitBranch} label="Runs" onClick={onOpenRuns} />
         <div className="min-w-0">
-          <h2 className="truncate text-sm font-semibold text-ink-900">{run?.title ?? "No run selected"}</h2>
-          <p className="truncate-start text-[11px] text-ink-400" title={runPath}>
+          <h2 className="truncate text-sm font-semibold text-ink-900">{selectionTitle ?? run?.title ?? "No run selected"}</h2>
+          {!selectionTitle ? <p className="truncate-start text-[11px] text-ink-400" title={runPath}>
             {runPath}
-          </p>
+          </p> : null}
         </div>
 
       </div>

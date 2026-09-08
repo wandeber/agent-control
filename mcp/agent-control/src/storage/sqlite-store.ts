@@ -204,6 +204,29 @@ export class SqliteStore {
     return rows.map((row) => this.runFromRow(row));
   }
 
+  listConsoleRuns(threadId?: string | null): RunRecord[] {
+    if (threadId === null) return [];
+    // Include registered/requesting conversations and their nested work, never
+    // unrelated runs merely because they share a project or MCP process.
+    const rows = threadId === undefined
+      ? this.db.prepare("select * from runs order by created_at desc, run_id").all()
+      : this.db.prepare(`with recursive associated(run_id) as (
+          select run_id from run_requesters where thread_id = @threadId
+          union select run_id from run_observers where thread_id = @threadId
+          union select run_id from agents where backend in ('codex-thread', 'codex-cli')
+            and json_extract(backend_handle_json, '$.thread_id') = @threadId
+          union select run_id from agents where backend = 'codex-subagent'
+            and json_extract(backend_handle_json, '$.native_agent_id') = @threadId
+          union select r.run_id from runs r join agents a on a.agent_id = r.created_by_agent_id
+            where (a.backend in ('codex-thread', 'codex-cli')
+              and json_extract(a.backend_handle_json, '$.thread_id') = @threadId)
+            or (a.backend = 'codex-subagent' and json_extract(a.backend_handle_json, '$.native_agent_id') = @threadId)
+          union select r.run_id from runs r join associated p on r.parent_run_id = p.run_id
+        ) select r.* from runs r join associated a on a.run_id = r.run_id
+          order by r.created_at desc, r.run_id`).all({ threadId });
+    return (rows as Row[]).map(row => this.runFromRow(row));
+  }
+
   listRunsByStatus(status: string): RunRecord[] {
     const rows = this.db
       .prepare("select * from runs where status = ? order by created_at asc")

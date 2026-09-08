@@ -6278,8 +6278,11 @@ export class AgentController {
             tail: text.slice(Math.max(0, text.length - maxChars))
         };
     }
-    getDashboardSnapshot(runId) {
-        const runs = this.listRuns(100);
+    getDashboardSnapshot(runId, scope) {
+        const runs = this.store.listConsoleRuns(scope?.threadId);
+        if (scope && runId && !runs.some(run => run.run_id === runId)) {
+            throw new ControllerError("This run is not associated with this Codex conversation.", "auth_required");
+        }
         const selectedRunId = runId ?? runs[0]?.run_id ?? null;
         const agents = selectedRunId
             ? this.listAgents({ runId: selectedRunId, includeUnregistered: true })

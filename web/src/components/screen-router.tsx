@@ -1,10 +1,11 @@
 "use client";
 
-import { Users, Workflow, RefreshCw } from "lucide-react";
+import { Users, Workflow, RefreshCw, Maximize2, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ConsoleSelectionProvider, useConsoleSelection } from "./console-selection";
 import { ConsoleShell } from "./console-shell";
 import { SubagentsShell } from "./subagents-shell";
+import { getMcpAppClient, shouldTryMcpApp } from "@/lib/mcp-app";
 
 export function ScreenRouter() {
   const [screen, setScreen] = useState("subagents");
@@ -34,7 +35,7 @@ export function ScreenRouter() {
           }} type="button">
             {fullConsole ? <Users className="size-4" /> : <Workflow className="size-4" />}
             {fullConsole ? "Subagents" : "Full Console"}
-          </button></div>
+          </button><BrowserConsoleButton screen={screen} /></div>
         </nav>
         <div className="agent-control-screen">
           {fullConsole ? <ConsoleShell onOpenConversation={() => { setScreen("subagents"); try { window.location.hash = "/subagents"; } catch { /* Keep in-memory navigation in opaque hosts. */ } }} /> : <SubagentsShell />}
@@ -55,4 +56,30 @@ function ConnectionIndicator() {
 function RefreshButton() {
   const { refreshCurrentScreen } = useConsoleSelection();
   return <button type="button" className="screen-navigation-link" aria-label="Refresh" title="Refresh" onClick={refreshCurrentScreen}><RefreshCw className="size-4" /></button>;
+}
+
+function BrowserConsoleButton({ screen }: { screen: string }) {
+  const { selectedRunId } = useConsoleSelection();
+  const [embedded, setEmbedded] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setEmbedded(shouldTryMcpApp()), []);
+  if (!embedded) return null;
+  const open = async () => {
+    setOpening(true);
+    setFailed(false);
+    try {
+      const client = await getMcpAppClient();
+      if (!client) throw new Error("Console unavailable");
+      await client.callTool("agent_control_console_open_browser", { screen, ...(selectedRunId ? { run_id: selectedRunId } : {}) });
+    } catch {
+      setFailed(true);
+    } finally { setOpening(false); }
+  };
+  return <>
+    {failed ? <span role="status" className="text-xs text-ink-400">Could not open browser. Try again.</span> : null}
+    <button type="button" className="screen-navigation-link" aria-label="Full screen" title="Open all runs in your browser" disabled={opening} onClick={() => void open()}>
+      {opening ? <LoaderCircle className="size-4 animate-spin" /> : <Maximize2 className="size-4" />}
+    </button>
+  </>;
 }

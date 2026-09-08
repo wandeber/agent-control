@@ -41,6 +41,7 @@ interface McpHostContext {
 }
 
 export interface ConsoleSelectionState {
+  panel_id?: string;
   requested_run_id: string | null;
   follow_latest: boolean;
   action?: "reuse" | "close";
@@ -65,6 +66,7 @@ const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
  */
 export class McpConsoleNotificationStore {
   private readonly listeners = new Set<ConsoleStateListener>();
+  private readonly retiredPanels = new Set<string>();
   private state: McpConsoleState = { snapshot: null, console: null };
 
   consume(event: Pick<MessageEvent, "data" | "source">, expectedSource: MessageEventSource | null): boolean {
@@ -125,6 +127,10 @@ export class McpConsoleNotificationStore {
 
     const snapshot = isDashboardSnapshot(structured.snapshot) ? structured.snapshot : undefined;
     const consoleState = parseConsoleSelection(structured.console);
+    const nextPanel = consoleState?.panel_id;
+    if (nextPanel && this.retiredPanels.has(nextPanel)) return;
+    const previousPanel = this.state.console?.panel_id;
+    if (nextPanel && previousPanel && nextPanel !== previousPanel) this.retiredPanels.add(previousPanel);
     if (!snapshot && !consoleState) {
       return;
     }
@@ -146,7 +152,7 @@ export class McpConsoleNotificationStore {
   private publish(patch: { snapshot?: DashboardSnapshot; console?: ConsoleSelectionState }): void {
     this.state = {
       snapshot: patch.snapshot ?? this.state.snapshot,
-      console: patch.console ?? this.state.console
+      console: patch.console ? { ...patch.console, panel_id: patch.console.panel_id ?? this.state.console?.panel_id } : this.state.console
     };
     for (const listener of this.listeners) {
       listener(this.state);
@@ -253,14 +259,20 @@ class AgentControlMcpAppClient {
 
   async callTool<T extends Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> {
     await this.connect();
+    const panelId = name.startsWith("agent_control_console_") ? await waitForConsolePanel() : undefined;
     const result = await this.request<CallToolResult>(
       "tools/call",
       {
         name,
-        arguments: args
+        arguments: panelId
+          ? { ...args, panel_id: panelId }
+          : args
       },
-      10000
+      name === "agent_control_console_open_browser" ? 15000 : 10000
     );
+    if (panelId && consoleNotifications.current().console?.panel_id !== panelId) {
+      throw new Error("The console panel has been reopened.");
+    }
     if (result.isError) {
       throw new Error(firstTextContent(result) ?? `MCP tool ${name} failed.`);
     }
@@ -330,6 +342,23 @@ class AgentControlMcpAppClient {
 
 let clientPromise: Promise<AgentControlMcpAppClient | null> | null = null;
 
+function waitForConsolePanel(): Promise<string> {
+  const current = consoleNotifications.current().console?.panel_id;
+  if (current) return Promise.resolve(current);
+  // The bridge can initialize before the host delivers the opening result.
+  // Wait for its scope instead of issuing an unscoped first refresh.
+  return new Promise((resolvePanel, reject) => {
+    let unsubscribe = () => {};
+    const timer = setTimeout(() => { unsubscribe(); reject(new Error("Waiting for the Codex console identity.")); }, 5000);
+    unsubscribe = consoleNotifications.subscribe(state => {
+      if (!state.console?.panel_id) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolvePanel(state.console.panel_id);
+    });
+  });
+}
+
 export function shouldTryMcpApp(): boolean {
   return typeof window !== "undefined" && window.parent !== window;
 }
@@ -397,11 +426,13 @@ function parseConsoleSelection(value: unknown): ConsoleSelectionState | null {
   const requestedRunId = nonEmptyString(record.requested_run_id);
   const action = record.action === "reuse" || record.action === "close" ? record.action : undefined;
   const commandId = nonEmptyString(record.command_id);
+  const panelId = nonEmptyString(record.panel_id);
   return {
     requested_run_id: requestedRunId,
     follow_latest: typeof record.follow_latest === "boolean" ? record.follow_latest : !requestedRunId,
     ...(action ? { action } : {}),
-    ...(commandId ? { command_id: commandId } : {})
+    ...(commandId ? { command_id: commandId } : {}),
+    ...(panelId ? { panel_id: panelId } : {})
   };
 }
 

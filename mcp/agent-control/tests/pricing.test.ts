@@ -52,10 +52,10 @@ describe("pricing configuration and run aggregation", () => {
       for (let i = 0; i < 2; i++) expect(controller.getDashboardSnapshot(run.run_id).costs?.total.total).toEqual({ usd: 3.55, partial: false });
       writeFileSync(join(root, ".agents", "pricing.toml"), '[models."gpt-6-astra"]\noutput_per_million=25\n');
       expect(controller.getDashboardSnapshot(run.run_id).costs?.total.total).toEqual({ usd: 3.3, partial: false });
-      // A selected historical run can fall outside the recent-run menu.
-      vi.spyOn(controller, "listRuns").mockReturnValueOnce([]);
+      // Historical project rates must survive more than 100 unrelated runs.
+      for (let i = 0; i < 101; i++) controller.createRun({ title: `Other run ${i}`, repoDir: root });
       const historicalSnapshot = controller.getDashboardSnapshot(run.run_id);
-      expect(historicalSnapshot.runs).toHaveLength(0);
+      expect(historicalSnapshot.runs).toHaveLength(102);
       expect(historicalSnapshot.costs?.total.total).toEqual({ usd: 3.3, partial: false });
       expect(controller.listUsageSnapshots({ runId: run.run_id })).toHaveLength(0);
     } finally { await controller.dispose(); store.close(); }

@@ -11,6 +11,7 @@ export interface ControlServerOptions {
 
 interface SocketState {
   runId: string | null;
+  runIds: string[];
   agentId: string | null;
   seenEventIds: Set<string>;
   lastLogBytes: number;
@@ -88,6 +89,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
   wss.on("connection", (client) => {
     const state: SocketState = {
       runId: null,
+      runIds: [],
       agentId: null,
       seenEventIds: new Set(controller.listEvents({ limit: 100 }).map((event) => event.event_id)),
       lastLogBytes: 0,
@@ -100,24 +102,29 @@ export async function startControlServer(options: ControlServerOptions): Promise
 
     client.on("message", (raw) => {
       try {
-        const message = JSON.parse(String(raw)) as { type?: string; run_id?: string | null; agent_id?: string | null };
+        const message = JSON.parse(String(raw)) as { type?: string; run_id?: string | null; run_ids?: string[]; agent_id?: string | null };
         if (message.type === "select") {
-          state.runId = message.run_id ?? state.runId;
+          state.runIds = [...new Set(message.run_ids ?? (message.run_id ? [message.run_id] : []))];
+          if (!state.runIds.every(id => typeof id === "string" && id.length > 0)) throw new Error("Invalid run selection.");
+          state.runId = state.runIds[0] ?? null;
           state.agentId = message.agent_id ?? null;
           state.lastLogBytes = 0;
           state.lastMessageSignature = "";
-          sendSocket(client, {
-            type: "snapshot",
-            snapshot: controller.getDashboardSnapshot(state.runId)
-          });
+          sendSelectedSnapshots(controller, client, state);
         }
       } catch {
         sendSocket(client, { type: "error", error: "Invalid websocket message." });
       }
     });
 
+    let ticking = false;
     const timer = setInterval(() => {
-      controller.runBackground(() => tickSocket(controller, client, state));
+      if (ticking) return;
+      ticking = true;
+      controller.runBackground(async () => {
+        try { await tickSocket(controller, client, state); }
+        finally { ticking = false; }
+      });
     }, 1000);
     timer.unref();
     socketTimers.add(timer);
@@ -136,9 +143,10 @@ export async function startControlServer(options: ControlServerOptions): Promise
   })();
   server.once("close", () => { void cleanup(); });
 
-  await new Promise<void>((resolveListen) => {
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
     server.listen(options.port, options.host, resolveListen);
-  });
+  }).catch(async error => { await cleanup(); throw error; });
 
   let closeTask: Promise<void> | undefined;
   return {
@@ -155,21 +163,32 @@ export async function startControlServer(options: ControlServerOptions): Promise
   };
 }
 
+function sendSelectedSnapshots(controller: Controller, client: WebSocket, state: SocketState) {
+  const snapshots = state.runIds.length
+    ? state.runIds.map(id => controller.getDashboardSnapshot(id))
+    : [controller.getDashboardSnapshot()];
+  sendSocket(client, { type: "snapshot", snapshot: snapshots[0], snapshots });
+  return snapshots;
+}
+
 async function tickSocket(controller: Controller, client: WebSocket, state: SocketState): Promise<void> {
   if (client.readyState !== client.OPEN) {
     return;
   }
-  await controller.pollActiveAgents(state.runId ?? undefined);
-  const snapshot = controller.getDashboardSnapshot(state.runId);
-  sendSocket(client, { type: "snapshot", snapshot });
-  if (state.agentId && !snapshot.agents.some((agent) => agent.agent_id === state.agentId)) {
+  // One socket owns the complete selection; no extra polling loop per canvas.
+  const runIds = state.runIds;
+  if (runIds.length) {
+    for (const runId of runIds) await controller.pollActiveAgents(runId);
+  } else await controller.pollActiveAgents();
+  if (runIds !== state.runIds || client.readyState !== client.OPEN) return;
+  const snapshots = sendSelectedSnapshots(controller, client, state);
+  if (state.agentId && !snapshots.some(snapshot => snapshot.agents.some((agent) => agent.agent_id === state.agentId))) {
     state.agentId = null;
     state.lastLogBytes = 0;
     state.lastMessageSignature = "";
   }
 
-  const events = controller
-    .listEvents({ runId: state.runId ?? undefined, limit: 100 })
+  const events = snapshots.flatMap(snapshot => snapshot.latest_events)
     .reverse()
     .filter((event) => !state.seenEventIds.has(event.event_id));
   for (const event of events) {
@@ -211,6 +230,11 @@ async function handleApi(
   response: ServerResponse,
   url: URL
 ): Promise<void> {
+  if (request.method === "GET" && url.pathname === "/api/control/snapshots") {
+    const ids = [...new Set(url.searchParams.getAll("run_id").filter(Boolean))];
+    sendJson(response, 200, ids.length ? ids.map(id => controller.getDashboardSnapshot(id)) : [controller.getDashboardSnapshot()]);
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/control/snapshot") {
     sendJson(response, 200, controller.getDashboardSnapshot(url.searchParams.get("run_id")));
     return;

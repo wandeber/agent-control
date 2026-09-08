@@ -11,9 +11,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createController } from "./core/factory.js";
 import { errorToPayload } from "./core/errors.js";
-import { withMcpCaller } from "./core/caller-context.js";
+import { currentCodexThreadId, withMcpCaller } from "./core/caller-context.js";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
+import { ConsoleSessions } from "./console-sessions.js";
+import { openBrowserConsole } from "./browser-console.js";
 import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
@@ -37,15 +39,8 @@ const MODEL_CONSOLE_META = {
   "openai/outputTemplate": CONSOLE_RESOURCE_URI,
   "openai/widgetAccessible": true
 };
-type ConsoleCommand = {
-  requested_run_id: string | null;
-  follow_latest: boolean;
-  action: "reuse" | "close";
-  command_id: string;
-};
-
-let pendingConsoleCommand: ConsoleCommand | null = null;
-let nextConsoleCommandId = 1;
+const consoleSessions = new ConsoleSessions();
+const PANEL_ID_PROPERTY = { panel_id: { type: "string", description: "Panel identity returned when this console was opened." } };
 
 const APP_TOOL_DEFINITIONS = [
   {
@@ -54,12 +49,14 @@ const APP_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
+        ...PANEL_ID_PROPERTY,
         run_id: { type: "string", description: "Optional run id to select." },
         command_id: {
           type: "string",
           description: "Internal app acknowledgement for the last console command. Do not set from the model."
         }
       },
+      required: ["panel_id"],
       additionalProperties: false
     },
     _meta: APP_TOOL_META
@@ -70,10 +67,11 @@ const APP_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
+        ...PANEL_ID_PROPERTY,
         agent_id: { type: "string", description: "Agent id." },
         limit: { type: "number", description: "Maximum messages to return." }
       },
-      required: ["agent_id"],
+      required: ["panel_id", "agent_id"],
       additionalProperties: false
     },
     _meta: APP_TOOL_META
@@ -84,10 +82,26 @@ const APP_TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       properties: {
+        ...PANEL_ID_PROPERTY,
         agent_id: { type: "string", description: "Agent id." },
         max_chars: { type: "number", description: "Maximum characters to return." }
       },
-      required: ["agent_id"],
+      required: ["panel_id", "agent_id"],
+      additionalProperties: false
+    },
+    _meta: APP_TOOL_META
+  },
+  {
+    name: "agent_control_console_open_browser",
+    description: "App-only. Open the global console in the system browser when the user presses Full screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...PANEL_ID_PROPERTY,
+        run_id: { type: "string" },
+        screen: { type: "string", enum: ["console", "subagents"] }
+      },
+      required: ["panel_id"],
       additionalProperties: false
     },
     _meta: APP_TOOL_META
@@ -97,7 +111,7 @@ const APP_TOOL_DEFINITIONS = [
 const OPEN_CONSOLE_TOOL = {
   name: "open_agent_control_console",
   description:
-    "Open the single native Agent Control console as a Codex MCP App panel, pinning run_id when supplied or following the latest run otherwise. Call this at most once; use the app-only snapshot tool to refresh the existing panel instead of opening another tab.",
+    "Open the native Agent Control panel for the calling Codex conversation. Only its associated runs are visible, using the host thread identity automatically. Pin run_id when supplied or follow its latest run. Call this once, then reuse the existing panel. The Full screen button opens the global console in the system browser.",
   inputSchema: {
     type: "object",
     properties: {
@@ -197,7 +211,7 @@ server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
   const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === request.params.name);
 
   try {
-    const appResult = await handleConsoleTool(request.params.name, request.params.arguments ?? {});
+    const appResult = await withMcpCaller(request.params._meta, () => handleConsoleTool(request.params.name, request.params.arguments ?? {}));
     if (appResult) {
       return appResult;
     }
@@ -268,10 +282,10 @@ async function handleConsoleTool(
 > {
   if (name === "open_agent_control_console") {
     const runId = stringField(input, "run_id");
-    // Opening a fresh native surface starts a new lifecycle. Do not replay a
-    // command that was queued for an older surface into this one.
-    pendingConsoleCommand = null;
-    const structuredContent = await loadConsoleSnapshot(controller, runId);
+    const threadId = currentCodexThreadId();
+    const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: threadId ?? null });
+    const session = consoleSessions.open(threadId);
+    const structuredContent = { ...snapshot, console: { ...snapshot.console, panel_id: session.id } };
     return {
       content: [
         {
@@ -286,14 +300,17 @@ async function handleConsoleTool(
 
   if (name === "reuse_agent_control_console") {
     const runId = stringField(input, "run_id");
-    const command = queueConsoleCommand("reuse", runId);
-    const snapshot = await loadConsoleSnapshot(controller, runId);
+    const threadId = currentCodexThreadId();
+    const session = consoleSessions.get(threadId);
+    const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
+    const command = consoleSessions.queue(session, "reuse", runId).command!;
     return {
       content: [{ type: "text", text: "Reused Agent Control console." }],
       structuredContent: {
         ...snapshot,
         console: {
           ...snapshot.console,
+          panel_id: session.id,
           action: command.action,
           command_id: command.command_id
         }
@@ -302,11 +319,13 @@ async function handleConsoleTool(
   }
 
   if (name === "close_agent_control_console") {
-    const command = queueConsoleCommand("close");
+    const session = consoleSessions.queue(consoleSessions.get(currentCodexThreadId()), "close");
+    const command = session.command!;
     return {
       content: [{ type: "text", text: "Requested Agent Control console teardown." }],
       structuredContent: {
         console: {
+          panel_id: session.id,
           requested_run_id: null,
           follow_latest: false,
           action: command.action,
@@ -318,11 +337,10 @@ async function handleConsoleTool(
 
   if (name === "agent_control_console_snapshot") {
     const runId = stringField(input, "run_id");
-    acknowledgeConsoleCommand(stringField(input, "command_id"));
-    const structuredContent = await loadConsoleSnapshot(controller, runId);
-    if (pendingConsoleCommand) {
-      structuredContent.console = pendingConsoleCommand;
-    }
+    const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+    const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
+    consoleSessions.acknowledge(session, stringField(input, "command_id"));
+    const structuredContent = { ...snapshot, console: { ...(session.command ?? snapshot.console), panel_id: session.id } };
     return {
       content: [{ type: "text", text: "Loaded Agent Control dashboard snapshot." }],
       structuredContent
@@ -331,6 +349,7 @@ async function handleConsoleTool(
 
   if (name === "agent_control_console_agent_messages") {
     const agentId = requiredStringField(input, "agent_id");
+    assertConsoleAgent(input, agentId);
     const limit = numberField(input, "limit", 12);
     return {
       content: [{ type: "text", text: "Loaded Agent Control agent messages." }],
@@ -340,6 +359,7 @@ async function handleConsoleTool(
 
   if (name === "agent_control_console_agent_log") {
     const agentId = requiredStringField(input, "agent_id");
+    assertConsoleAgent(input, agentId);
     const maxChars = numberField(input, "max_chars", 16000);
     return {
       content: [{ type: "text", text: "Loaded Agent Control agent log." }],
@@ -347,7 +367,23 @@ async function handleConsoleTool(
     };
   }
 
+  if (name === "agent_control_console_open_browser") {
+    const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+    const runId = stringField(input, "run_id");
+    if (runId) controller.getDashboardSnapshot(runId, { threadId: session.threadId });
+    const result = await openBrowserConsole(runId, stringField(input, "screen") === "subagents" ? "subagents" : "console");
+    return { content: [{ type: "text", text: "Opened the global console in the system browser." }], structuredContent: result };
+  }
+
   return null;
+}
+
+function assertConsoleAgent(input: unknown, agentId: string): void {
+  const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+  const agent = controller.getAgent(agentId);
+  if (!store.listConsoleRuns(session.threadId).some(run => run.run_id === agent.run_id)) {
+    throw new Error("This agent is not associated with this Codex conversation.");
+  }
 }
 
 async function readConsoleHtml(): Promise<string> {
@@ -435,23 +471,6 @@ function stringField(input: unknown, key: string): string | undefined {
   }
   const value = (input as Record<string, unknown>)[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function queueConsoleCommand(action: ConsoleCommand["action"], runId?: string): ConsoleCommand {
-  const command: ConsoleCommand = {
-    requested_run_id: runId ?? null,
-    follow_latest: !runId,
-    action,
-    command_id: `console-command-${nextConsoleCommandId++}`
-  };
-  pendingConsoleCommand = command;
-  return command;
-}
-
-function acknowledgeConsoleCommand(commandId?: string): void {
-  if (commandId && pendingConsoleCommand?.command_id === commandId) {
-    pendingConsoleCommand = null;
-  }
 }
 
 function requiredStringField(input: unknown, key: string): string {

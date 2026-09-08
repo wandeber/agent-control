@@ -14,11 +14,12 @@ import {
 import { Crosshair, LayoutGrid, LocateFixed, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  buildRelations,
-  focusedAgentId,
-  primaryAgentRelations
+  focusedAgentId
 } from "@/lib/graph";
-import { buildAgentTeam, projectTeamRelations, bundleAgentConnections, teamLayout, teamBounds, keepExternalCardsOutsideTeam } from "@/lib/team-graph";
+import { bundleAgentConnections, teamBounds, keepExternalCardsOutsideTeam } from "@/lib/team-graph";
+import { buildRunGraph, multiRunLayout, multiRunBounds, keepRunsSeparate } from "@/lib/multi-run-graph";
+import { runSelectionKey } from "@/lib/run-selection";
+import { RunGraphFrame } from "./run-graph-frame";
 import { AgentConnectionOverlay } from "./agent-connection-overlay";
 import { agentPresentation } from "@/lib/agent-presentation";
 import type { DashboardSnapshot } from "@/lib/types";
@@ -42,6 +43,7 @@ type RelationFlowEdge = Edge;
 
 export function AgentGraph({
   snapshot,
+  runSnapshots,
   selectedAgentId,
   onSelectAgent,
   onClearSelection,
@@ -49,21 +51,23 @@ export function AgentGraph({
   toolbarLeading
 }: {
   snapshot: DashboardSnapshot;
+  runSnapshots: DashboardSnapshot[];
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string) => void;
   onClearSelection?: () => void;
   onOpenConversation?: (agentId: string) => void;
   toolbarLeading?: React.ReactNode;
 }) {
-  const relations = useMemo(() => buildRelations(snapshot), [snapshot]);
-  const primary = useMemo(() => primaryAgentRelations(snapshot, relations), [snapshot, relations]);
+  const groups = useMemo(() => runSnapshots.map(buildRunGraph), [runSnapshots]);
+  const multiple = groups.length > 1;
   const focusId = focusedAgentId(snapshot, selectedAgentId);
-  const team = useMemo(() => buildAgentTeam(snapshot.agents), [snapshot.agents]);
-  const projectedRelations = useMemo(() => projectTeamRelations(team, relations, primary), [team, relations, primary]);
+  const initialLayout = useMemo(() => multiRunLayout(groups), [groups]);
+  const keepTeamsSeparate = useCallback((cards: AgentFlowNode[]) => keepRunsSeparate(groups, groups.flatMap(group =>
+    keepExternalCardsOutsideTeam(cards.filter(card => card.data.agent.run_id === group.snapshot.selected_run_id), group.team))), [groups]);
   const [nodes, setNodes] = useState<AgentFlowNode[]>([]);
-  const cameraKey = snapshot.selected_run_id ?? "none";
+  const cameraKey = runSelectionKey(runSnapshots.map(value => value.selected_run_id ?? "none"));
   const initialCamera = useRef(savedCameras.get(cameraKey));
-  const [follow, setFollow] = useState(initialCamera.current?.follow ?? true);
+  const [follow, setFollow] = useState(initialCamera.current?.follow ?? !multiple);
   const followRef = useRef(follow);
   followRef.current = follow;
   const [flowReady, setFlowReady] = useState(false);
@@ -79,39 +83,47 @@ export function AgentGraph({
       if (viewport) savedCameras.set(cameraKey, { viewport, follow: followRef.current });
     };
   }, [cameraKey, follow]);
-  const storageKey = `agent-control:graph:v3:${snapshot.selected_run_id ?? "none"}`;
+  const storageKey = `agent-control:graph:v3:${multiple ? cameraKey : snapshot.selected_run_id ?? "none"}`;
 
   useEffect(() => {
     const stored = readStoredPositions(storageKey);
-    const layout = teamLayout(snapshot, primary, team);
+    const layout = initialLayout;
     const sameRun = positionedRunRef.current === storageKey;
     positionedRunRef.current = storageKey;
-    setNodes((current) => keepExternalCardsOutsideTeam(snapshot.agents.map((agent) => {
+    setNodes((current) => keepTeamsSeparate(snapshot.agents.map((agent) => {
       const previous = sameRun ? current.find((node) => node.id === agent.agent_id) : undefined;
+      const anchor = sameRun ? current.find(node => node.data.agent.run_id === agent.run_id && layout.has(node.id)) : undefined;
+      const point = layout.get(agent.agent_id) ?? { x: 0, y: 0 };
+      const anchorDefault = anchor ? layout.get(anchor.id)! : null;
+      const newPosition = anchor && anchorDefault
+        ? { x: point.x + anchor.position.x - anchorDefault.x, y: point.y + anchor.position.y - anchorDefault.y } : point;
       return {
         ...previous,
         id: agent.agent_id,
         type: "agent",
         focusable: false,
-        position: previous?.position ?? stored.get(agent.agent_id) ?? layout.get(agent.agent_id) ?? { x: 0, y: 0 },
-        data: { agent, presentation: agentPresentation(snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
+        position: previous?.position ?? stored.get(agent.agent_id) ?? newPosition,
+        data: { agent, presentation: agentPresentation(runSnapshots.find(value => value.selected_run_id === agent.run_id) ?? snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
       };
-    }), team));
-  }, [primary, focusId, snapshot, storageKey, onSelectAgent, team]);
+    })));
+  }, [initialLayout, focusId, snapshot, runSnapshots, storageKey, onSelectAgent, keepTeamsSeparate]);
 
-  const connections = useMemo(() => bundleAgentConnections(
-    projectedRelations, focusId, false
-  ), [projectedRelations, focusId]);
+  const overlays = useMemo(() => groups.map(group => ({ ...group,
+    nodes: nodes.filter(node => node.data.agent.run_id === group.snapshot.selected_run_id),
+    connections: bundleAgentConnections(group.projected, focusId, false)
+  })), [groups, nodes, focusId]);
+  const runFrames = useMemo(() => multiRunBounds(groups, nodes), [groups, nodes]);
+  const connectionCount = overlays.reduce((sum, group) => sum + group.connections.length, 0);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<AgentFlowNode>[]) => {
       setNodes((current) => {
-        const next = keepExternalCardsOutsideTeam(applyNodeChanges<AgentFlowNode>(changes, current), team);
+        const next = keepTeamsSeparate(applyNodeChanges<AgentFlowNode>(changes, current));
         storePositions(storageKey, next);
         return next;
       });
     },
-    [storageKey, team]
+    [storageKey, keepTeamsSeparate]
   );
 
   const disableFollow = useCallback(() => {
@@ -130,12 +142,16 @@ export function AgentGraph({
     }
 
     const cardArea = flow.getNodesBounds(fittedNodes);
-    const frame = teamBounds(fittedNodes, team)?.frame;
-    const bounds = frame ? {
-      x: Math.min(cardArea.x, frame.x), y: Math.min(cardArea.y, frame.y - 20),
-      width: Math.max(cardArea.x + cardArea.width, frame.x + frame.width) - Math.min(cardArea.x, frame.x),
-      height: Math.max(cardArea.y + cardArea.height, frame.y + frame.height) - Math.min(cardArea.y, frame.y - 20)
-    } : cardArea;
+    const frames = multiple ? multiRunBounds(groups, fittedNodes) : groups.map(group => {
+      const cards = fittedNodes.filter(node => node.data.agent.run_id === group.snapshot.selected_run_id);
+      return teamBounds(cards, group.team)?.frame;
+    }).filter(frame => Boolean(frame));
+    const rects = [cardArea, ...frames.filter((frame): frame is NonNullable<typeof frame> => Boolean(frame))];
+    const left = Math.min(...rects.map(rect => rect.x));
+    const top = Math.min(...rects.map(rect => rect.y)) - 20;
+    const bounds = { x: left, y: top,
+      width: Math.max(...rects.map(rect => rect.x + rect.width)) - left,
+      height: Math.max(...rects.map(rect => rect.y + rect.height)) - top };
     const safeArea = getLargestGraphSafeArea(graphRoot);
     const availableWidth = Math.max(1, safeArea.width - SAFE_AREA_PADDING * 2);
     const availableHeight = Math.max(1, safeArea.height - SAFE_AREA_PADDING * 2);
@@ -173,10 +189,17 @@ export function AgentGraph({
         programmaticViewportRef.current = false;
       }, 0);
     });
-  }, [team]);
+  }, [groups, multiple]);
+
+  const fittedSelection = useRef(false);
+  useEffect(() => {
+    if (!multiple || initialCamera.current || fittedSelection.current || !flowReady || !nodes.length || nodes.some(node => !node.measured?.width)) return;
+    fittedSelection.current = true;
+    fitGraphToSafeArea(0);
+  }, [multiple, flowReady, nodes, fitGraphToSafeArea]);
 
   const organizeGraph = useCallback(() => {
-    const layout = teamLayout(snapshot, primary, team);
+    const layout = initialLayout;
     setFollow(false);
     setNodes((current) => {
       const arranged = current.map((node) => ({ ...node, position: layout.get(node.id) ?? node.position }));
@@ -184,7 +207,7 @@ export function AgentGraph({
       return arranged;
     });
     window.setTimeout(() => fitGraphToSafeArea(), 80);
-  }, [snapshot, primary, storageKey, fitGraphToSafeArea, team]);
+  }, [initialLayout, storageKey, fitGraphToSafeArea]);
 
   useEffect(() => {
     if (follow && flowReady) {
@@ -192,7 +215,7 @@ export function AgentGraph({
       return () => clearTimeout(timer);
     }
     return undefined;
-  }, [focusId, fitGraphToSafeArea, flowReady, follow, nodes.length, connections.length, selectedAgentId]);
+  }, [focusId, fitGraphToSafeArea, flowReady, follow, nodes.length, connectionCount, selectedAgentId]);
 
   useEffect(() => {
     const graphRoot = graphRootRef.current;
@@ -252,7 +275,10 @@ export function AgentGraph({
           panOnDrag
           proOptions={{ hideAttribution: true }}
         >
-          <AgentConnectionOverlay nodes={nodes} connections={connections} team={team} />
+          {multiple ? overlays.map((group, index) => <RunGraphFrame key={`frame:${group.snapshot.selected_run_id}`} runId={group.snapshot.selected_run_id!}
+            title={group.snapshot.runs.find(run => run.run_id === group.snapshot.selected_run_id)?.title ?? "Run"}
+            bounds={runFrames[index]} />) : null}
+          {overlays.map(group => <AgentConnectionOverlay key={group.snapshot.selected_run_id} nodes={group.nodes} connections={group.connections} team={group.team} />)}
           <Background gap={22} size={1} />
           <Controls onFitView={() => { setFollow(false); fitGraphToSafeArea(); }} position="bottom-left" showInteractive={false} />
           <MiniMap

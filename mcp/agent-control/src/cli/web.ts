@@ -159,14 +159,16 @@ async function buildWebRuntime(webDir: string): Promise<void> {
   await runCommand("pnpm", ["--dir", webDir, "build:runtime"]);
 }
 
-async function startStaticWebServer({
+export async function startStaticWebServer({
   host,
   port,
-  rootDir
+  rootDir,
+  instanceId
 }: {
   host: string;
   port: number;
   rootDir: string;
+  instanceId?: string;
 }): Promise<Server> {
   const root = resolve(rootDir);
   const server = createServer((request, response) => {
@@ -179,6 +181,12 @@ async function startStaticWebServer({
 
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${host}:${port}`}`);
+      if (instanceId && url.pathname === "/__agent_control_health") {
+        response.setHeader("content-type", "application/json");
+        response.setHeader("cache-control", "no-store");
+        response.end(JSON.stringify({ instanceId }));
+        return;
+      }
       const filePath = resolveStaticFile(root, url.pathname);
       if (!filePath) {
         sendStaticError(response, 404, "Not found");
@@ -190,7 +198,8 @@ async function startStaticWebServer({
     }
   });
 
-  await new Promise<void>((resolveListen) => {
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
     server.listen(port, host, resolveListen);
   });
   return server;

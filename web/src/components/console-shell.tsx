@@ -3,6 +3,7 @@
 import { Bot, Clock3, Info, PanelBottom, Workflow, X, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useSnapshotStream } from "@/lib/api";
+import { runSelectionKey } from "@/lib/run-selection";
 import { focusedAgentId } from "@/lib/graph";
 import { latestAgentFlowStep } from "@/lib/flow-steps";
 import { useConsoleSelection } from "./console-selection";
@@ -46,7 +47,7 @@ const DEFAULT_LAYOUT: ConsoleLayoutState = {
 };
 
 export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () => void }) {
-  const { registerRefresh, setConnection, selectedRunId, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
+  const { registerRefresh, setConnection, selectedRunId, selectedRunIds, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun } = useConsoleSelection();
   const [agentSelectionPinned, setAgentSelectionPinned] = useState(Boolean(selectedAgentId));
   const selectionRunRef = useRef<string | null | undefined>(undefined);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
@@ -61,11 +62,12 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
   const latestStepByAgentRef = useRef<Map<string, string | null>>(new Map());
   const { bottomPanel, runsOpen } = layout;
   const threadOpen = false;
-  const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot } = useSnapshotStream(
+  const { agentLog, agentError, connection, error, isLoading, refresh, selectedRun, snapshot, runSnapshots } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
     followLatestRun,
-    selectedAgentMessageLimit
+    selectedAgentMessageLimit,
+    selectedRunIds
   );
   useEffect(() => registerRefresh(refresh), [registerRefresh, refresh]);
   useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
@@ -103,7 +105,10 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
   }, [selectedAgentId, snapshot, followLatestRun, selectedRunId, agentSelectionPinned]);
 
   const selectedSnapshot = useMemo(() => snapshot, [snapshot]);
-  const flowGraphAvailable = Boolean(selectedSnapshot?.flows.length && selectedSnapshot.flow_instances.length);
+  const multipleRuns = runSnapshots.length > 1;
+  const selectionTitle = multipleRuns ? `${runSnapshots.length} runs selected` : selectedRun?.title ?? "No run selected";
+  const agentSnapshot = runSnapshots.find(value => value.agents.some(agent => agent.agent_id === selectedAgentId)) ?? snapshot;
+  const flowGraphAvailable = !multipleRuns && Boolean(selectedSnapshot?.flows.length && selectedSnapshot.flow_instances.length);
   const effectiveGraphMode = flowGraphAvailable ? graphMode : "agents";
   const latestSelectedAgentStepId = selectedSnapshot
     ? (latestAgentFlowStep(selectedSnapshot, selectedAgentId)?.step_instance_id ?? null)
@@ -304,6 +309,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
           onOpenAgent={() => toggleBottomPanel("agent")}
           onOpenRuns={toggleRunsPanel}
           run={selectedRun}
+          selectionTitle={multipleRuns ? selectionTitle : undefined}
           runsOpen={runsOpen}
         />
       </div>
@@ -325,12 +331,13 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
               />
             ) : (
               <AgentGraph
-                key={selectedSnapshot.selected_run_id ?? "none"}
+                key={runSelectionKey(runSnapshots.map(value => value.selected_run_id!))}
                 onSelectAgent={selectAgent}
                 onOpenConversation={(agentId) => { selectAgent(agentId); onOpenConversation(); }}
                 onClearSelection={() => setAgentSelectionPinned(false)}
                 selectedAgentId={agentSelectionPinned ? selectedAgentId : null}
                 snapshot={selectedSnapshot}
+                runSnapshots={runSnapshots}
                 toolbarLeading={graphModeSwitch}
               />
             )}
@@ -353,15 +360,16 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
           data-open={runsOpen ? "true" : "false"}
         >
           <ResizeHandle label="Resize runs panel" onPointerDown={startResize("runs")} orientation="vertical" />
-          <PanelHeader detail={selectedRun?.title ?? "Agent Control"} onClose={() => patchLayout({ runsOpen: false })} title="Runs" />
+          <PanelHeader detail={selectionTitle} onClose={() => patchLayout({ runsOpen: false })} title="Runs" />
           <div className="console-panel-body">
             <RunSidebar
-              onSelectRun={(runId) => {
-                selectRun(runId);
+              onSelectRun={(runId, additive) => {
+                selectRun(runId, additive);
                 setSelectedStepId(null);
                 setSelectedStepInstanceId(null);
-                patchLayout({ runsOpen: false });
+                if (!additive) patchLayout({ runsOpen: false });
               }}
+              selectedRunIds={selectedRunIds}
               selectedRunId={selectedRunId ?? selectedSnapshot.selected_run_id ?? null}
               snapshot={selectedSnapshot}
             />
@@ -421,10 +429,14 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
                 onSelectStepInstance={selectStepInstance}
                 selectedAgentId={selectedAgentId}
                 selectedStepInstanceId={selectedStepInstanceId}
-                snapshot={selectedSnapshot}
+                snapshot={agentSnapshot ?? selectedSnapshot}
               />
             ) : renderedBottomPanel === "run" ? (
-              <RunInfoPanel run={selectedRun} selectedStepInstanceId={selectedStepInstanceId} snapshot={selectedSnapshot} />
+              multipleRuns ? <div className="agent-scroll overflow-y-auto divide-y divide-[var(--line)]">
+                {runSnapshots.map(value => <RunInfoPanel key={value.selected_run_id} naturalHeight
+                  run={value.runs.find(run => run.run_id === value.selected_run_id) ?? null}
+                  selectedStepInstanceId={selectedStepInstanceId} snapshot={value} />)}
+              </div> : <RunInfoPanel run={selectedRun} selectedStepInstanceId={selectedStepInstanceId} snapshot={selectedSnapshot} />
             ) : (
               <Timeline selectedStepInstanceId={selectedStepInstanceId} snapshot={selectedSnapshot} />
             )}
@@ -559,7 +571,6 @@ function PanelHeader({
   return (
     <div className="console-panel-header">
       <div className="min-w-0">
-        <div className="text-xs font-semibold uppercase tracking-[0.1em] text-ink-500">{title}</div>
         <div className="truncate text-sm font-semibold text-ink-900">{detail}</div>
       </div>
       <button className="console-panel-close" onClick={onClose} type="button" aria-label={`Close ${title.toLowerCase()} panel`}>

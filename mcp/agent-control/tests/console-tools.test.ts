@@ -28,7 +28,7 @@ describe("loadConsoleSnapshot", () => {
 
     const result = await loadConsoleSnapshot(controller, "run-42");
 
-    expect(calls).toEqual(["poll:run-42", "snapshot:run-42"]);
+    expect(calls).toEqual(["snapshot:run-42", "poll:run-42"]);
     expect(result).toEqual({
       snapshot: { selected_run_id: "run-42" },
       console: { requested_run_id: "run-42", follow_latest: false }

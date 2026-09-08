@@ -233,6 +233,30 @@ Inside Codex, open the native side-panel console with the MCP tool:
 open_agent_control_console
 ```
 
+The integrated panel lists only runs associated with the Codex conversation that
+opened it: its registered participation, requester/observer bindings, and nested
+work. This scope comes from Codex's per-call thread metadata, not the current
+project or the MCP process environment. App reads keep an opaque panel identity,
+so multiple conversations can share one MCP process without mixing selections,
+messages, or close commands. Runs without a recorded association remain visible
+in the global browser console.
+
+The **Full screen** icon to the right of the screen switch opens that global
+console in the system browser. It keeps the selected run and screen while making
+all runs available across conversations and projects. In the browser, the run
+selector groups runs by directory with collapsible groups; the integrated
+panel keeps a simple conversation-scoped list. In the external browser, Ctrl-click
+(Cmd-click on macOS) adds or removes runs from the selection; a plain click selects
+one run. Multiple runs appear side by side in the Agents canvas, with a titled
+frame for each run, and Subagents groups their workers by run. Run Info keeps each
+run's usage and project pricing separate. Selection survives screen navigation,
+reloads, and browser history. The integrated panel remains single-selection.
+The browser service
+starts on demand on available `localhost` ports, is reused by subsequent clicks,
+and survives closing the MCP panel. macOS and Windows use the system browser;
+WSL opens the Windows browser. Opening the external view does not broaden the
+integrated panel's scope.
+
 The panel opens the simple **Subagents** screen by default: a worker list and
 its selected conversation. **Full console** opens a separate graph/flow screen;
 **Back to subagents** returns to the simple screen. The screens share run and

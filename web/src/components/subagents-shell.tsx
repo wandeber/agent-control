@@ -17,14 +17,15 @@ import { WorkspacePanel } from "./workspace-panel";
 
 /** Worker list and conversation, shown as the default Agent Control screen. */
 export function SubagentsShell() {
-  const { registerRefresh, setConnection, selectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
+  const { registerRefresh, setConnection, selectedRunId, selectedRunIds, followLatestRun, selectedAgentId, setSelectedAgentId } = useConsoleSelection();
   const [messageLimit, setMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [narrowViewport, setNarrowViewport] = useState<boolean | null>(null);
-  const { agentLog, agentError, connection, error, isLoading, refresh, snapshot } = useSnapshotStream(
+  const { agentLog, agentError, connection, error, isLoading, refresh, snapshot, runSnapshots } = useSnapshotStream(
     selectedRunId,
     selectedAgentId,
     followLatestRun,
-    messageLimit
+    messageLimit,
+    selectedRunIds
   );
   useEffect(() => registerRefresh(refresh), [registerRefresh, refresh]);
   useEffect(() => { setConnection(agentError ? "offline" : connection); }, [agentError, connection, setConnection]);
@@ -53,6 +54,8 @@ export function SubagentsShell() {
   const selectedAgent = selectedAgentId
     ? snapshot?.agents.find((agent) => agent.agent_id === selectedAgentId) ?? null
     : null;
+
+  const agentSnapshot = runSnapshots.find(value => value.agents.some(agent => agent.agent_id === selectedAgentId)) ?? snapshot;
 
   useEffect(() => {
     if (!snapshot || (!followLatestRun && selectedRunId && snapshot.selected_run_id !== selectedRunId)) return;
@@ -90,12 +93,16 @@ export function SubagentsShell() {
       <div className="subagents-layout">
         <aside className="subagents-list" data-mobile-hidden={selectedAgent ? "true" : "false"}>
           <div className="subagents-list-scroll">
+            {runSnapshots.length > 1 ? runSnapshots.map(value => <AgentGroup key={value.selected_run_id}
+              snapshot={value} agents={[...value.agents].sort(compareAgents)} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId}
+              title={value.runs.find(run => run.run_id === value.selected_run_id)?.title ?? "Run"} />) : <>
             {activeSubagents.length > 0 ? (
               <AgentGroup snapshot={snapshot} agents={activeSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Active" />
             ) : null}
             {finishedSubagents.length > 0 ? (
               <AgentGroup snapshot={snapshot} agents={finishedSubagents} onSelect={setSelectedAgentId} selectedAgentId={selectedAgentId} title="Finished" />
             ) : null}
+            </>}
           </div>
         </aside>
 
@@ -108,7 +115,7 @@ export function SubagentsShell() {
                 </button>
                 <div className="min-w-0">
                   <h2>{selectedAgent.title}</h2>
-                  <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span><AgentCostLabel snapshot={snapshot} agentId={selectedAgent.agent_id} /></p>
+                  <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span><AgentCostLabel snapshot={agentSnapshot ?? snapshot} agentId={selectedAgent.agent_id} /></p>
                 </div>
                 <StatusPill status={selectedAgent.status} />
               </header>
@@ -121,7 +128,7 @@ export function SubagentsShell() {
                   onRequestOlderMessages={() => setMessageLimit((value) => Math.min(MAX_AGENT_MESSAGE_LIMIT, value + AGENT_MESSAGE_LOAD_STEP))}
                   selectedAgentId={selectedAgent.agent_id}
                   selectedStepInstanceId={null}
-                  snapshot={snapshot}
+                  snapshot={agentSnapshot ?? snapshot}
                 />
               </div>
             </>
@@ -148,8 +155,9 @@ function AgentGroup({
   title: string;
 }) {
   return (
-    <section className="subagents-group">
+    <section className="subagents-group" aria-label={title}>
       <h2>{title}</h2>
+      {agents.length === 0 ? <p className="px-3 py-2 text-xs text-ink-400">No subagents yet</p> : null}
       <div className="subagents-group-items">
         {agents.map((agent) => (
           <button

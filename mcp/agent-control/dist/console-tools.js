@@ -1,10 +1,10 @@
 // Status updates must never block reading the already persisted dashboard.
 // One in-flight refresh per controller/run avoids duplicate backend work.
 const refreshes = new WeakMap();
-export async function loadConsoleSnapshot(controller, runId) {
+export async function loadConsoleSnapshot(controller, runId, scope) {
     // Following the latest run must not poll every historical backend. Apart
     // from wasting CPU, unavailable old endpoints delay the selected chat.
-    const initial = runId ? null : controller.getDashboardSnapshot();
+    const initial = controller.getDashboardSnapshot(runId, scope);
     const latestRunId = initial && typeof initial === "object" && "selected_run_id" in initial
         ? initial.selected_run_id : null;
     const effectiveRunId = runId ?? (typeof latestRunId === "string" ? latestRunId : undefined);
@@ -22,7 +22,7 @@ export async function loadConsoleSnapshot(controller, runId) {
         }
     }
     return {
-        snapshot: controller.getDashboardSnapshot(runId),
+        snapshot: initial,
         console: {
             requested_run_id: runId ?? null,
             follow_latest: !runId

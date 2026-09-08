@@ -6,7 +6,7 @@ import { costBreakdownLabel, costLabel } from "@/lib/costs";
 import { compactId, cx, elapsedFrom, formatDateTime, formatDuration, formatNumber, STATUS_STYLE } from "@/lib/format";
 import type { CostBreakdown, DashboardSnapshot, RunRecord } from "@/lib/types";
 
-export function RunInfoPanel({
+export function RunInfoPanel({ naturalHeight = false,
   run,
   selectedStepInstanceId,
   snapshot
@@ -14,6 +14,7 @@ export function RunInfoPanel({
   run: RunRecord | null;
   selectedStepInstanceId: string | null;
   snapshot: DashboardSnapshot;
+  naturalHeight?: boolean;
 }) {
   const elapsed = run ? formatDuration(elapsedFrom(run.created_at, run.status === "active" ? null : run.updated_at)) : "0s";
   const running = snapshot.status_counts.running ?? 0;
@@ -25,7 +26,7 @@ export function RunInfoPanel({
 
 
   return (
-    <section className="flex h-full min-h-0 flex-col bg-white">
+    <section className={cx("flex min-h-0 flex-col bg-white", !naturalHeight && "h-full")}>
       <div className="flex min-h-14 items-start justify-between gap-4 border-b border-black/8 px-4 py-3">
         <div className="min-w-0">
           <div className="truncate text-base font-semibold text-ink-900">{run?.title ?? "No run selected"}</div>
@@ -34,7 +35,7 @@ export function RunInfoPanel({
         {costs ? <div className="shrink-0 text-right" title={costBreakdownLabel(costs.total)}><div className="text-base font-semibold tabular-nums text-ink-900">{costLabel(costs.total.total)}</div><div className="text-[11px] text-ink-400">Estimated USD</div></div> : null}
       </div>
 
-        <div className="agent-scroll min-h-0 flex-1 overflow-auto p-4">
+        <div className={cx("p-4", !naturalHeight && "agent-scroll min-h-0 flex-1 overflow-auto")}>
           <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-ink-500">
             <span>{snapshot.agents.length} agents</span><span>{running} running</span><span>{waiting} waiting</span><span>{elapsed} elapsed</span>
           </div>
@@ -77,6 +78,7 @@ function FlowOverview({
 }: {
   selectedStepInstanceId: string | null;
   snapshot: DashboardSnapshot;
+  naturalHeight?: boolean;
 }) {
   const flowByRecordId = new Map(snapshot.flows.map((flow) => [flow.flow_record_id, flow]));
   const stepsByInstance = groupBy(snapshot.flow_steps, (step) => step.flow_instance_id);
