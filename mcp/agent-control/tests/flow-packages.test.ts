@@ -129,7 +129,8 @@ describe("durable work package fork and join", () => {
     expect(observer.wait_contract.tool).toBe("flow_packages");
     type Batch={events:Array<{event_id:string;type:string}>,cursor:string,processed_cursor:string,timed_out:boolean,ack_contract?:{tool:string;arguments:{request:{operation:string;cursor:string}}},wait_contract:{tool:string}};
     const wait=()=>controller.executeFlowPackages({flowInstanceId:id,request:{operation:"wait",timeout_ms:1}}) as Promise<Batch>;
-    const batch=await wait();expect(batch.events.some(e=>e.type==="agent.started")).toBe(true);expect(batch.ack_contract!.tool).toBe("flow_packages");expect(batch.ack_contract!.arguments.request).toEqual({operation:"ack",cursor:batch.cursor});
+    expect((await wait()).events).toEqual([]);await deliver("a");actor(parentId);
+    const batch=await wait();expect(batch.events.some(e=>e.type==="flow.notification")).toBe(true);expect(batch.events.some(e=>e.type==="agent.started")).toBe(false);expect(batch.ack_contract!.tool).toBe("flow_packages");expect(batch.ack_contract!.arguments.request).toEqual({operation:"ack",cursor:batch.cursor});
     expect(batch.processed_cursor).toBe(observer.processed_cursor);expect((await wait()).events).toEqual(batch.events);
     await expect(controller.executeFlowPackages({flowInstanceId:id,request:{operation:"ack",cursor:batch.cursor},agentToken:"invalid-token"})).rejects.toThrow();
     await expect(controller.executeFlowPackages({flowInstanceId:id,request:{operation:"ack",cursor:batch.cursor},agentToken:owner.agent_token})).rejects.toThrow(/cursor/i);

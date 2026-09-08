@@ -421,8 +421,8 @@ in the same open turn. Do not cancel or forget the original work. Retain each
 active run, observer, completion condition, and its own cursor. Where supported,
 wait on active runs concurrently; closure of one observation does not close the
 others. End only after all supervised work is resolved or the user explicitly
-pauses or cancels supervision. A short localized update may mention that the
-flow is still running and the conversation is returning to the wait.
+pauses or cancels supervision. Do not relay routine activity or create monitoring
+automations. The model stays in a pending tool call between actionable events.
 
 `observer.wait_contract` on launch and `wait_contract` on open event/timeout
 responses provide `run_wait` arguments with a one-hour timeout. A shorter wide
@@ -432,9 +432,31 @@ position; the event batch provides a cursor and explicit ACK contract.
 Acknowledge only after processing that batch. After
 interruption, resume from the last processed cursor. A closed observation returns
 `wait_contract: null`; check the remaining active runs before ending the turn.
-By default every supported event type is selected, covering present and future
-agents in the run, including phase changes, blockers, and completion. A completion-only flow observer uses
-`flow.completed`; a free-worker observer chooses its agent terminal events.
+By default every supported event type remains subscribed for observability.
+`run_wait` defaults to `wake_on: "control"`: decisions owned by this conversation,
+intervention and aggregate completion; the executing coordinator also receives
+routing events. A requester-owned decision can have `authority: coordinator`:
+it still needs the original conversation, but not necessarily a user question.
+`wake_on: "all"` (`--wake-on all`) returns each subscribed event when explicitly
+requested. ACK contracts preserve the selected wake policy. Parent waits also receive
+authorized descendant streams attached to the same conversation, with each
+event carrying its source `run_id`. Their native action references retain
+the source observation's authorization.
+
+The waiter filters before its effective batch limit, retains skipped events in
+history, and never acknowledges on timeout or cancellation. A new observer can
+recover a still-active decision gate created before it attached. Cancelling the
+wait leaves workers running; status I/O is shared in controller background tasks
+so a slow backend does not hold the conversation's cancellation or deadline.
+
+`completion` is null until all registered work in the run and descendants has
+settled, including flows, pending native actions and goals. When present it
+reports an `outcome` of `completed`, `failed` or `cancelled` and run/worker/flow
+counts. Empty runs are not completed. Unused planned roles of finished flows do
+not keep a run pending. A single `flow.completed`, a stopped observation, or an
+expired timeout does not establish successful completion. `has_more` indicates
+a remaining subscribed backlog; completion is withheld until it has been
+drained, including when `all` uses a small batch limit.
 
 Explicit `notify` delivers a compact informational injection to the requester.
 It never falls back to starting a competing turn. Acceptance means context was

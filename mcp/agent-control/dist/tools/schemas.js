@@ -36,7 +36,8 @@ export const runObserveSchema = z.object({
 });
 export const runWaitSchema = z.object({
     run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1).optional(),
-    timeout_ms: z.number().int().positive().optional(), limit: z.number().int().positive().max(100).optional()
+    timeout_ms: z.number().int().positive().optional(), limit: z.number().int().positive().max(100).optional(),
+    wake_on: z.enum(["control", "all"]).optional()
 });
 export const emptySchema = z.object({});
 export const runCreateSchema = z.object({
@@ -319,6 +320,6 @@ const flowCoordinatorFields = { flow_instance_id: z.string().min(1), agent_token
 export const flowContextUpdateSchema = z.object({ ...flowCoordinatorFields, context: z.string().min(1), expected_revision: z.number().int().nonnegative() });
 export const flowDecisionSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), value: z.unknown(), reason: z.string().min(1), expected_revision: z.number().int().nonnegative(), artifact_key: z.string().optional(), artifact_digest: z.string().regex(/^[a-f0-9]{64}$/).optional(), package_manifest_digest: z.string().regex(/^[a-f0-9]{64}$/).optional() });
 export const flowEvidenceSchema = z.object({ ...flowCoordinatorFields, key: z.string().min(1), request: evidenceRequestSchema, step_instance_id: z.string().optional() });
-export const runAckSchema = z.object({ run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1), agent_token: z.string().optional(), admin_key: z.string().optional() });
+export const runAckSchema = z.object({ wake_on: z.enum(["control", "all"]).optional(), run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1), agent_token: z.string().optional(), admin_key: z.string().optional() });
 export const flowOwnerRecoverSchema = z.object({ ...flowCoordinatorFields, role: z.string().min(1), restart_step_id: z.string().min(1), reason: z.string().min(1), expected_revision: z.number().int().nonnegative() });
 export const flowPackagesSchema = z.object({ ...flowCoordinatorFields, request: flowPackagesRequestSchema }).strict();

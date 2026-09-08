@@ -1,5 +1,6 @@
 import { currentCodexThreadId } from "./caller-context.js";
 import { readCodexSession, sessionBaseline } from "../adapters/codex-session.js";
+import { RunWakePolicy, sessionObservationKey, type RunWakeOn } from "./run-wake-policy.js";
 import { conversationWaitContract } from "./conversation-wait.js";
 import { compactFlowEvent } from "./flow-event-summary.js";
 import type { AgentController } from "./controller.js";
@@ -49,9 +50,11 @@ export interface WaitRunInput {
   limit?: number;
   signal?: AbortSignal;
   intervalMs?: number;
+  wakeOn?: RunWakeOn;
 }
 
 export interface AcknowledgeRunInput {
+  wakeOn?: RunWakeOn;
   runId: string;
   observerAgentId: string;
   cursor: string;
@@ -74,8 +77,10 @@ export function isPassiveObserver(agent: AgentRecord): boolean {
 
 export class RunObservation {
   private cursors: ObserverCursors;
+  private wakePolicy: RunWakePolicy;
   constructor(private store: SqliteStore, private controller: AgentController, private adapters: AdapterRegistry) {
     this.cursors = new ObserverCursors(store.db);
+    this.wakePolicy = new RunWakePolicy(store);
   }
 
   /** The first requester remains stable when a worker launches nested work. */
@@ -190,7 +195,8 @@ export class RunObservation {
         });
       }
       this.store.db.prepare("insert or ignore into run_requesters(run_id, thread_id) values (?, ?)").run(run.run_id, threadId);
-      const start = previous?.start_sequence ?? this.currentSequence();
+      const start = previous?.start_sequence ?? this.wakePolicy.initialSequence(run.run_id, agent,
+        this.observationOwners(agent, run.run_id), this.currentSequence());
       this.store.db.prepare(`insert into run_observers(observer_agent_id, run_id, thread_id, events_json, delivery, start_sequence, created_at)
         values (?, ?, ?, ?, ?, ?, ?) on conflict(observer_agent_id) do update set events_json = excluded.events_json, delivery = excluded.delivery`)
         .run(agent.agent_id, run.run_id, threadId, JSON.stringify(events), delivery, start, new Date().toISOString());
@@ -235,21 +241,25 @@ export class RunObservation {
       const advanced = this.cursors.acknowledge(agent.agent_id, sequence, state);
       const cursor = this.cursors.encode(input.runId, agent.agent_id, Math.max(sequence, state.processed_sequence), state);
       return { run_id: input.runId, observer_agent_id: agent.agent_id, cursor, processed_cursor: cursor, advanced,
-        wait_contract: conversationWaitContract(input.runId, agent.agent_id) };
+        wait_contract: conversationWaitContract(input.runId, agent.agent_id, input.wakeOn) };
     });
   }
 
   async wait(input: WaitRunInput) {
-    let sequence: number | undefined;
+    let sequence: number | undefined, fromSequence: number | undefined;
     let requestedCursor = input.cursor ?? "";
+    const wakeOn = input.wakeOn ?? "control";
+    if (wakeOn !== "control" && wakeOn !== "all") throw new ControllerError("Invalid run wait wake policy.", "tool_error");
     if (input.timeoutMs !== undefined && (!Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0)) {
       throw new ControllerError("Observation timeout must be a positive duration.", "tool_error");
     }
     const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 20)));
     const started = Date.now();
+    const refreshedSessions = new Map<string, string>();
+    const contract = () => conversationWaitContract(input.runId, input.observerAgentId, wakeOn);
     const empty = (timedOut: boolean, closed: boolean) => ({ run_id: input.runId, observer_agent_id: input.observerAgentId,
-      events: [] as ReturnType<typeof publicEvent>[], cursor: requestedCursor, timed_out: timedOut, closed,
-      wait_contract: closed ? null : conversationWaitContract(input.runId, input.observerAgentId) });
+      events: [] as ReturnType<typeof publicEvent>[], cursor: requestedCursor, completion: null,
+      timed_out: timedOut, closed, wait_contract: closed ? null : contract() });
     while (true) {
       input.signal?.throwIfAborted();
       const observer = this.store.db.prepare("select * from run_observers where observer_agent_id = ? and run_id = ?")
@@ -260,35 +270,67 @@ export class RunObservation {
       const state = this.cursors.state(agent.agent_id, observer.start_sequence);
       if (sequence === undefined) {
         requestedCursor = input.cursor ?? this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state);
-        sequence = this.cursors.decode(requestedCursor, input.runId, agent.agent_id, state, true);
+        fromSequence = sequence = this.cursors.decode(requestedCursor, input.runId, agent.agent_id, state, true);
       }
       if (sequence < observer.start_sequence || sequence > this.currentSequence()) {
         throw new ControllerError("Observation cursor is outside this subscription's history.", "tool_error");
       }
       const owners = this.observationOwners(agent, input.runId);
-      const types = this.eventTypes(observer.observer_agent_id);
-      if (!types.length) return empty(false, true);
-      const rows = this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
+      if (!this.eventTypes(observer.observer_agent_id).length) return empty(false, true);
+      const runIds = this.wakePolicy.runIds(input.runId);
+      const freshExternalSessions = runIds.every(id => this.store.listAgents({ runId: id }).every(candidate =>
+        candidate.unregistered_at || candidate.backend !== "codex-session" || refreshedSessions.get(candidate.agent_id) === sessionObservationKey(candidate)));
+      const settled = freshExternalSessions ? this.wakePolicy.completion(input.runId) : null;
+      // Nested launches attach the same conversation to their own runs. Consume
+      // only those authorized streams, keeping native action visibility per identity.
+      const scopes = new Map<string, { agent: AgentRecord; owners: string[]; start: number }>();
+      scopes.set(input.runId, { agent, owners, start: observer.start_sequence });
+      for (const runId of this.wakePolicy.runIds(input.runId).filter(id => id !== input.runId)) {
+        const attached = this.store.db.prepare("select observer_agent_id, start_sequence from run_observers where run_id = ? and thread_id = ?")
+          .get(runId, observer.thread_id) as { observer_agent_id: string; start_sequence: number } | undefined;
+        const participant = attached ? this.store.getAgent(attached.observer_agent_id) : null;
+        if (participant && !participant.unregistered_at) scopes.set(runId, { agent: participant, owners: this.observationOwners(participant, runId), start: attached!.start_sequence });
+      }
+      const rows = [...scopes].flatMap(([runId, scope]) => this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
         where e.run_id = ? and o.sequence > ? and ${MATCHING_OBSERVER_SUBSCRIPTION}
-        order by o.sequence limit ?`).all(input.runId, sequence, agent.agent_id, JSON.stringify(owners), owners.length ? 1 : 0, limit) as Array<Record<string, unknown>>;
-      if (rows.length) {
-        const deliveredSequence = Number(rows.at(-1)!.sequence);
-        this.cursors.delivered(agent.agent_id, sequence, deliveredSequence);
-        const cursor = this.cursors.encode(input.runId, agent.agent_id, deliveredSequence, state);
-        return { run_id: input.runId, observer_agent_id: input.observerAgentId,
-          events: rows.map((row) => publicEvent({ event_id: String(row.event_id), run_id: input.runId,
-            agent_id: row.agent_id === null ? null : String(row.agent_id), type: String(row.type) as EventType,
-            created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) }, owners, this.notificationStatus(agent.agent_id, String(row.event_id)))),
-          cursor, processed_cursor: this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state),
-          ack_contract: { tool: "run_ack" as const, arguments: { run_id: input.runId, observer_agent_id: agent.agent_id, cursor },
-            instruction: "After successfully handling all events through this cursor, acknowledge them explicitly. Fetching or receiving a notification does not acknowledge processing." },
-          timed_out: false, closed: false, wait_contract: conversationWaitContract(input.runId, input.observerAgentId) };
+        order by o.sequence limit 100`).all(runId, Math.max(sequence!, scope.start), scope.agent.agent_id, JSON.stringify(scope.owners), scope.owners.length ? 1 : 0) as Array<Record<string, unknown>>)
+        .sort((a, b) => Number(a.sequence) - Number(b.sequence)).slice(0, 100);
+      const events: ReturnType<typeof publicEvent>[] = [];
+      for (const row of rows) {
+        sequence = Number(row.sequence);
+        const scope = scopes.get(String(row.run_id))!;
+        const event: EventRecord = { event_id: String(row.event_id), run_id: String(row.run_id),
+          agent_id: row.agent_id === null ? null : String(row.agent_id), type: String(row.type) as EventType,
+          created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) };
+        if (wakeOn === "all" || this.wakePolicy.wakes(event, scope.agent, scope.owners)) {
+          events.push(publicEvent(event, scope.owners, this.notificationStatus(scope.agent.agent_id, event.event_id)));
+          if (events.length === limit) break;
+        }
+      }
+      // Filter before the effective batch limit. Skipped activity stays in history;
+      // only an explicit ACK of this delivered range commits the observer's progress.
+      const hasMore = [...scopes].some(([runId, scope]) => Boolean(this.store.db.prepare(`select 1 from events e join event_order o using(event_id)
+        where e.run_id = ? and o.sequence > ? and ${MATCHING_OBSERVER_SUBSCRIPTION} limit 1`)
+        .get(runId, Math.max(sequence!, scope.start), scope.agent.agent_id, JSON.stringify(scope.owners), scope.owners.length ? 1 : 0)));
+      // All requested deliveries must be drained before handing back terminal control.
+      const completion = hasMore ? null : settled;
+      if (events.length || completion) {
+        this.cursors.delivered(agent.agent_id, fromSequence!, sequence);
+        const cursor = this.cursors.encode(input.runId, agent.agent_id, sequence, state);
+        return { run_id: input.runId, observer_agent_id: input.observerAgentId, events, completion, has_more: hasMore, cursor,
+          processed_cursor: this.cursors.encode(input.runId, agent.agent_id, state.processed_sequence, state),
+          ack_contract: { tool: "run_ack" as const,
+            arguments: { run_id: input.runId, observer_agent_id: agent.agent_id, cursor, wake_on: wakeOn },
+            instruction: "After successfully handling this delivery, acknowledge its cursor explicitly. Receiving events never acknowledges processing." },
+          timed_out: false, closed: false, wait_contract: contract() };
       }
       if (run.status === "stopped") return empty(false, true);
       const remaining = input.timeoutMs === undefined ? Infinity : input.timeoutMs - (Date.now() - started);
       if (remaining <= 0) return empty(true, false);
-      // Refresh workers in deterministic code; the observing conversation itself is never polled or restarted.
-      await this.controller.pollActiveAgents(input.runId);
+      if (rows.length === 100) continue;
+      // Status refresh is deterministic code, never a supervisor model invocation.
+      void this.controller.refreshObservedRuns(runIds).then(ids => { for (const item of ids) refreshedSessions.set(item.agent_id, item.key); });
+      input.signal?.throwIfAborted();
       await cancellableDelay(Math.min(input.intervalMs ?? 1000, remaining), input.signal);
     }
   }
@@ -354,8 +396,13 @@ function publicEvent(event: EventRecord, owners: string[] = [], notificationStat
     : undefined;
   const phase = typeof event.payload.step_id === "string" ? event.payload.step_id : typeof event.payload.target_step_id === "string" ? event.payload.target_step_id : undefined;
   const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
-  return { event_id: event.event_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
+  return { event_id: event.event_id, run_id: event.run_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
     ...compactFlowEvent(event),
+    ...(event.payload.reason === "coordinator_gate" && event.payload.decision ? {
+      decision: Object.fromEntries(Object.entries(event.payload.decision as Record<string, unknown>)
+        .filter(([key]) => ["key", "artifact_key", "owner", "authority"].includes(key)))
+    } : {}),
+    ...(typeof event.payload.step_instance_id === "string" ? { step_instance_id: event.payload.step_instance_id } : {}),
     summary: `${event.type.replace(/[._]/g, " ")}${phase ? `: ${phase}` : ""}`,
     ...(flow ? { flow_instance_id: flow } : {}), ...(phase ? { step_id: phase } : {}),
     ...(ownerAction ? { orchestrator_action: ownerAction } : {}), ...(notificationStatus ? { notification_status: notificationStatus } : {}) };

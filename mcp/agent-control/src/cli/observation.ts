@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import type { RunWakeOn } from "../core/run-wake-policy.js";
 import type { EventType } from "../core/types.js";
 import { parseDurationMs } from "../core/duration.js";
 import type { AcknowledgeRunInput, RunObservation } from "../core/run-observation.js";
@@ -43,14 +44,15 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
     .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
     .option("--cursor <cursor>", "Explicit replay cursor; omit to resume the durable processed position. Fetching never acknowledges processing.")
     .option("--timeout <duration>", "Optional timeout such as 1h.")
-    .action(async (options: { run: string; observerAgentId: string; cursor?: string; timeout?: string }) => {
+    .option("--wake-on <policy>", "control (default) for actionable events and completion; all for each subscribed event.")
+    .action(async (options: { run: string; observerAgentId: string; cursor?: string; timeout?: string; wakeOn?: RunWakeOn }) => {
       const cancellation = new AbortController();
       const abort = () => cancellation.abort(new Error("Observation cancelled"));
       process.once("SIGINT", abort);
       process.once("SIGTERM", abort);
       try {
         deps.output(await deps.controller.waitForRun({ runId: options.run, observerAgentId: options.observerAgentId,
-          cursor: options.cursor, timeoutMs: options.timeout ? parseDurationMs(options.timeout) : undefined, signal: cancellation.signal }));
+          cursor: options.cursor, wakeOn: options.wakeOn, timeoutMs: options.timeout ? parseDurationMs(options.timeout) : undefined, signal: cancellation.signal }));
       } finally {
         process.removeListener("SIGINT", abort);
         process.removeListener("SIGTERM", abort);
@@ -61,9 +63,10 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
     .requiredOption("--run <id>", "Observed run.")
     .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
     .requiredOption("--cursor <cursor>", "Observer-bound cursor returned by run wait after handling the events.")
-    .action((options: { run: string; observerAgentId: string; cursor: string }) => {
+    .option("--wake-on <policy>", "Preserve control or all in the next wait contract.")
+    .action((options: { run: string; observerAgentId: string; cursor: string; wakeOn?: RunWakeOn }) => {
       const controller = deps.controller as typeof deps.controller & { acknowledgeRunEvents(input: AcknowledgeRunInput): ReturnType<RunObservation["acknowledge"]> };
       deps.output(controller.acknowledgeRunEvents({ runId: options.run, observerAgentId: options.observerAgentId,
-        cursor: options.cursor, ...deps.authOptions({ allowStoredAdminKey: true }) }));
+        cursor: options.cursor, wakeOn: options.wakeOn, ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
 }

@@ -17,7 +17,7 @@ export async function handleTool(
     case "flow_context_update": return controller.updateFlowContext({ flowInstanceId: String(input.flow_instance_id), context: String(input.context), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "flow_decision": return controller.recordFlowDecision({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), value: input.value, reason: String(input.reason), expectedRevision: Number(input.expected_revision), artifactKey: maybeString(input.artifact_key), artifactDigest: maybeString(input.artifact_digest), packageManifestDigest: maybeString(input.package_manifest_digest), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "flow_evidence": return controller.executeFlowEvidence({ flowInstanceId: String(input.flow_instance_id), key: String(input.key), request: input.request as import("../core/evidence/service.js").EvidenceRequest, stepInstanceId: maybeString(input.step_instance_id), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
-    case "run_ack": return controller.acknowledgeRunEvents({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id), cursor: String(input.cursor), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+    case "run_ack": return controller.acknowledgeRunEvents({ wakeOn: input.wake_on as "control" | "all" | undefined, runId: String(input.run_id), observerAgentId: String(input.observer_agent_id), cursor: String(input.cursor), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "worker_launch": return launchWorkerTool(controller, input);
     case "worker_attach": return attachWorkerTool(controller, input);
     case "flow_launch": return launchFlowTool(controller, input);
@@ -27,7 +27,8 @@ export async function handleTool(
         delivery: input.delivery as "wait" | "notify" | undefined, adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
     case "run_wait":
       return controller.waitForRun({ runId: String(input.run_id), observerAgentId: String(input.observer_agent_id),
-        cursor: maybeString(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit), signal });
+        cursor: maybeString(input.cursor), timeoutMs: maybeNumber(input.timeout_ms), limit: maybeNumber(input.limit),
+        wakeOn: input.wake_on as "control" | "all" | undefined, signal });
     case "backend_list":
       return controller.listBackends();
     case "flow_validate_config":

@@ -1,3 +1,4 @@
+import { sessionObservationKey } from "./run-wake-policy.js";
 import { applyProjectModels } from "./project-models.js";
 import { buildRunCosts } from "./pricing.js";
 import { CodexSessionAdapter } from "../adapters/codex-session.js";
@@ -6483,6 +6484,8 @@ export class AgentController {
     return messages;
   }
 
+  private successfulStatusReads = new Map<string, { version: number; key: string }>();
+
   async refreshAgentStatus(agentId: string): Promise<AgentRecord> {
     const agent = this.getAgent(agentId);
     if (agent.unregistered_at || (agent.backend !== "codex-session" && TERMINAL_STATUSES.has(agent.status))) {
@@ -6703,7 +6706,7 @@ export class AgentController {
           })
         );
         this.store.touchHeartbeat(current.agent_id);
-        return { agent: unresolved, projectedTerminal: false, deferredInvoking: false };
+        return { agent: unresolved, projectedTerminal: false, deferredInvoking: false, statusReadApplied: true };
       }
 
       // A terminal status from the same backend handle is authoritative proof
@@ -6750,7 +6753,10 @@ export class AgentController {
         });
       }
       this.store.touchHeartbeat(current.agent_id);
-      return { agent: updated, projectedTerminal, deferredInvoking: false };
+      return { agent: updated, projectedTerminal, deferredInvoking: false, statusReadApplied: true };
+    });
+    if (projection.statusReadApplied) this.successfulStatusReads.set(agentId, {
+      version: (this.successfulStatusReads.get(agentId)?.version ?? 0) + 1, key: sessionObservationKey(projection.agent)
     });
     for (const event of pendingEvents) {
       this.scheduleEventDelivery(event);
@@ -6776,6 +6782,40 @@ export class AgentController {
     }
     await this.checkHeartbeats();
     return refreshed;
+  }
+
+  private observationRefreshes = new Map<string, Promise<Array<{ agent_id: string; key: string }>>>();
+
+  /** Share status I/O between waiters without delaying their timeout or cancellation. */
+  refreshObservedRuns(runIds: string[]): Promise<Array<{ agent_id: string; key: string }>> {
+    if (this.disposing) return Promise.resolve([]);
+    const pending = runIds.map(runId => {
+      const existing = this.observationRefreshes.get(runId);
+      if (existing) return existing;
+      let finish!: (ids: Array<{ agent_id: string; key: string }>) => void;
+      const task = new Promise<Array<{ agent_id: string; key: string }>>(resolve => { finish = resolve; });
+      this.observationRefreshes.set(runId, task);
+      this.runBackground(async () => {
+        const freshSessions: Array<{ agent_id: string; key: string }> = [];
+        try {
+          await this.pollActiveAgents(runId);
+          // Imported sessions can start new turns outside this controller. A
+          // persisted terminal row is not sufficient evidence of completion.
+          for (const agent of this.store.listAgents({ runId })) {
+            if (agent.unregistered_at || agent.backend !== "codex-session") continue;
+            const before = this.successfulStatusReads.get(agent.agent_id)?.version ?? 0;
+            await this.refreshAgentStatus(agent.agent_id);
+            const read = this.successfulStatusReads.get(agent.agent_id);
+            if (read && read.version > before) freshSessions.push({ agent_id: agent.agent_id, key: read.key });
+          }
+        } finally {
+          this.observationRefreshes.delete(runId);
+          finish(freshSessions);
+        }
+      });
+      return task;
+    });
+    return Promise.all(pending).then(groups => groups.flat());
   }
 
   async waitForFlowTerminal(flowInstanceId: string, input: { intervalMs?: number; timeoutMs?: number } = {}) {

@@ -65,6 +65,14 @@ flow is still running; I am continuing to wait."
 
 ## Coordinator Decisions
 
+Use the launch response's own-thread `wait_contract` immediately after dispatch.
+Keep the turn open in the pending `run_wait` call with `wake_on: "control"`.
+The requester handles its decisions and the aggregate `completion` outcome;
+a separate executor also handles routing events. Do not relay routine phase
+progress. Answer user questions in commentary and resume the wait. Preserve
+ACK and cursor rules from `flow-runner`; subscription or notification alone is
+not a replacement for the pending call.
+
 Use `flow_decision` for configured decision steps. Their `owner: requester`
 binds the original conversational thread, even when another coordinator executes
 the run. `authority: coordinator` marks its narrow analysis-intent judgment;

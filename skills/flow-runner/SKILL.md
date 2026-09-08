@@ -279,10 +279,9 @@ boundary between operations, not the end of the model turn.
 
 When the user sends another message, answer in commentary, even if it is about
 an unrelated topic. Preserve the original work unless the user explicitly
-cancels or pauses it. At the end of an update, a short localized sentence can
-say: "The <flow> flow is still running; I am continuing to wait." Then re-enter
-`run_wait`; do not finish the turn after answering. No status sentence is needed
-when it would imply that completed work is still running.
+cancels or pauses it. Then re-enter the returned `wait_contract`; do not finish
+the turn after answering. Do not relay routine activity, inspect status repeatedly,
+or create monitoring automations while workers are running.
 
 Keep a record for every active run: its name, observer id, flow/worker ids,
 last successfully processed cursor, and completion condition. Do not overwrite
@@ -295,9 +294,27 @@ ids. Never advance a cursor for a batch the conversation did not process.
 Launch returns `observer.wait_contract`; event batches and timeouts return an
 updated `wait_contract` with `tool: "run_wait"`, ready-to-use `arguments`, and
 `turn_policy: "keep_open_while_work_pending"`. These are continuation guidance;
-the launch tool itself stays non-blocking. Use your newer processed cursor if a
-reused launch returns an older initial cursor. `closed: true` returns no next
+the launch tool itself stays non-blocking. Call the returned wait immediately:
+registration and subscription alone do not keep a tool call pending. Reusable
+contracts omit the cursor to recover durable acknowledged progress. `closed: true` returns no next
 wait for that observation; check the remaining supervised runs before ending.
+
+The default `wake_on: "control"` separates observable activity from events that
+need this thread. The requester receives decisions it owns (including
+`authority: coordinator` judgments, which do not automatically require asking
+the user), unresolved intervention, and aggregate completion. A separate
+executor also receives routing events and its native action references.
+Subscriptions still retain all selected events for the UI and inspection.
+Only use `wake_on: "all"` (`--wake-on all`) when the user requests individual
+worker completions or event updates. Preserve that policy in the returned ACK
+and next wait contracts.
+
+`completion` is null while registered work remains. When present, inspect its
+`outcome` (`completed`, `failed`, or `cancelled`): it covers every worker, flow,
+and descendant run, including outstanding goals and native actions. One
+`agent.completed` or `flow.completed` event is not whole-run completion.
+An observation closing is not proof of success. Acknowledge a handled delivery
+with its `ack_contract`; a timeout or cancelled wait does not acknowledge events.
 
 The default delivery mode is `wait`. Use renewable one-hour MCP waits below the
 effective client deadline. The bundled Codex server declares
@@ -307,7 +324,7 @@ effective client deadline. The bundled Codex server declares
 agentctl run wait \
   --run "$RUN_ID" \
   --observer-agent-id "$OBSERVER_AGENT_ID" \
-  --cursor "$OBSERVER_CURSOR" \
+  --wake-on control \
   --timeout 1h
 ```
 
@@ -326,11 +343,13 @@ continue supervising any remaining runs before considering a final response.
 Default observation covers every supported event type for the entire run,
 including workers registered later. Narrow filters only when explicitly requested. Select specific events with repeated
 `--requester-event` options on launch or `--event` on `agentctl run observe`.
-For a completion-only flow observation, select `flow.completed`. Independent
+For quiet supervision, keep the default full subscription and `wake_on: "control"`.
+Filtering only `flow.completed` would miss requester decisions. Independent
 worker terminal events do not mean the entire run has completed.
 
 The observer may inspect Agent Control run/flow state and compact agent
-summaries to answer the user. Keep its updates relevant and concise. It must
+summaries when answering a user question or resolving an actionable event.
+Otherwise stay in the pending wait. It must
 not claim a native action from an informational notification. If the same
 thread is already the authorized coordinator, it acts under that existing
 role; attaching observation does not create a second owner or grant.

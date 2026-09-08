@@ -31,6 +31,7 @@ export function registerObservationCommands(run, deps) {
         .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
         .option("--cursor <cursor>", "Explicit replay cursor; omit to resume the durable processed position. Fetching never acknowledges processing.")
         .option("--timeout <duration>", "Optional timeout such as 1h.")
+        .option("--wake-on <policy>", "control (default) for actionable events and completion; all for each subscribed event.")
         .action(async (options) => {
         const cancellation = new AbortController();
         const abort = () => cancellation.abort(new Error("Observation cancelled"));
@@ -38,7 +39,7 @@ export function registerObservationCommands(run, deps) {
         process.once("SIGTERM", abort);
         try {
             deps.output(await deps.controller.waitForRun({ runId: options.run, observerAgentId: options.observerAgentId,
-                cursor: options.cursor, timeoutMs: options.timeout ? parseDurationMs(options.timeout) : undefined, signal: cancellation.signal }));
+                cursor: options.cursor, wakeOn: options.wakeOn, timeoutMs: options.timeout ? parseDurationMs(options.timeout) : undefined, signal: cancellation.signal }));
         }
         finally {
             process.removeListener("SIGINT", abort);
@@ -50,9 +51,10 @@ export function registerObservationCommands(run, deps) {
         .requiredOption("--run <id>", "Observed run.")
         .requiredOption("--observer-agent-id <id>", "Registered observing participant.")
         .requiredOption("--cursor <cursor>", "Observer-bound cursor returned by run wait after handling the events.")
+        .option("--wake-on <policy>", "Preserve control or all in the next wait contract.")
         .action((options) => {
         const controller = deps.controller;
         deps.output(controller.acknowledgeRunEvents({ runId: options.run, observerAgentId: options.observerAgentId,
-            cursor: options.cursor, ...deps.authOptions({ allowStoredAdminKey: true }) }));
+            cursor: options.cursor, wakeOn: options.wakeOn, ...deps.authOptions({ allowStoredAdminKey: true }) }));
     });
 }

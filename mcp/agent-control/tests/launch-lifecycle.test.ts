@@ -57,7 +57,7 @@ describe("launch and shutdown boundaries", () => {
       expect(result.observer).toMatchObject({ thread_id: "original-user", event_types: [...EVENT_TYPES], delivery: "wait" });
       expect(result.continuation.action).toBe("orchestrator_action_required");
       expect(result.coordinator_observer.thread_id).toBe("conversation-lifecycle");
-      const waitArgs = { ...result.coordinator_observer.wait_contract.arguments, timeout_ms: 20 };
+      const waitArgs = { ...result.coordinator_observer.wait_contract.arguments, wake_on: "all", timeout_ms: 20 };
       const first = await client.callTool({ name: "run_wait", arguments: waitArgs });
       const batch = JSON.parse((first.content as Array<{ text: string }>)[0]!.text);
       expect(batch.events.map((event: { type: string }) => event.type)).toContain("flow.step_started");
@@ -65,10 +65,10 @@ describe("launch and shutdown boundaries", () => {
       expect(result.continuation.orchestrator_action).toMatchObject({
         operation: "spawn_agent", orchestrator_agent_id: result.coordinator_observer.observer_agent_id
       });
-      const userWait = await client.callTool({ name: "run_wait", arguments: result.observer.wait_contract.arguments });
+      const userWait = await client.callTool({ name: "run_wait", arguments: { ...result.observer.wait_contract.arguments, timeout_ms: 20 } });
       const userBatch = JSON.parse((userWait.content as Array<{ text: string }>)[0]!.text);
       expect(userBatch.events.every((event: any) => event.orchestrator_action === undefined)).toBe(true);
-      const pending = client.callTool({ name: "run_wait", arguments: { ...waitArgs, cursor: batch.cursor, timeout_ms: 3_600_000 } });
+      const pending = client.callTool({ name: "run_wait", arguments: { wake_on: "all", ...waitArgs, cursor: batch.cursor, timeout_ms: 3_600_000 } });
       // A later request proves the indefinite wait has entered the server before SIGTERM.
       await client.callTool({ name: "run_list", arguments: {} });
       process.kill(transport.pid!, "SIGTERM");

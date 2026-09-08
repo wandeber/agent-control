@@ -59,7 +59,7 @@ describe("run observation", () => {
       .emit({ runId, type, payload, agentId });
   }
   function wait(observation: ReturnType<typeof observe>, extra: Partial<Parameters<AgentController["waitForRun"]>[0]> = {}) {
-    return controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
+    return controller.waitForRun({ wakeOn: "all", runId: observation.run_id, observerAgentId: observation.observer_agent_id,
       cursor: observation.cursor, timeoutMs: 20, intervalMs: 1, ...extra });
   }
 
@@ -502,7 +502,7 @@ describe("run observation", () => {
       arguments: { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, timeout_ms: 3_600_000 } });
     expect(observation.wait_contract.arguments).not.toHaveProperty("cursor");
     const firstEvent = emit(observation.run_id, "flow.step_started", { step_id: "analysis" });
-    const first = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id });
+    const first = await controller.waitForRun({ wakeOn: "all", runId: observation.run_id, observerAgentId: observation.observer_agent_id });
     expect(first.events.map(e => e.event_id)).toEqual([firstEvent.event_id]);
     await handleTool(controller, "run_ack", { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: first.cursor });
     const cancellation = new AbortController();
@@ -511,11 +511,11 @@ describe("run observation", () => {
     await expect(pending).rejects.toThrow(/new user message/);
     // The model answers the user while backend events continue to be persisted.
     const duringReply = emit(observation.run_id, "flow.step_started", { step_id: "implementation" });
-    const resumed = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id, timeoutMs: 3_600_000 });
+    const resumed = await controller.waitForRun({ wakeOn: "all", runId: observation.run_id, observerAgentId: observation.observer_agent_id, timeoutMs: 3_600_000 });
     expect(resumed.events.map(e => e.event_id)).toEqual([duringReply.event_id]);
     expect(resumed.wait_contract!.arguments).not.toHaveProperty("cursor");
     await handleTool(controller, "run_ack", { run_id: observation.run_id, observer_agent_id: observation.observer_agent_id, cursor: resumed.cursor });
-    const timeout = await controller.waitForRun({ runId: observation.run_id, observerAgentId: observation.observer_agent_id,
+    const timeout = await controller.waitForRun({ wakeOn: "all", runId: observation.run_id, observerAgentId: observation.observer_agent_id,
       timeoutMs: 1, intervalMs: 1 });
     expect(timeout).toMatchObject({ timed_out: true, closed: false,
       wait_contract: { arguments: { timeout_ms: 3_600_000 } } });
@@ -530,14 +530,14 @@ describe("run observation", () => {
     const contract = launched.observer.wait_contract;
     expect(contract.arguments).not.toHaveProperty("cursor");
     expect(contract.arguments).not.toHaveProperty("agent_token");
-    const batch = await handleTool(controller, contract.tool, { ...contract.arguments, timeout_ms: 1 }) as any;
+    const batch = await handleTool(controller, contract.tool, { ...contract.arguments, wake_on: "all", timeout_ms: 1 }) as any;
     expect(batch.events.length).toBeGreaterThan(0);
     expect(batch.ack_contract.arguments).not.toHaveProperty("agent_token");
     const ack = await handleTool(controller, batch.ack_contract.tool, batch.ack_contract.arguments) as any;
     expect(ack.advanced).toBe(true);
     const next = await handleTool(controller, ack.wait_contract.tool, { ...ack.wait_contract.arguments, timeout_ms: 1 }) as any;
     expect(next.events).toEqual([]);
-    const replay = await handleTool(controller, contract.tool, { ...contract.arguments, cursor: launched.observer.cursor, timeout_ms: 1 }) as any;
+    const replay = await handleTool(controller, contract.tool, { ...contract.arguments, wake_on: "all", cursor: launched.observer.cursor, timeout_ms: 1 }) as any;
     expect(replay.events.map((event: any) => event.event_id)).toEqual(batch.events.map((event: any) => event.event_id));
   });
 
