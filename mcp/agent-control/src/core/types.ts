@@ -763,6 +763,7 @@ export interface AgentComputedState {
 }
 
 export interface DashboardSnapshot {
+  costs?: import("./pricing.js").RunCosts;
   run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
   selected_run_id: string | null;

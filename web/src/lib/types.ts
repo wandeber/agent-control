@@ -319,6 +319,7 @@ export interface AgentComputedState {
 }
 
 export interface DashboardSnapshot {
+  costs?: RunCosts;
   run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
   selected_run_id: string | null;
@@ -345,6 +346,35 @@ export interface DashboardSnapshot {
     context_used: number | null;
     context_limit: number | null;
   };
+}
+
+export interface CostAmount { usd: number | null; partial: boolean }
+export interface ExchangeRate { usd_per_eur: number; source: string | null; updated_at: string | null }
+export interface CostBreakdown {
+  input: CostAmount;
+  cached: CostAmount;
+  cache_write: CostAmount;
+  output: CostAmount;
+  total: CostAmount;
+}
+export interface AgentCost extends CostBreakdown {
+  agent_id: string;
+  model: string;
+  pricing_key: string | null;
+  rates: { input_per_million: number; cached_input_per_million: number; cache_write_input_per_million: number; output_per_million: number } | null;
+}
+export interface RunCosts {
+  currency: "USD";
+  updated_at: string;
+  source: string;
+  basis: string;
+  configuration_valid: boolean;
+  override_files: string[];
+  model_references?: Record<string, { model: string; source: string; basis: string }>;
+  exchange?: ExchangeRate;
+  agents: AgentCost[];
+  models: Array<CostBreakdown & { model: string }>;
+  total: CostBreakdown;
 }
 
 export interface AgentMessage {

@@ -1,6 +1,7 @@
 "use client";
 
 import { agentTokenLabel, agentModelLabel } from "@/lib/agent-presentation";
+import { AgentCostLabel } from "./agent-cost-label";
 
 import { useQuery } from "@tanstack/react-query";
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
@@ -112,7 +113,7 @@ export function WorkspacePanel({
         <div className="flex min-h-12 items-center justify-between gap-3 border-b border-black/8 bg-white/72 px-3 py-2">
           <div className="min-w-0">
             <div className="truncate text-xs font-semibold text-ink-900">{agent?.title ?? "Select an agent"}</div>
-            {agent ? <div className="flex flex-wrap items-baseline gap-x-3 text-[11px] text-ink-500"><span>{agentModelLabel(agent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span></div> : null}
+            {agent ? <div className="flex flex-wrap items-baseline gap-x-3 text-[11px] text-ink-500"><span>{agentModelLabel(agent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span><AgentCostLabel snapshot={snapshot} agentId={agent.agent_id} /></div> : null}
             <div className="truncate text-[11px] text-ink-400">
               {agent ? (
                 <>

@@ -49,7 +49,7 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
       <FloatingHandles type="target" />
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <AgentUsageIcon usage={data.presentation.usage} className={style.bg + " " + style.text} />
+          <AgentUsageIcon usage={data.presentation.usage} cost={data.presentation.cost} exchange={data.presentation.exchange} className={style.bg + " " + style.text} />
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-ink-900" title={data.agent.title}>{data.presentation.title}</div>
             {data.presentation.title.toLowerCase() !== data.agent.role?.replaceAll("_", " ").toLowerCase() ? (

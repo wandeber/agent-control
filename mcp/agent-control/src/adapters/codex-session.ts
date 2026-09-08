@@ -92,7 +92,10 @@ export function sessionUsage(handle: AgentHandle): AgentUsageObservation | null 
   const baseline = handle.data.usage_baseline as AgentUsageObservation | undefined;
   // Old attached conversations without a baseline must not charge their entire history to a run.
   if (!baseline && (handle.data.agent_control_role || handle.data.observation_only)) return null;
-  if (!baseline) return session.usage;
+  if (!baseline) {
+    const models = new Set(session.usageSamples.map(sample => sample.model));
+    return { ...session.usage, model: models.size > 1 ? "Mixed models" : session.usage.model };
+  }
   const result = { ...session.usage, source: "codex.rollout.since_attachment" };
   for (const field of ["input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens"] as const) {
     const value = session.usage[field], before = baseline[field];

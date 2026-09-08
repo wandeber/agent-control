@@ -1,4 +1,5 @@
 import { STATUS_STYLE } from "./format";
+import { agentCost } from "./costs";
 import { latestAgentFlowStep } from "./flow-steps";
 import type { AgentRecord, DashboardSnapshot, UsageSnapshotRecord } from "./types";
 
@@ -22,6 +23,8 @@ export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecor
     title: generatedCoordinatorTitle ? "Orchestrator" : snapshot.flows.some((flow) => agent.title === `${flow.flow_id}: ${agent.role}`) ? humanize(agent.role ?? "worker") : agent.title,
     phase,
     usage: snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage ?? null,
+    cost: agentCost(snapshot, agent.agent_id),
+    exchange: snapshot.costs?.exchange,
     tokens: agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage),
     activity: (text && activity?.kind === "tool" ? `${toolPrefix} · ${text}` : text) || summary || lastLine((agent.failure_reason ?? "").replaceAll("_", " ")) ||
       (agent.role === "observer" && running ? "Following run events" : agent.status === "planned" ? "Ready for its turn" :
@@ -32,6 +35,16 @@ export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecor
 
 function humanize(value: string) {
   return value.replaceAll("_", " ").replaceAll("-", " ").replace(/^./, (letter) => letter.toUpperCase());
+}
+
+/** Each row retains the registered thread title and cumulative usage of that agent identity. */
+export function agentCostRows(snapshot: DashboardSnapshot) {
+  const agents = new Map(snapshot.agents.map(agent => [agent.agent_id, agent]));
+  const usage = new Map(snapshot.computed_agents.map(agent => [agent.agent_id, agent.latest_usage]));
+  return (snapshot.costs?.agents ?? []).map(cost => {
+    const observed = usage.get(cost.agent_id);
+    return { agent_id: cost.agent_id, name: agents.get(cost.agent_id)?.title || cost.agent_id, cost, usage: summarizeUsage(observed ? [observed] : []) };
+  });
 }
 
 function lastLine(text: string) {
@@ -71,6 +84,11 @@ export function modelUsage(snapshot: DashboardSnapshot) {
     const model = usage.model || agent.model || (typeof agent.backend_handle?.resolved_model === "string" ? agent.backend_handle.resolved_model : "Unknown model");
     groups.set(model, [...(groups.get(model) ?? []), usage]);
   }
+  const all = [...groups.values()].flat();
+  return { rows: [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([model, items]) => ({ model, ...summarizeUsage(items) })), totals: summarizeUsage(all), reported: all.length };
+}
+
+function summarizeUsage(items: UsageSnapshotRecord[]) {
   const sum = (items: UsageSnapshotRecord[], key: "input_tokens" | "output_tokens" | "total_tokens" | "cached" | "uncached") => {
     const values = items.map((item) => {
       if (key !== "cached" && key !== "uncached") return item[key];
@@ -82,9 +100,7 @@ export function modelUsage(snapshot: DashboardSnapshot) {
     const known = values.filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
     return { value: known.length ? known.reduce((a, b) => a + b, 0) : null, partial: known.length < values.length };
   };
-  const summarize = (items: UsageSnapshotRecord[]) => ({ input: sum(items, "input_tokens"), cached: sum(items, "cached"), uncached: sum(items, "uncached"), output: sum(items, "output_tokens"), total: sum(items, "total_tokens") });
-  const all = [...groups.values()].flat();
-  return { rows: [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([model, items]) => ({ model, ...summarize(items) })), totals: summarize(all), reported: all.length };
+  return { input: sum(items, "input_tokens"), cached: sum(items, "cached"), uncached: sum(items, "uncached"), output: sum(items, "output_tokens"), total: sum(items, "total_tokens") };
 }
 
 /** Subdivisions are included in totals; the non-reasoning remainder can include tool calls. */

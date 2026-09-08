@@ -29,12 +29,14 @@ export class CodexCliAdapter {
         if (data.profile)
             data.profile_hash = this.profileHash(data.profile);
         // Presentation only: never turn the profile's model into a CLI override.
-        data.resolved_model = data.model ?? this.profileModel(data.profile);
+        const identity = this.profileIdentity(data.profile);
+        data.resolved_model = data.model ?? identity.model;
+        data.model_provider = identity.provider;
         data.logFile = join(data.dir, "stderr.log");
         await this.launch(data, input.prompt ?? "", undefined, input.agentToken);
         return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
     }
-    profileModel(profile) {
+    profileIdentity(profile) {
         const home = process.env.CODEX_HOME ?? join(homedir(), ".codex");
         const read = (path) => {
             try {
@@ -46,9 +48,11 @@ export class CodexCliAdapter {
         };
         const base = read(join(home, "config.toml"));
         const selected = profile ? read(join(home, `${profile}.config.toml`)) : {};
-        // Only export the model string; provider/auth configuration stays private.
+        // Only export identity strings for display/pricing; endpoints and authentication stay private.
         const model = selected.model ?? base.model;
-        return typeof model === "string" && model.trim() ? model : undefined;
+        const provider = selected.model_provider ?? base.model_provider ?? "openai";
+        return { model: typeof model === "string" && model.trim() ? model : undefined,
+            provider: typeof provider === "string" && provider.trim() ? provider : undefined };
     }
     profileHash(profile) {
         const path = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${profile}.config.toml`);

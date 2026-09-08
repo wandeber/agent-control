@@ -1,6 +1,7 @@
 "use client";
 
-import { agentModelLabel, agentTokenLabel, agentTotalLabel } from "@/lib/agent-presentation";
+import { agentModelLabel, agentTokenLabel } from "@/lib/agent-presentation";
+import { AgentCostLabel } from "./agent-cost-label";
 import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
@@ -107,7 +108,7 @@ export function SubagentsShell() {
                 </button>
                 <div className="min-w-0">
                   <h2>{selectedAgent.title}</h2>
-                  <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span></p>
+                  <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span><AgentCostLabel snapshot={snapshot} agentId={selectedAgent.agent_id} /></p>
                 </div>
                 <StatusPill status={selectedAgent.status} />
               </header>
@@ -162,7 +163,7 @@ function AgentGroup({
             <StatusDot status={agent.status} />
             <span className="subagent-list-copy">
               <span className="subagent-list-title">{agent.title}</span>
-              <span className="subagent-list-detail flex items-baseline gap-2"><span>{agentModelLabel(agent)}</span><span>{agentTotalLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage)}</span></span>
+              <span className="subagent-list-detail flex flex-wrap items-baseline gap-x-2"><span>{agentModelLabel(agent)}</span><AgentCostLabel snapshot={snapshot} agentId={agent.agent_id} /></span>
             </span>
             <StatusPill compact status={agent.status} />
           </button>

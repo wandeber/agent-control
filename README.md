@@ -4,6 +4,10 @@ Agent Control is a local deterministic control plane for agent workers. It is
 packaged as a Codex plugin with an MCP server and an `agentctl` CLI that share
 the same TypeScript core.
 
+The UI shows reported tokens and estimated USD costs per agent and per model,
+with a run total in Run Info. Prices are bundled for offline use and can be
+overridden globally or per project. See [token costs and pricing configuration](docs/pricing.md).
+
 Default workers and bundled flow roles use Codex (`codex-thread`) with
 `gpt-5.6-luna` and `max` reasoning. Existing explicit Codex selections, such as
 the development-v1 final reviewer, are preserved. OpenCode is an optional backend

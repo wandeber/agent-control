@@ -1,4 +1,5 @@
 import { applyProjectModels } from "./project-models.js";
+import { buildRunCosts } from "./pricing.js";
 import { CodexSessionAdapter } from "../adapters/codex-session.js";
 import { FlowPackages, flowPackagesRequestSchema, type FlowPackagesRequest, type FlowPackagesToolRequest, type PackageGroup, type PackageContext } from "./flow-packages.js";
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
@@ -8118,6 +8119,7 @@ export class AgentController {
       artifacts,
       latest_events: latestEvents,
       computed_agents: computedAgents,
+      costs: buildRunCosts(agents, latestUsageByAgent, selectedRunId ? this.store.getRun(selectedRunId)?.repo_dir : null),
       status_counts: statusCounts,
       usage_totals: usageTotals([...latestUsageByAgent.values()])
     };

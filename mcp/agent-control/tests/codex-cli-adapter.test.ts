@@ -110,6 +110,7 @@ console.log(JSON.stringify({type:'turn.completed'}));`),{mode:0o700});
 it('resolves arbitrary profile names with TOML semantics without exporting credentials or overriding the profile',async()=>{
  writeFileSync(join(dir,'custom.config.toml'),`# model = "wrong"
 model = 'yoda' # selected model
+model_provider = 'example'
 [model_providers.example]
 model = "nested-wrong"
 secret = "private-value"
@@ -117,6 +118,7 @@ secret = "private-value"
  const adapter=new CodexCliAdapter(),handle=await adapter.start({...input(),metadata:{profile:'custom'}});
  await terminal(adapter,handle);
  expect(handle.data.resolved_model).toBe('yoda');
+ expect(handle.data.model_provider).toBe('example');
  expect(handle.data.model).toBeUndefined();
  expect(JSON.stringify(handle)).not.toContain('private-value');
  const calls=JSON.parse(readFileSync(join(dir,'calls.jsonl'),'utf8').trim());

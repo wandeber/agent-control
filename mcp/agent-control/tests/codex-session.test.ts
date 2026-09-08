@@ -65,6 +65,10 @@ describe("existing Codex session observation", () => {
     expect(result).toMatchObject({ input_tokens: 100, cached_input_tokens: 50, output_tokens: 10, reasoning_output_tokens: 5, model: "yoda" });
     expect(sessionUsage({ backend: "codex-thread", id: thread, data: { thread_id: thread, agent_control_role: "observer" } })).toBeNull();
   });
+  it("does not attribute a mixed-model native session's entire cost to the last model", () => {
+    appendFileSync(path, row("turn_context", { model: "gpt-6-astra" }) + usage(200));
+    expect(sessionUsage({ backend: "codex-thread", id: thread, data: { thread_id: thread } })?.model).toBe("Mixed models");
+  });
   it("restores subscriptions after restart and retains every completion between reads", async () => {
     const attached = await withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread }));
     await controller.dispose();

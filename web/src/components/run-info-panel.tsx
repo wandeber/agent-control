@@ -1,8 +1,10 @@
 "use client";
 
-import { modelUsage } from "@/lib/agent-presentation";
+import { TokenUsageCell } from "./token-usage-cell";
+import { agentCostRows, modelUsage } from "@/lib/agent-presentation";
+import { costBreakdownLabel, costLabel } from "@/lib/costs";
 import { compactId, cx, elapsedFrom, formatDateTime, formatDuration, formatNumber, STATUS_STYLE } from "@/lib/format";
-import type { DashboardSnapshot, RunRecord } from "@/lib/types";
+import type { CostBreakdown, DashboardSnapshot, RunRecord } from "@/lib/types";
 
 export function RunInfoPanel({
   run,
@@ -17,6 +19,9 @@ export function RunInfoPanel({
   const running = snapshot.status_counts.running ?? 0;
   const waiting = snapshot.status_counts.waiting_for_input ?? 0;
   const consumption = modelUsage(snapshot);
+  const costs = snapshot.costs;
+  const models = [...new Set([...consumption.rows.map(row => row.model), ...(costs?.models.map(row => row.model) ?? [])])].sort();
+  const agentCosts = agentCostRows(snapshot);
 
 
   return (
@@ -26,25 +31,39 @@ export function RunInfoPanel({
           <div className="truncate text-base font-semibold text-ink-900">{run?.title ?? "No run selected"}</div>
           <div className="mt-0.5 truncate text-xs text-ink-400">{run?.repo_dir ?? run?.run_id ?? "Waiting for Agent Control data"}</div>
         </div>
+        {costs ? <div className="shrink-0 text-right" title={costBreakdownLabel(costs.total)}><div className="text-base font-semibold tabular-nums text-ink-900">{costLabel(costs.total.total)}</div><div className="text-[11px] text-ink-400">Estimated USD</div></div> : null}
       </div>
 
         <div className="agent-scroll min-h-0 flex-1 overflow-auto p-4">
           <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-ink-500">
             <span>{snapshot.agents.length} agents</span><span>{running} running</span><span>{waiting} waiting</span><span>{elapsed} elapsed</span>
           </div>
-          {consumption.rows.length ? <div className="mt-5">
-            <h3 className="text-sm font-semibold text-ink-900">Token consumption</h3>
-            <p className="mt-1 text-xs text-ink-400">Reported usage · input includes cached tokens; output includes reported reasoning. Missing usage is excluded; + marks a partial sum.</p>
+          {models.length ? <div className="mt-5">
+            <h3 className="text-sm font-semibold text-ink-900">Usage by model</h3>
             <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs tabular-nums">
-              <thead className="text-ink-400"><tr><th className="py-2 font-medium">Model</th><th className="px-3 py-2 text-right font-medium">Input</th><th className="px-3 py-2 text-right font-medium">Cached input</th><th className="px-3 py-2 text-right font-medium">Uncached input</th><th className="px-3 py-2 text-right font-medium">Output</th><th className="py-2 text-right font-medium">Total</th></tr></thead>
-              <tbody>{consumption.rows.map((row) => <tr key={row.model} className="border-t border-black/5"><th className="py-2 font-medium text-ink-700">{row.model}</th><UsageCells values={row} /></tr>)}</tbody>
-              <tfoot className="border-t border-black/10 font-semibold text-ink-900"><tr><th className="py-3">All models</th><UsageCells values={consumption.totals} /></tr></tfoot>
+              <thead className="text-ink-400"><tr><th className="py-2 font-medium">Model</th><th className="py-2 text-right font-medium">Tokens</th>{costs ? <th className="whitespace-nowrap pl-4 py-2 text-right font-medium">Cost (USD)</th> : null}</tr></thead>
+              <tbody>{models.map((model) => <tr key={model} className="border-t border-black/5"><th className="whitespace-nowrap py-2 font-medium text-ink-700">{model}</th><TokenUsageCell label={model} values={consumption.rows.find(row => row.model === model)} />{costs ? <CostCell cost={costs.models.find(row => row.model === model)} /> : null}</tr>)}</tbody>
+              <tfoot className="border-t border-black/10 font-semibold text-ink-900"><tr><th className="py-3">All models</th><TokenUsageCell label="All models" values={consumption.totals} />{costs ? <CostCell cost={costs.total} /> : null}</tr></tfoot>
+            </table></div>
+
+          </div> : null}
+
+          {agentCosts.length ? <div className="mt-5">
+            <h3 className="text-sm font-semibold text-ink-900">Usage by agent</h3>
+            <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs tabular-nums">
+              <thead className="text-ink-400"><tr><th className="py-2 font-medium">Agent</th><th className="px-3 py-2 font-medium">Model</th><th className="py-2 text-right font-medium">Tokens</th><th className="whitespace-nowrap pl-4 py-2 text-right font-medium">Cost (USD)</th></tr></thead>
+              <tbody>{agentCosts.map(row => <tr key={row.agent_id} className="border-t border-black/5"><th className="py-2 font-medium text-ink-700">{row.name}</th><td className="px-3 py-2 text-ink-500">{row.cost.model}</td><TokenUsageCell label={row.name} values={row.usage} /><CostCell cost={row.cost} /></tr>)}</tbody>
             </table></div>
           </div> : null}
 
           {snapshot.flow_instances.length > 0 ? (
             <FlowOverview selectedStepInstanceId={selectedStepInstanceId} snapshot={snapshot} />
           ) : null}
+
+          {costs ? <div className="mt-5">
+            {costs ? <p className="mt-3 text-xs text-ink-400">{costs.configuration_valid ? <>Estimated token costs at configured rates · <a className="underline underline-offset-2" href={costs.source} target="_blank" rel="noreferrer">OpenAI defaults: {costs.updated_at}</a>{costs.override_files.length ? " · Custom configuration applied" : " · Standard, short context"}. Excludes tool fees and subscription billing.</> : "Cost estimates unavailable: check your pricing configuration."}</p> : null}
+            {costs?.configuration_valid ? Object.entries(costs.model_references ?? {}).map(([model, reference]) => <p key={model} className="mt-1 text-xs text-ink-400">{model} default reference: <a className="underline underline-offset-2" href={reference.source} target="_blank" rel="noreferrer">{reference.model}</a> · {reference.basis}.</p>) : null}
+          </div> : null}
 
 
         </div>
@@ -180,7 +199,6 @@ function flowStepStatusClass(status: string): string {
   return "bg-zinc-50 text-zinc-600";
 }
 
-function UsageCells({ values }: { values: ReturnType<typeof modelUsage>["totals"] }) {
-  const label = (value: typeof values.input) => value.value === null ? "—" : `${new Intl.NumberFormat("en-US").format(value.value)}${value.partial ? "+" : ""}`;
-  return <>{(["input", "cached", "uncached", "output", "total"] as const).map((key) => <td key={key} className={key === "total" ? "py-2 text-right align-top" : "px-3 py-2 text-right align-top"}>{label(values[key])}</td>)}</>;
+function CostCell({ cost }: { cost?: CostBreakdown }) {
+  return <td className="whitespace-nowrap py-2 pl-4 text-right align-top" title={costBreakdownLabel(cost)}>{costLabel(cost?.total)}</td>;
 }

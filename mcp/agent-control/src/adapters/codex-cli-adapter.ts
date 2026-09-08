@@ -10,7 +10,7 @@ import { agentRuntimeDir } from "../core/paths.js";
 import type { AgentUsageObservation, AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatusSnapshot, StartAgentInput, ReadLatestOptions, StopOptions, StopResult } from "../core/types.js";
 import { writeState, type CliJob, type CliState } from "./codex-cli-runner.js";
 
-interface Data { dir: string; cwd: string; profile?: string; model?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; resolved_model?: string; logFile?: string; }
+interface Data { dir: string; cwd: string; profile?: string; model?: string; model_provider?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; resolved_model?: string; logFile?: string; }
 const unsupported = (message: string) => new ControllerError(message, "unsupported_operation");
 export class CodexCliAdapter implements AgentAdapter {
   readonly kind = "codex-cli";
@@ -27,21 +27,25 @@ export class CodexCliAdapter implements AgentAdapter {
     if (existsSync(join(data.dir, "state.json"))) throw unsupported("This CLI worker already has an execution; continue its existing session instead.");
     if (data.profile) data.profile_hash = this.profileHash(data.profile);
     // Presentation only: never turn the profile's model into a CLI override.
-    data.resolved_model = data.model ?? this.profileModel(data.profile);
+    const identity = this.profileIdentity(data.profile);
+    data.resolved_model = data.model ?? identity.model;
+    data.model_provider = identity.provider;
     data.logFile = join(data.dir, "stderr.log");
     await this.launch(data, input.prompt ?? "", undefined, input.agentToken);
     return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
   }
-  private profileModel(profile?: string): string | undefined {
+  private profileIdentity(profile?: string): { model?: string; provider?: string } {
     const home = process.env.CODEX_HOME ?? join(homedir(), ".codex");
     const read = (path: string) => {
       try { return parseToml(readFileSync(path, "utf8")); } catch { return {}; }
     };
     const base = read(join(home, "config.toml"));
     const selected = profile ? read(join(home, `${profile}.config.toml`)) : {};
-    // Only export the model string; provider/auth configuration stays private.
+    // Only export identity strings for display/pricing; endpoints and authentication stay private.
     const model = selected.model ?? base.model;
-    return typeof model === "string" && model.trim() ? model : undefined;
+    const provider = selected.model_provider ?? base.model_provider ?? "openai";
+    return { model: typeof model === "string" && model.trim() ? model : undefined,
+      provider: typeof provider === "string" && provider.trim() ? provider : undefined };
   }
   private profileHash(profile: string): string {
     const path = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${profile}.config.toml`);

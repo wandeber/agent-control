@@ -1,0 +1,73 @@
+{
+  "currency": "USD",
+  "updated_at": "2026-09-08",
+  "source": "https://developers.openai.com/api/docs/pricing",
+  "basis": "Standard API token prices, short context; excludes tool fees and subscription billing.",
+  "models": {
+    "gpt-6-astra": {
+      "input_per_million": 10,
+      "cached_input_per_million": 1,
+      "cache_write_input_per_million": 12.5,
+      "output_per_million": 50
+    },
+    "gpt-5.6-sol": {
+      "input_per_million": 4,
+      "cached_input_per_million": 0.4,
+      "cache_write_input_per_million": 5,
+      "output_per_million": 20
+    },
+    "gpt-5.6-terra": {
+      "input_per_million": 2,
+      "cached_input_per_million": 0.2,
+      "cache_write_input_per_million": 2.5,
+      "output_per_million": 12
+    },
+    "gpt-5.6-luna": {
+      "input_per_million": 0.2,
+      "cached_input_per_million": 0.02,
+      "cache_write_input_per_million": 0.25,
+      "output_per_million": 1.2
+    },
+    "gpt-5.5": {
+      "input_per_million": 5,
+      "cached_input_per_million": 0.5,
+      "cache_write_input_per_million": 5,
+      "output_per_million": 30
+    },
+    "gpt-5.4-mini": {
+      "input_per_million": 0.75,
+      "cached_input_per_million": 0.075,
+      "cache_write_input_per_million": 0.75,
+      "output_per_million": 4.5
+    },
+    "yoda": {
+      "input_per_million": 0.44,
+      "cached_input_per_million": 0.014,
+      "cache_write_input_per_million": 0.44,
+      "output_per_million": 1.32
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "input_per_million": 0.44,
+      "cached_input_per_million": 0.014,
+      "cache_write_input_per_million": 0.44,
+      "output_per_million": 1.32
+    }
+  },
+  "model_references": {
+    "yoda": {
+      "model": "deepseek-v4-flash-vision-exp",
+      "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "basis": "Peak API rates"
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "model": "deepseek-v4-flash-vision-exp",
+      "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "basis": "Peak API rates"
+    }
+  },
+  "exchange": {
+    "usd_per_eur": 1.1622,
+    "source": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+    "updated_at": "2026-09-07"
+  }
+}

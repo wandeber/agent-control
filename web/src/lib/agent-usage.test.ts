@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentTokenLabel, agentTotalLabel, modelUsage, usageBreakdown } from "./agent-presentation";
+import { agentCostRows, agentTokenLabel, agentTotalLabel, modelUsage, usageBreakdown } from "./agent-presentation";
 import type { UsageSnapshotRecord, DashboardSnapshot } from "./types";
 
 const usage = (values: Partial<UsageSnapshotRecord>) => ({ input_tokens: null, output_tokens: null, total_tokens: null, ...values }) as UsageSnapshotRecord;
@@ -48,4 +48,21 @@ it("aggregates cache per model without treating missing cache usage as uncached"
   expect(modelUsage(snapshot).rows[0]).toMatchObject({ input: { value: 150, partial: false }, cached: { value: 120, partial: false }, uncached: { value: 30, partial: false } });
   snapshot.computed_agents[1].latest_usage!.cached_input_tokens = null;
   expect(modelUsage(snapshot).totals).toMatchObject({ cached: { value: 80, partial: true }, uncached: { value: 20, partial: true } });
+});
+
+it("keeps thread titles and individual token partitions even when agents share a role or model", () => {
+  const snapshot = { agents: [
+    { agent_id: "a", title: "Spring poem", role: "worker", model: "yoda" },
+    { agent_id: "b", title: "Summer poem", role: "worker", model: "yoda" }
+  ], computed_agents: [
+    { agent_id: "a", latest_usage: usage({ input_tokens: 100, cached_input_tokens: 80, output_tokens: 20, total_tokens: 120 }) },
+    { agent_id: "b", latest_usage: usage({ input_tokens: 50, cached_input_tokens: null, output_tokens: 10, total_tokens: 60 }) }
+  ], costs: { agents: [{ agent_id: "a", model: "yoda" }, { agent_id: "b", model: "yoda" }] } } as unknown as DashboardSnapshot;
+  const rows = agentCostRows(snapshot);
+  expect(rows.map(row => row.name)).toEqual(["Spring poem", "Summer poem"]);
+  expect(rows[0].usage).toMatchObject({ input: { value: 100 }, cached: { value: 80 }, uncached: { value: 20 }, output: { value: 20 }, total: { value: 120 } });
+  expect(rows[1].usage).toMatchObject({ input: { value: 50 }, cached: { value: null }, uncached: { value: null }, output: { value: 10 }, total: { value: 60 } });
+  expect(rows.reduce((sum, row) => sum + row.usage.total.value!, 0)).toBe(modelUsage(snapshot).totals.total.value);
+  snapshot.computed_agents[0].latest_usage = null;
+  expect(agentCostRows(snapshot)[0].usage.total.value).toBeNull();
 });
