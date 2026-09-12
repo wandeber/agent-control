@@ -21,6 +21,11 @@ export const FAILURE_REASONS = [
     "stale_artifact",
     "tool_error",
     "worker_reported_blocker",
+    "validation",
+    "not_found",
+    "conflict",
+    "capability_unavailable",
+    "unsupported_runtime",
     "unsupported_operation",
     "unknown"
 ];

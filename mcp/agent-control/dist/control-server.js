@@ -6,8 +6,12 @@ import { createReadStream, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { createController } from "./core/factory.js";
+import { AgentDefinitionService } from "./agent-definitions.js";
+import { errorToPayload } from "./core/errors.js";
+import { resolveAdminKey } from "./core/identity.js";
 export async function startControlServer(options) {
     const { controller, store } = createController();
+    const agentDefinitions = new AgentDefinitionService(controller);
     let uiOrigin = options.uiOrigin;
     const permissionTokens = new Map();
     let closing = false;
@@ -24,16 +28,17 @@ export async function startControlServer(options) {
             return;
         }
         const approvalRoute = request.url?.startsWith("/api/control/permissions/") || request.url?.startsWith("/api/control/canvas/") || request.url?.startsWith("/api/control/questions/");
-        if (approvalRoute) {
+        const catalogRoute = request.url?.startsWith("/api/control/agent-definitions") === true;
+        if (approvalRoute || catalogRoute) {
             const expectedHost = `localhost:${server.address()?.port}`;
             if (!["::1", "127.0.0.1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "") || !uiOrigin || request.headers.origin !== uiOrigin || request.headers.host !== expectedHost || request.headers["sec-fetch-site"] === "cross-site") {
-                sendJson(response, 403, { error: "Permission decisions require the configured local console origin." });
+                sendJson(response, 403, { error: catalogRoute ? "Configured agents require the configured local console origin." : "Permission decisions require the configured local console origin." });
                 return;
             }
             response.setHeader("Access-Control-Allow-Origin", uiOrigin);
             response.setHeader("Vary", "Origin");
             response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Agent-Control-Permission");
-            response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+            response.setHeader("Access-Control-Allow-Methods", catalogRoute ? "GET, POST, DELETE, OPTIONS" : "POST, OPTIONS");
         }
         else
             setCorsHeaders(response);
@@ -65,6 +70,10 @@ export async function startControlServer(options) {
                     ok: true,
                     name: "Agent Control API"
                 });
+                return;
+            }
+            if (catalogRoute) {
+                await handleAgentDefinitionApi(agentDefinitions, controller, request, response, url);
                 return;
             }
             if (approvalRoute && request.method === "POST") {
@@ -166,9 +175,8 @@ export async function startControlServer(options) {
             sendJson(response, 404, { error: "Not found." });
         }
         catch (error) {
-            sendJson(response, approvalRoute ? 409 : 500, {
-                error: error instanceof Error ? error.message : String(error)
-            });
+            const payload = errorToPayload(error);
+            sendJson(response, catalogRoute ? agentDefinitionErrorStatus(payload.reason) : approvalRoute ? 409 : 500, catalogRoute ? payload : { error: error instanceof Error ? error.message : String(error) });
         }
     };
     const wss = new WebSocketServer({ noServer: true });
@@ -322,6 +330,64 @@ async function tickSocket(controller, client, state) {
             state.lastMessageSignature = "";
             sendSocket(client, { type: "error", error: error instanceof Error ? error.message : String(error) });
         }
+    }
+}
+async function handleAgentDefinitionApi(service, controller, request, response, url) {
+    const base = "/api/control/agent-definitions";
+    if (request.method === "GET" && url.pathname === base) {
+        sendJson(response, 200, service.list());
+        return;
+    }
+    if (request.method === "GET" && url.pathname === `${base}/inventory`) {
+        sendJson(response, 200, await service.inventory({
+            repo_dir: url.searchParams.get("repo_dir") ?? undefined,
+            refresh: url.searchParams.get("refresh") === "true"
+        }));
+        return;
+    }
+    if (request.method === "POST" && url.pathname === `${base}/configure`) {
+        const body = await readJson(request);
+        sendJson(response, 200, service.configure(body, {
+            trustedCatalogCapability: true
+        }));
+        return;
+    }
+    if (request.method === "POST" && url.pathname === `${base}/launch`) {
+        const body = await readJson(request);
+        sendJson(response, 201, await service.launch(body, {
+            controller,
+            output: () => { },
+            authOptions: () => ({
+                agentToken: optionalStringField(body, "agent_token") ?? undefined,
+                adminKey: optionalStringField(body, "admin_key") ?? resolveAdminKey()
+            })
+        }));
+        return;
+    }
+    const definition = url.pathname.match(/^\/api\/control\/agent-definitions\/([^/]+)$/);
+    if (request.method === "GET" && definition) {
+        sendJson(response, 200, service.get({ definition_id: decodeURIComponent(definition[1]) }));
+        return;
+    }
+    if (request.method === "DELETE" && definition) {
+        const body = await readJson(request);
+        sendJson(response, 200, service.delete({
+            definition_id: decodeURIComponent(definition[1]),
+            expected_revision: stringField(body, "expected_revision")
+        }, { trustedCatalogCapability: true }));
+        return;
+    }
+    sendJson(response, 404, { error: "Not found.", reason: "not_found", details: {} });
+}
+function agentDefinitionErrorStatus(reason) {
+    switch (reason) {
+        case "validation": return 400;
+        case "auth_required": return 401;
+        case "not_found": return 404;
+        case "conflict": return 409;
+        case "capability_unavailable":
+        case "unsupported_runtime": return 503;
+        default: return 500;
     }
 }
 async function handleApi(controller, request, response, url) {

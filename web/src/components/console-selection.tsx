@@ -18,6 +18,7 @@ function useSharedSelection() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
   const [projectDir, setProjectDir] = useState<string | null>(null);
+  const [selectionHydrated, setSelectionHydrated] = useState(false);
   const pinned = useRef(false);
   const historyHydrated = useRef(false);
   const lastHostSelection = useRef<ConsoleSelectionState | null>(null);
@@ -37,6 +38,7 @@ function useSharedSelection() {
     if (!historyHydrated.current) {
       syncHistory();
       historyHydrated.current = true;
+      setSelectionHydrated(true);
     }
     // Fragment-only history moves change screens, not the selected worker.
     let search = window.location.search;
@@ -87,7 +89,7 @@ function useSharedSelection() {
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
-  return { selectedFlowId, setSelectedFlowId, projectDir, registerRefresh, refreshCurrentScreen, connection, setConnection, selectedRunId, selectedRunIds, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
+  return { selectedFlowId, setSelectedFlowId, projectDir, selectionHydrated, registerRefresh, refreshCurrentScreen, connection, setConnection, selectedRunId, selectedRunIds, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
 }
 
 const SelectionContext = createContext<ReturnType<typeof useSharedSelection> | null>(null);

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { McpConsoleNotificationStore } from "./mcp-app";
+import { AgentDefinitionApiError } from "./agent-definitions";
+import { McpConsoleNotificationStore, mcpToolCallError } from "./mcp-app";
 import type { DashboardSnapshot } from "./types";
 
 describe("McpConsoleNotificationStore", () => {
@@ -10,6 +11,12 @@ describe("McpConsoleNotificationStore", () => {
     expect(store.current().console).toMatchObject({ screen: "flows", flow_id: "draft", repo_dir: "/project" });
     store.applyToolResult({ structuredContent: { console: { panel_id: "flow-panel", screen: "flows", flow_id: "new", repo_dir: "/project", command_id: "new-selection", action: "reuse" } } });
     expect(store.current().console?.flow_id).toBe("new");
+  });
+
+  it("accepts the reusable agents screen without requiring a run", () => {
+    const store = new McpConsoleNotificationStore();
+    store.applyToolResult({ structuredContent: { console: { panel_id: "agents-panel", screen: "agents" } } });
+    expect(store.current().console).toMatchObject({ panel_id: "agents-panel", screen: "agents" });
   });
 
   it("retains the opener id across input notifications and ignores late results from retired panels", () => {
@@ -150,6 +157,29 @@ describe("McpConsoleNotificationStore", () => {
     ).toBe(true);
 
     expect(store.current()).toEqual({ snapshot: null, console: null });
+  });
+});
+
+describe("MCP tool errors", () => {
+  it("normalizes the configured-agent conflict envelope without exposing its revision hash", () => {
+    const currentRevision = "7156ca85f2b3c285e85c615cc6582a086c0fd3d7618d18c7d18d8be5d11775d2";
+    const error = mcpToolCallError("agent_control_console_agent_definition_configure", {
+      isError: true,
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: "Configured agent catalog revision conflict.",
+          reason: "conflict",
+          details: { current_revision: currentRevision }
+        })
+      }]
+    });
+
+    expect(error).toBeInstanceOf(AgentDefinitionApiError);
+    expect(error.message).toBe("Configured agent catalog revision conflict.");
+    expect(error.message).not.toContain(currentRevision);
+    expect((error as AgentDefinitionApiError).reason).toBe("conflict");
+    expect((error as AgentDefinitionApiError).details.current_revision).toBe(currentRevision);
   });
 });
 

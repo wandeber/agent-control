@@ -7,6 +7,7 @@ import type { Command } from "commander";
 import { parseDurationMs } from "../core/duration.js";
 import { defaultControlHome } from "../core/paths.js";
 import type { AgentLinkType, AgentRecord, AgentStartResult, EventType } from "../core/types.js";
+import type { CompiledAgentConfiguration } from "../core/agent-definition-inventory.js";
 import {
   collect,
   type CliDeps,
@@ -64,6 +65,8 @@ export type WorkerLaunchOptions = RequesterOptions & {
   watchTimeout?: string;
   watchTimeoutMs?: number;
   watchIntervalMs: number;
+  /** Internal immutable definition settings; never exposed as ad hoc CLI overrides. */
+  configuredAgent?: CompiledAgentConfiguration;
 };
 
 type WatchTarget =
@@ -379,7 +382,13 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
         prompt,
         server: options.server ?? (options.backend === "opencode-server" ? DEFAULT_OPENCODE_SERVER : undefined),
         model,
-        metadata: { ...(options.approvalPolicy ? { approval_policy: options.approvalPolicy } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) },
+        metadata: {
+          ...(options.approvalPolicy ? { approval_policy: options.approvalPolicy } : {}),
+          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+          ...(options.profile ? { profile: options.profile } : {}),
+          ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+          ...(options.configuredAgent ? { configured_agent: options.configuredAgent } : {})
+        },
         expectedArtifacts,
         attachments,
         agentToken

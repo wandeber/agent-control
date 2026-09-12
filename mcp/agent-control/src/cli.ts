@@ -16,6 +16,7 @@ import {
 import { registerWatchCommands, registerWorkerCommands, startDetachedWatch } from "./cli/worker.js";
 import { addRequesterOptions, attachRequester, registerObservationCommands, type RequesterOptions } from "./cli/observation.js";
 import { registerWebCommands } from "./cli/web.js";
+import { registerAgentDefinitionCommands } from "./cli/agent-definitions.js";
 import { startControlServer } from "./control-server.js";
 import { parseDurationMs } from "./core/duration.js";
 import { observeLaunchCoordinator, prepareLaunchOwner } from "./core/launch-context.js";
@@ -63,6 +64,7 @@ registerQuestionCommands(program, cliDeps);
 registerWatchCommands(program, cliDeps);
 registerSmokeCommands(program, cliDeps);
 registerMarketplaceCommands(program, output);
+registerAgentDefinitionCommands(program, cliDeps);
 
 const auth = program.command("auth").description("Authenticate Agent Control orchestrators.");
 

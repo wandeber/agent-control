@@ -9,12 +9,38 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError } from "../core/errors.js";
 import { agentRuntimeDir } from "../core/paths.js";
 import { enqueueCliJob, requestCliStop } from "./codex-cli-runner.js";
+import { compiledSnapshotHash } from "../core/agent-definition-inventory.js";
 const unsupported = (message) => new ControllerError(message, "unsupported_operation");
+function configuredAgent(value) {
+    if (value === undefined)
+        return undefined;
+    const candidate = value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    if (candidate.snapshot_version !== 1 ||
+        typeof candidate.definition_id !== "string" ||
+        typeof candidate.model !== "string" ||
+        typeof candidate.model_provider !== "string" ||
+        typeof candidate.reasoning_effort !== "string" ||
+        typeof candidate.executable !== "string" ||
+        typeof candidate.repo_dir !== "string" ||
+        !Array.isArray(candidate.plugins) ||
+        !Array.isArray(candidate.skills) ||
+        !Array.isArray(candidate.mcp_servers) ||
+        !Array.isArray(candidate.apps) ||
+        !Array.isArray(candidate.app_server_overrides)) {
+        throw unsupported("Configured-agent launch metadata is invalid.");
+    }
+    return candidate;
+}
+function agentRuntimeDirFromData(data) {
+    return dirname(data.dir);
+}
 export class CodexCliAdapter {
     kind = "codex-cli";
     capabilities() { return { canStart: true, canInterrupt: true, canRequestPermissions: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: false }; }
@@ -25,14 +51,19 @@ export class CodexCliAdapter {
         readInteractiveProfile(data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined, data.profile_hash);
     }
     async start(input) {
-        if (input.attachments?.length || input.server)
-            throw unsupported("codex-cli does not support attachments or server overrides; configure a Codex profile instead.");
+        const configured = configuredAgent(input.metadata?.configured_agent);
+        if (!configured && input.attachments?.length)
+            throw unsupported("codex-cli does not support attachments; configure a Codex profile instead.");
+        if (input.server)
+            throw unsupported("codex-cli does not support a server override; configure a Codex profile instead.");
         const profile = input.metadata?.profile;
         if (profile !== undefined && (typeof profile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(profile)))
             throw unsupported("Invalid Codex profile name.");
         const sandbox = input.metadata?.sandbox ?? "workspace";
         if (!["workspace", "read_only"].includes(String(sandbox)))
             throw unsupported("codex-cli sandbox must be read_only or workspace.");
+        if (configured && profile)
+            throw unsupported("Configured agents cannot also select a mutable Codex profile.");
         const data = { dir: join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "codex-cli"), cwd: input.agent.repo_dir ?? process.cwd(), profile: profile,
             model: input.model ?? input.agent.model ?? undefined, sandbox: sandbox === "read_only" ? "read-only" : "workspace-write", reasoning_effort: input.metadata?.reasoning_effort };
         mkdirSync(data.dir, { recursive: true, mode: 0o700 });
@@ -42,19 +73,31 @@ export class CodexCliAdapter {
             data.profile_hash = this.profileHash(data.profile);
         // Presentation only: never turn the profile's model into a CLI override.
         const identity = this.profileIdentity(data.profile);
-        data.resolved_model = data.model ?? identity.model;
-        data.model_provider = identity.provider;
+        data.resolved_model = configured?.model ?? data.model ?? identity.model;
+        data.model_provider = configured?.model_provider ?? identity.provider;
+        data.reasoning_effort = configured?.reasoning_effort ?? data.reasoning_effort;
         data.logFile = join(data.dir, "stderr.log");
-        data.executable = process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex";
+        data.executable = configured?.executable ?? process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex";
         if (typeof input.metadata?.permission_db_path === "string" && input.metadata.permission_db_path !== ":memory:") {
             data.access_agent_id = input.agent.agent_id;
             data.access_db_path = input.metadata.permission_db_path;
         }
         if (input.metadata?.approval_policy === "on-request")
             data.approval_policy = "on-request";
-        if (data.approval_policy && !data.access_db_path)
+        if ((data.approval_policy || configured) && !data.access_db_path)
             throw unsupported("Interactive CLI requires a persistent Agent Control database.");
-        await this.launch(data, input.prompt ?? "", true, input.agentToken);
+        if (configured) {
+            if (configured.repo_dir !== data.cwd)
+                throw unsupported("Configured-agent repository changed before launch.");
+            const snapshot = { ...configured, execution_agent_id: input.agent.agent_id };
+            const snapshotPath = join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "configured-agent-snapshot.json");
+            const snapshotHash = compiledSnapshotHash(snapshot);
+            writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+            data.snapshot_hash = snapshotHash;
+            data.definition_id = configured.definition_id;
+            data.definition_name = configured.definition_name;
+        }
+        await this.launch(data, input.prompt ?? "", true, input.agentToken, input.attachments ?? []);
         return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
     }
     profileIdentity(profile) {
@@ -81,7 +124,7 @@ export class CodexCliAdapter {
             throw unsupported("A persisted Codex profile file is required for managed CLI continuity.");
         return createHash("sha256").update(readFileSync(path)).digest("hex");
     }
-    async launch(data, prompt, initial, agentToken) {
+    async launch(data, prompt, initial, agentToken, attachments = []) {
         if (data.profile && this.profileHash(data.profile) !== data.profile_hash)
             throw unsupported("Codex profile changed since launch; review its model/provider before continuing.");
         const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", data.sandbox, "-c", 'approval_policy="never"'];
@@ -92,7 +135,10 @@ export class CodexCliAdapter {
         if (data.reasoning_effort)
             args.push("-c", `model_reasoning_effort=${JSON.stringify(data.reasoning_effort)}`);
         const profilePath = data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined;
-        let interactiveRequested = Boolean(data.approval_policy);
+        const snapshotPath = data.snapshot_hash
+            ? join(agentRuntimeDirFromData(data), "configured-agent-snapshot.json")
+            : undefined;
+        let interactiveRequested = Boolean(data.approval_policy || snapshotPath);
         if (data.access_db_path && data.access_agent_id) {
             const db = new Database(data.access_db_path);
             try {
@@ -110,7 +156,8 @@ export class CodexCliAdapter {
             ...(profilePath ? { profile_path: profilePath, profile_hash: data.profile_hash } : {}),
             ...(data.access_agent_id && data.access_db_path ? { interactive: { agent_id: data.access_agent_id, db_path: data.access_db_path,
                     model: data.model, model_provider: data.model_provider, reasoning_effort: data.reasoning_effort,
-                    sandbox: data.sandbox === "read-only" ? "read_only" : "workspace", approval_policy: data.approval_policy } } : {}) };
+                    sandbox: data.sandbox === "read-only" ? "read_only" : "workspace", approval_policy: data.approval_policy,
+                    attachments, snapshot_path: snapshotPath, snapshot_hash: data.snapshot_hash } } : {}) };
         const messageId = enqueueCliJob(data.dir, job, initial);
         // Each contender uses a process-owned lock. Enqueue and dispatch share a
         // separate short lock, so a finishing supervisor cannot lose a new message.

@@ -13,7 +13,7 @@ import {
   ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import { createController } from "./core/factory.js";
-import { errorToPayload } from "./core/errors.js";
+import { ControllerError, errorToPayload } from "./core/errors.js";
 import { currentCodexThreadId, withMcpCaller } from "./core/caller-context.js";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
@@ -24,6 +24,19 @@ import { openBrowserConsole } from "./browser-console.js";
 import { escapeInlineScript } from "./inline-script.js";
 import { handleTool } from "./tools/handlers.js";
 import { TOOL_DEFINITIONS } from "./tools/tool-definitions.js";
+import { AGENT_DEFINITION_TOOL_DEFINITIONS } from "./tools/agent-definition-tools.js";
+import {
+  AgentDefinitionService,
+  agentDefinitionConfigureToolSchema,
+  agentDefinitionDeleteToolSchema,
+  agentDefinitionGetSchema,
+  agentDefinitionInventorySchema,
+  agentDefinitionLaunchSchema,
+  agentDefinitionListSchema,
+  managedAgentsForThread
+} from "./agent-definitions.js";
+import type { ConfigureAgentDefinitionInput, DeleteAgentDefinitionInput } from "./core/agent-definitions.js";
+import { resolveAdminKey } from "./core/identity.js";
 
 const { controller, store } = createController();
 const MCP_APP_VERSION = AGENT_CONTROL_VERSION;
@@ -45,10 +58,11 @@ const MODEL_CONSOLE_META = {
   "openai/widgetAccessible": true
 };
 const consoleSessions = new ConsoleSessions();
+const agentDefinitions = new AgentDefinitionService(controller);
 const PANEL_ID_PROPERTY = { panel_id: { type: "string", description: "Panel identity returned when this console was opened." } };
 
 const FLOW_SELECTION_PROPERTIES = {
-  screen: { type: "string", enum: ["console", "subagents", "flows"], description: "Select Flows to inspect or live-preview a definition without starting a run." },
+  screen: { type: "string", enum: ["console", "subagents", "flows", "agents"], description: "Select Flows or Agents without starting a run." },
   flow_id: { type: "string", description: "Catalog flow ID to preview, including a new flow being authored." },
   repo_dir: { type: "string", description: "Absolute task project directory for local flows and model overrides. Inferred from the calling thread when omitted." }
 };
@@ -125,7 +139,7 @@ const APP_TOOL_DEFINITIONS = [
         ...PANEL_ID_PROPERTY,
         run_id: { type: "string" },
         flow_id: { type: "string" },
-        screen: { type: "string", enum: ["console", "subagents", "flows"] }
+        screen: { type: "string", enum: ["console", "subagents", "flows", "agents"] }
       },
       required: ["panel_id"],
       additionalProperties: false
@@ -133,6 +147,21 @@ const APP_TOOL_DEFINITIONS = [
     _meta: APP_TOOL_META
   }
 ] as const;
+
+const APP_AGENT_DEFINITION_TOOL_DEFINITIONS = AGENT_DEFINITION_TOOL_DEFINITIONS.map((definition) => {
+  const inputSchema = definition.inputSchema as { properties?: Record<string, unknown>; required?: string[] };
+  const { admin_key, agent_token, ...properties } = inputSchema.properties ?? {};
+  return {
+    name: `agent_control_console_${definition.name}`,
+    description: `App-only. ${definition.description}`,
+    inputSchema: {
+      ...inputSchema,
+      properties: { ...PANEL_ID_PROPERTY, ...properties },
+      required: ["panel_id", ...(inputSchema.required ?? [])]
+    },
+    _meta: APP_TOOL_META
+  };
+});
 
 const OPEN_CONSOLE_TOOL = {
   name: "open_agent_control_console",
@@ -197,7 +226,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     OPEN_CONSOLE_TOOL,
     REUSE_CONSOLE_TOOL,
     CLOSE_CONSOLE_TOOL,
-    ...APP_TOOL_DEFINITIONS
+    ...APP_TOOL_DEFINITIONS,
+    ...APP_AGENT_DEFINITION_TOOL_DEFINITIONS
   ]
 }));
 
@@ -253,7 +283,9 @@ server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
   }
 
   try {
-    const input = tool.schema.parse(request.params.arguments ?? {});
+    const input = tool.name.startsWith("agent_definition_")
+      ? request.params.arguments ?? {}
+      : tool.schema.parse(request.params.arguments ?? {});
     const result = await withMcpCaller(request.params._meta, () => handleTool(controller, tool.name, input as Record<string, unknown>, AbortSignal.any([extra.signal, shutdownCancellation.signal])));
     await controller.drainDeliveries();
     return jsonResult(result);
@@ -312,9 +344,11 @@ async function handleConsoleTool(
     const runId = stringField(input, "run_id");
     const threadId = currentCodexThreadId();
     const selection = consoleFlowSelection(input, threadId);
-    const snapshot = selection.screen === "flows" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
+    const snapshot = selection.screen === "flows" || selection.screen === "agents" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
       : await loadConsoleSnapshot(controller, runId, { threadId: threadId ?? null });
-    const session = consoleSessions.open(threadId, selection);
+    const session = consoleSessions.open(threadId, selection, {
+      catalogManagement: managedAgentsForThread(controller, threadId ?? "").length === 0
+    });
     const structuredContent = { ...snapshot, console: { ...snapshot.console, ...session.selection, panel_id: session.id } };
     return {
       content: [
@@ -333,7 +367,7 @@ async function handleConsoleTool(
     const threadId = currentCodexThreadId();
     const session = consoleSessions.get(threadId);
     const selection = consoleFlowSelection(input, threadId, session.selection.repo_dir);
-    const snapshot = selection.screen === "flows" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
+    const snapshot = selection.screen === "flows" || selection.screen === "agents" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
       : await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
     const command = consoleSessions.queue(session, "reuse", runId, selection).command!;
     return {
@@ -365,6 +399,57 @@ async function handleConsoleTool(
           command_id: command.command_id
         }
       }
+    };
+  }
+
+  if (name.startsWith("agent_control_console_agent_definition_")) {
+    const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+    if (!session.catalogManagement) {
+      throw new ControllerError(
+        "Managed worker threads cannot access personal configured-agent catalog controls.",
+        "auth_required"
+      );
+    }
+    const { panel_id, ...args } = input as Record<string, unknown>;
+    let result: unknown;
+    if (name === "agent_control_console_agent_definition_list") {
+      result = agentDefinitions.list(args);
+    } else if (name === "agent_control_console_agent_definition_get") {
+      result = agentDefinitions.get(args);
+    } else if (name === "agent_control_console_agent_definition_inventory") {
+      const parsed = args as { repo_dir?: string; refresh?: boolean };
+      result = await agentDefinitions.inventory({
+        ...parsed,
+        repo_dir: parsed.repo_dir ?? session.selection.repo_dir
+      });
+    } else if (name === "agent_control_console_agent_definition_configure") {
+      result = agentDefinitions.configure(args as ConfigureAgentDefinitionInput, {
+        trustedCatalogCapability: true,
+        currentThreadId: session.threadId
+      });
+    } else if (name === "agent_control_console_agent_definition_delete") {
+      result = agentDefinitions.delete(args as DeleteAgentDefinitionInput, {
+        trustedCatalogCapability: true,
+        currentThreadId: session.threadId
+      });
+    } else if (name === "agent_control_console_agent_definition_launch") {
+      const parsed = {
+        ...args,
+        repo_dir: args.repo_dir ?? session.selection.repo_dir
+      };
+      result = await agentDefinitions.launch(parsed, {
+        controller,
+        output: () => {},
+        authOptions: () => ({ adminKey: resolveAdminKey() })
+      });
+    } else {
+      return null;
+    }
+    return {
+      content: [{ type: "text", text: "Completed configured-agent catalog operation." }],
+      structuredContent: result && typeof result === "object"
+        ? result as Record<string, unknown>
+        : { result }
     };
   }
 
@@ -436,7 +521,13 @@ async function handleConsoleTool(
     const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
     const runId = stringField(input, "run_id");
     if (runId) controller.getDashboardSnapshot(runId, { threadId: session.threadId });
-    const result = await openBrowserConsole(runId, stringField(input, "screen") === "flows" ? "flows" : stringField(input, "screen") === "subagents" ? "subagents" : "console", { ...session.selection, flow_id: stringField(input, "flow_id") ?? session.selection.flow_id });
+    const requestedScreen = stringField(input, "screen");
+    const screen = requestedScreen === "flows" || requestedScreen === "subagents" || requestedScreen === "agents"
+      ? requestedScreen
+      : "console";
+    // The UI sends its current selection. An omitted flow means the catalog,
+    // even when this panel was originally opened on a specific flow.
+    const result = await openBrowserConsole(runId, screen, { ...session.selection, flow_id: stringField(input, "flow_id") });
     return { content: [{ type: "text", text: "Opened the global console in the system browser." }], structuredContent: result };
   }
 
@@ -446,7 +537,7 @@ async function handleConsoleTool(
 function consoleFlowSelection(input: unknown, threadId?: string, previousRepo?: string): FlowConsoleSelection {
   const screen = stringField(input, "screen");
   const repo = stringField(input, "repo_dir") ?? previousRepo ?? (threadId ? readCodexSession(threadId)?.cwd : undefined);
-  return { ...(screen === "flows" || screen === "console" || screen === "subagents" ? { screen } : {}),
+  return { ...(screen === "flows" || screen === "console" || screen === "subagents" || screen === "agents" ? { screen } : {}),
     ...(stringField(input, "flow_id") ? { flow_id: stringField(input, "flow_id") } : {}),
     ...(repo ? { repo_dir: resolve(repo) } : {}) };
 }

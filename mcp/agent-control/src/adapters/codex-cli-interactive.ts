@@ -3,6 +3,16 @@ import { CodexAppServerClient } from "./codex-thread-adapter.js";
 import { attachApprovalBroker } from "./codex-approval-broker.js";
 import { AgentAccessStore, accessTurnOverrides, type AccessPolicy } from "../core/agent-access.js";
 import { readInteractiveProfile, interactiveProfileOverrides } from "./codex-interactive-profile.js";
+import { resolve } from "node:path";
+import {
+  loadAgentDefinitionInventory,
+  refreshCompiledAgentConfiguration,
+  type CompiledAgentConfiguration
+} from "../core/agent-definition-inventory.js";
+import {
+  readConfiguredAgentExecutionSnapshot,
+  verifyConfiguredAgentThread
+} from "../core/configured-agent-runtime.js";
 
 export interface InteractiveCliJob {
   executable: string;
@@ -17,6 +27,9 @@ export interface InteractiveCliJob {
   approval_policy?: "on-request";
   agent_id: string;
   db_path: string;
+  attachments?: string[];
+  snapshot_path?: string;
+  snapshot_hash?: string;
 }
 export interface InteractiveTurnControl {
   session?: string;
@@ -33,7 +46,35 @@ const record = (value: unknown): Record<string, any> => value && typeof value ==
 
 /** The detached CLI supervisor owns this RPC connection for the whole turn. */
 export async function runInteractiveCliTurn(job: InteractiveCliJob, control: InteractiveTurnControl): Promise<{ thread_id?: string; status: "completed" | "failed" | "waiting_for_input" }> {
-  const client = new CodexAppServerClient("stdio://", undefined, { executable: job.executable, args: ["app-server", "--listen", "stdio://"], cwd: job.cwd, detached: true });
+  const hasSnapshot = Boolean(job.snapshot_path || job.snapshot_hash);
+  if (hasSnapshot && (!job.snapshot_path || !job.snapshot_hash)) {
+    throw new Error("Configured-agent snapshot binding is incomplete.");
+  }
+  let configured: CompiledAgentConfiguration | undefined;
+  if (job.snapshot_path && job.snapshot_hash) {
+    const snapshot = readConfiguredAgentExecutionSnapshot(job.snapshot_path, job.snapshot_hash, job.agent_id);
+    if (
+      snapshot.executable !== job.executable ||
+      resolve(snapshot.repo_dir) !== resolve(job.cwd) ||
+      snapshot.model !== job.model ||
+      snapshot.model_provider !== job.model_provider ||
+      snapshot.reasoning_effort !== job.reasoning_effort ||
+      job.profile_path
+    ) {
+      throw new Error("Configured-agent execution no longer matches its immutable snapshot.");
+    }
+    const inventory = await loadAgentDefinitionInventory(job.cwd, true, snapshot.executable);
+    configured = refreshCompiledAgentConfiguration(snapshot, inventory);
+  }
+  const client = new CodexAppServerClient("stdio://", undefined, {
+    executable: job.executable,
+    args: [
+      "app-server", "--listen", "stdio://",
+      ...(configured?.app_server_overrides ?? []).flatMap((entry) => ["-c", entry])
+    ],
+    cwd: job.cwd,
+    detached: true
+  });
   const db = new Database(job.db_path);
   db.pragma("busy_timeout = 5000");
   const access = new AgentAccessStore(db);
@@ -87,16 +128,17 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
   const removeClose = client.onClose(() => { if (!closing) finish("failed"); });
   try {
     await startup(client.initialize());
-    const profile = readInteractiveProfile(job.profile_path, job.profile_hash);
+    const profile = configured ? {} : readInteractiveProfile(job.profile_path, job.profile_hash);
     const loaded = Object.keys(profile).length ? await startup(client.request("config/read", { cwd: job.cwd, includeLayers: true })) : {};
     const config = interactiveProfileOverrides(profile, loaded);
-    if (job.reasoning_effort) config.model_reasoning_effort = job.reasoning_effort;
+    if (!configured && job.reasoning_effort) config.model_reasoning_effort = job.reasoning_effort;
     const requested = access.getAgentAccess(job.agent_id);
     requestRevision = requested.revision;
     const policy: AccessPolicy = requested.requested ?? { sandbox: job.sandbox, approval_policy: job.approval_policy ?? "never" };
     expectedPolicy = accessTurnOverrides(policy, job.cwd);
     const params = { ...(control.session ? { threadId: control.session } : {}), cwd: job.cwd, config,
       ...(job.model ? { model: job.model } : {}), approvalPolicy: expectedPolicy.approvalPolicy,
+      ...(!control.session && configured ? { developerInstructions: configured.developer_instructions } : {}),
       approvalsReviewer: "user", sandbox: policy.sandbox === "read_only" ? "read-only" : policy.sandbox === "full_access" ? "danger-full-access" : "workspace-write" };
     const response = record(await startup(control.dispatch(() => client.requestConnected(control.session ? "thread/resume" : "thread/start", params))));
     const actualId = record(response.thread).id;
@@ -106,6 +148,10 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     const expectedProvider = config.model_provider ?? job.model_provider;
     if (expectedModel && response.model !== expectedModel) throw new Error("Codex did not retain the selected model; no prompt was sent.");
     if (expectedProvider && response.modelProvider !== expectedProvider) throw new Error("Codex did not retain the selected model provider; no prompt was sent.");
+    if (configured) {
+      const inventory = await loadAgentDefinitionInventory(job.cwd, false, configured.executable);
+      await verifyConfiguredAgentThread(client, configured, inventory, response, actualId, job.cwd);
+    }
     if (!requested.requested) {
       if (typeof record(response.sandbox).type !== "string") throw new Error("Codex did not confirm the existing sandbox; no prompt was sent.");
       // Transport selection must retain profile/base network and filesystem
@@ -119,7 +165,10 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     if (beforeTurn) return { thread_id: actualId, status: beforeTurn === "interrupt" ? "waiting_for_input" : "failed" };
     attachApprovalBroker(client, { agent_id: job.agent_id, thread_id: actualId, db_path: job.db_path, closeOnTurnCompleted: false });
     const started = record(await startup(control.dispatch(() => client.requestConnected("turn/start", { threadId: actualId,
-      input: [{ type: "text", text: job.prompt }], ...expectedPolicy,
+      input: [
+        { type: "text", text: job.prompt },
+        ...(job.attachments ?? []).map((path) => ({ type: "localImage", path }))
+      ], ...expectedPolicy,
       ...(job.reasoning_effort ? { effort: job.reasoning_effort } : {}) }))));
     turnId = record(started.turn).id;
     if (typeof turnId !== "string") throw new Error("Codex did not confirm the interactive turn identity.");

@@ -242,7 +242,13 @@ export async function launchWorker(options, deps) {
             prompt,
             server: options.server ?? (options.backend === "opencode-server" ? DEFAULT_OPENCODE_SERVER : undefined),
             model,
-            metadata: { ...(options.approvalPolicy ? { approval_policy: options.approvalPolicy } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) },
+            metadata: {
+                ...(options.approvalPolicy ? { approval_policy: options.approvalPolicy } : {}),
+                ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+                ...(options.profile ? { profile: options.profile } : {}),
+                ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+                ...(options.configuredAgent ? { configured_agent: options.configuredAgent } : {})
+            },
             expectedArtifacts,
             attachments,
             agentToken

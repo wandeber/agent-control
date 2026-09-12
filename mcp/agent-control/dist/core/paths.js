@@ -11,6 +11,9 @@ export function defaultStatePath() {
 export function defaultStateFilePath() {
     return join(defaultControlHome(), "state.sqlite");
 }
+export function agentDefinitionCatalogPath() {
+    return join(defaultControlHome(), "agents", "catalog.json");
+}
 export function credentialsRoot(dbPath = defaultStatePath()) {
     const controlHome = defaultControlHome();
     if (dbPath !== ":memory:" && resolve(dbPath) === resolve(defaultStateFilePath())) {

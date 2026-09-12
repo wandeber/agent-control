@@ -4,6 +4,9 @@ import type { AgentController } from "../core/controller.js";
 import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
 import type { AgentLinkType, AgentStatus, EventType, FlowStepInstanceStatus } from "../core/types.js";
+import { AgentDefinitionService } from "../agent-definitions.js";
+import type { ConfigureAgentDefinitionInput, DeleteAgentDefinitionInput } from "../core/agent-definitions.js";
+import { resolveAdminKey } from "../core/identity.js";
 
 export async function handleTool(
   controller: AgentController,
@@ -11,7 +14,33 @@ export async function handleTool(
   input: Record<string, unknown>,
   signal?: AbortSignal
 ): Promise<unknown> {
+  const agentDefinitions = new AgentDefinitionService(controller);
   switch (name) {
+    case "agent_definition_list": return agentDefinitions.list(input);
+    case "agent_definition_get": return agentDefinitions.get(input);
+    case "agent_definition_inventory": return agentDefinitions.inventory(input);
+    case "agent_definition_configure": {
+      const { admin_key, agent_token, ...request } = input;
+      return agentDefinitions.configure(request as ConfigureAgentDefinitionInput, {
+        adminKey: maybeString(admin_key),
+        agentToken: maybeString(agent_token)
+      });
+    }
+    case "agent_definition_delete": {
+      const { admin_key, agent_token, ...request } = input;
+      return agentDefinitions.delete(request as unknown as DeleteAgentDefinitionInput, {
+        adminKey: maybeString(admin_key),
+        agentToken: maybeString(agent_token)
+      });
+    }
+    case "agent_definition_launch": return agentDefinitions.launch(input, {
+      controller,
+      output: () => {},
+      authOptions: () => ({
+        agentToken: maybeString(input.agent_token),
+        adminKey: maybeString(input.admin_key) ?? resolveAdminKey()
+      })
+    });
     case "question_ask": return controller.askUserQuestion(input as import("./questions.js").QuestionAskInput, signal);
     case "question_get": return controller.getUserQuestion(String(input.question_id), { agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
     case "question_list": return controller.listUserQuestions(String(input.run_id), { agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Configured agents"
+  short_description: "Find, configure, and invoke saved agents"
+  default_prompt: "Use $configured-agents to find the right saved Agent Control agent and delegate this task with its configuration."

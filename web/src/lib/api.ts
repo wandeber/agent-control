@@ -16,6 +16,16 @@ import { snapshotStreamIsLoading } from "./snapshot-stream-state";
 import { combineRunSnapshots } from "./run-snapshots";
 import type { AgentLogTail, AgentMessage, DashboardSnapshot, UserQuestionRequest, UserQuestionAnswers, PermissionRequest, AgentAccessSnapshot, AccessPolicy, SocketPayload } from "./types";
 import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
+import type {
+  AgentCatalogResult,
+  AgentDefinitionConfigureInput,
+  AgentDefinitionConfigureResult,
+  AgentDefinitionDeleteResult,
+  AgentDefinitionGetResult,
+  AgentDefinitionInventoryResult
+} from "./agent-definitions";
+import type { AgentDefinitionLaunchInput, AgentDefinitionLaunchResult } from "./agent-definitions";
+import { AgentDefinitionApiError } from "./agent-definitions";
 
 export type ConnectionState = "connecting" | "live" | "offline";
 
@@ -183,6 +193,68 @@ export function artifactImageUrl(artifactId: string): string {
     return "";
   }
   return `${controlApiBase()}/api/control/artifacts/${encodeURIComponent(artifactId)}/file`;
+}
+
+export async function fetchAgentDefinitions(): Promise<AgentCatalogResult> {
+  const client = await getMcpAppClient();
+  if (client) return await client.callTool<AgentCatalogResult>("agent_control_console_agent_definition_list", {});
+  return await agentDefinitionHttp<AgentCatalogResult>("/api/control/agent-definitions");
+}
+
+export async function fetchAgentDefinition(definitionId: string): Promise<AgentDefinitionGetResult> {
+  const client = await getMcpAppClient();
+  if (client) return await client.callTool<AgentDefinitionGetResult>("agent_control_console_agent_definition_get", { definition_id: definitionId });
+  return await agentDefinitionHttp<AgentDefinitionGetResult>(`/api/control/agent-definitions/${encodeURIComponent(definitionId)}`);
+}
+
+export async function fetchAgentDefinitionInventory(repoDir?: string | null, refresh = false): Promise<AgentDefinitionInventoryResult> {
+  const client = await getMcpAppClient();
+  const input = { ...(repoDir ? { repo_dir: repoDir } : {}), ...(refresh ? { refresh: true } : {}) };
+  if (client) return await client.callTool<AgentDefinitionInventoryResult>("agent_control_console_agent_definition_inventory", input);
+  const query = new URLSearchParams();
+  if (repoDir) query.set("repo_dir", repoDir);
+  if (refresh) query.set("refresh", "true");
+  return await agentDefinitionHttp<AgentDefinitionInventoryResult>(`/api/control/agent-definitions/inventory${query.size ? `?${query}` : ""}`);
+}
+
+export async function configureAgentDefinition(input: AgentDefinitionConfigureInput): Promise<AgentDefinitionConfigureResult> {
+  const client = await getMcpAppClient();
+  if (client) return await client.callTool<AgentDefinitionConfigureResult>("agent_control_console_agent_definition_configure", input);
+  return await agentDefinitionHttp<AgentDefinitionConfigureResult>("/api/control/agent-definitions/configure", { method: "POST", body: JSON.stringify(input) });
+}
+
+export async function deleteAgentDefinition(definitionId: string, expectedRevision: string): Promise<AgentDefinitionDeleteResult> {
+  const client = await getMcpAppClient();
+  const input = { definition_id: definitionId, expected_revision: expectedRevision };
+  if (client) return await client.callTool<AgentDefinitionDeleteResult>("agent_control_console_agent_definition_delete", input);
+  return await agentDefinitionHttp<AgentDefinitionDeleteResult>(`/api/control/agent-definitions/${encodeURIComponent(definitionId)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ expected_revision: expectedRevision })
+  });
+}
+
+export async function launchAgentDefinition(input: AgentDefinitionLaunchInput): Promise<AgentDefinitionLaunchResult> {
+  const client = await getMcpAppClient();
+  if (client) return await client.callTool<AgentDefinitionLaunchResult>("agent_control_console_agent_definition_launch", { ...input });
+  return await agentDefinitionHttp<AgentDefinitionLaunchResult>("/api/control/agent-definitions/launch", { method: "POST", body: JSON.stringify(input) });
+}
+
+async function agentDefinitionHttp<T>(path: string, init?: RequestInit): Promise<T> {
+  if (shouldTryMcpApp()) throw new AgentDefinitionApiError("The Codex console connection is unavailable.", "offline");
+  const response = await fetch(`${controlApiBase()}${path}`, {
+    ...init,
+    headers: { ...(init?.body ? { "Content-Type": "application/json" } : {}), ...init?.headers }
+  });
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!response.ok) {
+    const details = payload?.details && typeof payload.details === "object" ? payload.details as Record<string, unknown> : {};
+    throw new AgentDefinitionApiError(
+      typeof payload?.error === "string" ? payload.error : `Agent definition request failed: ${response.status}`,
+      typeof payload?.reason === "string" ? payload.reason : "unknown",
+      details
+    );
+  }
+  return payload as T;
 }
 
 export function useSnapshotStream(

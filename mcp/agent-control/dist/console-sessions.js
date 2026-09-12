@@ -4,13 +4,19 @@ import { ControllerError } from "./core/errors.js";
 export class ConsoleSessions {
     sessions = new Map();
     byThread = new Map();
-    open(threadId, selection = {}) {
+    open(threadId, selection = {}, options = {}) {
         if (!threadId)
             throw new ControllerError("Open Agent Control from an identified Codex conversation.", "auth_required");
         const previous = this.byThread.get(threadId);
         if (previous)
             this.sessions.delete(previous);
-        const session = { id: randomUUID(), threadId, command: null, selection };
+        const session = {
+            id: randomUUID(),
+            threadId,
+            command: null,
+            selection,
+            catalogManagement: options.catalogManagement === true
+        };
         this.sessions.set(session.id, session);
         this.byThread.set(threadId, session.id);
         return session;

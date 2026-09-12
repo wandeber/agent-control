@@ -128,7 +128,7 @@ export async function supervise(dir) {
                 const args = [...next.job.args, ...(session ? ["resume", session] : []), "-"];
                 writeState(dir, { ...state, status: "running", turn_id: next.id, runtime_turn_id: undefined, updated_at: new Date().toISOString() });
                 appendFileSync(join(dir, "events.jsonl"), JSON.stringify({ type: "agent_control.prompt", text: next.job.prompt, created_at: new Date().toISOString() }) + "\n", { mode: 0o600 });
-                let interactive = state.transport === "app-server" || Boolean(next.job.interactive?.approval_policy);
+                let interactive = state.transport === "app-server" || Boolean(next.job.interactive?.approval_policy || next.job.interactive?.snapshot_path);
                 if (next.job.interactive) {
                     const accessDb = new Database(next.job.interactive.db_path);
                     try {

@@ -10,6 +10,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { WebSocketServer, type WebSocket } from "ws";
 import { createController } from "./core/factory.js";
 import type { AgentLinkType } from "./core/types.js";
+import { AgentDefinitionService } from "./agent-definitions.js";
+import type { ConfigureAgentDefinitionInput } from "./core/agent-definitions.js";
+import { errorToPayload } from "./core/errors.js";
+import { resolveAdminKey } from "./core/identity.js";
 
 export interface ControlServerOptions {
   host: string;
@@ -30,6 +34,7 @@ type Controller = ReturnType<typeof createController>["controller"];
 
 export async function startControlServer(options: ControlServerOptions): Promise<{ server: Server; setUiOrigin: (origin: string) => void; close: () => Promise<void> }> {
   const { controller, store } = createController();
+  const agentDefinitions = new AgentDefinitionService(controller);
   let uiOrigin = options.uiOrigin;
   const permissionTokens = new Map<string, { agent: string; request: string; expires: number }>();
   let closing = false;
@@ -42,15 +47,16 @@ export async function startControlServer(options: ControlServerOptions): Promise
   const handleRequest = async (request: IncomingMessage, response: ServerResponse) => {
     if (closing) { response.writeHead(503); response.end(); return; }
     const approvalRoute = request.url?.startsWith("/api/control/permissions/") || request.url?.startsWith("/api/control/canvas/") || request.url?.startsWith("/api/control/questions/");
-    if (approvalRoute) {
+    const catalogRoute = request.url?.startsWith("/api/control/agent-definitions") === true;
+    if (approvalRoute || catalogRoute) {
       const expectedHost = `localhost:${(server.address() as AddressInfo)?.port}`;
       if (!["::1", "127.0.0.1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "") || !uiOrigin || request.headers.origin !== uiOrigin || request.headers.host !== expectedHost || request.headers["sec-fetch-site"] === "cross-site") {
-        sendJson(response, 403, { error: "Permission decisions require the configured local console origin." }); return;
+        sendJson(response, 403, { error: catalogRoute ? "Configured agents require the configured local console origin." : "Permission decisions require the configured local console origin." }); return;
       }
       response.setHeader("Access-Control-Allow-Origin", uiOrigin);
       response.setHeader("Vary", "Origin");
       response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Agent-Control-Permission");
-      response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      response.setHeader("Access-Control-Allow-Methods", catalogRoute ? "GET, POST, DELETE, OPTIONS" : "POST, OPTIONS");
     } else setCorsHeaders(response);
     if (request.method === "OPTIONS") {
       response.statusCode = 204;
@@ -80,6 +86,10 @@ export async function startControlServer(options: ControlServerOptions): Promise
           ok: true,
           name: "Agent Control API"
         });
+        return;
+      }
+      if (catalogRoute) {
+        await handleAgentDefinitionApi(agentDefinitions, controller, request, response, url);
         return;
       }
       if (approvalRoute && request.method === "POST") {
@@ -140,9 +150,9 @@ export async function startControlServer(options: ControlServerOptions): Promise
       }
       sendJson(response, 404, { error: "Not found." });
     } catch (error) {
-      sendJson(response, approvalRoute ? 409 : 500, {
-        error: error instanceof Error ? error.message : String(error)
-      });
+      const payload = errorToPayload(error);
+      sendJson(response, catalogRoute ? agentDefinitionErrorStatus(payload.reason) : approvalRoute ? 409 : 500,
+        catalogRoute ? payload : { error: error instanceof Error ? error.message : String(error) });
     }
   };
 
@@ -294,6 +304,72 @@ async function tickSocket(controller: Controller, client: WebSocket, state: Sock
       state.lastMessageSignature = "";
       sendSocket(client, { type: "error", error: error instanceof Error ? error.message : String(error) });
     }
+  }
+}
+
+async function handleAgentDefinitionApi(
+  service: AgentDefinitionService,
+  controller: Controller,
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL
+): Promise<void> {
+  const base = "/api/control/agent-definitions";
+  if (request.method === "GET" && url.pathname === base) {
+    sendJson(response, 200, service.list());
+    return;
+  }
+  if (request.method === "GET" && url.pathname === `${base}/inventory`) {
+    sendJson(response, 200, await service.inventory({
+      repo_dir: url.searchParams.get("repo_dir") ?? undefined,
+      refresh: url.searchParams.get("refresh") === "true"
+    }));
+    return;
+  }
+  if (request.method === "POST" && url.pathname === `${base}/configure`) {
+    const body = await readJson(request);
+    sendJson(response, 200, service.configure(body as ConfigureAgentDefinitionInput, {
+      trustedCatalogCapability: true
+    }));
+    return;
+  }
+  if (request.method === "POST" && url.pathname === `${base}/launch`) {
+    const body = await readJson(request);
+    sendJson(response, 201, await service.launch(body, {
+      controller,
+      output: () => {},
+      authOptions: () => ({
+        agentToken: optionalStringField(body, "agent_token") ?? undefined,
+        adminKey: optionalStringField(body, "admin_key") ?? resolveAdminKey()
+      })
+    }));
+    return;
+  }
+  const definition = url.pathname.match(/^\/api\/control\/agent-definitions\/([^/]+)$/);
+  if (request.method === "GET" && definition) {
+    sendJson(response, 200, service.get({ definition_id: decodeURIComponent(definition[1]!) }));
+    return;
+  }
+  if (request.method === "DELETE" && definition) {
+    const body = await readJson(request);
+    sendJson(response, 200, service.delete({
+      definition_id: decodeURIComponent(definition[1]!),
+      expected_revision: stringField(body, "expected_revision")
+    }, { trustedCatalogCapability: true }));
+    return;
+  }
+  sendJson(response, 404, { error: "Not found.", reason: "not_found", details: {} });
+}
+
+function agentDefinitionErrorStatus(reason: unknown): number {
+  switch (reason) {
+    case "validation": return 400;
+    case "auth_required": return 401;
+    case "not_found": return 404;
+    case "conflict": return 409;
+    case "capability_unavailable":
+    case "unsupported_runtime": return 503;
+    default: return 500;
   }
 }
 

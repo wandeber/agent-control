@@ -1,7 +1,7 @@
 "use client";
 
 import { Background, Controls, ReactFlow, applyNodeChanges, type Edge, type Node, type NodeProps, type ReactFlowInstance } from "@xyflow/react";
-import { Bot, Check, FileText, GitBranch, Search, Workflow } from "lucide-react";
+import { ArrowLeft, Bot, Check, ChevronRight, FileText, GitBranch, Search, Workflow } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -11,11 +11,13 @@ import { shouldTryMcpApp } from "@/lib/mcp-app";
 import { useFlowPreview, type FlowDefinition, type FlowPromptPreview } from "@/lib/flow-preview";
 import { useConsoleSelection } from "./console-selection";
 import { PhaseEdgeOverlay } from "./flow-phase-graph";
+import { SettingsLayout, type SettingsSection } from "./settings-navigation";
 
-export function FlowsShell() {
+export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSection) => void }) {
   const { selectedFlowId, setSelectedFlowId, projectDir, registerRefresh, setConnection } = useConsoleSelection();
   const { data, definition, connection, refresh } = useFlowPreview(projectDir, selectedFlowId);
   const [query, setQuery] = useState("");
+  const detailOpen = Boolean(selectedFlowId);
   const [stepId, setStepId] = useState<string | null>(null);
   const [tab, setTab] = useState("instructions");
   useEffect(() => registerRefresh(refresh), [refresh, registerRefresh]);
@@ -35,26 +37,37 @@ export function FlowsShell() {
       window.history.replaceState(window.history.state, "", url.href);
     }
   };
+  const showList = () => {
+    setSelectedFlowId(null);
+    if (!shouldTryMcpApp()) {
+      const url = new URL(window.location.href); url.searchParams.delete("flow_id");
+      window.history.replaceState(window.history.state, "", url.href);
+    }
+  };
+  const navigateSettings = (section: SettingsSection) => {
+    showList();
+    if (section !== "flows") onNavigate(section);
+  };
   const flows = data?.flows.filter(flow => `${flow.flow_id ?? flow.directory_name} ${flow.description ?? ""}`.toLowerCase().includes(query.toLowerCase())) ?? [];
 
-  return <main className="flows-shell">
-    <aside className="flow-library agent-scroll" aria-label="Flow catalog">
-      <label className="flow-search"><Search size={15} /><input aria-label="Search flows" placeholder="Search flows" value={query} onChange={event => setQuery(event.target.value)} /></label>
+  return <SettingsLayout section="flows" onSelect={navigateSettings}>
+    {!detailOpen ? <section className="settings-catalog agent-scroll" aria-label="Flow catalog"><div className="settings-catalog-inner">
+      <header className="settings-catalog-heading"><div><h1>Flows</h1><p>Explore workflows, their phases, and the agents that carry them out.</p></div></header>
+      <div className="settings-catalog-toolbar"><label className="settings-search"><Search size={15} /><input aria-label="Search flows" placeholder="Search flows" value={query} onChange={event => setQuery(event.target.value)} /></label>{data ? <span>{data.flows.length} {data.flows.length === 1 ? "flow" : "flows"}</span> : null}</div>
       {data?.catalogs.map(catalog => {
         const entries = flows.filter(flow => flow.catalog_id === catalog.catalog_id);
         if (!entries.length) return null;
-        return <section key={catalog.catalog_id}><h2>{catalog.name}</h2>{entries.map(flow => {
+        return <section key={catalog.catalog_id} className="settings-catalog-group"><h2>{catalog.name}</h2><div className="settings-entry-list">{entries.map(flow => {
           const id = flow.flow_id ?? flow.directory_name;
-          return <button key={flow.config_path} className="flow-library-item" aria-pressed={id === (selectedFlowId ?? data.selected_flow_id)} onClick={() => chooseFlow(id)}>
-            <Workflow size={16} /><span><strong>{id}</strong><small>{flow.description ?? (flow.valid ? "Flow definition" : "Draft in progress")}</small></span>
+          return <button key={flow.config_path} type="button" className="settings-entry settings-flow-entry" onClick={() => chooseFlow(id)}>
+            <span className="agent-avatar agent-avatar-large" aria-hidden="true"><Workflow size={19} /></span><span className="settings-entry-copy"><span className="settings-entry-title"><strong title={id}>{id}</strong>{!flow.valid ? <small>Draft in progress</small> : null}</span><span className="settings-entry-description">{flow.description ?? (flow.valid ? "Flow definition" : "Draft in progress")}</span></span><span className="settings-entry-open">View flow<ChevronRight size={15} /></span>
           </button>;
-        })}</section>;
+        })}</div></section>;
       })}
-      {data && !flows.length ? <p className="flow-muted">{query ? "No matching flows." : "Create a flow with Codex to see it here."}</p> : null}
-      <p className="flow-library-hint">Create or edit flows with Codex. Saved changes appear here automatically.</p>
-    </aside>
-    <section className="flow-preview-main">
-      <header className="flow-preview-heading"><div><h1>{definition?.config.id ?? selectedFlowId ?? "Choose a flow"}</h1><p>{definition?.config.description ?? "Explore phases, agent instructions and routes before running a flow."}</p></div><span className="flow-preview-badge">Source preview</span></header>
+      {!data || !flows.length ? <p className="settings-list-empty">{!data ? connection === "offline" ? "Flows unavailable. Use Refresh to try again." : "Loading flows…" : query ? "No matching flows." : "Create a flow with Codex to see it here."}</p> : null}
+      <p className="settings-catalog-hint">Create or edit flows with Codex. Saved changes appear here automatically.</p>
+    </div></section> : <section className="flow-preview-main">
+      <header className="flow-preview-heading"><div><button type="button" className="settings-back" aria-label="Back to flows" onClick={showList}><ArrowLeft size={16} />Flows</button><h1>{definition?.config.id ?? selectedFlowId ?? "Choose a flow"}</h1><p>{definition?.config.description ?? "Explore phases, agent instructions and routes before running a flow."}</p></div><span className="flow-preview-badge">Source preview</span></header>
       {data?.error ? <details className="flow-draft-notice"><summary>{definition ? "Draft in progress · showing the last valid version" : "Draft in progress"}</summary><p>{data.error}</p></details> : null}
       {definition ? <div className="flow-preview-workspace">
         <DefinitionGraph key={flowKey} definition={definition} selectedStepId={selectedStep} onSelect={setStepId} />
@@ -77,8 +90,8 @@ export function FlowsShell() {
         </aside>
       </div> : <div className="flow-preview-empty"><Workflow size={36} /><p>{connection === "connecting" ? "Loading flows…" : connection === "offline" ? "Offline" : "Your flow will appear here as Codex creates it."}</p><span>Project flows live in .agents/flows/&lt;flow-id&gt;/flow.yaml</span></div>}
       <footer className="flow-preview-footer"><span>{projectDir ?? data?.project_dir ?? "Shared flow catalogs"}</span><span>{definition ? `${phaseCount} ${phaseCount === 1 ? "phase" : "phases"} · ${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : "No run required"}</span></footer>
-    </section>
-  </main>;
+    </section>}
+  </SettingsLayout>;
 }
 
 function PromptSection({ title, prompts, description }: { title: string; prompts: FlowPromptPreview[]; description?: string }) {

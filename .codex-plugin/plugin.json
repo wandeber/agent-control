@@ -1,7 +1,7 @@
 {
   "name": "agent-control",
-  "version": "0.2.19",
-  "description": "Local agent control plane for declarative flows, native Codex subagent orchestration, supervision, and live inspection through MCP, CLI, and a native console.",
+  "version": "0.2.20",
+  "description": "Local agent control plane for reusable configured agents, declarative flows, Codex orchestration, supervision, and live inspection through MCP, CLI, and a native console.",
   "author": {
     "name": "wandeber",
     "url": "https://github.com/wandeber"
@@ -23,8 +23,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Control",
-    "shortDescription": "Declarative flows, native Codex subagents, CLI, and live console",
-    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering durable event subscriptions with renewable waits and explicit acknowledgement. Find and converse with existing project tasks, attach their sessions and the requester to a shared run, and use native Codex communication when Agent Control is unavailable.",
+    "shortDescription": "Configured agents, declarative flows, and live supervision",
+    "longDescription": "A deterministic local control plane and native Codex console for running declarative flows, bridging root-owned Codex subagent v2 actions, supervising Codex and OpenCode workers, recording artifacts and transitions, polling only cheap external status, visualizing agent relationships, exposing compact local API/WebSocket state, and delivering durable event subscriptions with renewable waits and explicit acknowledgement. Find and converse with existing project tasks, attach their sessions and the requester to a shared run, and use native Codex communication when Agent Control is unavailable. Create reusable named agents with individual Codex models, instructions, and ordered plugin, skill, and MCP selections; configure and launch them from the console or tools.",
     "developerName": "wandeber",
     "category": "Developer Tools",
     "capabilities": [
@@ -35,7 +35,7 @@
     "defaultPrompt": [
       "Use $development-flow to clarify a software task and run development-flow-v1.",
       "Use $flow-author to design or refine declarative Agent Control flow configs.",
-      "Use $flow-runner to discover, execute, resume, inspect, or debug an Agent Control flow."
+      "Use $configured-agents to discover, configure, or invoke a saved Agent Control agent."
     ],
     "brandColor": "#2563EB",
     "screenshots": []

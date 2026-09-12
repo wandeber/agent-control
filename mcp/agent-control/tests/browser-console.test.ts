@@ -39,7 +39,7 @@ describe("external global console", () => {
     let url: URL | undefined;
     try {
       await client.connect(transport);
-      const opened = await client.callTool({ name: "open_agent_control_console", arguments: {}, _meta: { threadId: "thread-a" } });
+      const opened = await client.callTool({ name: "open_agent_control_console", arguments: { screen: "flows", flow_id: "demo-age-duration", repo_dir: resolve("../..") }, _meta: { threadId: "thread-a" } });
       const panelId = (opened.structuredContent as any).console.panel_id;
       const result = await client.callTool({ name: "agent_control_console_open_browser", arguments: { panel_id: panelId, run_id: a.run_id, screen: "console" } });
       expect(result.isError).not.toBe(true);
@@ -48,6 +48,13 @@ describe("external global console", () => {
       expect(url.hash).toBe("#/console");
       const again = await client.callTool({ name: "agent_control_console_open_browser", arguments: { panel_id: panelId, screen: "subagents" } });
       expect(new URL((again.structuredContent as any).url).origin).toBe(url.origin);
+      const catalog = await client.callTool({ name: "agent_control_console_open_browser", arguments: { panel_id: panelId, screen: "flows" } });
+      const catalogUrl = new URL((catalog.structuredContent as any).url);
+      expect(catalogUrl.hash).toBe("#/flows");
+      expect(catalogUrl.searchParams.has("flow_id")).toBe(false);
+      expect(catalogUrl.searchParams.get("repo_dir")).toBe(resolve("../.."));
+      const detail = await client.callTool({ name: "agent_control_console_open_browser", arguments: { panel_id: panelId, screen: "flows", flow_id: "development-flow-v1" } });
+      expect(new URL((detail.structuredContent as any).url).searchParams.get("flow_id")).toBe("development-flow-v1");
       const recordPath = join(root, "browser-console", readdirSync(join(root, "browser-console")).find(file => file.endsWith(".json"))!);
       const record = JSON.parse(readFileSync(recordPath, "utf8"));
       // A temporarily stalled listener must not cause another daemon to spawn.

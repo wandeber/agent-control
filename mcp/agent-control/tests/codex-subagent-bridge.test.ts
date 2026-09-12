@@ -195,7 +195,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Fresh native review",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -239,7 +239,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Pending native manual reroute",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -295,7 +295,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Running native manual reroute",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -385,7 +385,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Restart native manual reroute",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -465,7 +465,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Fresh native prompt retry",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const promptPath = join(tmp, "late-native-review.md");
@@ -842,7 +842,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Cross-grant owner A",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -903,7 +903,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Two independent native flow owners",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const startA = controller.startFlow({
@@ -1836,7 +1836,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     `);
     legacy
       .prepare("insert into runs values (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run("run_legacy_grants", "Legacy grant migration", "/repo", null, null, "active", now, now);
+      .run("run_legacy_grants", "Legacy grant migration", tmp, null, null, "active", now, now);
     const insertAgent = legacy.prepare(
       "insert into agents values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
@@ -1847,7 +1847,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
       "Legacy orchestrator",
       "orchestrator",
       null,
-      "/repo",
+      tmp,
       null,
       null,
       0,
@@ -1865,7 +1865,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
       "Legacy worker",
       "worker",
       null,
-      "/repo",
+      tmp,
       null,
       null,
       0,
@@ -2594,7 +2594,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Retry failed native spawn",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -3447,7 +3447,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Late-report shutdown owner",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: ownerAdapter.kind,
       backendHandle: { id: "late-report-shutdown-owner" }
     });
@@ -4008,7 +4008,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Same-role follow-up orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -4169,7 +4169,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Fast same-role follow-up orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -4314,7 +4314,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Native handoff owner",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: ownerAdapter.kind,
       backendHandle: { id: "native-handoff-owner" }
     });
@@ -5190,7 +5190,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: `Native handoff owner ${suffix}`,
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: ownerAdapter.kind,
       backendHandle: { id: `native-handoff-owner-${suffix}` }
     });
@@ -5245,7 +5245,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: `Same-role owner ${suffix}`,
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: ownerAdapter.kind,
       backendHandle: { id: `same-role-owner-${suffix}` }
     });
@@ -5425,7 +5425,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_native_bridge_test",
       title: "Root native orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({

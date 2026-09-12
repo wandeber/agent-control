@@ -89,7 +89,9 @@ describe("request-scoped Codex MCP identity", () => {
       const legacy = await client.callTool({ name: "flow_evidence", arguments: { ...args, key: "explicit_identity", agent_token: explicitToken } });
       expect(legacy.isError).toBe(false); expect(parsed(legacy).actor_id).toBe(dispatched.agent!.agent_id);
       const observer = started.observer!;
-      const observed = parsed(await client.callTool({ name: "run_wait", arguments: { run_id: owner.run.run_id, observer_agent_id: observer.observer_agent_id, timeout_ms: 10 }, _meta: { threadId: "original-user" } }));
+      // Consume recorded history for the identity check without refreshing the
+      // fixture's synthetic thread through the MCP server's real Codex adapter.
+      const observed = parsed(await client.callTool({ name: "run_wait", arguments: { run_id: owner.run.run_id, observer_agent_id: observer.observer_agent_id, timeout_ms: 10, wake_on: "all" }, _meta: { threadId: "original-user" } }));
       const ackArgs = { run_id: owner.run.run_id, observer_agent_id: observer.observer_agent_id, cursor: observed.cursor };
       expect((await client.callTool({ name: "run_ack", arguments: ackArgs, _meta: { threadId } })).isError).toBe(true);
       expect((await client.callTool({ name: "run_ack", arguments: ackArgs, _meta: { threadId: "original-user" } })).isError).toBe(false);

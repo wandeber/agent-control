@@ -39,7 +39,7 @@ describe("processed observer cursors", () => {
   }
   function emit(runId: string) { return store.createEvent({ runId, type: "flow.completed" }); }
   function wait(observer: ReturnType<typeof observe>, extra: Partial<Parameters<RunObservation["wait"]>[0]> = {}) {
-    return observations.wait({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, timeoutMs: 1, intervalMs: 1, ...extra });
+    return observations.wait({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, wakeOn: "all", timeoutMs: 1, intervalMs: 1, ...extra });
   }
   function ack(observer: ReturnType<typeof observe>, cursor: string) {
     return observations.acknowledge({ runId: observer.run_id, observerAgentId: observer.observer_agent_id, cursor, adminKey });

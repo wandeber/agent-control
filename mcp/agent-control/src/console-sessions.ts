@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ControllerError } from "./core/errors.js";
 
 export interface FlowConsoleSelection {
-  screen?: "console" | "subagents" | "flows";
+  screen?: "console" | "subagents" | "flows" | "agents";
   flow_id?: string;
   repo_dir?: string;
 }
@@ -14,11 +14,12 @@ export interface ConsoleCommand extends FlowConsoleSelection {
   command_id: string;
 }
 
-interface ConsoleSession {
+export interface ConsoleSession {
   id: string;
   threadId: string;
   command: ConsoleCommand | null;
   selection: FlowConsoleSelection;
+  catalogManagement: boolean;
 }
 
 /** An app-only panel id preserves the opener when the host omits tool metadata. */
@@ -26,11 +27,21 @@ export class ConsoleSessions {
   private sessions = new Map<string, ConsoleSession>();
   private byThread = new Map<string, string>();
 
-  open(threadId: string | undefined, selection: FlowConsoleSelection = {}): ConsoleSession {
+  open(
+    threadId: string | undefined,
+    selection: FlowConsoleSelection = {},
+    options: { catalogManagement?: boolean } = {}
+  ): ConsoleSession {
     if (!threadId) throw new ControllerError("Open Agent Control from an identified Codex conversation.", "auth_required");
     const previous = this.byThread.get(threadId);
     if (previous) this.sessions.delete(previous);
-    const session = { id: randomUUID(), threadId, command: null, selection };
+    const session = {
+      id: randomUUID(),
+      threadId,
+      command: null,
+      selection,
+      catalogManagement: options.catalogManagement === true
+    };
     this.sessions.set(session.id, session);
     this.byThread.set(threadId, session.id);
     return session;

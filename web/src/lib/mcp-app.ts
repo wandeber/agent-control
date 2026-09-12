@@ -1,5 +1,6 @@
 "use client";
 
+import { AgentDefinitionApiError } from "./agent-definitions";
 import type { DashboardSnapshot } from "./types";
 
 interface JsonRpcSuccess<T> {
@@ -41,7 +42,7 @@ interface McpHostContext {
 }
 
 export interface ConsoleSelectionState {
-  screen?: "console" | "subagents" | "flows";
+  screen?: "console" | "subagents" | "flows" | "agents";
   flow_id?: string;
   repo_dir?: string;
   panel_id?: string;
@@ -261,7 +262,7 @@ class AgentControlMcpAppClient {
     }
   }
 
-  async callTool<T extends Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> {
+  async callTool<T>(name: string, args: Record<string, unknown>): Promise<T> {
     await this.connect();
     const panelId = name.startsWith("agent_control_console_") ? await waitForConsolePanel() : undefined;
     const result = await this.request<CallToolResult>(
@@ -272,13 +273,15 @@ class AgentControlMcpAppClient {
           ? { ...args, panel_id: panelId }
           : args
       },
-      name === "agent_control_console_open_browser" ? 15000 : 10000
+      name === "agent_control_console_agent_definition_inventory" || name === "agent_control_console_agent_definition_launch"
+        ? 45000
+        : name === "agent_control_console_open_browser" ? 15000 : 10000
     );
     if (panelId && consoleNotifications.current().console?.panel_id !== panelId) {
       throw new Error("The console panel has been reopened.");
     }
     if (result.isError) {
-      throw new Error(firstTextContent(result) ?? `MCP tool ${name} failed.`);
+      throw mcpToolCallError(name, result);
     }
 
     if (result.structuredContent) {
@@ -342,6 +345,35 @@ class AgentControlMcpAppClient {
   private notify(method: string, params: Record<string, unknown>): void {
     window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
   }
+}
+
+/** Converts MCP error envelopes into concise errors without exposing serialized payloads in the UI. */
+export function mcpToolCallError(name: string, result: CallToolResult): Error {
+  const text = firstTextContent(result)?.trim();
+  const structured = asRecord(result.structuredContent);
+  let parsedText: Record<string, unknown> | null = null;
+  let textWasJson = false;
+  if (text) {
+    try {
+      textWasJson = true;
+      parsedText = asRecord(JSON.parse(text));
+    } catch {
+      textWasJson = false;
+    }
+  }
+  const payload = typeof structured?.error === "string" ? structured : parsedText;
+  const fallback = name.startsWith("agent_control_console_agent_definition_")
+    ? "Agent definition request failed."
+    : `MCP tool ${name} failed.`;
+  const message = nonEmptyString(payload?.error) ?? (text && !textWasJson ? text : fallback);
+  if (name.startsWith("agent_control_console_agent_definition_")) {
+    return new AgentDefinitionApiError(
+      message,
+      nonEmptyString(payload?.reason) ?? "unknown",
+      asRecord(payload?.details) ?? {}
+    );
+  }
+  return new Error(message);
 }
 
 let clientPromise: Promise<AgentControlMcpAppClient | null> | null = null;
@@ -442,7 +474,7 @@ function parseConsoleSelection(value: unknown): ConsoleSelectionState | null {
 }
 
 function flowSelectionFields(record: Record<string, unknown>): Partial<ConsoleSelectionState> {
-  return { ...(record.screen === "flows" || record.screen === "console" || record.screen === "subagents" ? { screen: record.screen } : {}),
+  return { ...(record.screen === "flows" || record.screen === "console" || record.screen === "subagents" || record.screen === "agents" ? { screen: record.screen } : {}),
     ...(nonEmptyString(record.flow_id) ? { flow_id: String(record.flow_id) } : {}),
     ...(nonEmptyString(record.repo_dir) ? { repo_dir: String(record.repo_dir) } : {}) };
 }

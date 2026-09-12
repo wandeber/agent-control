@@ -374,7 +374,7 @@ describe("AgentController", () => {
     const result = controller.orchestratorLogin({
       adminKey: "ack_login_test",
       title: "Root orchestration",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake"
     });
     const resolved = controller.requireAgentToken(result.agent_token);
@@ -390,20 +390,20 @@ describe("AgentController", () => {
     const backendHandle = {
       thread_id: "thread_123",
       agent_control_role: "orchestrator",
-      cwd: "/repo"
+      cwd: tmp
     };
 
     const first = controller.orchestratorLogin({
       adminKey: "ack_login_reuse_test",
       title: "Reusable orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake",
       backendHandle
     });
     const second = controller.orchestratorLogin({
       adminKey: "ack_login_reuse_test",
       title: "Reusable orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       runId: first.run.run_id,
       backend: "fake",
       backendHandle
@@ -450,9 +450,11 @@ describe("AgentController", () => {
       title: "Root run",
       backend: "fake"
     });
+    const childRepo = join(tmp, "child");
+    mkdirSync(childRepo);
     const child = controller.createRun({
       title: "Child run",
-      repoDir: "/repo/child",
+      repoDir: childRepo,
       agentToken: login.agent_token
     });
     const siblingAgent = controller.registerAgent({
@@ -504,7 +506,7 @@ describe("AgentController", () => {
   });
 
   it("creates runs and registers agents", () => {
-    const run = controller.createRun({ title: "test run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "test run", repoDir: tmp });
     const agent = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -1130,7 +1132,7 @@ describe("AgentController", () => {
   });
 
   it("runs a simple multi-step flow, selects a transition, and binds artifacts", () => {
-    const run = controller.createRun({ title: "flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "flow run", repoDir: tmp });
     const analyst = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -1223,7 +1225,7 @@ describe("AgentController", () => {
       run: {
         run_id: run.run_id,
         title: "flow run",
-        repo_dir: "/repo"
+        repo_dir: tmp
       },
       worker: {
         agent_id: analyst.agent_id,
@@ -1350,7 +1352,7 @@ describe("AgentController", () => {
   });
 
   it("reuses an active flow instance when start is called again for the same run and flow", () => {
-    const run = controller.createRun({ title: "reused flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "reused flow run", repoDir: tmp });
     const config = {
       id: "reused-flow",
       version: "1.0.0",
@@ -1375,7 +1377,7 @@ describe("AgentController", () => {
   });
 
   it("dispatches an active flow step using a subscriber agent without creating a temporary orchestrator", async () => {
-    const run = controller.createRun({ title: "subscriber dispatch run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "subscriber dispatch run", repoDir: tmp });
     const orchestrator = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -1426,7 +1428,7 @@ describe("AgentController", () => {
   it.each(["codex-thread", "opencode-server"])("dispatches %s flows with the selected adapter server and Codex effort", async (backend) => {
     const worker = new FakeAdapter(backend);
     registry.register(worker);
-    const run = controller.createRun({ title: "Backend defaults", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Backend defaults", repoDir: tmp });
     const orchestrator = controller.registerAgent({ runId: run.run_id, backend: "fake", title: "Orchestrator", role: "orchestrator" });
     const isCodex = backend === "codex-thread";
     const started = controller.startFlow({ runId: run.run_id, config: {
@@ -1444,7 +1446,7 @@ describe("AgentController", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_planned_flow_test",
       title: "Planned role run",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake"
     });
     const config = {
@@ -1601,7 +1603,7 @@ describe("AgentController", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_fresh_review_flow_test",
       title: "Fresh review run",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake"
     });
     const started = controller.startFlow({
@@ -1768,7 +1770,7 @@ describe("AgentController", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_fresh_prompt_retry_test",
       title: "Fresh prompt retry",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake"
     });
     const promptPath = join(tmp, "late-final-review.md");
@@ -1854,7 +1856,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Concurrent fresh start", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Concurrent fresh start", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -1924,7 +1926,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Manual route beats invoking start", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Manual route beats invoking start", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -1989,7 +1991,7 @@ describe("AgentController", () => {
   });
 
   it("awaits cleanup of a running fresh worker before returning a manual route", async () => {
-    const run = controller.createRun({ title: "Manual route cleans fresh worker", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Manual route cleans fresh worker", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2045,7 +2047,7 @@ describe("AgentController", () => {
     const initialAdapter = new DeferredFakeAdapter("codex-thread");
     initialAdapter.stopErrorAtCall = 1;
     registry.register(initialAdapter);
-    const run = controller.createRun({ title: "Retry durable manual cleanup", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Retry durable manual cleanup", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2203,7 +2205,7 @@ describe("AgentController", () => {
   });
 
   it("retains a reused worker that is still owned by the manually selected step", async () => {
-    const run = controller.createRun({ title: "Manual route retains reused worker", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Manual route retains reused worker", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2250,7 +2252,7 @@ describe("AgentController", () => {
   it("cancels a prepared fresh start when stop wins before invocation", async () => {
     const codexThreadAdapter = new FakeCodexThreadAdapter();
     registry.register(codexThreadAdapter);
-    const run = controller.createRun({ title: "Prepared fresh start stop", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Prepared fresh start stop", repoDir: tmp });
     const promptPath = join(tmp, "not-yet-available-review.md");
     const started = controller.startFlow({
       runId: run.run_id,
@@ -2297,7 +2299,7 @@ describe("AgentController", () => {
   });
 
   it("atomically blocks a fresh step when stop cancels its prepared start boundary", async () => {
-    const run = controller.createRun({ title: "Prepared boundary stop interleaving", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Prepared boundary stop interleaving", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2359,7 +2361,7 @@ describe("AgentController", () => {
   });
 
   it("maps a failed durable start attempt to a precise blocked flow without adapter I/O", async () => {
-    const run = controller.createRun({ title: "Failed start attempt mapping", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Failed start attempt mapping", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2425,7 +2427,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Ambiguous fresh start", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Ambiguous fresh start", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2506,7 +2508,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Manual route beats late start", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Manual route beats late start", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2572,7 +2574,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Manual route after late recovery", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Manual route after late recovery", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2630,7 +2632,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Completed route beats late start", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Completed route beats late start", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2696,7 +2698,7 @@ describe("AgentController", () => {
       "The backend accepted thread/start but its response was lost."
     );
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Rejected start response", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Rejected start response", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2744,7 +2746,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Fresh start stop race", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Fresh start stop race", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2797,7 +2799,7 @@ describe("AgentController", () => {
     deferredAdapter.startGate = startGate;
     deferredAdapter.stopGate = stopGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Restart-safe late start cleanup", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Restart-safe late start cleanup", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -2988,7 +2990,7 @@ describe("AgentController", () => {
   });
 
   it("re-drives a persisted stopping worker after restart without a start attempt", async () => {
-    const run = controller.createRun({ title: "Restart durable manual cleanup", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Restart durable manual cleanup", repoDir: tmp });
     const worker = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -3058,7 +3060,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Recovered OpenCode launch", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Recovered OpenCode launch", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3141,7 +3143,7 @@ describe("AgentController", () => {
     const startGate = createDeferred<void>();
     deferredAdapter.startGate = startGate;
     registry.register(deferredAdapter);
-    const run = controller.createRun({ title: "Recovered start loses route", repoDir: "/repo" });
+    const run = controller.createRun({ title: "Recovered start loses route", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3238,7 +3240,7 @@ describe("AgentController", () => {
   });
 
   it("auto-continues reported flow steps without routing through an orchestrator", async () => {
-    const run = controller.createRun({ title: "auto flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "auto flow run", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3290,7 +3292,7 @@ describe("AgentController", () => {
   });
 
   it("auto-continues compactly from the MCP flow_step_report handler", async () => {
-    const run = controller.createRun({ title: "tool auto flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "tool auto flow run", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3354,7 +3356,7 @@ describe("AgentController", () => {
   });
 
   it("blocks a flow when a terminal worker never reports its step result", async () => {
-    const run = controller.createRun({ title: "missing report flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "missing report flow run", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3388,7 +3390,7 @@ describe("AgentController", () => {
   });
 
   it("includes flow blocker and notification instructions in subscription notifications", async () => {
-    const run = controller.createRun({ title: "flow notification run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "flow notification run", repoDir: tmp });
     const subscriber = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -3427,7 +3429,7 @@ describe("AgentController", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_finish_notify_test",
       title: "Finish notification orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "fake"
     });
     await controller.startAgent({ agentId: login.agent.agent_id, prompt: "register visible orchestrator" });
@@ -3486,7 +3488,7 @@ describe("AgentController", () => {
   });
 
   it("accepts markdown prompt references for roles and steps", () => {
-    const run = controller.createRun({ title: "prompted flow run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "prompted flow run", repoDir: tmp });
     const started = controller.startFlow({
       runId: run.run_id,
       config: {
@@ -3723,7 +3725,7 @@ describe("AgentController", () => {
   });
 
   it("records visual links, usage snapshots, and dashboard aggregates", () => {
-    const run = controller.createRun({ title: "visual run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "visual run", repoDir: tmp });
     const planner = controller.registerAgent({
       runId: run.run_id,
       backend: "fake",
@@ -3825,7 +3827,7 @@ describe("AgentController", () => {
           server: "http://localhost:1",
           model: "opencode-go/deepseek-v4-pro",
           title: "passive read",
-          repoDir: "/repo",
+          repoDir: tmp,
           pidFile: join(runtimeDir, "opencode.pid"),
           logFile,
           exitFile: join(runtimeDir, "opencode-exit.json"),
@@ -5729,12 +5731,12 @@ describe("AgentController", () => {
   it.each(["provider/explicit-model", undefined])("recovers OpenCode runtime handles without inventing a model (%s)", async (model) => {
     const opencodeAdapter = new FakeAdapter("opencode-server");
     registry.register(opencodeAdapter);
-    const run = controller.createRun({ title: "opencode run", repoDir: "/repo" });
+    const run = controller.createRun({ title: "opencode run", repoDir: tmp });
     const agent = controller.registerAgent({
       runId: run.run_id,
       backend: "opencode-server",
       title: "implementation",
-      repoDir: "/repo",
+      repoDir: tmp,
       model,
       status: "running"
     });
@@ -5750,7 +5752,7 @@ describe("AgentController", () => {
         server: "http://localhost:53910",
         model,
         title: "implementation",
-        repoDir: "/repo",
+        repoDir: tmp,
         pidFile,
         logFile,
         expectedArtifacts: [join(tmp, "implementation-report.md")]

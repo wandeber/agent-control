@@ -4,6 +4,7 @@ import { flowPackagesRequestJsonSchema } from "../core/flow-packages.js";
 import { evidenceRequestJsonSchema } from "../core/evidence/service.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
 import { ORCHESTRATOR_ACTION_ID_RE } from "../core/ids.js";
+import { AGENT_DEFINITION_TOOL_DEFINITIONS } from "./agent-definition-tools.js";
 import { workerAttachSchema } from "./schemas.js";
 import {
   flowPackagesSchema, flowContextUpdateSchema, flowOwnerRecoverSchema, flowDecisionSchema, flowEvidenceSchema, runAckSchema,
@@ -79,6 +80,7 @@ const operatorProperties = { admin_key: stringProperty("Explicit local administr
 const positionProperties = { agent_id: stringProperty("Agent in this run."), x: numberProperty("Run-local canvas x coordinate."), y: numberProperty("Run-local canvas y coordinate.") };
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   ...QUESTION_TOOLS,
+  ...AGENT_DEFINITION_TOOL_DEFINITIONS,
   { name: "permission_list", description: "Read real native permission requests, their exact scope, supported choices and delivery state for a run. Original Codex requester or explicit local admin only. Review before deciding; incomplete scope cannot be approved.", inputSchema: objectSchema({ ...operatorProperties, run_id: stringProperty("Run id.") }, ["run_id"]), schema: permissionListSchema },
   { name: "permission_decide", description: "Submit an authorized approve/reject decision for one real, currently owned native request. Requires user authorization for that scope or an explicit delegation to assess safe requests. Never grants blanket access. Idempotent same decision; conflicting/stale decisions fail. submitting means recorded, sent means handed to Codex, resolved means native acknowledgment. Resume run_wait after handling the event.", inputSchema: objectSchema({ ...operatorProperties, agent_id: stringProperty("Request owner."), request_id: stringProperty("Exact native request id from permission_list."), decision: enumProperty(["approve", "reject"], "Decision for the displayed scope.") }, ["agent_id", "request_id", "decision"]), schema: permissionDecideSchema },
   { name: "canvas_positions_get", description: "Read persisted per-run agent positions and CAS revision. Empty positions mean automatic layout. Coordinates exclude multi-run frame offsets; only real agent nodes can be positioned. Original requester or explicit local admin only.", inputSchema: objectSchema({ ...operatorProperties, run_id: stringProperty("Run id.") }, ["run_id"]), schema: canvasGetSchema },

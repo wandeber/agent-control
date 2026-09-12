@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -11,7 +11,7 @@ import { approvalRuntime } from "./fixtures/approval-runtime.js";
 
 const roots: string[] = [];
 let runtime: Awaited<ReturnType<typeof approvalRuntime>> | undefined;
-afterEach(async () => { await runtime?.close(); runtime = undefined; for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
+afterEach(async () => { await runtime?.close(); runtime = undefined; vi.unstubAllEnvs(); for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 const temp = () => { const path = mkdtempSync(join(tmpdir(), "ac-interactive-test-")); roots.push(path); return path; };
 
 it("preserves profile identity, nested project precedence and disabled layers", () => {
@@ -82,4 +82,27 @@ it("waits for an owned stdio process that ignores graceful termination before re
     await client.closeAndWait();
     expect(() => process.kill(pid, 0)).toThrow();
   } finally { await client.closeAndWait(); }
+});
+
+it("passes the controller home, database, and worker credential to owned app-server processes", async () => {
+  const dir = temp();
+  vi.stubEnv("AGENT_CONTROL_HOME", join(dir, "home"));
+  vi.stubEnv("AGENT_CONTROL_DB", join(dir, "controller.sqlite"));
+  vi.stubEnv("AGENT_CONTROL_TOKEN", "worker-token");
+  const script = `const readline=require('node:readline').createInterface({input:process.stdin}); readline.on('line',line=>{const request=JSON.parse(line); if(request.id!==undefined) process.stdout.write(JSON.stringify({id:request.id,result:{home:process.env.AGENT_CONTROL_HOME,db:process.env.AGENT_CONTROL_DB,token:process.env.AGENT_CONTROL_TOKEN}})+'\\n');});`;
+  const client = new CodexAppServerClient("stdio://", undefined, {
+    executable: process.execPath,
+    args: ["-e", script],
+    cwd: dir
+  });
+  try {
+    await client.initialize();
+    await expect(client.request("environment/read", {})).resolves.toEqual({
+      home: join(dir, "home"),
+      db: join(dir, "controller.sqlite"),
+      token: "worker-token"
+    });
+  } finally {
+    await client.closeAndWait();
+  }
 });

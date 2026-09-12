@@ -36,11 +36,83 @@ The plugin also ships Agent Control skills:
 - `flow-author` for designing declarative flow packages
 - `flow-configurator` for setting backend/model environment overrides
 - `flow-runner` for launching, resuming, and inspecting flows
+- `configured-agents` for discovering, configuring, and invoking reusable agents with saved models and capabilities
 - `converse-with-task` for finding an existing project task, exchanging a requested message, and following its response through Agent Control or native Codex
 
 The controller does not plan, review, or decide semantic quality. It registers
 agents, starts work, sends messages, reads compact status, stops agents,
 records goals and heartbeats, and delivers subscription events.
+
+## Configured Agents
+
+**Settings** keeps only **Agents** and **Flows** in its sidebar. Each section
+opens a catalog in the main area; selecting an entry opens its configuration or
+flow diagram, with a Back button to return to the catalog. Subagents and Full
+Console remain execution views, and returning to Settings restores its last
+section. A direct flow link or MCP request with `flow_id` opens that flow's
+details without starting a run.
+
+The **Settings → Agents** section (`#/agents`) manages a personal catalog of reusable agents.
+Each definition has its own name, description, developer instructions, Codex
+model/provider/reasoning selection, and ordered plugins, standalone skills, and
+standalone MCP servers. Open Settings from any console screen, or use
+`open_agent_control_console({ screen: "agents", repo_dir: "/absolute/project" })`.
+The default screen remains Subagents.
+
+Catalog rows show a name and one truncated description line; agents also show
+their model and reasoning beside the name. Agent rows have no reorder controls.
+The editor supports create, copy, delete, search, task launch, and ordering each
+agent's plugins, skills, and MCP servers.
+Toggles update immediately and save through a serialized queue; changing a switch
+does not reload Codex's inventory. Required Agent Control infrastructure stays
+enabled. New definitions start with optional capabilities disabled. Plugin-owned
+skills and MCPs are grouped under their plugin rather than shown as independent
+switches. The optional advanced skill catalog budget maps to
+`skills.max_context_tokens` (1–10,000).
+
+Definitions live in `~/.agent-control/agents/catalog.json`, under the configured
+Agent Control home. Each capability array's order is preserved
+in the file and compiled settings. This is deterministic saved order, not a
+guarantee that Codex prioritizes those skills in its initial context.
+
+The same service is exposed to ordinary Codex conversations, CLI clients, the
+local HTTP API, and the embedded console:
+
+| MCP tool | Purpose |
+| --- | --- |
+| `agent_definition_list` | List definitions in saved order and read the catalog revision. |
+| `agent_definition_get` | Read a definition by stable ID or normalized exact name. |
+| `agent_definition_inventory` | Discover actual models and installed capabilities for a project. |
+| `agent_definition_configure` | Create, edit, copy, or reorder using the current revision. |
+| `agent_definition_delete` | Delete a definition using the current revision. |
+| `agent_definition_launch` | Launch a worker using the saved configuration. |
+
+The CLI mirrors these operations under `agentctl agent-definition`; local HTTP
+uses `/api/control/agent-definitions`. Mutations use compare-and-swap revisions
+and atomic persistence. A supplied capability array replaces the complete saved
+array; omitted patch fields remain unchanged. Catalog writes require local
+operator authority. Worker/run credentials cannot edit the shared catalog.
+
+Use `$configured-agents` for requests such as "which agents are available?",
+"create a video editor with these plugins", or "ask the analyst to investigate
+this task". The skill resolves actual catalog entries and invokes their saved
+configuration without substituting a default role or model.
+
+Each execution gets an immutable private configuration snapshot and uses the
+same qualified Codex executable for inventory, launch, and continuation. Startup
+checks the actual model, instructions, and enabled capabilities before sending a
+model turn. Unsupported runtime behavior or a missing selected capability blocks
+with a concrete error. The observed PATH Codex 0.146.0 does not support the
+required plugin isolation; bundled Codex 0.153.4 does. An explicitly selected
+executable is never replaced silently.
+
+Launch reuses normal worker supervision and requester event subscriptions.
+Follow-ups continue the returned execution `agent_id`, not the saved
+`definition_id`. Editing or deleting a definition affects future launches;
+existing workers keep their snapshot. The initiating conversation remains in
+the returned renewable wait/ack lifecycle until its supervised work settles.
+Global Codex configuration and credentials are not copied or rewritten.
+
 
 ## Codex Marketplace
 

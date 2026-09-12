@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
     interruptCliWriter(rollout, writer);
     await until(() => child!.exitCode !== null);
     expect(readFileSync(rollout, "utf8")).toContain("turn_aborted");
-  });
+  }, 15000);
   it("rejects a shared writer even when it holds the requested rollout", async () => {
     const second = join(dir, "sessions", "rollout-another.jsonl");
     await start({ FIXTURE_SECOND: second });

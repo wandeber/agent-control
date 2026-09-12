@@ -195,17 +195,11 @@ async function toPackageIntegration() {
   expect(launched.coordinator_observer!.observer_agent_id).not.toBe(snapshot().runtime!.decision_owners!.requester);
   expect(controller.getAgent(step.agent_id!).role).toBe("implementer");
   expect(launched.wait_contract).toMatchObject({ tool: "flow_packages", arguments: { flow_instance_id: id, request: { operation: "wait", timeout_ms: 3_600_000 } } });
-  // Exercise the returned tool contracts with a short fixture deadline. Launch
-  // events must already be observable, and fetching them must not acknowledge.
+  // Informational launch events do not wake the coordinator under the default
+  // control policy. A real package delivery below must wake it for acceptance.
   const waitArguments = { ...launched.wait_contract!.arguments, request: { ...launched.wait_contract!.arguments.request, timeout_ms: 1 } };
-  const batch = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
-  expect(batch.events.length).toBeGreaterThan(0);
-  expect(batch.processed_cursor).not.toBe(batch.cursor);
-  expect(batch.ack_contract).toMatchObject({ tool: "flow_packages", arguments: { flow_instance_id: id, request: { operation: "ack", cursor: batch.cursor } } });
-  const ack = await handleTool(controller, batch.ack_contract.tool, batch.ack_contract.arguments) as any;
-  expect(ack.advanced).toBe(true);
-  const next = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
-  expect(next.events.map((event: any) => event.event_id).filter((eventId: string) => batch.events.some((event: any) => event.event_id === eventId))).toEqual([]);
+  const initialWait = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
+  expect(initialWait.events).toEqual([]);
   expect(Object.values(launched.branches).map(branch => branch.state)).toEqual(["running", "running"]);
   expect(new Set(Object.values(launched.branches).map(branch => branch.agent_id)).size).toBe(2);
   expect(snapshot().runtime!.packages!.manifest_digest).toBe(approvedManifest);
@@ -221,6 +215,14 @@ async function toPackageIntegration() {
     adapter.statuses.set(branch.agent_id!, "completed");
   }
   vi.stubEnv("CODEX_THREAD_ID", ownerThread);
+  const batch = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
+  expect(batch.events.length).toBeGreaterThan(0);
+  expect(batch.processed_cursor).not.toBe(batch.cursor);
+  expect(batch.ack_contract).toMatchObject({ tool: "flow_packages", arguments: { flow_instance_id: id, request: { operation: "ack", cursor: batch.cursor } } });
+  const ack = await handleTool(controller, batch.ack_contract.tool, batch.ack_contract.arguments) as any;
+  expect(ack.advanced).toBe(true);
+  const next = await handleTool(controller, launched.wait_contract!.tool, waitArguments) as any;
+  expect(next.events.map((event: any) => event.event_id).filter((eventId: string) => batch.events.some((event: any) => event.event_id === eventId))).toEqual([]);
   const accepted = await packages({ operation: "accept", deliveries, reason: "Both exact deliveries satisfy their approved package contracts." });
   expect(Object.values(accepted.branches).every(branch => branch.state === "accepted")).toBe(true);
   // Even a false worker claim cannot bypass runtime-derived integration.

@@ -146,7 +146,7 @@ describe("local root-bridge credential store", () => {
     const login = transactionalController.orchestratorLogin({
       adminKey: "ack_local_credential_test",
       title: "Transactional credential orchestrator",
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const startInput = {
@@ -554,7 +554,7 @@ describe("local root-bridge credential store", () => {
     const login = controller.orchestratorLogin({
       adminKey: "ack_local_credential_test",
       title: `Root credential orchestrator ${Date.now()} ${Math.random()}`,
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = controller.startFlow({
@@ -574,7 +574,7 @@ describe("local root-bridge credential store", () => {
     const login = runtime.controller.orchestratorLogin({
       adminKey: "ack_local_credential_test",
       title: `Isolated credential orchestrator ${suffix}`,
-      repoDir: "/repo",
+      repoDir: tmp,
       backend: "manual"
     });
     const start = runtime.controller.startFlow({

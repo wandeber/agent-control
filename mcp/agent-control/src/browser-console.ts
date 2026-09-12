@@ -96,7 +96,7 @@ export function browserOpenCommand(url: string, platform = process.platform, wsl
   return ["xdg-open", [url]];
 }
 
-export async function openBrowserConsole(runId?: string, screen: "console" | "subagents" | "flows" = "console", preview?: { flow_id?: string; repo_dir?: string }): Promise<{ url: string }> {
+export async function openBrowserConsole(runId?: string, screen: "console" | "subagents" | "flows" | "agents" = "console", preview?: { flow_id?: string; repo_dir?: string }): Promise<{ url: string }> {
   const url = new URL(await ensureBrowserConsole());
   if (runId) url.searchParams.set("run_id", runId);
   if (preview?.flow_id) url.searchParams.set("flow_id", preview.flow_id);
