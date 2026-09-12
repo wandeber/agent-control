@@ -1,6 +1,7 @@
 "use client";
 
 import { agentModelLabel, agentTokenLabel } from "@/lib/agent-presentation";
+import { QuestionBadge } from "./user-questions";
 import { AgentCostLabel } from "./agent-cost-label";
 import { AgentAccess } from "./agent-access";
 import { ArrowLeft } from "lucide-react";
@@ -170,7 +171,9 @@ function AgentGroup({
             onClick={() => onSelect(agent.agent_id)}
             type="button"
           >
-            <StatusDot status={agent.status} />
+            {(snapshot.user_questions ?? []).some(question => question.agent_id === agent.agent_id && question.state === "pending")
+              ? <QuestionBadge count={(snapshot.user_questions ?? []).filter(question => question.agent_id === agent.agent_id && question.state === "pending").length} />
+              : <StatusDot status={agent.status} />}
             <span className="subagent-list-copy">
               <span className="subagent-list-title">{agent.title}</span>
               <span className="subagent-list-detail flex flex-wrap items-baseline gap-x-2"><span>{agentModelLabel(agent)}</span><AgentCostLabel snapshot={snapshot} agentId={agent.agent_id} /></span>

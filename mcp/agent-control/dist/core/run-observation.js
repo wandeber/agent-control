@@ -376,6 +376,7 @@ function publicEvent(event, owners = [], notificationStatus) {
     const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
     return { event_id: event.event_id, run_id: event.run_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
         ...compactFlowEvent(event),
+        ...(typeof event.payload.question_id === "string" ? { question_id: event.payload.question_id, question_title: event.payload.title } : {}),
         ...(typeof event.payload.permission_request_id === "string" ? { permission_request_id: event.payload.permission_request_id, permission_state: event.payload.permission_state } : {}),
         ...(event.payload.reason === "coordinator_gate" && event.payload.decision ? {
             decision: Object.fromEntries(Object.entries(event.payload.decision)

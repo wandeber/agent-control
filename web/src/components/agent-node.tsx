@@ -19,6 +19,7 @@ export interface AgentNodeData extends Record<string, unknown> {
   presentation: ReturnType<typeof agentPresentation>;
   selected: boolean;
   permissionRequests?: PermissionRequest[];
+  questionCount?: number;
   access?: AgentAccessSnapshot;
   onSelect: () => void;
 }
@@ -40,9 +41,10 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
         }
       }}
       data-agent-card={data.agent.agent_id}
+      data-has-question={Boolean(data.questionCount)}
       className={[
         "group w-[300px] rounded-xl border bg-white p-3.5 text-left shadow-node backdrop-blur-xl transition",
-        style.border,
+        data.questionCount ? "border-amber-300 shadow-[0_0_0_3px_rgba(251,191,36,0.15)]" : style.border,
         data.selected ? "ring-2 ring-teal-300" : "ring-0"
       ].join(" ")}
     >
@@ -52,7 +54,7 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
       <FloatingHandles type="target" />
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <AgentUsageIcon usage={data.presentation.usage} cost={data.presentation.cost} exchange={data.presentation.exchange} className={style.bg + " " + style.text} />
+          <AgentUsageIcon questionCount={data.questionCount} usage={data.presentation.usage} cost={data.presentation.cost} exchange={data.presentation.exchange} className={style.bg + " " + style.text} />
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-ink-900" title={data.agent.title}>{data.presentation.title}</div>
             {data.presentation.title.toLowerCase() !== data.agent.role?.replaceAll("_", " ").toLowerCase() ? (

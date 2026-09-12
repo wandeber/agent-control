@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { initializeQuestionSchema } from "./question-schema.js";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { isBridgeGrantId, isOrchestratorActionId, newId, nowIso } from "../core/ids.js";
@@ -41,6 +42,7 @@ export class SqliteStore {
         try {
             this.migrate();
             initializeObservationSchema(this.db);
+            initializeQuestionSchema(this.db);
         }
         catch (error) {
             // A failed transactional migration has already rolled its data changes

@@ -133,7 +133,7 @@ require installing Agent Settings.
 
 ## Development Flow Evidence
 
-The bundled `development-flow-v1` version 1.2.2 records the current accepted
+The bundled `development-flow-v1` version 1.2.3 records the current accepted
 contract before dispatch, preserves Context and Analysis with the same analyst,
 checks intent with the clarification owner, and requires approval of the exact
 plan after the analyst's review. Integration is conditional; mechanical
@@ -1035,3 +1035,26 @@ agentctl permission decide --agent AGENT_ID --request REQUEST_ID --decision appr
 agentctl canvas positions get --run RUN_ID
 agentctl canvas positions set --run RUN_ID --revision 0 --file positions.json
 ```
+
+### Questions from agents
+
+Every worker launch includes the user-question tool contract. An authenticated
+worker can call `question_ask` with its `agent_id`, a stable `request_key`, a
+`title`, and 1–3 `questions` (`id`, `prompt`, optional `options`). Requests are
+persistent and appear together in Full Console, independently of the selected
+room or chat. Pending questions also mark agent avatars, the Subagents list,
+and rooms. Users can choose an option, multiple options when requested, or
+write a free-text answer. The inbox can be collapsed without dismissing requests.
+
+`question_ask` defaults to a one-hour wait returning the user's saved answers.
+Use `wait=false` for independent work and then `question_wait`; recover an
+interrupted call with `question_get` or `question_list`. The original requester
+or an explicit operator can relay an actual user answer with `question_answer`.
+Answers never start a replacement worker turn, approve native permissions, or
+replace flow approval gates. CLI equivalents are under `agentctl question`.
+
+Timeline places each agent on the same clock, with separate working intervals
+and blank waiting/resumption gaps. Local Codex history uses native turn times
+across rollouts; other backends show labeled controller observations. Missing
+history is marked explicitly. Zoom reveals short pauses without widening bars
+or inventing activity from elapsed lifetime.

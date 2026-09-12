@@ -1,3 +1,4 @@
+import { consoleQuestionAnswerSchema } from "./tools/questions.js";
 import { canvasSetSchema } from "./tools/schemas.js";
 import { randomUUID } from "node:crypto";
 import { previewFlowCatalog } from "./core/flow-preview.js";
@@ -22,7 +23,7 @@ export async function startControlServer(options) {
             response.end();
             return;
         }
-        const approvalRoute = request.url?.startsWith("/api/control/permissions/") || request.url?.startsWith("/api/control/canvas/");
+        const approvalRoute = request.url?.startsWith("/api/control/permissions/") || request.url?.startsWith("/api/control/canvas/") || request.url?.startsWith("/api/control/questions/");
         if (approvalRoute) {
             const expectedHost = `localhost:${server.address()?.port}`;
             if (!["::1", "127.0.0.1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "") || !uiOrigin || request.headers.origin !== uiOrigin || request.headers.host !== expectedHost || request.headers["sec-fetch-site"] === "cross-site") {
@@ -71,6 +72,35 @@ export async function startControlServer(options) {
                 if (url.pathname === "/api/control/canvas/positions") {
                     const input = canvasSetSchema.parse(body);
                     sendJson(response, 200, { canvas_positions: controller.setCanvasPositions(input.run_id, input.expected_revision, input.positions) });
+                    return;
+                }
+                if (url.pathname === "/api/control/questions/access" || url.pathname === "/api/control/questions/answer") {
+                    const input = consoleQuestionAnswerSchema.parse(body);
+                    const agent = controller.getAgent(input.agent_id);
+                    const question = controller.getDashboardSnapshot(agent.run_id).user_questions?.find(item => item.question_id === input.question_id && item.agent_id === input.agent_id);
+                    if (!question) {
+                        sendJson(response, 404, { error: "Question not found for this agent." });
+                        return;
+                    }
+                    const requestKey = `question:${input.question_id}`;
+                    if (url.pathname.endsWith("/access")) {
+                        for (const [key, value] of permissionTokens)
+                            if (value.expires < Date.now())
+                                permissionTokens.delete(key);
+                        const token = randomUUID();
+                        permissionTokens.set(token, { agent: input.agent_id, request: requestKey, expires: Date.now() + 60_000 });
+                        response.setHeader("Cache-Control", "no-store");
+                        sendJson(response, 200, { token });
+                        return;
+                    }
+                    const token = String(request.headers["x-agent-control-permission"] ?? ""), grant = permissionTokens.get(token);
+                    if (!grant || grant.expires < Date.now() || grant.agent !== input.agent_id || grant.request !== requestKey) {
+                        sendJson(response, 403, { error: "Missing or expired question-scoped console capability." });
+                        return;
+                    }
+                    const answered = controller.answerConsoleQuestion(input.agent_id, input.question_id, input.answers);
+                    permissionTokens.delete(token);
+                    sendJson(response, 200, { question: answered });
                     return;
                 }
                 const agentId = String(body.agent_id), requestId = String(body.request_id);

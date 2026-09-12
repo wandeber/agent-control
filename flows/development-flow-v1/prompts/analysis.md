@@ -16,9 +16,12 @@ require conversion. Keep normal ORM/schema migrations, actual external contracts
 confirmed preservation obligations, and migration history. A fresh-data design
 does not authorize executing destructive database operations.
 Name the source and scope of each required exception. If a material product or
-lifecycle or valued-data preservation choice is unresolved, report `needs_clarification` with the question
-and meaningful options in the handback summary to the original conversation
-before committing to a solution; do not substitute your answer for the user's.
+lifecycle or valued-data preservation choice is unresolved, use `question_ask`
+when available and wait for the actual answer. Return its question id and answer
+in the handback; report `needs_clarification` until the original conversation
+records the updated acceptance context. If direct questions are unavailable,
+return the complete question and meaningful options through the clarification
+route. Do not commit to a solution by substituting your answer for the user's.
 
 Map the solution to requested behavior and acceptance criteria. Define affected
 contracts, invariants, interfaces, consumers, constraints, alternatives where

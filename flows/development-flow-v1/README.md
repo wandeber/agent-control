@@ -227,3 +227,21 @@ Planner `record_review` supplies its current passed complete validation receipt
 in `source_receipt_ids`. The service derives the mechanical-report fingerprint;
 the semantic draft must not invent it. A readable historical receipt provides
 lineage and findings, not authority to satisfy a current gate.
+
+## Shared user questions and activity timeline
+
+Workers can use `question_ask` to reach the user directly in the Full Console
+inbox and their chat. Pending questions also mark agent nodes, the subagent
+list, and rooms. Several requests can be answered independently without changing
+the selected agent. The default wait is one hour; `question_get`, `question_list`,
+and `question_wait` recover the same durable request. Only the verified operator
+may relay a user's actual answer through `question_answer`. The original
+conversation still records material answers with `flow_context_update` before
+dependent work and owns content-bound approval gates.
+
+Timeline uses one shared clock and a lane per agent. Filled segments represent
+active turns, including ordinary tools; blank gaps represent recorded waits or
+inactive periods. Resumed turns produce additional segments. Local Codex history
+uses native timestamps across resumed rollouts; other backends use labeled
+controller observations. Missing history remains unavailable or partial. Zoom
+in to inspect short pauses; overlapping segments show real parallel execution.

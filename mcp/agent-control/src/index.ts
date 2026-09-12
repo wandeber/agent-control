@@ -1,3 +1,4 @@
+import { consoleQuestionAnswerSchema, questionAnswersJsonSchema } from "./tools/questions.js";
 import { canvasSetSchema } from "./tools/schemas.js";
 import type { AccessPolicy } from "./core/agent-access.js";
 import { readFile } from "node:fs/promises";
@@ -53,6 +54,8 @@ const FLOW_SELECTION_PROPERTIES = {
 };
 
 const APP_TOOL_DEFINITIONS = [
+  { name: "agent_control_console_question_answer", description: "App-only. Record the user's submitted answers for an agent question associated with this conversation, independently of the selected room/chat.",
+    inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, agent_id: { type: "string" }, question_id: { type: "string" }, answers: questionAnswersJsonSchema }, required: ["panel_id", "agent_id", "question_id", "answers"], additionalProperties: false }, _meta: APP_TOOL_META },
   { name: "agent_control_console_canvas_positions", description: "App-only. Persist a node drag or organize action for a run associated with this panel.",
     inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, run_id: { type: "string" }, expected_revision: { type: "integer" }, positions: { type: "array", items: { type: "object", properties: { agent_id: { type: "string" }, x: { type: "number" }, y: { type: "number" } }, required: ["agent_id", "x", "y"], additionalProperties: false } } }, required: ["panel_id", "run_id", "expected_revision", "positions"], additionalProperties: false }, _meta: APP_TOOL_META },
   { name: "agent_control_console_access_request", description: "App-only. Set this agent's explicit access policy for its next turn; never interrupts work or grants the current pending permission.",
@@ -390,6 +393,12 @@ async function handleConsoleTool(
     const parsed = canvasSetSchema.parse(args);
     if (!store.listConsoleRuns(session.threadId).some(run => run.run_id === parsed.run_id)) throw new Error("This run is not associated with this Codex conversation.");
     return { content: [{ type: "text", text: "Saved canvas positions." }], structuredContent: { canvas_positions: controller.setCanvasPositions(parsed.run_id, parsed.expected_revision, parsed.positions) } };
+  }
+  if (name === "agent_control_console_question_answer") {
+    const { panel_id, ...args } = input as Record<string, unknown>;
+    const parsed = consoleQuestionAnswerSchema.parse(args);
+    assertConsoleAgent(input, parsed.agent_id);
+    return { content: [{ type: "text", text: "Recorded the user's answer." }], structuredContent: { question: controller.answerConsoleQuestion(parsed.agent_id, parsed.question_id, parsed.answers) } };
   }
   if (name === "agent_control_console_access_request") {
     const agentId = requiredStringField(input, "agent_id");

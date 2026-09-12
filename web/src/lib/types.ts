@@ -12,6 +12,10 @@ export type AgentStatus =
   | "unknown";
 
 export type EventType =
+  | "question.requested"
+  | "question.answered"
+  | "question.wait_started"
+  | "question.wait_ended"
   | "agent.started"
   | "agent.status_changed"
   | "agent.message"
@@ -326,6 +330,15 @@ export interface AgentAccessSnapshot {
   effective: { approval_policy: unknown; sandbox_policy: Record<string, unknown>; thread_id: string; observed_at: string } | null;
   revision: number; effective_revision: number | null; state: "pending" | "applied" | "unverified" | "unsupported";
 }
+export interface UserQuestionItem { id: string; prompt: string; options?: Array<{ id: string; label: string; description?: string }>; multiple?: boolean }
+export type UserQuestionAnswers = Record<string, { option_ids: string[]; text: string }>;
+export interface UserQuestionRequest {
+  question_id: string; run_id: string; agent_id: string; agent_title: string; run_title: string;
+  title: string; request_key: string; questions: UserQuestionItem[];
+  state: "pending" | "answered" | "cancelled"; answers: UserQuestionAnswers | null;
+  created_at: string; answered_at: string | null;
+}
+
 export interface PermissionRequest {
   request_id: string; agent_id: string; thread_id: string; turn_id: string; item_id: string;
   kind: "command" | "files" | "permissions"; title: string; reason: string | null;
@@ -338,6 +351,9 @@ export interface PermissionRequest {
 export interface CanvasPosition { agent_id: string; x: number; y: number }
 export interface CanvasPositions { run_id: string; revision: number; coordinate_space: "run"; positions: CanvasPosition[]; updated_at: string | null }
 export interface DashboardSnapshot {
+  agent_timeline?: { started_at: string; ended_at: string; rows: Array<{ agent_id: string; source: "native" | "controller"; coverage: "complete" | "partial" | "unavailable"; segments: Array<{ id: string; started_at: string; ended_at: string | null }> }> };
+  /** Pending questions across visible rooms, plus the selected room's answered history. */
+  user_questions?: UserQuestionRequest[];
   canvas_positions?: CanvasPositions;
   agent_access?: AgentAccessSnapshot[];
   permission_requests?: PermissionRequest[];

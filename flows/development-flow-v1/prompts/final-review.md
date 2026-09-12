@@ -53,3 +53,9 @@ After refresh, the validator may request guarded closure using your existing
 approval. Changed results or missing/rejected approval return to this same
 reviewer. A transport/permission failure follows the runtime's distinct blocked
 handback contract instead.
+
+For material user decisions, use the available Agent Control `question_ask`
+interface and resume its `question_wait` after timeouts. Report actual answers
+and question ids to the original conversation for accepted-context updates
+before dependent work. If unavailable, use the configured clarification route.
+A clarification answer is not permission approval or a flow-gate decision.

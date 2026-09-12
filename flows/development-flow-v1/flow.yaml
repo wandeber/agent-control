@@ -1,7 +1,7 @@
 # Role model defaults match HDT; project preferences are resolved from .agents/models.toml.
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
-version: 1.2.2
+version: 1.2.3
 description: Clean pre-production development by default, proactive user clarification
   through the available question interface, evidence-based compatibility exceptions,
   normal ORM/schema migrations with old development data recreated when simpler,

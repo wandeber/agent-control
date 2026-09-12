@@ -144,7 +144,7 @@ export function AgentGraph({
         type: "agent",
         focusable: false,
         position: dragging.current || !revisionChanged ? previous?.position ?? newPosition : point,
-        data: { agent, access: snapshot.agent_access?.find(item => item.agent_id === agent.agent_id), permissionRequests: snapshot.permission_requests?.filter(request => request.agent_id === agent.agent_id), presentation: agentPresentation(runSnapshots.find(value => value.selected_run_id === agent.run_id) ?? snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
+        data: { agent, questionCount: (snapshot.user_questions ?? []).filter(question => question.agent_id === agent.agent_id && question.state === "pending").length, access: snapshot.agent_access?.find(item => item.agent_id === agent.agent_id), permissionRequests: snapshot.permission_requests?.filter(request => request.agent_id === agent.agent_id), presentation: agentPresentation(runSnapshots.find(value => value.selected_run_id === agent.run_id) ?? snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
       };
     }));
   }, [layoutRevision, initialLayout, focusId, snapshot, runSnapshots, storageKey, onSelectAgent]);

@@ -1,5 +1,6 @@
 "use client";
 
+import { QuestionCards } from "./user-questions";
 import { mergeToolMessages, permissionsForTool, readToolActivity } from "@/lib/tool-activity";
 import { AgentAccess } from "./agent-access";
 import { PermissionRequests } from "./permission-request";
@@ -140,6 +141,9 @@ export function WorkspacePanel({
         </div>
       ) : null}
       {visibleEvidence?.available ? <div className="shrink-0 px-3 py-2"><FlowEvidenceDetails view={visibleEvidence} /></div> : null}
+      {tab === "chat" && (snapshot.user_questions ?? []).some(question => question.agent_id === agentId) ? (
+        <div className="chat-questions"><QuestionCards requests={(snapshot.user_questions ?? []).filter(question => question.agent_id === agentId)} /></div>
+      ) : null}
       <div className="min-h-0 flex-1">
         {tab === "chat" ? (
           <div className="agent-chat h-full min-h-0">

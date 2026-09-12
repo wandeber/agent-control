@@ -1,3 +1,4 @@
+import type { UserQuestionRequest } from "./user-questions.js";
 export const AGENT_STATUSES = [
   "planned",
   "queued",
@@ -69,6 +70,10 @@ export interface AgentStartAttemptRecord {
 }
 
 export const EVENT_TYPES = [
+  "question.requested",
+  "question.answered",
+  "question.wait_started",
+  "question.wait_ended",
   "agent.started",
   "agent.status_changed",
   "agent.message",
@@ -766,6 +771,9 @@ export interface AgentComputedState {
 }
 
 export interface DashboardSnapshot {
+  agent_timeline?: import("./agent-timeline.js").AgentTimeline;
+  /** Pending questions across visible rooms, plus the selected room's answered history. */
+  user_questions?: UserQuestionRequest[];
   canvas_positions?: import("./canvas-positions.js").CanvasPositions;
   agent_access?: import("./agent-access.js").AgentAccessSnapshot[];
   permission_requests?: import("./permission-requests.js").PermissionRequest[];

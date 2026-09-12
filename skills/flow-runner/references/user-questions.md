@@ -1,9 +1,29 @@
 # User Questions
 
 The conversation receiving the user's request owns clarification and actual
-user decisions. A worker reports a missing decision and its consequences to
-that conversation through the configured clarification/blocker route. A worker
-or a separate executing coordinator must not answer on the user's behalf.
+user decisions. A worker can ask directly through Agent Control's `question_ask`
+when available: its questions appear in the shared Full Console inbox and the
+owning chat, with badges on the agent and room. Use your own registered
+`agent_id`, a stable `request_key`, a short `title`, and one to three `questions`
+with stable `id`, complete `prompt`, and optional answer `options` (`id`, `label`,
+optional `description`). Free text is always available. Use authenticated native
+identity or your own runtime credential; never copy credentials into prompts.
+
+By default `question_ask` waits up to one hour and returns the actual saved
+answers (`option_ids` and `text` by question id). Use `wait=false` for independent
+work, then `question_wait`. Recover with `question_get` or `question_list`; after
+a timeout or cancelled transport, resume the existing question's wait instead
+of creating another request or ending the turn while required work is pending.
+The user may answer from any visible room. Answers do not start another worker
+turn. `question_answer` is for the verified requester/operator to relay an
+answer the user actually gave, never for a worker to choose on their behalf.
+
+Pass material answers back through the configured clarification route so the
+original conversation records them in accepted flow context before dependent
+work. If direct questions are unavailable or access is denied, report the
+question and its consequences through that route for the original conversation
+to ask. A worker or separate executing coordinator must not invent the answer.
+Clarification does not approve backend permissions or content-bound flow gates.
 
 Review the request, prior answers, and repository evidence before asking. Raise
 unresolved choices about desired behavior, users, scope, acceptance, and material

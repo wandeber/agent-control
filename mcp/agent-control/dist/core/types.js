@@ -43,6 +43,10 @@ export const AGENT_START_ATTEMPT_PHASES = [
     "cancelled"
 ];
 export const EVENT_TYPES = [
+    "question.requested",
+    "question.answered",
+    "question.wait_started",
+    "question.wait_ended",
     "agent.started",
     "agent.status_changed",
     "agent.message",

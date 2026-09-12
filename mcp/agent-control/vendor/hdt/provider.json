@@ -3,8 +3,8 @@
   "provider": "hdt-review-checkpoint",
   "source_repository": "https://github.com/wandeber/agent-settings",
   "source_path": "plugins/development-workflow/skills/handle-development-task/scripts/review_checkpoint.py",
-  "source_version": "0.1.21",
-  "source_commit": "4d75325e8d5f1f942a12fb4ec2280ed18819e68b",
+  "source_version": "0.1.22",
+  "source_commit": "24fe98a9a1e25bdcd35316688a6977ccc342aa2c",
   "source_dirty": false,
   "sha256": "8b8e8906d6005fda943b35081202bd6c98f1018a98b5e27288178bcb6734b5fb",
   "companions": {

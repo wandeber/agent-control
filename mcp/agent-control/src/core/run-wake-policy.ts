@@ -41,6 +41,7 @@ export class RunWakePolicy {
     const ids = this.runIds(runId);
     let workers = 0, flows = 0, failed = false, cancelled = false;
     for (const id of ids) {
+      if (this.store.db.prepare("select 1 from user_questions q join agents a on a.agent_id=q.agent_id join runs r on r.run_id=q.run_id where q.run_id=? and q.state='pending' and a.unregistered_at is null and a.status not in ('stopping','stopped') and r.status not in ('stopping','stopped')").get(id)) return null;
       const priorWorkers = workers;
       const run = this.store.getRun(id)!;
       if (run.status === "stopping") return null;
@@ -100,6 +101,12 @@ export class RunWakePolicy {
       const requester = this.store.db.prepare("select thread_id from run_requesters where run_id=?").get(event.run_id ?? observer.run_id) as { thread_id: string } | undefined;
       return operational || requester?.thread_id === observer.backend_handle?.thread_id;
     }
+    if (event.type === "question.requested" || event.type === "question.answered") {
+      const question = this.store.db.prepare("select state from user_questions where question_id=?").get(String(payload.question_id)) as { state: string } | undefined;
+      if (!question || (event.type === "question.requested" && question.state !== "pending")) return false;
+      const requester = this.store.db.prepare("select thread_id from run_requesters where run_id=?").get(event.run_id ?? observer.run_id) as { thread_id: string } | undefined;
+      return requester?.thread_id === observer.backend_handle?.thread_id || sameThread(event.agent_id);
+    }
     if (event.type === "flow.notification") {
       if (payload.reason === "coordinator_gate") {
         const flowId = typeof payload.flow_instance_id === "string" ? payload.flow_instance_id : undefined;
@@ -140,7 +147,8 @@ export class RunWakePolicy {
     const rows = this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
       left join flow_step_instances s on s.step_instance_id = json_extract(e.payload_json, '$.step_instance_id')
       where e.run_id in (select value from json_each(?)) and ((e.type = 'flow.notification' and s.status = 'active' and json_extract(e.payload_json, '$.reason') = 'coordinator_gate')
-        or (e.type = 'agent.status_changed' and json_extract(e.payload_json, '$.permission_state') = 'pending')) order by o.sequence`).all(JSON.stringify(this.runIds(runId))) as Array<Record<string, unknown>>;
+        or (e.type = 'agent.status_changed' and json_extract(e.payload_json, '$.permission_state') = 'pending')
+        or e.type = 'question.requested') order by o.sequence`).all(JSON.stringify(this.runIds(runId))) as Array<Record<string, unknown>>;
     for (const row of rows) {
       if (String(row.run_id) !== runId && !this.store.db.prepare("select 1 from run_observers where run_id = ? and thread_id = ?")
         .get(String(row.run_id), String(observer.backend_handle?.thread_id ?? ""))) continue;

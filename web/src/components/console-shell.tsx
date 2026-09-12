@@ -18,6 +18,7 @@ import { AgentInspector } from "./agent-inspector";
 import { FlowPhaseGraph, type FlowStepSelection } from "./flow-phase-graph";
 import { RunInfoPanel } from "./run-info-panel";
 import { RunSidebar } from "./run-sidebar";
+import { QuestionInbox } from "./user-questions";
 import { Timeline } from "./timeline";
 import { TopBar } from "./top-bar";
 import { EmptyState, Panel } from "./ui";
@@ -302,6 +303,10 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
       data-thread-open={threadOpen ? "true" : "false"}
       style={shellStyle}
     >
+      {snapshot ? <QuestionInbox requests={snapshot.user_questions ?? []} onSelectAgent={question => {
+        if (question.run_id !== snapshot.selected_run_id) { selectionRunRef.current = question.run_id; selectRun(question.run_id); }
+        setSelectedAgentId(question.agent_id); setAgentSelectionPinned(true); setGraphMode("agents");
+      }} /> : null}
       <div className="console-top">
         <TopBar
           connection={agentError ? "offline" : connection}

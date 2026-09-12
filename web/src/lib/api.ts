@@ -14,7 +14,7 @@ import {
 import { SerialRefreshCoordinator } from "./refresh-coordinator";
 import { snapshotStreamIsLoading } from "./snapshot-stream-state";
 import { combineRunSnapshots } from "./run-snapshots";
-import type { AgentLogTail, AgentMessage, DashboardSnapshot, PermissionRequest, AgentAccessSnapshot, AccessPolicy, SocketPayload } from "./types";
+import type { AgentLogTail, AgentMessage, DashboardSnapshot, UserQuestionRequest, UserQuestionAnswers, PermissionRequest, AgentAccessSnapshot, AccessPolicy, SocketPayload } from "./types";
 import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
 
 export type ConnectionState = "connecting" | "live" | "offline";
@@ -401,6 +401,23 @@ interface McpRefreshPayload {
   messageLimit: number;
   messages: AgentMessage[] | null;
   log: AgentLogTail | null;
+}
+
+export async function answerUserQuestion(request: UserQuestionRequest, answers: UserQuestionAnswers): Promise<UserQuestionRequest> {
+  const client = await getMcpAppClient();
+  const input = { agent_id: request.agent_id, question_id: request.question_id, answers };
+  if (client) return (await client.callTool<{ question: UserQuestionRequest }>("agent_control_console_question_answer", input)).question;
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
+  const call = async (route: string, token?: string) => {
+    const response = await fetch(`${controlApiBase()}/api/control/questions/${route}`, { method: "POST", headers: {
+      "Content-Type": "application/json", ...(token ? { "X-Agent-Control-Permission": token } : {})
+    }, body: JSON.stringify(input) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `Question response failed: ${response.status}`);
+    return result;
+  };
+  const access = await call("access");
+  return (await call("answer", access.token)).question;
 }
 
 export async function decidePermission(request: PermissionRequest, decision: "approve" | "reject"): Promise<PermissionRequest> {

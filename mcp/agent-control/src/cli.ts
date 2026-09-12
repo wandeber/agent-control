@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { registerQuestionCommands } from "./cli/questions.js";
 import { registerOperatorCommands } from "./cli/operator.js";
 import { Command } from "commander";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
@@ -58,6 +59,7 @@ program
 const cliDeps = { controller, output, authOptions };
 registerWorkerCommands(program, cliDeps);
 registerOperatorCommands(program, cliDeps);
+registerQuestionCommands(program, cliDeps);
 registerWatchCommands(program, cliDeps);
 registerSmokeCommands(program, cliDeps);
 registerMarketplaceCommands(program, output);

@@ -4,6 +4,11 @@ import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
 export async function handleTool(controller, name, input, signal) {
     switch (name) {
+        case "question_ask": return controller.askUserQuestion(input, signal);
+        case "question_get": return controller.getUserQuestion(String(input.question_id), { agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "question_list": return controller.listUserQuestions(String(input.run_id), { agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
+        case "question_wait": return controller.waitForUserQuestion(String(input.question_id), { agentToken: maybeString(input.agent_token), timeoutMs: maybeNumber(input.timeout_ms) }, signal);
+        case "question_answer": return controller.answerOperatorQuestion(String(input.question_id), input.answers, { agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
         case "permission_list": return controller.listPermissions(String(input.run_id), { adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
         case "permission_decide": return controller.decideOperatorPermission(String(input.agent_id), String(input.request_id), input.decision, { adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
         case "canvas_positions_get":

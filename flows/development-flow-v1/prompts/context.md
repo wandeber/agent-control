@@ -19,11 +19,14 @@ the change remain appropriate. Investigate concrete evidence of valued data or
 production use before recommending old-format converters or backfills.
 
 If uncertainty would change the solution or require compatibility/data conversion,
-report `needs_clarification` with a concrete question, practical options, the
-recommended clean approach when appropriate, and the consequence of each choice.
-Put the question in the handback summary, not only in the Context document.
-The original conversation asks through its available question UI or text
-fallback; do not decide for the user or wait until implementation is blocked.
+ask through the available Agent Control `question_ask` interface, with concrete
+options, the recommended clean approach when appropriate, and each consequence.
+Wait for the actual answer; include its question id and answer in the handback
+summary so the original conversation updates accepted flow context before
+dependent work. Report `needs_clarification` until that context is recorded.
+If direct questions are unavailable, put the complete question in the handback
+for the original conversation's question UI or text fallback. Do not decide
+for the user or wait until implementation is blocked.
 Ask about losing/recreating old data versus converting it when material evidence
 of valued data or production leaves preservation unresolved. Record confirmed
 answers separately from assumptions. A fresh-data design does not authorize

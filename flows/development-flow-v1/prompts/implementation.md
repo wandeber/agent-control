@@ -50,3 +50,9 @@ It derives whether Integration is required from that accepted group; do not
 supply or rely on an `integration_needed` claim. Do not edit the consolidated
 result in parallel with external package authors or claim their outputs are
 already integrated. Avoid another complete suite solely for a handoff.
+
+For material user decisions, use the available Agent Control `question_ask`
+interface and resume its `question_wait` after timeouts. Report actual answers
+and question ids to the original conversation for accepted-context updates
+before dependent work. If unavailable, use the configured clarification route.
+A clarification answer is not permission approval or a flow-gate decision.

@@ -1,3 +1,5 @@
+import { projectAgentTimeline } from "./agent-timeline.js";
+import { UserQuestions, type UserQuestionContent, type UserQuestionAnswers } from "./user-questions.js";
 import { CanvasPositionStore, type CanvasPosition } from "./canvas-positions.js";
 import { RunConversationUsage, hasRunConversationUsage } from "./run-conversation-usage.js";
 import { currentMcpThreadId } from "./caller-context.js";
@@ -141,6 +143,7 @@ export class AgentController {
   private readonly controllerInstanceId = newId("controller");
   private readonly observations: RunObservation;
   private readonly permissions: PermissionRequests;
+  private readonly userQuestions: UserQuestions;
   private readonly canvasPositions: CanvasPositionStore;
   private readonly agentAccess: AgentAccessStore;
   private readonly flowRuntime: FlowRuntime;
@@ -165,6 +168,7 @@ export class AgentController {
     options: AgentControllerOptions = {}
   ) {
     this.permissions = new PermissionRequests(store.db);
+    this.userQuestions = new UserQuestions(store, event => this.emit(event));
     this.canvasPositions = new CanvasPositionStore(store);
     this.agentAccess = new AgentAccessStore(store.db);
     this.observations = new RunObservation(store, this, adapters);
@@ -5699,7 +5703,7 @@ export class AgentController {
   async startAgent(input: Parameters<AgentController["startAgentExecution"]>[0] & RequesterInput): Promise<AgentStartResult> {
     const agent = this.getAgent(input.agentId);
     const observer = this.ensureRequester(agent.run_id, input);
-    const result = await this.startAgentExecution(input);
+    const result = await this.startAgentExecution({ ...input, prompt: input.prompt === undefined ? undefined : `${input.prompt}\n\n${userQuestionWorkerContract(agent.agent_id)}` });
     return { ...result, observer };
   }
 
@@ -8205,6 +8209,59 @@ export class AgentController {
     };
   }
 
+  private requireQuestionOwner(agentId?: string, agentToken?: string): AgentRecord {
+    const caller = this.flowCaller(agentToken, agentId ? [agentId] : undefined);
+    if (!caller || caller.unregistered_at || (agentId && caller.agent_id !== agentId)) throw new ControllerError("Questions require the originating agent's authenticated identity.", "auth_required");
+    return caller;
+  }
+
+  async askUserQuestion(input: UserQuestionContent & { agent_id?: string; agent_token?: string; wait?: boolean; timeout_ms?: number }, signal?: AbortSignal) {
+    const agent = this.requireQuestionOwner(input.agent_id, input.agent_token);
+    const question = this.userQuestions.ask(agent, { title: input.title, questions: input.questions, request_key: input.request_key });
+    if (input.wait !== false) return this.waitForUserQuestion(question.question_id, { agentToken: input.agent_token, timeoutMs: input.timeout_ms }, signal);
+    return { question, wait_contract: { tool: "question_wait", arguments: { question_id: question.question_id, timeout_ms: 3_600_000 } } };
+  }
+
+  getUserQuestion(questionId: string, auth: { agentToken?: string; adminKey?: string } = {}) {
+    const question = this.userQuestions.get(questionId);
+    if (auth.adminKey !== undefined) { this.authorizeRunOperator(question.run_id, auth); return question; }
+    const caller = this.flowCaller(auth.agentToken, [question.agent_id]);
+    if (!caller || caller.agent_id !== question.agent_id || caller.unregistered_at) this.authorizeRunOperator(question.run_id, auth);
+    return question;
+  }
+
+  listUserQuestions(runId: string, auth: { agentToken?: string; adminKey?: string } = {}) {
+    if (auth.adminKey !== undefined) { this.authorizeRunOperator(runId, auth); return { questions: this.userQuestions.list([runId]) }; }
+    if (!auth.agentToken) {
+      try { this.authorizeRunOperator(runId, auth); return { questions: this.userQuestions.list([runId]) }; }
+      catch { /* An authenticated worker may still read its own questions. */ }
+    }
+    const candidates = this.store.listAgents({ runId });
+    const caller = this.flowCaller(auth.agentToken, candidates.map(agent => agent.agent_id));
+    if (caller && !caller.unregistered_at) return { questions: this.userQuestions.list([runId]).filter(question => question.agent_id === caller.agent_id) };
+    this.authorizeRunOperator(runId, auth);
+    return { questions: this.userQuestions.list([runId]) };
+  }
+
+  async waitForUserQuestion(questionId: string, input: { agentToken?: string; timeoutMs?: number } = {}, signal?: AbortSignal) {
+    const question = this.userQuestions.get(questionId);
+    this.requireQuestionOwner(question.agent_id, input.agentToken);
+    return this.userQuestions.wait(questionId, input.timeoutMs, AbortSignal.any([this.backgroundAbort.signal, ...(signal ? [signal] : [])]));
+  }
+
+  answerOperatorQuestion(questionId: string, answers: UserQuestionAnswers, auth: { agentToken?: string; adminKey?: string } = {}) {
+    const question = this.userQuestions.get(questionId);
+    this.authorizeRunOperator(question.run_id, auth);
+    return this.answerConsoleQuestion(question.agent_id, questionId, answers);
+  }
+
+  /** Call only after the app panel or browser origin has authorized this agent. */
+  answerConsoleQuestion(agentId: string, questionId: string, answers: UserQuestionAnswers) {
+    const question = this.userQuestions.get(questionId);
+    if (question.agent_id !== agentId) throw new ControllerError("Question does not belong to this agent.", "auth_required");
+    return this.userQuestions.answer(questionId, answers);
+  }
+
   getAgentAccess(agentId: string): AgentAccessSnapshot {
     const agent = this.getAgent(agentId), access = this.agentAccess.getAgentAccess(agentId);
     return ["codex-thread", "codex-cli"].includes(agent.backend) ? access : { ...access, state: "unsupported" };
@@ -8365,6 +8422,8 @@ export class AgentController {
     });
 
     return {
+      agent_timeline: selectedRunId ? projectAgentTimeline(this.store, agents, conversationWindow ?? conversationUsage.window(selectedRunId), new Date(now).toISOString()) : undefined,
+      user_questions: [...new Map([...this.userQuestions.list(runs.map(run => run.run_id), true), ...(selectedRunId ? this.userQuestions.list([selectedRunId]) : [])].map(question => [question.question_id, question])).values()],
       permission_requests: this.permissions.list(agents.map(agent => agent.agent_id)),
       agent_access: agents.map(agent => this.getAgentAccess(agent.agent_id)),
       generated_at: new Date(now).toISOString(),
@@ -8586,6 +8645,7 @@ export class AgentController {
       "Use the generated runtime and reporting contracts as the source of truth.",
       "Write the required artifact paths before reporting.",
       "Keep any in-process status terse.",
+      "Use question_ask for material user decisions when available; report actual answers to the original conversation for accepted-context updates before dependent work. Clarification never replaces a flow gate.",
       currentFlow.config.policy?.strict ? "Use only the assigned Agent Control MCP tools for evidence and reporting." : "Do not assume the caller is Codex; use Agent Control MCP or CLI reporting exactly as instructed."
     ];
     const runtimeContractRecord =
@@ -10741,4 +10801,8 @@ function deleteRuntimePath(result: PurgeResult, path: string): void {
     const message = error instanceof Error ? error.message : String(error);
     result.skipped_runtime_paths.push(`${path} :: ${message}`);
   }
+}
+
+function userQuestionWorkerContract(agentId: string): string {
+  return `Agent Control user questions: your registered agent_id is ${agentId}. For a material user decision, call question_ask with this agent_id, a stable request_key, a short title, and 1–3 questions ({id,prompt,options?:[{id,label,description?}]}). The user sees them in the shared console. Use your own authenticated runtime identity; never borrow credentials. The default waits one hour and returns the user's saved answers. For independent work use wait=false, then question_wait. After timeout or interrupted transport recover this same question with question_get/question_wait; do not duplicate it or end the turn while required work remains. If these tools are unavailable, hand the question to the original conversation. Never answer for the user. A clarification is not a backend permission or flow-gate approval.`;
 }

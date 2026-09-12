@@ -1,7 +1,8 @@
 "use client";
 
+import { Fragment, useState } from "react";
 import { Clock3 } from "lucide-react";
-import { cx, formatDuration, STATUS_STYLE } from "@/lib/format";
+import { cx, formatDuration } from "@/lib/format";
 import type { DashboardSnapshot } from "@/lib/types";
 
 export function Timeline({
@@ -11,37 +12,48 @@ export function Timeline({
   selectedStepInstanceId: string | null;
   snapshot: DashboardSnapshot;
 }) {
-  const computed = new Map(snapshot.computed_agents.map((item) => [item.agent_id, item]));
-  const maxElapsed = Math.max(1, ...snapshot.computed_agents.map((item) => item.elapsed_ms));
+  const [zoom, setZoom] = useState(1);
+  const timeline = snapshot.agent_timeline;
+  const start = Date.parse(timeline?.started_at ?? snapshot.generated_at);
+  const end = Date.parse(timeline?.ended_at ?? snapshot.generated_at);
+  const duration = Math.max(1, end - start);
+  const rows = new Map(timeline?.rows.map(row => [row.agent_id, row]));
   const flowByInstanceId = new Map(snapshot.flow_instances.map((instance) => [instance.flow_instance_id, instance]));
+  const time = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   return (
     <div className="phase-timeline h-full overflow-auto bg-white p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2 text-xs font-semibold text-ink-700">
-          <Clock3 className="size-3.5" />
-          Phase swimlane
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-semibold text-ink-700"><Clock3 className="size-3.5" /> Agent activity</div>
+        <div className="flex items-center gap-2 text-[11px] text-ink-500">
+          <span>Filled: working · Gaps: inactive or waiting</span>
+          <button type="button" aria-label="Zoom out timeline" disabled={zoom === 1} onClick={() => setZoom(value => Math.max(1, value / 2))} className="timeline-zoom">−</button>
+          <button type="button" onClick={() => setZoom(1)} className="timeline-zoom">{zoom === 1 ? "Fit" : `${zoom}×`}</button>
+          <button type="button" aria-label="Zoom in timeline" disabled={zoom >= 128} onClick={() => setZoom(value => Math.min(128, value * 2))} className="timeline-zoom">+</button>
         </div>
-        <span className="text-[11px] text-ink-400">{snapshot.latest_events.length} recent events</span>
       </div>
-      <div className="agent-scroll flex h-[64px] gap-2 overflow-x-auto pb-1">
-        {snapshot.agents.map((agent) => {
-          const item = computed.get(agent.agent_id);
-          const width = Math.max(82, Math.round(((item?.elapsed_ms ?? 0) / maxElapsed) * 220));
-          const style = STATUS_STYLE[agent.status];
-          return (
-            <div
-              className={["flex shrink-0 flex-col justify-between rounded-md border px-2 py-1.5", style.bg, style.border].join(" ")}
-              key={agent.agent_id}
-              style={{ width }}
-            >
-              <div className="truncate text-[11px] font-semibold text-ink-800">{agent.role ?? agent.title}</div>
-              <div className="flex items-center justify-between gap-2">
-                <span className={["size-1.5 rounded-full", style.dot].join(" ")} />
-                <span className="truncate text-[10px] font-medium text-ink-500">{formatDuration(item?.elapsed_ms)}</span>
+      <div className="activity-timeline-scroll">
+        <div className="activity-timeline-grid" style={{ width: `${zoom * 100}%`, minWidth: 560 }}>
+          <div className="activity-timeline-label text-[10px] text-ink-400">Agent / working time</div>
+          <div className="activity-timeline-ruler">
+            {[0, 0.25, 0.5, 0.75, 1].map((fraction) => <span key={fraction} style={{ left: `${fraction * 100}%`, transform: fraction === 1 ? "translateX(-100%)" : "none" }}>{time(start + duration * fraction)}</span>)}
+          </div>
+          {snapshot.agents.map(agent => {
+            const row = rows.get(agent.agent_id);
+            const total = row?.segments.reduce((sum, segment) => sum + Math.max(0, Date.parse(segment.ended_at ?? timeline!.ended_at) - Date.parse(segment.started_at)), 0) ?? 0;
+            return <Fragment key={agent.agent_id}>
+              <div className="activity-timeline-label" title={`${agent.title} · ${row?.source === "native" ? "Native turn timestamps" : "Observed controller timestamps"}${row?.coverage !== "complete" ? " · Incomplete timing history" : ""}`}>
+                <strong>{agent.title}</strong><span>{row?.segments.length ? formatDuration(total) : "Timing unavailable"}{row?.source === "controller" && row.segments.length ? " · observed" : ""}{row?.coverage === "partial" ? " · partial" : ""}</span>
               </div>
-            </div>
-          );
-        })}
+              <div className="activity-timeline-track" aria-label={`${agent.title} activity`}>
+                {row?.segments.map((segment, index) => {
+                  const from = Date.parse(segment.started_at), to = Date.parse(segment.ended_at ?? timeline!.ended_at);
+                  const label = `${agent.title} · Work period ${index + 1} · ${time(from)}–${segment.ended_at ? time(to) : "now"} · ${formatDuration(to - from)}`;
+                  return <div key={segment.id} role="img" aria-label={label} title={label} className={cx("activity-timeline-bar", segment.ended_at === null && "is-live")} style={{ left: `${Math.max(0, (from - start) / duration) * 100}%`, width: `${Math.max(0, to - from) / duration * 100}%` }} />;
+                })}
+              </div>
+            </Fragment>;
+          })}
+        </div>
       </div>
       {snapshot.flow_steps.length > 0 ? (
         <div className="mt-4">

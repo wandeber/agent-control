@@ -1,5 +1,6 @@
 "use client";
 
+import { QuestionBadge } from "./user-questions";
 import { ChevronRight, Folder, Search } from "lucide-react";
 import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { elapsedFrom, formatDuration } from "@/lib/format";
@@ -51,7 +52,7 @@ export function RunSidebar({
     <div className="flex flex-col divide-y divide-[var(--line)]">
       {rows.map(({ run, depth }) => (
         <div key={run.run_id} style={{ paddingLeft: `${depth * 12}px` }}>
-          <RunRow depth={depth} run={run} selected={selectedRunIds.includes(run.run_id) || run.run_id === selectedRunId}
+          <RunRow depth={depth} run={run} questionCount={(snapshot?.user_questions ?? []).filter(question => question.run_id === run.run_id && question.state === "pending").length} selected={selectedRunIds.includes(run.run_id) || run.run_id === selectedRunId}
             onClick={(event) => onSelectRun(run.run_id, groupByDirectory && (event.ctrlKey || event.metaKey))} />
         </div>
       ))}
@@ -116,9 +117,11 @@ function RunRow({
   depth,
   run,
   selected,
-  onClick
+  onClick,
+  questionCount
 }: {
   depth: number;
+  questionCount: number;
   run: RunRecord;
   selected: boolean;
   onClick: (event: MouseEvent<HTMLButtonElement>) => void;
@@ -138,7 +141,7 @@ function RunRow({
       type="button"
     >
       <div className="flex items-center justify-between gap-2">
-        <div className="min-w-0 truncate text-xs font-semibold text-ink-900">{run.title}</div>
+        <div className="flex min-w-0 items-center gap-2"><QuestionBadge count={questionCount} /><span className="truncate text-xs font-semibold text-ink-900">{run.title}</span></div>
         <span className="shrink-0 whitespace-nowrap text-[10px] font-medium text-ink-500">{elapsed}</span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2">
