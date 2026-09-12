@@ -769,7 +769,7 @@ describe("codex-subagent durable orchestrator bridge", () => {
           Date.parse(durableFollowup.claimed_at!) + 1_000
         ).toISOString()
       });
-      expect(terminalSync.agent.status).toBe("stopped");
+      expect(terminalSync.agent.status).toBe("waiting_for_input");
     } finally {
       competitor.close();
     }

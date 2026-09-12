@@ -41,10 +41,16 @@
       "output_per_million": 4.5
     },
     "yoda": {
-      "input_per_million": 0.44,
-      "cached_input_per_million": 0.014,
-      "cache_write_input_per_million": 0.44,
-      "output_per_million": 1.32
+      "input_per_million": 0.15,
+      "cached_input_per_million": 0.03,
+      "cache_write_input_per_million": 0.15,
+      "output_per_million": 0.5
+    },
+    "glm-5.3-flash": {
+      "input_per_million": 0.15,
+      "cached_input_per_million": 0.03,
+      "cache_write_input_per_million": 0.15,
+      "output_per_million": 0.5
     },
     "deepseek-v4-flash-vision-exp": {
       "input_per_million": 0.44,
@@ -55,9 +61,16 @@
   },
   "model_references": {
     "yoda": {
-      "model": "deepseek-v4-flash-vision-exp",
-      "source": "https://api-docs.deepseek.com/quick_start/pricing/",
-      "basis": "Peak API rates"
+      "model": "glm-5.3-flash",
+      "source": "https://docs.z.ai/guides/overview/pricing",
+      "basis": "Z.ai API reference rates",
+      "updated_at": "2026-09-11"
+    },
+    "glm-5.3-flash": {
+      "model": "glm-5.3-flash",
+      "source": "https://docs.z.ai/guides/overview/pricing",
+      "basis": "Z.ai API reference rates",
+      "updated_at": "2026-09-11"
     },
     "deepseek-v4-flash-vision-exp": {
       "model": "deepseek-v4-flash-vision-exp",

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ControllerError } from "./errors.js";
 import { verifyAdminKey } from "./identity.js";
 import { currentCodexThreadId } from "./caller-context.js";
@@ -14,8 +16,22 @@ export function prepareLaunchOwner(controller, input) {
     if (threadId) {
         // App-server workers do not inherit a per-worker MCP token. Recover their
         // existing participant locally, keeping its role and original run requester.
-        const candidates = controller.listAgents().filter(agent => agent.backend === "codex-thread" &&
-            agent.backend_handle?.thread_id === threadId && agent.role !== "observer" &&
+        const matchesThread = (agent) => {
+            if (agent.backend === "codex-thread")
+                return agent.backend_handle?.thread_id === threadId;
+            if (agent.backend !== "codex-cli" || typeof agent.backend_handle?.dir !== "string")
+                return false;
+            try {
+                return JSON.parse(readFileSync(join(agent.backend_handle.dir, "state.json"), "utf8")).thread_id === threadId;
+            }
+            catch {
+                return false;
+            }
+        };
+        // Identify managed workers globally before applying a requested run filter.
+        // A nested CLI worker cannot become a new operator by omitting its token.
+        const workers = controller.listAgents().filter(agent => !agent.unregistered_at && matchesThread(agent) && (agent.backend === "codex-cli" || agent.work_generation > 0 || !["observer", "orchestrator"].includes(agent.role ?? "")));
+        const candidates = workers.length ? workers : controller.listAgents().filter(agent => !agent.unregistered_at && matchesThread(agent) && agent.role !== "observer" &&
             (input.runId ? agent.run_id === input.runId : agent.role !== "orchestrator"));
         if (candidates.length > 1)
             throw new ControllerError("Current Codex thread belongs to multiple runs; supply run_id.", "auth_required");
@@ -29,6 +45,11 @@ export function prepareLaunchOwner(controller, input) {
         runTitle: input.title, runId: input.runId, repoDir: input.repoDir, backend: threadId ? "codex-thread" : "manual", objective: input.title,
         model: threadId ? readCodexSession(threadId)?.model ?? undefined : undefined,
         backendHandle: threadId ? { thread_id: threadId, agent_control_role: "orchestrator", cwd: input.repoDir } : undefined });
+    // Only the privileged bootstrap establishes operator authority. Routine
+    // observation maintenance deliberately cannot synthesize this grant.
+    const requester = input.requesterThreadId ?? controller.originalRequesterThread(login.run.run_id) ?? threadId;
+    if (requester)
+        controller.observeRun({ runId: login.run.run_id, threadId: requester, adminKey: input.adminKey });
     return { agent: login.agent, runId: login.run.run_id, agentToken: login.agent_token };
 }
 /** A separate executing conversation needs its own cursor and action visibility. */

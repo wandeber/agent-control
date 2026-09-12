@@ -69,12 +69,12 @@ describe("agent card activity", () => {
     expect(agentPresentation(snapshot, agents[2]!).kind).toBe("tool");
     expect(agentPresentation(snapshot, { ...agents[2]!, status: "completed" }).kind).toBe("tool");
   });
-  it("labels the phase and rejects activity from the previous attempt", () => {
+  it("labels the phase separately while retaining the last recorded message", () => {
     const snapshot = data();
     snapshot.flow_instances = [{ flow_instance_id: "i", current_step_id: "plan_review", status: "active" }] as DashboardSnapshot["flow_instances"];
     snapshot.flow_steps = [{ step_instance_id: "step", flow_instance_id: "i", agent_id: "b", step_id: "plan_review", status: "active", created_at: "2026-09-05T10:01:00Z", updated_at: "2026-09-05T10:01:00Z" }] as DashboardSnapshot["flow_steps"];
     snapshot.computed_agents = [{ agent_id: "b", activity: { kind: "message", text: "Old answer", observed_at: "2026-09-05T10:00:00Z" } }] as DashboardSnapshot["computed_agents"];
-    expect(agentPresentation(snapshot, agents[2]!)).toMatchObject({ phase: "Phase: Plan review", kind: "status" });
+    expect(agentPresentation(snapshot, agents[2]!)).toMatchObject({ phase: "Phase: Plan review", kind: "message", activity: "Old answer" });
     snapshot.flow_instances[0]!.status = "completed";
     expect(agentPresentation(snapshot, agents[2]!).phase).toBe("Last phase: Plan review");
   });
@@ -90,9 +90,15 @@ describe("agent card activity", () => {
   it("keeps the last completed tool visible without describing a stopped agent as executing it", () => {
     const snapshot = data();
     snapshot.computed_agents = [{ agent_id: "b", activity: { kind: "tool", text: "Run tests", state: "completed" } }] as DashboardSnapshot["computed_agents"];
-    expect(agentPresentation(snapshot, { ...agents[2]!, status: "completed" }).activity).toBe("Tool completed · Run tests");
+    expect(agentPresentation(snapshot, { ...agents[2]!, status: "completed" }).activity).toBe("Run tests");
     snapshot.computed_agents[0]!.activity!.state = "running";
-    expect(agentPresentation(snapshot, { ...agents[2]!, status: "stopped" }).activity).toBe("Last tool · Run tests");
+    expect(agentPresentation(snapshot, { ...agents[2]!, status: "stopped" }).activity).toBe("Run tests");
+  });
+
+  it("never substitutes a status, error or placeholder for an absent message", () => {
+    for (const status of ["planned", "running", "waiting_for_input", "completed", "failed", "stopped"] as const) {
+      expect(agentPresentation(data(), { ...agents[2]!, status, failure_reason: "backend_failed" }).activity).toBe("");
+    }
   });
 
 });

@@ -1,20 +1,31 @@
+import { toolActivity } from "../core/tool-activity.js";
+import { readCodexSession, sessionUsage } from "./codex-session.js";
+import Database from "better-sqlite3";
+import { AgentAccessStore } from "../core/agent-access.js";
+import { PermissionRequests } from "../core/permission-requests.js";
+import { readInteractiveProfile } from "./codex-interactive-profile.js";
 import { parse as parseToml } from "smol-toml";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError } from "../core/errors.js";
 import { agentRuntimeDir } from "../core/paths.js";
 import type { AgentUsageObservation, AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatusSnapshot, StartAgentInput, ReadLatestOptions, StopOptions, StopResult } from "../core/types.js";
-import { writeState, type CliJob, type CliState } from "./codex-cli-runner.js";
+import { enqueueCliJob, requestCliStop, type CliJob, type CliState } from "./codex-cli-runner.js";
 
-interface Data { dir: string; cwd: string; profile?: string; model?: string; model_provider?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; resolved_model?: string; logFile?: string; }
+interface Data { dir: string; cwd: string; profile?: string; model?: string; model_provider?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; executable?: string; resolved_model?: string; logFile?: string; access_agent_id?: string; access_db_path?: string; approval_policy?: "on-request"; }
 const unsupported = (message: string) => new ControllerError(message, "unsupported_operation");
 export class CodexCliAdapter implements AgentAdapter {
   readonly kind = "codex-cli";
-  capabilities() { return { canStart: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: false }; }
+  capabilities() { return { canStart: true, canInterrupt: true, canRequestPermissions: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: false }; }
+  validateInteractiveAccess(handle: AgentHandle): void {
+    const data = handle.data as unknown as Data;
+    if (data.profile && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(data.profile)) throw unsupported("Invalid persisted Codex profile name.");
+    readInteractiveProfile(data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined, data.profile_hash);
+  }
   async start(input: StartAgentInput): Promise<AgentHandle> {
     if (input.attachments?.length || input.server) throw unsupported("codex-cli does not support attachments or server overrides; configure a Codex profile instead.");
     const profile = input.metadata?.profile;
@@ -31,7 +42,13 @@ export class CodexCliAdapter implements AgentAdapter {
     data.resolved_model = data.model ?? identity.model;
     data.model_provider = identity.provider;
     data.logFile = join(data.dir, "stderr.log");
-    await this.launch(data, input.prompt ?? "", undefined, input.agentToken);
+    data.executable = process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex";
+    if (typeof input.metadata?.permission_db_path === "string" && input.metadata.permission_db_path !== ":memory:") {
+      data.access_agent_id = input.agent.agent_id; data.access_db_path = input.metadata.permission_db_path;
+    }
+    if (input.metadata?.approval_policy === "on-request") data.approval_policy = "on-request";
+    if (data.approval_policy && !data.access_db_path) throw unsupported("Interactive CLI requires a persistent Agent Control database.");
+    await this.launch(data, input.prompt ?? "", true, input.agentToken);
     return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
   }
   private profileIdentity(profile?: string): { model?: string; provider?: string } {
@@ -52,66 +69,83 @@ export class CodexCliAdapter implements AgentAdapter {
     if (!existsSync(path)) throw unsupported("A persisted Codex profile file is required for managed CLI continuity.");
     return createHash("sha256").update(readFileSync(path)).digest("hex");
   }
-  private async launch(data: Data, prompt: string, session?: string, agentToken?: string): Promise<void> {
+  private async launch(data: Data, prompt: string, initial: boolean, agentToken?: string): Promise<string> {
     if (data.profile && this.profileHash(data.profile) !== data.profile_hash) throw unsupported("Codex profile changed since launch; review its model/provider before continuing.");
-    try { mkdirSync(join(data.dir, "active")); } catch { throw unsupported("CLI worker already has an active turn. Wait before continuing."); }
     const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", data.sandbox, "-c", 'approval_policy="never"'];
     if (data.profile) args.push("--profile", data.profile);
     if (data.model) args.push("--model", data.model);
     if (data.reasoning_effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(data.reasoning_effort)}`);
-    if (session) args.push("resume", session);
-    args.push("-");
+    const profilePath = data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined;
+    let interactiveRequested = Boolean(data.approval_policy);
+    if (data.access_db_path && data.access_agent_id) {
+      const db = new Database(data.access_db_path);
+      try { interactiveRequested ||= Boolean(new AgentAccessStore(db).getAgentAccess(data.access_agent_id).requested); }
+      finally { db.close(); }
+    }
+    if (interactiveRequested || (existsSync(join(data.dir, "state.json")) && this.state(data).transport === "app-server")) readInteractiveProfile(profilePath, data.profile_hash);
     if (agentToken) writeFileSync(join(data.dir, "credential"), agentToken, { mode: 0o600 });
-    rmSync(join(data.dir, "ready"), { force: true });
-    rmSync(join(data.dir, "cancelled"), { force: true });
-    rmSync(join(data.dir, "stop.json"), { force: true });
-    const job: CliJob = { executable: process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex", args, cwd: data.cwd, prompt };
-    writeState(data.dir, { status: "running", thread_id: session, updated_at: new Date().toISOString() });
-    writeFileSync(join(data.dir, "job.json"), JSON.stringify(job), { mode: 0o600 });
-    appendFileSync(join(data.dir, "events.jsonl"), JSON.stringify({ type: "agent_control.prompt", text: prompt, created_at: new Date().toISOString() }) + "\n", { mode: 0o600 });
-    // A separate Node supervisor survives disposal/reload of the MCP process.
+    const job: CliJob = { executable: data.executable ?? process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex", args, cwd: data.cwd, prompt,
+      ...(profilePath ? { profile_path: profilePath, profile_hash: data.profile_hash } : {}),
+      ...(data.access_agent_id && data.access_db_path ? { interactive: { agent_id: data.access_agent_id, db_path: data.access_db_path,
+        model: data.model, model_provider: data.model_provider, reasoning_effort: data.reasoning_effort,
+        sandbox: data.sandbox === "read-only" ? "read_only" as const : "workspace" as const, approval_policy: data.approval_policy } } : {}) };
+    const messageId = enqueueCliJob(data.dir, job, initial);
+    // Each contender uses a process-owned lock. Enqueue and dispatch share a
+    // separate short lock, so a finishing supervisor cannot lose a new message.
     const bundledRunner = fileURLToPath(new URL("./codex-cli-runner.js", import.meta.url));
     const runner = existsSync(bundledRunner) ? bundledRunner : fileURLToPath(new URL("../../dist/adapters/codex-cli-runner.js", import.meta.url));
     const env = { ...process.env };
     delete env.AGENT_CONTROL_TOKEN; delete env.AGENT_CONTROL_ADMIN_KEY;
     if (existsSync(join(data.dir, "credential"))) env.AGENT_CONTROL_TOKEN = readFileSync(join(data.dir, "credential"), "utf8");
     const child = spawn(process.execPath, [runner, "--supervise", data.dir], { detached: true, stdio: "ignore", env });
-    try {
-      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-      child.unref();
-      for (let i=0;i<100;i++) {
-        if (existsSync(join(data.dir, "ready"))) return;
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+    if (initial) {
+      for (let i = 0; i < 100; i++) {
+        if (existsSync(join(data.dir, "ready"))) return messageId;
         await new Promise(resolve => setTimeout(resolve, 50));
       }
-      throw unsupported("CLI supervisor did not acknowledge startup.");
-    } catch (error) {
-      // Cancellation is fenced on disk before signaling our owned supervisor.
-      // Keep the active lock until it acknowledges exit, preventing late starts.
-      writeFileSync(join(data.dir, "cancelled"), "cancelled", { mode: 0o600 });
-      if (child.pid && child.exitCode === null && child.signalCode === null) {
-        const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
-        child.kill("SIGTERM");
-        await exited;
-      }
-      writeState(data.dir, { status: "failed", thread_id: session, updated_at: new Date().toISOString() });
-      rmSync(join(data.dir, "active"), { recursive: true, force: true });
-      throw error;
+      throw unsupported("CLI supervisor did not acknowledge startup; inspect the existing execution before retrying.");
     }
+    return messageId;
   }
   async sendMessage(handle: AgentHandle, message: AgentMessageInput): Promise<void> {
-    const data = handle.data as unknown as Data, state = this.state(data);
-    if (state.status === "running") throw unsupported("CLI worker is busy; wait for its current turn before continuing.");
-    if (!state.thread_id || !/^[a-zA-Z0-9-]+$/.test(state.thread_id)) throw unsupported("CLI worker has no persisted session ID to resume.");
-    await this.launch(data, message.message, state.thread_id);
+    await this.sendMessageWithReceipt(handle, message);
+  }
+  async sendMessageWithReceipt(handle: AgentHandle, message: AgentMessageInput) {
+    const data = handle.data as unknown as Data;
+    this.state(data); // Reject a stale active supervisor before accepting more work.
+    const messageId = await this.launch(data, message.message, false);
+    return { delivered: false as const, queued: true, message_id: messageId, orchestrator_action: null };
   }
   private state(data: Data): CliState {
     const state: CliState = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8"));
     if (state.status === "running" && Date.now() - Date.parse(state.updated_at) > 30_000) throw new ControllerError("CLI supervisor heartbeat is temporarily unavailable.", "backend_unavailable");
     return state;
   }
-  async getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot> { const state = this.state(handle.data as unknown as Data); return { status: state.status, updatedAt: state.updated_at, data: { thread_id: state.thread_id, exit_code: state.exit_code } }; }
+  async getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot> {
+    const data = handle.data as unknown as Data, state = this.state(data);
+    let permissionId: string | undefined;
+    if (state.status === "running" && data.access_db_path && data.access_agent_id) {
+      const db = new Database(data.access_db_path);
+      try { permissionId = new PermissionRequests(db).list([data.access_agent_id]).find(request => request.state === "pending" && request.thread_id === state.thread_id)?.request_id; }
+      finally { db.close(); }
+    }
+    return { status: permissionId ? "waiting_for_input" : state.status, updatedAt: state.updated_at,
+      data: { thread_id: state.thread_id, exit_code: state.exit_code, ...(permissionId ? { permission_request_id: permissionId, reason: "backend_permission_request" } : {}) } };
+  }
   readUsage(handle: AgentHandle): AgentUsageObservation | null {
     const data = handle.data as unknown as Data;
+    try {
+      const state = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8"));
+      const session = typeof state.thread_id === "string" ? readCodexSession(state.thread_id) : null;
+      if (session?.usage) {
+        if ((data.resolved_model && session.model !== data.resolved_model) || (data.model_provider && session.modelProvider !== data.model_provider)) return null;
+        // The native ledger includes in-progress and interrupted requests too.
+        // Interactive app-server completion events contain no CLI usage object.
+        return sessionUsage({ ...handle, data: { thread_id: state.thread_id } });
+      }
+    } catch { /* Older CLI journals remain a supported, independently measured source. */ }
     const journal = join(data.dir, "events.jsonl");
     try {
       const turns = new Map<number, { input: number | null; output: number | null; cached: number | null; writes: number | null; reasoning: number | null }>();
@@ -156,6 +190,9 @@ export class CodexCliAdapter implements AgentAdapter {
     const data = handle.data as unknown as Data;
     const messages = new Map<string, AgentMessage>();
     let generation = 0;
+    let turn = 0;
+    let nativeThread: string | undefined;
+    let nativeTurn: string | undefined;
     // Persisted chat stays readable even if its supervisor is unavailable.
     const state = JSON.parse(readFileSync(join(data.dir, "state.json"), "utf8")) as CliState;
     const updatedAt = state.updated_at;
@@ -163,6 +200,8 @@ export class CodexCliAdapter implements AgentAdapter {
     for (const [index, line] of readFileSync(join(data.dir, "events.jsonl"), "utf8").split("\n").entries()) { try {
       const event = JSON.parse(line), item = event.item;
       if (event.type === "agent_control.prompt") generation++;
+      if (event.type === "thread.started") nativeThread = event.thread_id;
+      if (event.type === "turn.started") { turn++; nativeTurn = event.turn_id; }
       if (event.type === "agent_control.prompt") messages.set(`prompt-${index}`, { id: `prompt-${index}`, role: "user", text: event.text, created_at: event.created_at });
       if (event.type === "turn.failed" || (event.type === "agent_control.turn_finished" && event.status === "failed")) {
         failureGeneration = generation;
@@ -173,8 +212,10 @@ export class CodexCliAdapter implements AgentAdapter {
       // payload remains in the event journal and diagnostics in the technical log.
       if (!["agent_message", "todo_list", "command_execution", "mcp_tool_call", "web_search", "file_change", "collab_tool_call"].includes(item.type)) continue;
       const text = item.type === "agent_message" ? item.text : item.type === "todo_list" ? `update_plan\nInput: ${JSON.stringify({plan: item.items?.map((task: {text:string;completed:boolean}) => ({step:task.text,status:task.completed ? "completed" : "pending"}))})}` : `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item)}${item.aggregated_output ? `\n${item.aggregated_output}` : ""}`;
-      const id = `${generation}:${item.id ?? `event-${index}`}`;
-      messages.set(id, { id, role: item.type === "agent_message" ? "assistant" : "tool", text, created_at: updatedAt, metadata: { type: item.type === "agent_message" ? "text" : "tool", itemType: item.type } });
+      const id = `${generation}:${turn}:${item.id ?? `event-${index}`}`;
+      messages.set(id, { id, role: item.type === "agent_message" ? "assistant" : "tool", text, created_at: updatedAt, metadata: { turnId: `${generation}:${turn}`, type: item.type === "agent_message" ? "text" : "tool", itemType: item.type,
+        ...(typeof nativeThread === "string" && typeof nativeTurn === "string" && typeof item.id === "string" ? { approval_identity: { thread_id: nativeThread, turn_id: nativeTurn, item_id: item.id } } : {}),
+        ...(item.type !== "agent_message" ? { tool_activity: toolActivity(item, id, event.type) } : {}) } });
     } catch { /* Ignore incomplete trailing event while the process is writing. */ } }
     if (state.status === "failed" && failureGeneration !== generation) {
       messages.set(`failure-${generation}`, this.failureMessage(generation, updatedAt));
@@ -184,11 +225,20 @@ export class CodexCliAdapter implements AgentAdapter {
   private failureMessage(generation: number, created_at: string): AgentMessage {
     return { id: `failure-${generation}`, role: "system", text: "The agent could not complete this turn. See Logs for technical details.", created_at, metadata: { type: "text", itemType: "turn.failed" } };
   }
+  async interrupt(handle: AgentHandle): Promise<StopResult> {
+    return this.stop(handle, { mode: "interrupt" });
+  }
   async stop(handle: AgentHandle, options: StopOptions): Promise<StopResult> {
     const data = handle.data as unknown as Data;
-    if (this.state(data).status !== "running") return { status: this.state(data).status };
-    writeFileSync(join(data.dir, "stop.json"), JSON.stringify(options), { mode: 0o600 });
-    for (let i=0;i<50;i++) { await new Promise(resolve => setTimeout(resolve, 100)); if (this.state(data).status !== "running") return { status: this.state(data).status }; }
+    const target = requestCliStop(data.dir, options.mode);
+    for (let i = 0; i < 50; i++) {
+      const state = this.state(data);
+      const settled = target === "legacy"
+        ? state.status !== "running" && !existsSync(join(data.dir, "active"))
+        : !target || state.turn_id !== target || state.status !== "running";
+      if (settled) return { status: state.status };
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
     throw unsupported("CLI stop is still pending; inspect status or explicitly request kill.");
   }
   watchStatus(handle: AgentHandle, onChange: (snapshot: AgentStatusSnapshot) => void | Promise<void>): () => void {

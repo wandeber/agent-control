@@ -2,6 +2,7 @@
 
 import { agentModelLabel, agentTokenLabel } from "@/lib/agent-presentation";
 import { AgentCostLabel } from "./agent-cost-label";
+import { AgentAccess } from "./agent-access";
 import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSnapshotStream } from "@/lib/api";
@@ -117,6 +118,7 @@ export function SubagentsShell() {
                   <h2>{selectedAgent.title}</h2>
                   <p className="flex flex-wrap items-baseline gap-x-3"><span>{agentModelLabel(selectedAgent)}</span><span>{agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === selectedAgent.agent_id)?.latest_usage)}</span><AgentCostLabel snapshot={agentSnapshot ?? snapshot} agentId={selectedAgent.agent_id} /></p>
                 </div>
+                <AgentAccess key={selectedAgent.agent_id} snapshot={agentSnapshot?.agent_access?.find(item => item.agent_id === selectedAgent.agent_id)} />
                 <StatusPill status={selectedAgent.status} />
               </header>
               <div className="subagents-chat-body">

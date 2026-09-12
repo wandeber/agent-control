@@ -14,7 +14,7 @@ import {
 import { SerialRefreshCoordinator } from "./refresh-coordinator";
 import { snapshotStreamIsLoading } from "./snapshot-stream-state";
 import { combineRunSnapshots } from "./run-snapshots";
-import type { AgentLogTail, AgentMessage, DashboardSnapshot, SocketPayload } from "./types";
+import type { AgentLogTail, AgentMessage, DashboardSnapshot, PermissionRequest, AgentAccessSnapshot, AccessPolicy, SocketPayload } from "./types";
 import { agentLogQueryKey, agentMessagesQueryKey } from "./workspace-refresh-policy";
 
 export type ConnectionState = "connecting" | "live" | "offline";
@@ -401,4 +401,50 @@ interface McpRefreshPayload {
   messageLimit: number;
   messages: AgentMessage[] | null;
   log: AgentLogTail | null;
+}
+
+export async function decidePermission(request: PermissionRequest, decision: "approve" | "reject"): Promise<PermissionRequest> {
+  const client = await getMcpAppClient();
+  const input = { agent_id: request.agent_id, request_id: request.request_id, decision };
+  if (client) return (await client.callTool<{ permission: PermissionRequest }>("agent_control_console_permission_decide", input)).permission;
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
+  const call = async (route: string, token?: string) => {
+    const response = await fetch(`${controlApiBase()}/api/control/permissions/${route}`, { method: "POST", headers: {
+      "Content-Type": "application/json", ...(token ? { "X-Agent-Control-Permission": token } : {})
+    }, body: JSON.stringify(input) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `Permission request failed: ${response.status}`);
+    return result;
+  };
+  // Capability is scoped to this request and kept outside snapshots/local storage.
+  const access = await call("access");
+  return (await call("decide", access.token)).permission;
+}
+
+export async function requestAgentAccess(access: AgentAccessSnapshot, policy: AccessPolicy): Promise<AgentAccessSnapshot> {
+  const client = await getMcpAppClient();
+  const input = { agent_id: access.agent_id, revision: access.revision, policy };
+  if (client) return (await client.callTool<{ access: AgentAccessSnapshot }>("agent_control_console_access_request", input)).access;
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
+  const call = async (route: string, token?: string) => {
+    const response = await fetch(`${controlApiBase()}/api/control/permissions/${route}`, { method: "POST", headers: {
+      "Content-Type": "application/json", ...(token ? { "X-Agent-Control-Permission": token } : {})
+    }, body: JSON.stringify(input) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `Access request failed: ${response.status}`);
+    return result;
+  };
+  const accessToken = await call("access-policy-token");
+  return (await call("access-policy", accessToken.token)).access;
+}
+
+export async function setCanvasPositions(runId: string, revision: number, positions: import("./types").CanvasPosition[]): Promise<import("./types").CanvasPositions> {
+  const client = await getMcpAppClient();
+  const input = { run_id: runId, expected_revision: revision, positions };
+  if (client) return (await client.callTool<{ canvas_positions: import("./types").CanvasPositions }>("agent_control_console_canvas_positions", input)).canvas_positions;
+  if (shouldTryMcpApp()) throw new Error("The Codex console connection is unavailable.");
+  const response = await fetch(`${controlApiBase()}/api/control/canvas/positions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error ?? "Could not save canvas positions.");
+  return result.canvas_positions;
 }

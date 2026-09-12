@@ -1,4 +1,4 @@
-import type { CostAmount, CostBreakdown, DashboardSnapshot, ExchangeRate } from "./types";
+import type { AgentCost, CostAmount, CostBreakdown, DashboardSnapshot, ExchangeRate } from "./types";
 
 function moneyLabel(value: number, currency: "USD" | "EUR", partial: boolean): string {
   const format = new Intl.NumberFormat("en-US", { style: "currency", currency, minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -20,6 +20,15 @@ export function euroCostLabel(cost?: CostAmount | null, exchange?: ExchangeRate 
 
 export function agentCost(snapshot: DashboardSnapshot, agentId: string) {
   return snapshot.costs?.agents.find(item => item.agent_id === agentId) ?? null;
+}
+
+export function costAvailabilityLabel(cost?: AgentCost | null, configurationValid = true): string | null {
+  if (!configurationValid) return "Invalid pricing configuration. Correct the configured rates to calculate costs.";
+  if (!cost) return "Estimated cost unavailable: pricing or token usage has not been reported.";
+  if (cost.model === "Mixed models") return "The token total spans multiple models without a reliable per-model breakdown.";
+  if (!cost.rates) return "No verified or configured price for this model and provider.";
+  if (cost.total.usd === null) return "Rates are available; waiting for reliable token usage.";
+  return cost.total.partial ? "+ marks a partial estimate: some token usage is unavailable or inconsistent." : null;
 }
 
 export function costBreakdownLabel(cost?: CostBreakdown | null): string {

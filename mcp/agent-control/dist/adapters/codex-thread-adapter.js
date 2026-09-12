@@ -1,3 +1,8 @@
+import { AgentAccessStore, accessTurnOverrides } from "../core/agent-access.js";
+import Database from "better-sqlite3";
+import { PermissionRequests } from "../core/permission-requests.js";
+import { attachApprovalBroker } from "./codex-approval-broker.js";
+import { toolActivity } from "../core/tool-activity.js";
 import { ConnectionRecovery, connectWithStartup } from "./connection-recovery.js";
 import { sessionUsage } from "./codex-session.js";
 import { spawn } from "node:child_process";
@@ -16,6 +21,8 @@ const connectionRecovery = new ConnectionRecovery();
 const TURN_START_TIMEOUT_MS = 3_000;
 const ROLLOUT_COMPATIBILITY_ERROR = /does not start with session metadata/i;
 const CAPABILITIES = {
+    canInterrupt: true,
+    canRequestPermissions: true,
     canStart: true,
     canSendMessage: true,
     canReadLatest: true,
@@ -33,6 +40,8 @@ export class CodexThreadAdapter {
     }
     async start(input) {
         const handleData = parseOptionalHandle(input.agent.backend_handle);
+        const accessIdentity = input.metadata?.permission_db_path ? { access_agent_id: input.agent.agent_id, access_db_path: String(input.metadata.permission_db_path) } : {};
+        const approval = input.metadata?.approval_policy === "on-request" ? { approval_policy: "on-request", approval_agent_id: input.agent.agent_id, approval_db_path: String(input.metadata.permission_db_path) } : {};
         const appServerUrl = resolveAppServerUrl(input.server, input.metadata, handleData);
         const authToken = resolveAuthToken(input.metadata, handleData);
         const reasoningEffort = stringValue(input.metadata?.reasoning_effort) ?? handleData?.reasoning_effort;
@@ -40,6 +49,8 @@ export class CodexThreadAdapter {
         if (handleData?.thread_id) {
             const data = {
                 ...handleData,
+                ...approval,
+                ...accessIdentity,
                 reasoning_effort: reasoningEffort,
                 sandbox,
                 flow_writable_root: stringValue(input.metadata?.flow_writable_root) ?? handleData?.flow_writable_root,
@@ -67,6 +78,8 @@ export class CodexThreadAdapter {
             const thread = readThreadFromResponse(startResponse, "thread/start");
             const data = {
                 thread_id: thread.id,
+                ...approval,
+                ...accessIdentity,
                 reasoning_effort: reasoningEffort,
                 sandbox,
                 flow_writable_root: stringValue(input.metadata?.flow_writable_root) ?? handleData?.flow_writable_root,
@@ -86,7 +99,7 @@ export class CodexThreadAdapter {
             };
         }
         finally {
-            client.close();
+            client.closeUnlessRetained();
         }
     }
     async stageNotification(handle, message) {
@@ -100,7 +113,7 @@ export class CodexThreadAdapter {
             });
         }
         finally {
-            client.close();
+            client.closeUnlessRetained();
         }
     }
     async sendMessage(handle, message) {
@@ -127,7 +140,25 @@ export class CodexThreadAdapter {
         const data = parseHandle(handle);
         const thread = await readThread(data);
         const latestTurn = latestTurnOf(thread);
-        const status = mapThreadStatus(thread, latestTurn, data);
+        let status = mapThreadStatus(thread, latestTurn, data);
+        let permissionId;
+        const permissionDb = data.approval_db_path ?? data.access_db_path;
+        const permissionAgent = data.approval_agent_id ?? data.access_agent_id;
+        if (permissionDb && permissionAgent) {
+            const db = new Database(permissionDb);
+            try {
+                const permissions = new PermissionRequests(db).list([permissionAgent]).filter(request => request.turn_id === latestTurn?.id && request.thread_id === data.thread_id);
+                if (["running", "waiting_for_input"].includes(status))
+                    permissionId = permissions.find(request => request.state === "pending")?.request_id;
+                if (latestTurn?.status === "interrupted" && permissions.some(request => request.decision === "reject" && request.reject_interrupts_turn))
+                    status = "waiting_for_input";
+            }
+            finally {
+                db.close();
+            }
+            if (permissionId)
+                status = "waiting_for_input";
+        }
         return {
             status,
             failureReason: status === "failed" ? "tool_error" : undefined,
@@ -135,6 +166,7 @@ export class CodexThreadAdapter {
                 ? `Codex thread ${thread.id} latest turn is ${latestTurn.status}.`
                 : `Codex thread ${thread.id} has no turns.`,
             data: {
+                ...(permissionId ? { permission_request_id: permissionId, reason: "backend_permission_request" } : {}),
                 threadId: thread.id,
                 threadStatus: thread.status,
                 latestTurnId: latestTurn?.id,
@@ -164,7 +196,7 @@ export class CodexThreadAdapter {
                         role: "tool",
                         text: `${item.tool ?? item.command ?? item.type}\nInput: ${JSON.stringify(item.arguments ?? item)}${item.aggregatedOutput ? `\n${item.aggregatedOutput}` : ""}`,
                         created_at: timestampFromSeconds(turn.completedAt ?? turn.startedAt),
-                        metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type, type: "tool" }
+                        metadata: { threadId: thread.id, turnId: turn.id, itemType: item.type, type: "tool", tool_activity: toolActivity(item, item.id ?? `${turn.id}-${messages.length}`) }
                     });
                 }
                 if (item.type === "userMessage") {
@@ -183,13 +215,17 @@ export class CodexThreadAdapter {
         }
         return messages.slice(-Math.max(1, options.limit));
     }
+    async interrupt(handle) {
+        const result = await this.stop(handle, { mode: "interrupt" });
+        return { ...result, status: result.status === "stopped" ? "running" : result.status };
+    }
     async stop(handle, _options) {
         const data = parseHandle(handle);
         const thread = await readThread(data);
         const latestTurn = latestTurnOf(thread);
         if (!latestTurn || latestTurn.status !== "inProgress") {
             return {
-                status: mapThreadStatus(thread, latestTurn, data),
+                status: _options.mode === "interrupt" ? mapThreadStatus(thread, latestTurn, data) : "stopped",
                 message: "Codex thread has no active turn to interrupt."
             };
         }
@@ -206,7 +242,7 @@ export class CodexThreadAdapter {
                 if (!isRolloutCompatibilityError(error)) {
                     throw error;
                 }
-                client.close();
+                client.closeUnlessRetained();
                 const fallback = createCompatibilityAppServerClient(data);
                 if (!fallback) {
                     throw error;
@@ -219,7 +255,7 @@ export class CodexThreadAdapter {
                     });
                 }
                 finally {
-                    fallback.close();
+                    fallback.closeUnlessRetained();
                 }
             }
             return {
@@ -229,7 +265,7 @@ export class CodexThreadAdapter {
             };
         }
         finally {
-            client.close();
+            client.closeUnlessRetained();
         }
     }
     async unregister(_handle, _options) {
@@ -247,7 +283,7 @@ async function startTurn(data, message, model) {
             if (!isRolloutCompatibilityError(error)) {
                 throw error;
             }
-            client.close();
+            client.closeUnlessRetained();
             const fallback = createCompatibilityAppServerClient(data);
             if (!fallback) {
                 throw error;
@@ -257,12 +293,12 @@ async function startTurn(data, message, model) {
                 return await resumeAndStartTurn(fallback, data, message, model);
             }
             finally {
-                fallback.close();
+                fallback.closeUnlessRetained();
             }
         }
     }
     finally {
-        client.close();
+        client.closeUnlessRetained();
     }
 }
 async function injectMessage(data, message) {
@@ -277,7 +313,7 @@ async function injectMessage(data, message) {
             if (!isRolloutCompatibilityError(error)) {
                 throw error;
             }
-            client.close();
+            client.closeUnlessRetained();
             const fallback = createCompatibilityAppServerClient(data);
             if (!fallback) {
                 throw error;
@@ -287,12 +323,12 @@ async function injectMessage(data, message) {
                 await injectMessageThroughClient(fallback, data, message);
             }
             finally {
-                fallback.close();
+                fallback.closeUnlessRetained();
             }
         }
     }
     finally {
-        client.close();
+        client.closeUnlessRetained();
     }
 }
 async function injectMessageThroughClient(client, data, message) {
@@ -306,6 +342,11 @@ async function injectMessageThroughClient(client, data, message) {
             }
         ]
     });
+}
+function enableApprovalBroker(client, data) {
+    if ((data.approval_policy === "on-request" || data.approval_policy === "untrusted") && data.approval_agent_id && data.approval_db_path && !client.retainForApprovals) {
+        attachApprovalBroker(client, { agent_id: data.approval_agent_id, thread_id: data.thread_id, db_path: data.approval_db_path });
+    }
 }
 async function resumeAndStartTurn(client, data, message, model) {
     try {
@@ -336,6 +377,34 @@ async function resumeAndStartTurn(client, data, message, model) {
     }
 }
 async function startTurnOnLoadedThread(client, data, message, model, cwd) {
+    const accessDb = data.access_db_path && data.access_agent_id ? new Database(data.access_db_path) : null;
+    const accessStore = accessDb ? new AgentAccessStore(accessDb) : null;
+    const access = accessStore?.getAgentAccess(data.access_agent_id);
+    const expectedAccess = access?.requested ? accessTurnOverrides(access.requested, cwd ?? data.cwd, data.flow_writable_root) : null;
+    let overrides = expectedAccess;
+    let preserveActivePolicy = false;
+    if (accessStore) {
+        try {
+            const current = await client.request("thread/read", { threadId: data.thread_id, includeTurns: true });
+            // A continuation can steer an active turn. Keep its current permissions;
+            // requested changes belong to the next actual turn boundary.
+            preserveActivePolicy = !current.thread || current.thread.status.type === "active" || latestTurnOf(current.thread)?.status === "inProgress";
+        }
+        catch {
+            preserveActivePolicy = true;
+        }
+        if (preserveActivePolicy)
+            overrides = null;
+    }
+    if (overrides)
+        data = { ...data, approval_policy: overrides.approvalPolicy === "never" ? undefined : overrides.approvalPolicy,
+            approval_agent_id: data.access_agent_id, approval_db_path: data.access_db_path };
+    if (preserveActivePolicy && access?.effective?.thread_id === data.thread_id) {
+        const approval = access.effective.approval_policy;
+        data = { ...data, approval_policy: approval === "on-request" || approval === "untrusted" ? approval : undefined,
+            approval_agent_id: data.access_agent_id, approval_db_path: data.access_db_path };
+    }
+    enableApprovalBroker(client, data);
     const waiter = createTurnActivationWaiter(client, data.thread_id);
     const turnCwd = cwd ?? data.cwd;
     try {
@@ -347,10 +416,12 @@ async function startTurnOnLoadedThread(client, data, message, model, cwd) {
             model: model ?? undefined,
             // Retain the explicit effort when this worker receives another turn.
             effort: data.reasoning_effort ?? undefined,
-            ...(data.sandbox === "read_only" ? { sandboxPolicy: { type: "readOnly" }, approvalPolicy: "never" } : data.sandbox === "workspace" ? { sandboxPolicy: { type: "workspaceWrite", writableRoots: [turnCwd, data.flow_writable_root].filter(Boolean), networkAccess: true }, approvalPolicy: "never" } : {})
+            ...(preserveActivePolicy ? {} : data.sandbox === "read_only" ? { sandboxPolicy: { type: "readOnly" }, approvalPolicy: data.approval_policy ?? "never" } : data.sandbox === "workspace" ? { sandboxPolicy: { type: "workspaceWrite", writableRoots: [turnCwd, data.flow_writable_root].filter(Boolean), networkAccess: true }, approvalPolicy: data.approval_policy ?? "never" } : data.approval_policy ? { approvalPolicy: data.approval_policy } : {}),
+            ...overrides
         });
         const turnResponse = result;
         if (turnResponse.turn?.id) {
+            client.bindApprovalTurn?.(turnResponse.turn.id);
             await waiter.waitForTurn(turnResponse.turn.id).catch((error) => {
                 if (!isTimeoutError(error)) {
                     throw error;
@@ -363,12 +434,30 @@ async function startTurnOnLoadedThread(client, data, message, model, cwd) {
         }
         else {
             waiter.dispose();
+            if (client.retainForApprovals) {
+                client.close();
+                throw new Error("Interactive approval launch returned no turn identity.");
+            }
+        }
+        if (accessStore) {
+            try {
+                const observed = await client.request("thread/resume", { threadId: data.thread_id });
+                if (observed.thread?.id === data.thread_id && observed.approvalPolicy !== undefined && observed.sandbox) {
+                    accessStore.confirmAgentAccess(data.access_agent_id, access.revision, { thread_id: data.thread_id,
+                        approval_policy: observed.approvalPolicy, sandbox_policy: observed.sandbox }, expectedAccess ? { ...expectedAccess, ...(observed.cwd === turnCwd && typeof observed.cwd === "string" ? { implicitCwd: observed.cwd } : {}) } : undefined);
+                }
+            }
+            catch { /* Requested stays pending until the backend confirms its effective policy. */ }
         }
         return turnResponse;
     }
     catch (error) {
+        client.close();
         waiter.dispose();
         throw error;
+    }
+    finally {
+        accessDb?.close();
     }
 }
 async function readThread(data, allowHistoryFallback = false) {
@@ -382,7 +471,7 @@ async function readThread(data, allowHistoryFallback = false) {
             if (!isRolloutCompatibilityError(error)) {
                 throw error;
             }
-            client.close();
+            client.closeUnlessRetained();
             const fallback = createCompatibilityAppServerClient(data);
             if (!fallback) {
                 throw error;
@@ -392,7 +481,7 @@ async function readThread(data, allowHistoryFallback = false) {
                 return await readThreadThroughClient(fallback, data);
             }
             finally {
-                fallback.close();
+                fallback.closeUnlessRetained();
             }
         }
     }
@@ -403,7 +492,7 @@ async function readThread(data, allowHistoryFallback = false) {
         const command = resolveCompatibilityStdioCommand();
         if (!allowHistoryFallback || !local || !command || !(error instanceof ControllerError) || error.reason !== "backend_unavailable")
             throw error;
-        client.close();
+        client.closeUnlessRetained();
         const archive = new CodexAppServerClient("stdio://", undefined, command);
         try {
             await archive.initialize();
@@ -414,7 +503,7 @@ async function readThread(data, allowHistoryFallback = false) {
         }
     }
     finally {
-        client.close();
+        client.closeUnlessRetained();
     }
 }
 async function readThreadThroughClient(client, data) {
@@ -514,8 +603,22 @@ export class CodexAppServerClient {
     url;
     authToken;
     stdioCommand;
+    retainForApprovals = false;
+    bindApprovalTurn;
+    serverRequestHandlers = new Set();
+    closeHandlers = new Set();
+    onServerRequest(handler) { this.serverRequestHandlers.add(handler); return () => { this.serverRequestHandlers.delete(handler); }; }
+    onClose(handler) { this.closeHandlers.add(handler); return () => { this.closeHandlers.delete(handler); }; }
+    respond(id, result) { if (!this.isConnected())
+        throw new Error("Approval connection disconnected."); this.sendJson({ id, result }); }
+    closeUnlessRetained() { if (!this.retainForApprovals)
+        this.close(); }
+    notifyClosed() { for (const handler of [...this.closeHandlers])
+        handler(); }
     socket = null;
     process = null;
+    ownedProcesses = new Map();
+    ownedGroups = new Set();
     processBuffer = "";
     processStderr = "";
     nextId = 1;
@@ -537,18 +640,30 @@ export class CodexAppServerClient {
         });
         this.notify("initialized", {});
     }
-    async request(method, params) {
-        await this.connect();
+    request(method, params) {
+        // The connected path writes synchronously so a caller can fence dispatch
+        // against cancellation while returning the asynchronous RPC response.
+        if (!this.isConnected())
+            return this.connect().then(() => this.requestConnected(method, params));
+        return this.requestConnected(method, params);
+    }
+    requestConnected(method, params) {
         if (!this.isConnected()) {
-            throw new ControllerError("Codex app-server connection is not open.", "backend_unavailable", {
+            return Promise.reject(new ControllerError("Codex app-server connection is not open.", "backend_unavailable", {
                 appServerUrl: this.url
-            });
+            }));
         }
         const id = String(this.nextId++);
         const response = new Promise((resolve, reject) => {
             this.pending.set(id, { resolve, reject });
         });
-        this.sendJson({ id, method, params });
+        try {
+            this.sendJson({ id, method, params });
+        }
+        catch (error) {
+            this.pending.get(id)?.reject(error instanceof Error ? error : new Error(String(error)));
+            this.pending.delete(id);
+        }
         return response;
     }
     notify(method, params) {
@@ -560,19 +675,70 @@ export class CodexAppServerClient {
             this.notificationHandlers.delete(handler);
         };
     }
-    close() {
+    close(force = false) {
+        this.notifyClosed();
+        for (const pending of this.pending.values())
+            pending.reject(new Error("Codex app-server connection closed."));
+        this.pending.clear();
         this.socket?.close();
         this.socket = null;
-        this.process?.kill("SIGTERM");
+        for (const child of this.ownedProcesses.keys())
+            this.signalOwnedProcess(child, force ? "SIGKILL" : "SIGTERM");
         this.process = null;
         this.processBuffer = "";
         this.processStderr = "";
+    }
+    async closeAndWait() {
+        this.close();
+        const closing = [...this.ownedProcesses.entries()];
+        const settled = async (ms) => {
+            const deadline = Date.now() + ms;
+            do {
+                for (const pid of this.ownedGroups) {
+                    try {
+                        process.kill(-pid, 0);
+                    }
+                    catch {
+                        this.ownedGroups.delete(pid);
+                    }
+                }
+                if (!this.ownedProcesses.size && !this.ownedGroups.size)
+                    return true;
+                await sleep(50);
+            } while (Date.now() < deadline);
+            return false;
+        };
+        if (await settled(1500))
+            return;
+        for (const [child] of closing)
+            this.signalOwnedProcess(child, "SIGKILL");
+        for (const pid of this.ownedGroups) {
+            try {
+                process.kill(-pid, "SIGKILL");
+            }
+            catch {
+                this.ownedGroups.delete(pid);
+            }
+        }
+        if (!await settled(5000))
+            throw new Error("The owned Codex process has not exited; the same session must remain blocked.");
+    }
+    signalOwnedProcess(child, signal) {
+        if (!this.ownedProcesses.has(child))
+            return;
+        try {
+            if (typeof this.stdioCommand === "object" && this.stdioCommand.detached && child.pid)
+                process.kill(-child.pid, signal);
+            else
+                child.kill(signal);
+        }
+        catch { /* Exit confirmation, rather than signal delivery, releases the owner. */ }
     }
     async connect() {
         if (this.isConnected()) {
             return;
         }
-        await connectionRecovery.connect(this.usesStdio() ? `${this.url}:${this.resolveStdioCommand()}` : this.url, async () => {
+        await connectionRecovery.connect(this.usesStdio() ? `${this.url}:${JSON.stringify(this.resolveStdioCommand())}` : this.url, async () => {
             if (this.usesStdio()) {
                 await this.connectStdio();
             }
@@ -607,14 +773,16 @@ export class CodexAppServerClient {
     }
     async connectStdio() {
         const command = this.resolveStdioCommand();
-        const [bin, ...args] = splitCommand(command);
+        const [bin, ...args] = typeof command === "string" ? splitCommand(command) : [command.executable, ...command.args];
         if (!bin) {
             throw new ControllerError("Codex app-server stdio command is empty.", "backend_unavailable", {
                 appServerUrl: this.url
             });
         }
         await new Promise((resolve, reject) => {
-            const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+            const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], ...(typeof command === "object" ? { cwd: command.cwd, detached: command.detached } : {}) });
+            const exit = new Promise(done => { child.once("close", () => { this.ownedProcesses.delete(child); done(); }); });
+            this.ownedProcesses.set(child, exit);
             const timeout = setTimeout(() => {
                 child.kill("SIGTERM");
                 reject(new ControllerError("Timed out starting Codex app-server stdio transport.", "backend_unavailable", {
@@ -622,12 +790,15 @@ export class CodexAppServerClient {
                     command
                 }));
             }, 5000);
-            child.stdout.on("data", (chunk) => this.handleProcessStdout(String(chunk)));
+            child.stdout.on("data", (chunk) => { if (this.process === child)
+                this.handleProcessStdout(String(chunk)); });
             child.stderr.on("data", (chunk) => {
                 this.processStderr += String(chunk);
             });
             child.once("spawn", () => {
                 clearTimeout(timeout);
+                if (typeof command === "object" && command.detached && child.pid)
+                    this.ownedGroups.add(child.pid);
                 this.process = child;
                 resolve();
             });
@@ -639,9 +810,10 @@ export class CodexAppServerClient {
                 }));
             });
             child.once("exit", (code) => {
-                if (this.process === child) {
-                    this.process = null;
-                }
+                if (this.process !== child)
+                    return;
+                this.process = null;
+                this.notifyClosed();
                 for (const pending of this.pending.values()) {
                     pending.reject(new ControllerError("Codex app-server stdio process exited.", "backend_unavailable", {
                         appServerUrl: this.url,
@@ -674,8 +846,13 @@ export class CodexAppServerClient {
                     appServerUrl: this.url
                 }));
             });
-            socket.on("message", (raw) => this.handleMessage(String(raw)));
+            socket.on("message", (raw) => { if (this.socket === socket)
+                this.handleMessage(String(raw)); });
             socket.on("close", () => {
+                if (this.socket !== socket)
+                    return;
+                this.socket = null;
+                this.notifyClosed();
                 for (const pending of this.pending.values()) {
                     pending.reject(new ControllerError("Codex app-server websocket closed.", "backend_unavailable", {
                         appServerUrl: this.url
@@ -724,8 +901,13 @@ export class CodexAppServerClient {
                     socketPath
                 }));
             });
-            socket.on("message", (raw) => this.handleMessage(String(raw)));
+            socket.on("message", (raw) => { if (this.socket === socket)
+                this.handleMessage(String(raw)); });
             socket.on("close", () => {
+                if (this.socket !== socket)
+                    return;
+                this.socket = null;
+                this.notifyClosed();
                 for (const pending of this.pending.values()) {
                     pending.reject(new ControllerError("Codex app-server Unix socket closed.", "backend_unavailable", {
                         appServerUrl: this.url,
@@ -754,6 +936,11 @@ export class CodexAppServerClient {
             message = JSON.parse(raw);
         }
         catch {
+            return;
+        }
+        if (message.id !== undefined && typeof message.method === "string") {
+            for (const handler of this.serverRequestHandlers)
+                handler({ id: message.id, method: message.method, params: message.params });
             return;
         }
         // The app-server can emit notifications without an id while a request is
@@ -827,7 +1014,13 @@ function parseOptionalHandle(value) {
             : typeof value.agentControlRole === "string"
                 ? value.agentControlRole
                 : undefined,
-        cwd: typeof value.cwd === "string" ? value.cwd : undefined
+        cwd: typeof value.cwd === "string" ? value.cwd : undefined,
+        recoverable_interrupt: value.recoverable_interrupt === true,
+        access_agent_id: stringValue(value.access_agent_id),
+        access_db_path: stringValue(value.access_db_path),
+        approval_policy: value.approval_policy === "on-request" || value.approval_policy === "untrusted" ? value.approval_policy : undefined,
+        approval_agent_id: stringValue(value.approval_agent_id),
+        approval_db_path: stringValue(value.approval_db_path)
     };
 }
 function parseHandle(handle) {
@@ -861,6 +1054,17 @@ function compactHandle(data) {
     }
     if (data.flow_writable_root)
         handle.flow_writable_root = data.flow_writable_root;
+    if (data.recoverable_interrupt)
+        handle.recoverable_interrupt = true;
+    if (data.approval_policy) {
+        handle.approval_policy = data.approval_policy;
+        handle.approval_agent_id = data.approval_agent_id;
+        handle.approval_db_path = data.approval_db_path;
+    }
+    if (data.access_agent_id) {
+        handle.access_agent_id = data.access_agent_id;
+        handle.access_db_path = data.access_db_path;
+    }
     if (data.sandbox)
         handle.sandbox = data.sandbox;
     if (data.reasoning_effort) {
@@ -979,6 +1183,8 @@ function latestTurnOf(thread) {
     return thread.turns?.[thread.turns.length - 1];
 }
 function mapThreadStatus(thread, latestTurn, data) {
+    if (thread.status.type === "active" && thread.status.activeFlags?.some(flag => ["waitingOnApproval", "waitingOnUserInput"].includes(flag)))
+        return "waiting_for_input";
     if (thread.status.type === "systemError") {
         return "failed";
     }
@@ -1002,7 +1208,7 @@ function mapThreadStatus(thread, latestTurn, data) {
         return "failed";
     }
     if (latestTurn.status === "interrupted") {
-        return "stopped";
+        return data.recoverable_interrupt ? "waiting_for_input" : "stopped";
     }
     return "unknown";
 }

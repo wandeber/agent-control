@@ -1,7 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { costLabel, euroCostLabel } from "./costs";
+import { costAvailabilityLabel, costLabel, euroCostLabel } from "./costs";
+import type { AgentCost } from "./types";
 
 describe("USD presentation", () => {
+  it("explains missing prices separately from missing usage, invalid configuration and partial totals", () => {
+    const cost = { model: "yoda", rates: {}, total: { usd: null, partial: true } } as AgentCost;
+    expect(costAvailabilityLabel(cost)).toContain("reliable token usage");
+    expect(costAvailabilityLabel({ ...cost, rates: null })).toContain("price for this model and provider");
+    expect(costAvailabilityLabel({ ...cost, model: "Mixed models" })).toContain("per-model breakdown");
+    expect(costAvailabilityLabel(cost, false)).toContain("Invalid pricing configuration");
+    expect(costAvailabilityLabel(null)).toContain("not been reported");
+    expect(costAvailabilityLabel({ ...cost, total: { usd: .01, partial: true } })).toContain("partial estimate");
+    expect(costAvailabilityLabel({ ...cost, total: { usd: 0, partial: false } })).toBeNull();
+  });
   it("distinguishes unknown, zero, tiny costs and partial sums", () => {
     expect(costLabel()).toBe("—");
     expect(costLabel({ usd: null, partial: true })).toBe("—");

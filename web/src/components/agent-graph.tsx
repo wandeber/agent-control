@@ -16,8 +16,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   focusedAgentId
 } from "@/lib/graph";
-import { bundleAgentConnections, teamBounds, keepExternalCardsOutsideTeam } from "@/lib/team-graph";
-import { buildRunGraph, multiRunLayout, multiRunBounds, keepRunsSeparate } from "@/lib/multi-run-graph";
+import { bundleAgentConnections, teamBounds } from "@/lib/team-graph";
+import { buildRunGraph, multiRunLayout, multiRunBounds } from "@/lib/multi-run-graph";
+import { setCanvasPositions } from "@/lib/api";
+import { teamLayout } from "@/lib/team-graph";
+import type { CanvasPositions, CanvasPosition } from "@/lib/types";
 import { runSelectionKey } from "@/lib/run-selection";
 import { RunGraphFrame } from "./run-graph-frame";
 import { AgentConnectionOverlay } from "./agent-connection-overlay";
@@ -58,12 +61,49 @@ export function AgentGraph({
   onOpenConversation?: (agentId: string) => void;
   toolbarLeading?: React.ReactNode;
 }) {
-  const groups = useMemo(() => runSnapshots.map(buildRunGraph), [runSnapshots]);
+  const [savedLayouts, setSavedLayouts] = useState<Record<string, CanvasPositions>>({});
+  const [layoutError, setLayoutError] = useState<string | null>(null);
+  const [layoutEpoch, setLayoutEpoch] = useState(0);
+  const dragging = useRef<{ id: string; runId: string; revision: number; screen: { x: number; y: number }; local: { x: number; y: number } } | null>(null);
+  const groups = useMemo(() => runSnapshots.map(value => {
+    const saved = savedLayouts[value.selected_run_id ?? ""];
+    return buildRunGraph(saved && saved.revision > (value.canvas_positions?.revision ?? 0) ? { ...value, canvas_positions: saved } : value);
+  }), [runSnapshots, savedLayouts]);
+  const layoutRevision = groups.map(group => `${group.snapshot.selected_run_id}:${group.snapshot.canvas_positions?.revision ?? 0}`).join("|") + `:${layoutEpoch}`;
+  const appliedRevision = useRef("");
+  const savePositions = useCallback(async (runId: string, revision: number, points: CanvasPosition[]) => {
+    try {
+      const result = await setCanvasPositions(runId, revision, points);
+      setSavedLayouts(current => ({ ...current, [runId]: result })); setLayoutError(null);
+    } catch (error) {
+      setLayoutError(error instanceof Error ? error.message : String(error));
+      // An external edit wins over a stale drag; never silently retry it.
+      setLayoutEpoch(value => value + 1);
+    }
+  }, []);
+  const migratedRuns = useRef(new Set<string>());
+  useEffect(() => {
+    for (const group of groups) {
+      const runId = group.snapshot.selected_run_id;
+      if (!runId || migratedRuns.current.has(runId)) continue;
+      migratedRuns.current.add(runId);
+      if (group.snapshot.canvas_positions?.revision) continue;
+      try {
+        // Legacy combined views used global coordinates; only single-run keys
+        // have a safe, unambiguous migration into the shared run-local layout.
+        const stored = JSON.parse(window.localStorage.getItem(`agent-control:graph:v3:${runId}`) ?? "{}");
+        const ids = new Set(group.snapshot.agents.map(agent => agent.agent_id));
+        const points = Object.entries(stored).flatMap(([id, value]) => {
+          const point = value as { x?: number; y?: number } | null;
+          return ids.has(id) && point && Number.isFinite(point.x) && Number.isFinite(point.y) && Math.abs(point.x!) <= 1e6 && Math.abs(point.y!) <= 1e6 ? [{ agent_id: id, x: point.x!, y: point.y! }] : [];
+        });
+        if (points.length) void savePositions(runId, 0, points);
+      } catch { /* Unavailable or corrupt legacy storage leaves automatic layout. */ }
+    }
+  }, [groups, savePositions]);
   const multiple = groups.length > 1;
   const focusId = focusedAgentId(snapshot, selectedAgentId);
   const initialLayout = useMemo(() => multiRunLayout(groups), [groups]);
-  const keepTeamsSeparate = useCallback((cards: AgentFlowNode[]) => keepRunsSeparate(groups, groups.flatMap(group =>
-    keepExternalCardsOutsideTeam(cards.filter(card => card.data.agent.run_id === group.snapshot.selected_run_id), group.team))), [groups]);
   const [nodes, setNodes] = useState<AgentFlowNode[]>([]);
   const cameraKey = runSelectionKey(runSnapshots.map(value => value.selected_run_id ?? "none"));
   const initialCamera = useRef(savedCameras.get(cameraKey));
@@ -86,11 +126,12 @@ export function AgentGraph({
   const storageKey = `agent-control:graph:v3:${multiple ? cameraKey : snapshot.selected_run_id ?? "none"}`;
 
   useEffect(() => {
-    const stored = readStoredPositions(storageKey);
+    const revisionChanged = appliedRevision.current !== layoutRevision;
+    if (!dragging.current) appliedRevision.current = layoutRevision;
     const layout = initialLayout;
     const sameRun = positionedRunRef.current === storageKey;
     positionedRunRef.current = storageKey;
-    setNodes((current) => keepTeamsSeparate(snapshot.agents.map((agent) => {
+    setNodes((current) => snapshot.agents.map((agent) => {
       const previous = sameRun ? current.find((node) => node.id === agent.agent_id) : undefined;
       const anchor = sameRun ? current.find(node => node.data.agent.run_id === agent.run_id && layout.has(node.id)) : undefined;
       const point = layout.get(agent.agent_id) ?? { x: 0, y: 0 };
@@ -102,11 +143,11 @@ export function AgentGraph({
         id: agent.agent_id,
         type: "agent",
         focusable: false,
-        position: previous?.position ?? stored.get(agent.agent_id) ?? newPosition,
-        data: { agent, presentation: agentPresentation(runSnapshots.find(value => value.selected_run_id === agent.run_id) ?? snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
+        position: dragging.current || !revisionChanged ? previous?.position ?? newPosition : point,
+        data: { agent, access: snapshot.agent_access?.find(item => item.agent_id === agent.agent_id), permissionRequests: snapshot.permission_requests?.filter(request => request.agent_id === agent.agent_id), presentation: agentPresentation(runSnapshots.find(value => value.selected_run_id === agent.run_id) ?? snapshot, agent), selected: agent.agent_id === focusId, onSelect: () => onSelectAgent(agent.agent_id) }
       };
-    })));
-  }, [initialLayout, focusId, snapshot, runSnapshots, storageKey, onSelectAgent, keepTeamsSeparate]);
+    }));
+  }, [layoutRevision, initialLayout, focusId, snapshot, runSnapshots, storageKey, onSelectAgent]);
 
   const overlays = useMemo(() => groups.map(group => ({ ...group,
     nodes: nodes.filter(node => node.data.agent.run_id === group.snapshot.selected_run_id),
@@ -118,12 +159,11 @@ export function AgentGraph({
   const onNodesChange = useCallback(
     (changes: NodeChange<AgentFlowNode>[]) => {
       setNodes((current) => {
-        const next = keepTeamsSeparate(applyNodeChanges<AgentFlowNode>(changes, current));
-        storePositions(storageKey, next);
+        const next = applyNodeChanges<AgentFlowNode>(changes, current);
         return next;
       });
     },
-    [storageKey, keepTeamsSeparate]
+    [storageKey]
   );
 
   const disableFollow = useCallback(() => {
@@ -199,15 +239,14 @@ export function AgentGraph({
   }, [multiple, flowReady, nodes, fitGraphToSafeArea]);
 
   const organizeGraph = useCallback(() => {
-    const layout = initialLayout;
     setFollow(false);
-    setNodes((current) => {
-      const arranged = current.map((node) => ({ ...node, position: layout.get(node.id) ?? node.position }));
-      storePositions(storageKey, arranged);
-      return arranged;
-    });
+    for (const group of groups) {
+      const layout = teamLayout(group.snapshot, group.primary, group.team);
+      const positions = group.snapshot.agents.map(agent => ({ agent_id: agent.agent_id, ...(layout.get(agent.agent_id) ?? { x: 0, y: 0 }) }));
+      if (positions.length) void savePositions(group.snapshot.selected_run_id!, group.snapshot.canvas_positions?.revision ?? 0, positions);
+    }
     window.setTimeout(() => fitGraphToSafeArea(), 80);
-  }, [initialLayout, storageKey, fitGraphToSafeArea]);
+  }, [groups, savePositions, fitGraphToSafeArea]);
 
   useEffect(() => {
     if (follow && flowReady) {
@@ -251,10 +290,13 @@ export function AgentGraph({
         </div>
       </div>
 
+      {layoutError && <div role="alert" className="absolute bottom-4 left-14 right-40 z-30 rounded-lg bg-white p-2 text-xs text-red-700 shadow">{layoutError}</div>}
       <div className="absolute inset-0">
         <ReactFlow<AgentFlowNode, RelationFlowEdge>
           defaultViewport={initialCamera.current?.viewport}
           edges={[]}
+          elementsSelectable={false}
+          selectionOnDrag={false}
           maxZoom={GRAPH_MAX_ZOOM}
           minZoom={GRAPH_MIN_ZOOM}
           nodes={nodes}
@@ -269,7 +311,18 @@ export function AgentGraph({
           onNodeDoubleClick={(_, node) => onOpenConversation?.(node.id)}
           zoomOnDoubleClick={false}
           onPaneClick={onClearSelection}
-          onNodeDragStart={disableFollow}
+          onNodeDragStart={(_, node) => {
+            disableFollow();
+            const group = groups.find(item => item.snapshot.selected_run_id === node.data.agent.run_id)!;
+            const local = group.snapshot.canvas_positions?.positions.find(point => point.agent_id === node.id)
+              ?? teamLayout(group.snapshot, group.primary, group.team).get(node.id) ?? { x: 0, y: 0 };
+            dragging.current = { id: node.id, runId: node.data.agent.run_id, revision: group.snapshot.canvas_positions?.revision ?? 0, screen: { ...node.position }, local };
+          }}
+          onNodeDragStop={(_, node) => {
+            const start = dragging.current; dragging.current = null;
+            if (start?.id === node.id) void savePositions(start.runId, start.revision, [{ agent_id: node.id,
+              x: start.local.x + node.position.x - start.screen.x, y: start.local.y + node.position.y - start.screen.y }]);
+          }}
           onNodesChange={onNodesChange}
           onlyRenderVisibleElements={false}
           panOnDrag
@@ -443,31 +496,4 @@ function clamp(value: number, min: number, max: number): number {
 
 function isFollowFocusAgentStatus(status: string): boolean {
   return status === "starting" || status === "running" || status === "waiting_for_input" || status === "blocked" || status === "failed";
-}
-
-function readStoredPositions(key: string): Map<string, { x: number; y: number }> {
-  if (typeof window === "undefined") {
-    return new Map();
-  }
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "{}") as Record<string, { x: number; y: number }>;
-    return new Map(Object.entries(parsed));
-  } catch {
-    return new Map();
-  }
-}
-
-function storePositions(key: string, nodes: AgentFlowNode[]): void {
-  if (typeof window === "undefined") {
-    return;
-  }
-  const values: Record<string, { x: number; y: number }> = {};
-  for (const node of nodes) {
-    values[node.id] = node.position;
-  }
-  try {
-    window.localStorage.setItem(key, JSON.stringify(values));
-  } catch {
-    // Sandboxed MCP hosts can deny storage; layout still works in memory.
-  }
 }

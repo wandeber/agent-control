@@ -32,6 +32,7 @@ export type WorkerLaunchOptions = RequesterOptions & {
   model?: string;
   profile?: string;
   sandbox?: "read_only" | "workspace";
+  approvalPolicy?: "on-request";
   reasoningEffort?: string;
   title: string;
   promptFile?: string;
@@ -128,6 +129,7 @@ export function registerWorkerCommands(program: Command, deps: CliDeps): void {
     .option("--backend <backend>", "Backend kind; defaults to codex-cli with profile, otherwise codex-thread.")
     .option("--profile <profile>", "Codex CLI profile for any configured provider/model.")
     .option("--sandbox <sandbox>", "read_only or workspace.")
+    .option("--approval-policy <policy>", "On-request approvals in the console for managed Codex workers; defaults unchanged.")
     .option("--server <url>", "Backend server URL.")
     .option("--repo <dir>", "Repository directory.")
     .option("--repo-dir <dir>", "Repository directory.")
@@ -169,7 +171,10 @@ export function registerWorkerCommands(program: Command, deps: CliDeps): void {
     .option("--watch-timeout <duration>", "Detached watcher timeout such as 30m or 8h.")
     .option("--watch-timeout-ms <ms>", "Detached watcher timeout in milliseconds.", parseIntOption)
     .option("--watch-interval-ms <ms>", "Detached watcher refresh interval.", parseIntOption, DEFAULT_WORKER_WATCH_INTERVAL_MS)
-    .action(async (options: WorkerLaunchOptions) => deps.output(await launchWorker(options, deps)));
+    .action(async (options: WorkerLaunchOptions) => {
+      if (options.approvalPolicy && (options.backend ?? (options.profile ? "codex-cli" : "codex-thread")) !== "codex-cli") throw new Error("Interactive codex-thread approvals require MCP worker_launch; CLI profile workers use their detached supervisor.");
+      deps.output(await launchWorker(options, deps));
+    });
 }
 
 export function registerWatchCommands(program: Command, deps: CliDeps): void {
@@ -210,6 +215,7 @@ export function registerWatchCommands(program: Command, deps: CliDeps): void {
 
 export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps): Promise<Record<string, unknown>> {
   options.backend ??= options.profile ? "codex-cli" : "codex-thread";
+  if (options.approvalPolicy && (options.approvalPolicy !== "on-request" || !["codex-thread", "codex-cli"].includes(options.backend))) throw new Error("Interactive approvals require a managed Codex backend and on-request.");
   if (options.profile && options.backend !== "codex-cli") throw new Error("--profile requires codex-cli.");
   if (options.sandbox && !["codex-cli", "codex-thread"].includes(options.backend)) throw new Error("--sandbox requires a Codex backend.");
   // Validate the complete handoff envelope before authentication can lead to
@@ -373,7 +379,7 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
         prompt,
         server: options.server ?? (options.backend === "opencode-server" ? DEFAULT_OPENCODE_SERVER : undefined),
         model,
-        metadata: { ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) },
+        metadata: { ...(options.approvalPolicy ? { approval_policy: options.approvalPolicy } : {}), ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}), ...(options.profile ? { profile: options.profile } : {}), ...(options.sandbox ? { sandbox: options.sandbox } : {}) },
         expectedArtifacts,
         attachments,
         agentToken

@@ -13,6 +13,7 @@ export const workerAttachSchema = z.object({
     admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional()
 });
 export const workerLaunchSchema = z.object({
+    approval_policy: z.literal("on-request").optional(),
     ...requesterFields, title: z.string().min(1), prompt: z.string().min(1).optional(), prompt_file: z.string().min(1).optional(),
     repo_dir: z.string().min(1).optional(), run_id: z.string().min(1).optional(), backend: z.string().min(1).optional(),
     profile: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/).optional(), sandbox: z.enum(["read_only", "workspace"]).optional(),
@@ -323,3 +324,9 @@ export const flowEvidenceSchema = z.object({ ...flowCoordinatorFields, key: z.st
 export const runAckSchema = z.object({ wake_on: z.enum(["control", "all"]).optional(), run_id: z.string().min(1), observer_agent_id: z.string().min(1), cursor: z.string().min(1), agent_token: z.string().optional(), admin_key: z.string().optional() });
 export const flowOwnerRecoverSchema = z.object({ ...flowCoordinatorFields, role: z.string().min(1), restart_step_id: z.string().min(1), reason: z.string().min(1), expected_revision: z.number().int().nonnegative() });
 export const flowPackagesSchema = z.object({ ...flowCoordinatorFields, request: flowPackagesRequestSchema }).strict();
+const operatorFields = { admin_key: z.string().min(1).optional(), agent_token: z.string().min(1).optional() };
+export const permissionListSchema = z.object({ ...operatorFields, run_id: z.string().min(1) }).strict();
+export const permissionDecideSchema = z.object({ ...operatorFields, agent_id: z.string().min(1), request_id: z.string().min(1), decision: z.enum(["approve", "reject"]) }).strict();
+export const canvasGetSchema = permissionListSchema;
+export const canvasSetSchema = z.object({ ...operatorFields, run_id: z.string().min(1), expected_revision: z.number().int().nonnegative(),
+    positions: z.array(z.object({ agent_id: z.string().min(1), x: z.number().finite().min(-1e6).max(1e6), y: z.number().finite().min(-1e6).max(1e6) }).strict()).min(1).max(1000) }).strict();

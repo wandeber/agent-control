@@ -352,7 +352,7 @@ describe("run observation", () => {
     expect(heartbeat.mock.calls.length).toBe(before);
     status = { status: "running", data: { activity: null } };
     await controller.refreshAgentStatus(worker.agent_id);
-    expect(controller.getDashboardSnapshot(worker.run_id).computed_agents[0]?.activity).toBeUndefined();
+    expect(controller.getDashboardSnapshot(worker.run_id).computed_agents[0]?.activity).toMatchObject({ text: "Current public line" });
   });
 
   it("refreshes identical operation timestamps on a later turn", async () => {

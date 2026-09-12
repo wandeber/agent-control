@@ -51,6 +51,7 @@ export function RunInfoPanel({ naturalHeight = false,
 
           {agentCosts.length ? <div className="mt-5">
             <h3 className="text-sm font-semibold text-ink-900">Usage by agent</h3>
+            {snapshot.computed_agents.some(agent => agent.latest_usage?.scope_started_at) ? <p className="mt-1 text-xs text-ink-400">Coordinator usage is counted from run start until its work finishes. Earlier conversation is excluded.</p> : null}
             <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs tabular-nums">
               <thead className="text-ink-400"><tr><th className="py-2 font-medium">Agent</th><th className="px-3 py-2 font-medium">Model</th><th className="py-2 text-right font-medium">Tokens</th><th className="whitespace-nowrap pl-4 py-2 text-right font-medium">Cost (USD)</th></tr></thead>
               <tbody>{agentCosts.map(row => <tr key={row.agent_id} className="border-t border-black/5"><th className="py-2 font-medium text-ink-700">{row.name}</th><td className="px-3 py-2 text-ink-500">{row.cost.model}</td><TokenUsageCell label={row.name} values={row.usage} /><CostCell cost={row.cost} /></tr>)}</tbody>
@@ -63,7 +64,7 @@ export function RunInfoPanel({ naturalHeight = false,
 
           {costs ? <div className="mt-5">
             {costs ? <p className="mt-3 text-xs text-ink-400">{costs.configuration_valid ? <>Estimated token costs at configured rates · <a className="underline underline-offset-2" href={costs.source} target="_blank" rel="noreferrer">OpenAI defaults: {costs.updated_at}</a>{costs.override_files.length ? " · Custom configuration applied" : " · Standard, short context"}. Excludes tool fees and subscription billing.</> : "Cost estimates unavailable: check your pricing configuration."}</p> : null}
-            {costs?.configuration_valid ? Object.entries(costs.model_references ?? {}).map(([model, reference]) => <p key={model} className="mt-1 text-xs text-ink-400">{model} default reference: <a className="underline underline-offset-2" href={reference.source} target="_blank" rel="noreferrer">{reference.model}</a> · {reference.basis}.</p>) : null}
+            {costs?.configuration_valid ? Object.entries(costs.model_references ?? {}).map(([model, reference]) => <p key={model} className="mt-1 text-xs text-ink-400">{model} default reference: <a className="underline underline-offset-2" href={reference.source} target="_blank" rel="noreferrer">{reference.model}</a> · {reference.basis}{reference.updated_at ? ` · Verified ${reference.updated_at}` : ""}.</p>) : null}
           </div> : null}
 
 

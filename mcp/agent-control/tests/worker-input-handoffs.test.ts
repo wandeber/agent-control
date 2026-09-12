@@ -374,6 +374,7 @@ function createCliHarness(): {
   const startAgent = vi.fn(async () => ({ ...agent, status: "running" as const }));
   const controller = {
     orchestratorLogin: vi.fn(() => ({ run: { run_id: agent.run_id }, agent: { ...agent, agent_id: "owner" }, agent_token: "owner-token" })),
+    originalRequesterThread: vi.fn(() => undefined),
     ensureRequester: vi.fn(() => ({ observer_agent_id: "observer_handoff_test", run_id: agent.run_id })),
     createRun: vi.fn(() => ({ run_id: agent.run_id })),
     registerAgent,

@@ -12,7 +12,8 @@ import { readCodexSession } from "./codex-session.js";
 import { hasRolloutWriter, type CliWriter } from "./cli-writer.js";
 
 export interface CliContinuity { thread_id: string; cwd: string; model: string; profile?: string; fingerprint: string; executable: string; effort?: string; approval_policy?: string; sandbox_policy?: Record<string, unknown> }
-interface QueuedMessage { id: string; continuity: CliContinuity; prompt: string; state: "pending" | "dispatched" | "completed" | "failed" | "uncertain" | "cancelled"; error?: string; baseline?: number; writer?: { pid: number; started: string } }
+export interface DispatchFence { database: string; agent_id: string; run_id: string; }
+interface QueuedMessage { id: string; continuity: CliContinuity; prompt: string; state: "pending" | "dispatched" | "completed" | "failed" | "uncertain" | "cancelled"; error?: string; baseline?: number; writer?: { pid: number; started: string }; dispatch_fence?: DispatchFence }
 const home = () => process.env.CODEX_HOME ?? join(homedir(), ".codex");
 const bridgeDir = (id: string) => join(defaultControlHome(), "attached-cli", id);
 function takeLock(path: string): Database.Database | null {
@@ -67,11 +68,11 @@ function save(path: string, value: QueuedMessage) {
   const temp = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temp, JSON.stringify(value), { mode: 0o600 }); renameSync(temp, path);
 }
-export function queueCliMessage(continuity: CliContinuity, prompt: string) {
+export function queueCliMessage(continuity: CliContinuity, prompt: string, fence?: DispatchFence) {
   if (config(continuity.profile).fingerprint !== continuity.fingerprint) throw new ControllerError("Codex configuration changed since attachment; reattach after reviewing the same model/provider.", "unsupported_operation");
   const dir = bridgeDir(continuity.thread_id); mkdirSync(dir, { recursive: true, mode: 0o700 });
   const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
-  save(join(dir, `${id}.json`), { id, continuity, prompt, state: "pending" });
+  save(join(dir, `${id}.json`), { id, continuity, prompt, state: "pending", ...(fence ? { dispatch_fence: fence } : {}) });
   ensureCliBridge(continuity.thread_id);
   return id;
 }
@@ -112,6 +113,21 @@ export function ensureCliBridge(threadId: string) {
 
 const pause = () => new Promise(resolve => setTimeout(resolve, 1000));
 const birth = (pid: number) => { try { return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return ""; } };
+function withDispatchFence<T>(entry: QueuedMessage, action: () => T): T | undefined {
+  const fence = entry.dispatch_fence;
+  if (!fence) return action();
+  // Hold the controller's write reservation through spawn. A cancellation
+  // committed before dispatch wins even if the sending MCP process has died.
+  if (!existsSync(fence.database)) return undefined;
+  const db = takeLock(fence.database);
+  if (!db) throw new ControllerError("Controller cancellation is being reconciled; dispatch will retry.", "backend_unavailable");
+  try {
+    const allowed = db.prepare(`select 1 from agents a join runs r on r.run_id = a.run_id
+      where a.agent_id = ? and a.run_id = ? and a.unregistered_at is null
+      and a.status not in ('stopping', 'stopped') and r.status not in ('stopping', 'stopped')`).get(fence.agent_id, fence.run_id);
+    return allowed ? action() : undefined;
+  } finally { releaseLock(db); }
+}
 export async function superviseAttachedCli(threadId: string) {
   const dir = bridgeDir(threadId), lock = join(dir, "supervisor");
   if (!existsSync(dir)) return;
@@ -145,8 +161,9 @@ export async function superviseAttachedCli(threadId: string) {
       let dispatched: Promise<void> | undefined;
       try { dispatched = mutateQueue(dir, () => {
         if ((JSON.parse(readFileSync(path, "utf8")) as QueuedMessage).state !== "pending") return undefined;
-        value.state = "dispatched"; value.baseline = session.lastIndex; save(path, value);
-        return new Promise<void>(resolve => {
+        const accepted = withDispatchFence(value, () => {
+          value.state = "dispatched"; value.baseline = session.lastIndex; save(path, value);
+          return new Promise<void>(resolve => {
         const child = spawn(value.continuity.executable, args, { cwd: value.continuity.cwd, stdio: ["pipe", "pipe", "pipe"] });
         if (child.pid) { value.writer = { pid: child.pid, started: birth(child.pid) }; save(path, value); }
         child.stdin.on("error", () => {}); child.stdin.end(value.prompt);
@@ -170,7 +187,10 @@ export async function superviseAttachedCli(threadId: string) {
         };
         child.once("error", () => finish(false));
         child.once("close", code => finish(code === 0));
+          });
         });
+        if (!accepted) { value.state = "cancelled"; value.prompt = ""; save(path, value); }
+        return accepted;
       }); } catch (error) {
         if (error instanceof ControllerError && error.reason === "backend_unavailable") { await pause(); continue; }
         throw error;

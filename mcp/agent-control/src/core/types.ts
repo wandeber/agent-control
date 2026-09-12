@@ -469,6 +469,9 @@ export interface UsageSnapshotRecord {
   source: string | null;
   model: string | null;
   captured_at: string;
+  /** Conversation usage bounded to this run, rather than the thread's lifetime. */
+  scope_started_at?: string;
+  scope_ended_at?: string | null;
 }
 
 export interface FlowRecord {
@@ -763,6 +766,9 @@ export interface AgentComputedState {
 }
 
 export interface DashboardSnapshot {
+  canvas_positions?: import("./canvas-positions.js").CanvasPositions;
+  agent_access?: import("./agent-access.js").AgentAccessSnapshot[];
+  permission_requests?: import("./permission-requests.js").PermissionRequest[];
   costs?: import("./pricing.js").RunCosts;
   run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
@@ -814,6 +820,7 @@ export interface PurgeResult {
 }
 
 export interface AgentCapabilities {
+  canRequestPermissions?: boolean;
   canStart: boolean;
   canSendMessage: boolean;
   canReadLatest: boolean;
@@ -872,6 +879,10 @@ export interface StopOptions {
   mode: "graceful" | "interrupt" | "kill";
 }
 
+export type MessageReceipt = { delivered: true } | {
+  delivered: false; queued?: boolean; message_id?: string; orchestrator_action: null;
+};
+
 export interface StopResult {
   status: AgentStatus;
   failureReason?: FailureReason;
@@ -886,6 +897,8 @@ export interface UnregisterOptions {
 export type AgentUsageObservation = Omit<UsageSnapshotRecord, "usage_id" | "run_id" | "agent_id">;
 
 export interface AgentAdapter {
+  /** Validate exact-session interactive configuration without changing access. */
+  validateInteractiveAccess?(handle: AgentHandle): void;
   /** Read cumulative observed usage from durable local state; must not launch work. */
   readUsage?(handle: AgentHandle): AgentUsageObservation | null;
   /** Append an observation without creating a competing turn. No fallback is allowed. */
@@ -894,6 +907,9 @@ export interface AgentAdapter {
   capabilities(): AgentCapabilities;
   start(input: StartAgentInput): Promise<AgentHandle>;
   sendMessage(handle: AgentHandle, message: AgentMessageInput): Promise<void>;
+  sendMessageWithReceipt?(handle: AgentHandle, message: AgentMessageInput): Promise<MessageReceipt>;
+  /** Interrupt only the current turn, preserving the session and future work. */
+  interrupt?(handle: AgentHandle): Promise<StopResult>;
   getStatus(handle: AgentHandle): Promise<AgentStatusSnapshot>;
   readLatest(handle: AgentHandle, options: ReadLatestOptions): Promise<AgentMessage[]>;
   stop(handle: AgentHandle, options: StopOptions): Promise<StopResult>;

@@ -1,3 +1,9 @@
+import { canvasSetSchema } from "./tools/schemas.js";
+import { randomUUID } from "node:crypto";
+import type { AddressInfo } from "node:net";
+import type { AccessPolicy } from "./core/agent-access.js";
+import type { PermissionDecision } from "./core/permission-requests.js";
+import { previewFlowCatalog } from "./core/flow-preview.js";
 import { createReadStream, existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -7,6 +13,7 @@ import type { AgentLinkType } from "./core/types.js";
 export interface ControlServerOptions {
   host: string;
   port: number;
+  uiOrigin?: string;
 }
 
 interface SocketState {
@@ -20,8 +27,10 @@ interface SocketState {
 
 type Controller = ReturnType<typeof createController>["controller"];
 
-export async function startControlServer(options: ControlServerOptions): Promise<{ server: Server; close: () => Promise<void> }> {
+export async function startControlServer(options: ControlServerOptions): Promise<{ server: Server; setUiOrigin: (origin: string) => void; close: () => Promise<void> }> {
   const { controller, store } = createController();
+  let uiOrigin = options.uiOrigin;
+  const permissionTokens = new Map<string, { agent: string; request: string; expires: number }>();
   let closing = false;
   const activeRequests = new Set<Promise<void>>();
   const socketTimers = new Set<ReturnType<typeof setInterval>>();
@@ -31,7 +40,17 @@ export async function startControlServer(options: ControlServerOptions): Promise
   });
   const handleRequest = async (request: IncomingMessage, response: ServerResponse) => {
     if (closing) { response.writeHead(503); response.end(); return; }
-    setCorsHeaders(response);
+    const approvalRoute = request.url?.startsWith("/api/control/permissions/") || request.url?.startsWith("/api/control/canvas/");
+    if (approvalRoute) {
+      const expectedHost = `localhost:${(server.address() as AddressInfo)?.port}`;
+      if (!["::1", "127.0.0.1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "") || !uiOrigin || request.headers.origin !== uiOrigin || request.headers.host !== expectedHost || request.headers["sec-fetch-site"] === "cross-site") {
+        sendJson(response, 403, { error: "Permission decisions require the configured local console origin." }); return;
+      }
+      response.setHeader("Access-Control-Allow-Origin", uiOrigin);
+      response.setHeader("Vary", "Origin");
+      response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Agent-Control-Permission");
+      response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    } else setCorsHeaders(response);
     if (request.method === "OPTIONS") {
       response.statusCode = 204;
       response.end();
@@ -62,13 +81,49 @@ export async function startControlServer(options: ControlServerOptions): Promise
         });
         return;
       }
+      if (approvalRoute && request.method === "POST") {
+        const body = await readJson(request);
+        if (url.pathname === "/api/control/canvas/positions") {
+          const input = canvasSetSchema.parse(body);
+          sendJson(response, 200, { canvas_positions: controller.setCanvasPositions(input.run_id, input.expected_revision, input.positions) }); return;
+        }
+        const agentId = String(body.agent_id), requestId = String(body.request_id);
+        if (url.pathname === "/api/control/permissions/access-policy-token") {
+          const access = controller.getAgentAccess(agentId);
+          if (access.state === "unsupported") { sendJson(response, 409, { error: "This backend does not support access changes." }); return; }
+          for (const [key, value] of permissionTokens) if (value.expires < Date.now()) permissionTokens.delete(key);
+          const token = randomUUID(); permissionTokens.set(token, { agent: agentId, request: `access:${body.revision}`, expires: Date.now() + 60_000 });
+          response.setHeader("Cache-Control", "no-store"); sendJson(response, 200, { token }); return;
+        }
+        if (url.pathname === "/api/control/permissions/access-policy") {
+          const token = String(request.headers["x-agent-control-permission"] ?? ""), grant = permissionTokens.get(token);
+          if (!grant || grant.expires < Date.now() || grant.agent !== agentId || grant.request !== `access:${body.revision}`) { sendJson(response, 403, { error: "Missing or expired agent-scoped console capability." }); return; }
+          const access = controller.requestAgentAccess(agentId, body.policy as AccessPolicy, Number(body.revision));
+          permissionTokens.delete(token); sendJson(response, 200, { access }); return;
+        }
+        if (url.pathname === "/api/control/permissions/access") {
+          const agent = controller.getAgent(agentId);
+          const permission = controller.getDashboardSnapshot(agent.run_id).permission_requests?.find(item => item.request_id === requestId && item.agent_id === agentId);
+          if (!permission) { sendJson(response, 404, { error: "Permission request not found." }); return; }
+          for (const [key, value] of permissionTokens) if (value.expires < Date.now()) permissionTokens.delete(key);
+          const token = randomUUID(); permissionTokens.set(token, { agent: agentId, request: requestId, expires: Date.now() + 60_000 });
+          response.setHeader("Cache-Control", "no-store"); sendJson(response, 200, { token }); return;
+        }
+        if (url.pathname === "/api/control/permissions/decide") {
+          const token = String(request.headers["x-agent-control-permission"] ?? "");
+          const grant = permissionTokens.get(token);
+          if (!grant || grant.expires < Date.now() || grant.agent !== agentId || grant.request !== requestId) { sendJson(response, 403, { error: "Missing or expired request-scoped console capability." }); return; }
+          const permission = controller.decidePermission(agentId, requestId, body.decision as PermissionDecision);
+          permissionTokens.delete(token); sendJson(response, 200, { permission }); return;
+        }
+      }
       if (url.pathname.startsWith("/api/control")) {
         await handleApi(controller, request, response, url);
         return;
       }
       sendJson(response, 404, { error: "Not found." });
     } catch (error) {
-      sendJson(response, 500, {
+      sendJson(response, approvalRoute ? 409 : 500, {
         error: error instanceof Error ? error.message : String(error)
       });
     }
@@ -151,6 +206,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
   let closeTask: Promise<void> | undefined;
   return {
     server,
+    setUiOrigin: origin => { const value = new URL(origin); if (value.protocol !== "http:" || value.hostname !== "localhost") throw new Error("The console must use a localhost origin."); uiOrigin = value.origin; },
     close: () => closeTask ??= (async () => {
       // Stop accepting work first; upgraded sockets otherwise keep close pending.
       closing = true;
@@ -230,6 +286,17 @@ async function handleApi(
   response: ServerResponse,
   url: URL
 ): Promise<void> {
+  if (request.method === "GET" && url.pathname === "/api/control/flows") {
+    // Prompt text is a local file read. Cross-site pages must not use the
+    // dashboard's legacy permissive CORS policy to read project sources.
+    const origin = request.headers.origin;
+    if (request.headers["sec-fetch-site"] === "cross-site" || (origin && !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin))) {
+      sendJson(response, 403, { error: "Flow source previews are available to the local console only." });
+      return;
+    }
+    sendJson(response, 200, previewFlowCatalog(url.searchParams.get("repo_dir"), url.searchParams.get("flow_id")));
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/control/snapshots") {
     const ids = [...new Set(url.searchParams.getAll("run_id").filter(Boolean))];
     sendJson(response, 200, ids.length ? ids.map(id => controller.getDashboardSnapshot(id)) : [controller.getDashboardSnapshot()]);

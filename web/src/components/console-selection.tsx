@@ -16,12 +16,16 @@ function useSharedSelection() {
   const [selectedRunIds, setSelectedRunIds] = useState<string[]>([]);
   const [followLatestRun, setFollowLatestRun] = useState(true);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
+  const [projectDir, setProjectDir] = useState<string | null>(null);
   const pinned = useRef(false);
   const historyHydrated = useRef(false);
   const lastHostSelection = useRef<ConsoleSelectionState | null>(null);
 
   useEffect(() => {
     const syncHistory = () => {
+      const params = new URLSearchParams(window.location.search);
+      if (!shouldTryMcpApp()) { setSelectedFlowId(params.get("flow_id")); setProjectDir(params.get("repo_dir")); }
       const ids = readRunSelection(window.location.search, shouldTryMcpApp());
       const runId = ids[0] ?? null;
       setSelectedRunIds(ids);
@@ -50,6 +54,8 @@ function useSharedSelection() {
       if (!selection || selection === lastHostSelection.current ||
         (selection.command_id && selection.command_id === lastHostSelection.current?.command_id)) return;
       lastHostSelection.current = selection;
+      if (selection.flow_id) setSelectedFlowId(selection.flow_id);
+      if (selection.repo_dir) setProjectDir(selection.repo_dir);
       if (selection.action === "close") {
         void requestMcpAppTeardown();
       } else if (selection.requested_run_id) {
@@ -81,7 +87,7 @@ function useSharedSelection() {
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
-  return { registerRefresh, refreshCurrentScreen, connection, setConnection, selectedRunId, selectedRunIds, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
+  return { selectedFlowId, setSelectedFlowId, projectDir, registerRefresh, refreshCurrentScreen, connection, setConnection, selectedRunId, selectedRunIds, setSelectedRunId, followLatestRun, selectedAgentId, setSelectedAgentId, selectRun };
 }
 
 const SelectionContext = createContext<ReturnType<typeof useSharedSelection> | null>(null);

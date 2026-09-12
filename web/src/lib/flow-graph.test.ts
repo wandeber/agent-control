@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildFlowVisualModel } from "./flow-graph";
+import { buildFlowDefinitionGraph, buildFlowVisualModel } from "./flow-graph";
 import { diagramPath, flowDiagramEdges, flowDiagramPositions, PHASE_HEIGHT, PHASE_WIDTH, routeFlowDiagram, visibleFlowDiagramEdges } from "./flow-diagram";
 import type { DashboardSnapshot, FlowStepInstanceRecord, FlowTransitionRecord } from "./types";
 
@@ -138,5 +138,18 @@ describe("readable flow routes", () => {
         }
       }
     }
+  });
+});
+
+
+describe("unstarted source graph", () => {
+  it("includes declared transitions and prompts without synthesizing executed steps", () => {
+    const graph = buildFlowDefinitionGraph({ id: "draft", initial_step: "first", steps: {
+      first: { role: "writer", prompt: "Write", on: { reported: { to: "review" } } },
+      review: { role: "reviewer", on: { reported: { transitions: [{ id: "retry", to: "first" }, { id: "done", finish: true }] } } }
+    } });
+    expect(graph.nodes.filter(node => node.stepId).map(node => node.stepId)).toEqual(["first", "review"]);
+    expect(graph.nodes.every(node => !node.isCurrent && !node.latestStep && !node.instanceCount)).toBe(true);
+    expect(graph.edges.map(edge => [edge.source, edge.target])).toEqual([["step:first", "step:review"], ["step:review", "step:first"], ["step:review", "finish:done"]]);
   });
 });

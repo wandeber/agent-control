@@ -96,22 +96,22 @@ describe("pricing configuration and run aggregation", () => {
     writeFileSync(join(home, "pricing.toml"), '[models."gateway/gpt-6-astra"]\ninput_per_million=0\ncached_input_per_million=0\ncache_write_input_per_million=0\noutput_per_million=0\n');
     expect(buildRunCosts([a], new Map([["a", usage()]]), null, home).total.total).toEqual({ usd: 0, partial: false });
   });
-  it("prices Yoda with its explicit multimodal DeepSeek peak reference and combines workers by model", () => {
+  it("prices Yoda with its explicit GLM 5.3 Flash reference and combines workers by model", () => {
     const workers = [
       agent("a", { backend: "codex-cli", model: "yoda", backend_handle: { model_provider: "softec-ai-lab" } }),
       agent("b", { backend: "codex-cli", model: "yoda", backend_handle: { profile: "legacy-yoda-profile" } })
     ];
     const result = buildRunCosts(workers, new Map(workers.map(worker => [worker.agent_id, usage({ model: "yoda" })])), null, temp());
     for (const cost of result.agents) {
-      expect(cost.rates).toEqual({ input_per_million: .44, cached_input_per_million: .014, cache_write_input_per_million: .44, output_per_million: 1.32 });
-      expect(cost.total.usd).toBeCloseTo(.1124, 10);
+      expect(cost.rates).toEqual({ input_per_million: .15, cached_input_per_million: .03, cache_write_input_per_million: .15, output_per_million: .5 });
+      expect(cost.total.usd).toBeCloseTo(.059, 10);
       expect(cost.total.partial).toBe(false);
     }
     expect(result.models).toHaveLength(1);
     expect(result.models[0].model).toBe("yoda");
-    expect(result.models[0].total.usd).toBeCloseTo(.2248, 10);
+    expect(result.models[0].total.usd).toBeCloseTo(.118, 10);
     expect(result.total.total).toEqual(result.models[0].total);
-    expect(result.model_references?.yoda).toEqual({ model: "deepseek-v4-flash-vision-exp", source: "https://api-docs.deepseek.com/quick_start/pricing/", basis: "Peak API rates" });
+    expect(result.model_references?.yoda).toEqual({ model: "glm-5.3-flash", source: "https://docs.z.ai/guides/overview/pricing", basis: "Z.ai API reference rates", updated_at: "2026-09-11" });
   });
   it("allows partial Yoda overrides and more specific provider rates", () => {
     const home = temp();

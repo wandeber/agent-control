@@ -14,6 +14,27 @@ subscriptions, and visual relationship guidance, use the Agent Control flow
 patterns reference at `docs/flow-patterns.md` when that repository path is
 available.
 
+## Live Source Preview
+
+To show, create, or edit a flow with the user watching, open the native panel
+with `open_agent_control_console({screen: "flows", flow_id: "<id>", repo_dir: "<absolute task project>"})`.
+When the panel is already open, use `reuse_agent_control_console` with the same
+selection fields. Preview does not need a run and must not launch workers.
+
+The Flows screen lists bundled, user, and project catalogs and shows effective
+models/reasoning, role prompts, phase instructions, artifacts, and routes. It
+refreshes directly from source files while visible; no model polling, event
+subscription, or wait loop is needed for authoring. A new local package under
+`.agents/flows/<id>/flow.yaml` appears automatically. Select its ID before
+creation when useful. Edit the real YAML/JSON and Markdown prompt files through
+Codex, then validate the finished definition. During an incomplete save the UI
+keeps the last valid preview and recovers on the next valid save.
+
+Project model overrides still use `.agents/models.toml` and deterministic
+catalog resolution. Editing sources changes the preview and future launches;
+it never replaces an already running flow's pinned config or prompts. Do not
+modify an installed plugin cache to create a project flow.
+
 ## Authoring Rules
 
 - Keep Agent Control generic: do not bake one workflow's result labels into the

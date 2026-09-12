@@ -4,13 +4,13 @@ import { ControllerError } from "./core/errors.js";
 export class ConsoleSessions {
     sessions = new Map();
     byThread = new Map();
-    open(threadId) {
+    open(threadId, selection = {}) {
         if (!threadId)
             throw new ControllerError("Open Agent Control from an identified Codex conversation.", "auth_required");
         const previous = this.byThread.get(threadId);
         if (previous)
             this.sessions.delete(previous);
-        const session = { id: randomUUID(), threadId, command: null };
+        const session = { id: randomUUID(), threadId, command: null, selection };
         this.sessions.set(session.id, session);
         this.byThread.set(threadId, session.id);
         return session;
@@ -26,10 +26,11 @@ export class ConsoleSessions {
     forApp(threadId, panelId) {
         return this.get(panelId ? threadId : undefined, panelId);
     }
-    queue(session, action, runId) {
+    queue(session, action, runId, selection = {}) {
         // A concurrent open may have retired the captured panel during a read.
         this.get(session.threadId, session.id);
-        session.command = { requested_run_id: runId ?? null, follow_latest: !runId, action, command_id: randomUUID() };
+        session.selection = { ...session.selection, ...selection };
+        session.command = { ...session.selection, requested_run_id: runId ?? null, follow_latest: !runId, action, command_id: randomUUID() };
         return session;
     }
     acknowledge(session, commandId) {

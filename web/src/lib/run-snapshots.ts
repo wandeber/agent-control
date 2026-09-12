@@ -6,7 +6,7 @@ export function combineRunSnapshots(snapshots: DashboardSnapshot[]): DashboardSn
   if (!first || snapshots.length === 1) return first ?? null;
   const result = { ...first, costs: undefined };
   const keys = ["agents", "agent_links", "flows", "flow_instances", "flow_steps", "flow_reports", "flow_transitions",
-    "flow_artifact_bindings", "subscriptions", "heartbeats", "goals", "artifacts", "latest_events", "computed_agents", "run_observers"] as const;
+    "flow_artifact_bindings", "subscriptions", "heartbeats", "goals", "artifacts", "latest_events", "computed_agents", "run_observers", "permission_requests", "agent_access"] as const;
   for (const key of keys) {
     // Records are identities owned by runs. Shared flow definitions are deduplicated.
     Object.assign(result, { [key]: snapshots.flatMap<unknown>(snapshot => snapshot[key] ?? []) });

@@ -26,12 +26,16 @@ export function multiRunLayout(groups: ReturnType<typeof buildRunGraph>[]) {
   let offsetX = 0;
   for (const { snapshot, primary, team } of groups) {
     const layout = teamLayout(snapshot, primary, team);
-    const cards = keepExternalCardsOutsideTeam(snapshot.agents.map(agent => ({ id: agent.agent_id, position: layout.get(agent.agent_id) ?? { x: 0, y: 0 } })), team);
+    // The run origin comes from automatic layout, never from edited bounds.
+    // Otherwise moving the leftmost (or only) card cancels its own displacement.
+    const automatic = runGraphBounds(snapshot.agents.map(agent => ({ id: agent.agent_id, position: layout.get(agent.agent_id) ?? { x: 0, y: 0 } })), team);
+    for (const point of snapshot.canvas_positions?.positions ?? []) layout.set(point.agent_id, { x: point.x, y: point.y });
+    const cards = snapshot.agents.map(agent => ({ id: agent.agent_id, position: layout.get(agent.agent_id) ?? { x: 0, y: 0 } }));
     const bounds = runGraphBounds(cards, team);
     for (const card of cards) positions.set(card.id, groups.length > 1
-      ? { x: card.position.x - bounds.x + offsetX, y: card.position.y - bounds.y }
+      ? { x: card.position.x - automatic.x + offsetX, y: card.position.y - automatic.y }
       : card.position);
-    offsetX += bounds.width + 120;
+    offsetX += Math.max(automatic.width, bounds.x + bounds.width - automatic.x) + 120;
   }
   return positions;
 }

@@ -120,10 +120,14 @@ export function browserOpenCommand(url, platform = process.platform, wsl = Boole
         return ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Start-Process -FilePath '${url.replaceAll("'", "''")}'`]];
     return ["xdg-open", [url]];
 }
-export async function openBrowserConsole(runId, screen = "console") {
+export async function openBrowserConsole(runId, screen = "console", preview) {
     const url = new URL(await ensureBrowserConsole());
     if (runId)
         url.searchParams.set("run_id", runId);
+    if (preview?.flow_id)
+        url.searchParams.set("flow_id", preview.flow_id);
+    if (preview?.repo_dir)
+        url.searchParams.set("repo_dir", preview.repo_dir);
     url.hash = `/${screen}`;
     const [command, args] = browserOpenCommand(url.href);
     await promisify(execFile)(command, args, { timeout: 5000, windowsHide: true });
@@ -139,6 +143,7 @@ async function serve(recordPath, instanceId) {
         await api.close();
         throw error;
     }
+    api.setUiOrigin(`http://localhost:${web.address().port}`);
     const url = `http://localhost:${web.address().port}/?apiPort=${api.server.address().port}`;
     const temporary = `${recordPath}.${process.pid}.tmp`;
     try {

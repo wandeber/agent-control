@@ -4,6 +4,13 @@ import { parseDurationMs } from "../core/duration.js";
 import { ControllerError } from "../core/errors.js";
 export async function handleTool(controller, name, input, signal) {
     switch (name) {
+        case "permission_list": return controller.listPermissions(String(input.run_id), { adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
+        case "permission_decide": return controller.decideOperatorPermission(String(input.agent_id), String(input.request_id), input.decision, { adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
+        case "canvas_positions_get":
+        case "canvas_positions_set": {
+            controller.authorizeRunOperator(String(input.run_id), { adminKey: maybeString(input.admin_key), agentToken: maybeString(input.agent_token) });
+            return name === "canvas_positions_get" ? controller.getCanvasPositions(String(input.run_id)) : controller.setCanvasPositions(String(input.run_id), Number(input.expected_revision), input.positions);
+        }
         case "flow_packages": return controller.executeFlowPackages({ flowInstanceId: String(input.flow_instance_id), request: input.request, agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key), signal });
         case "flow_owner_recover": return controller.recoverFlowOwner({ flowInstanceId: String(input.flow_instance_id), role: String(input.role), restartStepId: String(input.restart_step_id), reason: String(input.reason), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });
         case "flow_context_update": return controller.updateFlowContext({ flowInstanceId: String(input.flow_instance_id), context: String(input.context), expectedRevision: Number(input.expected_revision), agentToken: maybeString(input.agent_token), adminKey: maybeString(input.admin_key) });

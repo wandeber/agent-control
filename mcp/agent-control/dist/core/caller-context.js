@@ -19,3 +19,5 @@ export function currentCodexThreadId() {
     const caller = callers.getStore();
     return caller ? caller.threadId : process.env.CODEX_THREAD_ID?.trim() || undefined;
 }
+/** Only the host-supplied MCP identity, never a CLI environment claim. */
+export function currentMcpThreadId() { return callers.getStore()?.threadId; }

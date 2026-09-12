@@ -16,6 +16,7 @@ export async function launchWorkerTool(controller: AgentController, input: Recor
     phase: String(input.phase ?? "task"), role: input.role as string | undefined,
     repo: (input.repo_dir as string | undefined) ?? process.cwd(), runId: input.run_id as string | undefined,
     profile: input.profile as string | undefined, sandbox: input.sandbox as "read_only" | "workspace" | undefined,
+    approvalPolicy: input.approval_policy as "on-request" | undefined,
     model: input.model as string | undefined, reasoningEffort: input.reasoning_effort as string | undefined,
     server: input.server as string | undefined, objective: input.objective as string | undefined,
     outputArtifact: input.output_artifact as string | undefined,

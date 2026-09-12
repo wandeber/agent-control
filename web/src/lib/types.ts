@@ -131,6 +131,8 @@ export interface AgentLinkRecord {
 }
 
 export interface UsageSnapshotRecord {
+  scope_started_at?: string;
+  scope_ended_at?: string | null;
   usage_id: string;
   run_id: string;
   agent_id: string;
@@ -167,13 +169,13 @@ export interface FlowConfigRecord {
   description?: string;
   initial_step: string;
   artifacts?: Record<string, { path?: string; description?: string }>;
-  roles?: Record<string, { backend?: string; model?: string; description?: string; prompt_ref?: string }>;
+  roles?: Record<string, { backend?: string; model?: string | null; reasoning_effort?: string | null; description?: string; prompt_ref?: string }>;
   prompts?: Record<string, { path?: string; description?: string }>;
   steps: Record<string, FlowStepConfigRecord>;
 }
 
 export interface FlowStepConfigRecord {
-  execution?: "agent" | "coordinator";
+  execution?: "agent" | "worker" | "coordinator";
   decision?: { key: string; artifact_key?: string; authority?: "user" | "coordinator"; owner?: "requester" | "orchestrator" };
   role?: string;
   agent_id?: string;
@@ -318,7 +320,27 @@ export interface AgentComputedState {
   activity?: { kind: "message" | "tool"; text: string; observed_at?: string; state?: "running" | "completed" | "failed" } | null;
 }
 
+export interface AccessPolicy { sandbox: "read_only" | "workspace" | "full_access"; approval_policy: "on-request" | "never" | "untrusted" }
+export interface AgentAccessSnapshot {
+  agent_id: string; requested: AccessPolicy | null;
+  effective: { approval_policy: unknown; sandbox_policy: Record<string, unknown>; thread_id: string; observed_at: string } | null;
+  revision: number; effective_revision: number | null; state: "pending" | "applied" | "unverified" | "unsupported";
+}
+export interface PermissionRequest {
+  request_id: string; agent_id: string; thread_id: string; turn_id: string; item_id: string;
+  kind: "command" | "files" | "permissions"; title: string; reason: string | null;
+  reject_interrupts_turn?: boolean;
+  scope: Record<string, unknown>; scope_complete: boolean; choices: Array<"approve" | "reject">;
+  state: "pending" | "submitting" | "sent" | "resolved" | "unavailable";
+  decision: "approve" | "reject" | null; created_at: string;
+}
+
+export interface CanvasPosition { agent_id: string; x: number; y: number }
+export interface CanvasPositions { run_id: string; revision: number; coordinate_space: "run"; positions: CanvasPosition[]; updated_at: string | null }
 export interface DashboardSnapshot {
+  canvas_positions?: CanvasPositions;
+  agent_access?: AgentAccessSnapshot[];
+  permission_requests?: PermissionRequest[];
   costs?: RunCosts;
   run_observers?: Array<{ observer_agent_id: string; run_id: string; event_types: EventType[]; delivery: "wait" | "notify" }>;
   generated_at: string;
@@ -370,7 +392,7 @@ export interface RunCosts {
   basis: string;
   configuration_valid: boolean;
   override_files: string[];
-  model_references?: Record<string, { model: string; source: string; basis: string }>;
+  model_references?: Record<string, { model: string; source: string; basis: string; updated_at?: string }>;
   exchange?: ExchangeRate;
   agents: AgentCost[];
   models: Array<CostBreakdown & { model: string }>;

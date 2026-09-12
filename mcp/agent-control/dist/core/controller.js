@@ -1,6 +1,12 @@
+import { CanvasPositionStore } from "./canvas-positions.js";
+import { RunConversationUsage, hasRunConversationUsage } from "./run-conversation-usage.js";
+import { currentMcpThreadId } from "./caller-context.js";
+import { AgentAccessStore } from "./agent-access.js";
+import { PermissionRequests, permissionOwnerMatches } from "./permission-requests.js";
 import { sessionObservationKey } from "./run-wake-policy.js";
 import { applyProjectModels } from "./project-models.js";
 import { buildRunCosts } from "./pricing.js";
+import { readCodexSession } from "../adapters/codex-session.js";
 import { FlowPackages, flowPackagesRequestSchema } from "./flow-packages.js";
 import { FlowRuntime, artifactDigest, digest, pinFlowConfig } from "./flow-runtime.js";
 import { EvidenceService } from "./evidence/service.js";
@@ -40,6 +46,9 @@ export class AgentController {
     credentialStore;
     controllerInstanceId = newId("controller");
     observations;
+    permissions;
+    canvasPositions;
+    agentAccess;
     flowRuntime;
     disposing = false;
     disposeTask = null;
@@ -58,6 +67,9 @@ export class AgentController {
         this.store = store;
         this.adapters = adapters;
         this.credentialStore = credentialStore;
+        this.permissions = new PermissionRequests(store.db);
+        this.canvasPositions = new CanvasPositionStore(store);
+        this.agentAccess = new AgentAccessStore(store.db);
         this.observations = new RunObservation(store, this, adapters);
         this.flowRuntime = new FlowRuntime(store);
         const configuredDelays = options.nativeActionDeliveryRetryDelaysMs ??
@@ -89,7 +101,7 @@ export class AgentController {
         // Re-drive every such worker on startup so a crash between the durable
         // transition and adapter/native cleanup cannot strand an abandoned worker.
         for (const agent of this.store.listAgents({ includeUnregistered: true })) {
-            if (agent.status === "stopping") {
+            if (agent.status === "stopping" && this.hasDurableStopIntent(agent)) {
                 startupCleanupAgentIds.add(agent.agent_id);
             }
         }
@@ -210,6 +222,7 @@ export class AgentController {
     observeRun(input) {
         return this.observations.observe(input);
     }
+    originalRequesterThread(runId) { return this.observations.requesterThread(runId); }
     ensureRequester(runId, input = {}) {
         return this.observations.ensure(runId, input);
     }
@@ -236,7 +249,8 @@ export class AgentController {
     saveActivity(agent, value) {
         const activity = parseActivity(value);
         if (!activity) {
-            this.store.db.prepare("delete from agent_activity where agent_id = ?").run(agent.agent_id);
+            // Clear live progress without deleting the last text shown on the card.
+            this.store.db.prepare("update agent_activity set activity_json = json_set(activity_json, '$.cleared', json('true')) where agent_id = ?").run(agent.agent_id);
             return;
         }
         const existing = this.readActivity(agent);
@@ -250,7 +264,39 @@ export class AgentController {
         if (!row)
             return undefined;
         const value = JSON.parse(row.activity_json);
-        return value.work_generation === agent.work_generation ? parseActivity(value) ?? undefined : undefined;
+        return !value.cleared && value.work_generation === agent.work_generation ? parseActivity(value) ?? undefined : undefined;
+    }
+    readDashboardActivity(agent) {
+        const row = this.store.db.prepare("select activity_json from agent_activity where agent_id = ?").get(agent.agent_id);
+        let activity = row ? parseActivity(JSON.parse(row.activity_json)) ?? undefined : undefined;
+        // Recover historical cards from their actual conversation without opening
+        // the chat, launching work, or treating earlier output as live flow progress.
+        const handle = agent.backend_handle;
+        if (agent.backend.startsWith("codex") && handle && !handle.remote_session) {
+            try {
+                const threadId = agent.backend === "codex-cli" && typeof handle.dir === "string"
+                    ? JSON.parse(readFileSync(join(handle.dir, "state.json"), "utf8")).thread_id : handle.thread_id;
+                const session = typeof threadId === "string" ? readCodexSession(threadId) : null;
+                for (const message of [...(session?.messages ?? [])].reverse()) {
+                    let candidate = null;
+                    if (message.role === "assistant" && message.metadata?.type === "text") {
+                        candidate = parseActivity({ kind: "message", text: message.text, observed_at: message.created_at });
+                    }
+                    else if (message.role === "tool") {
+                        const tool = message.metadata?.tool_activity;
+                        if (tool?.name && tool.name !== "Tool result")
+                            candidate = parseActivity({ kind: "tool", text: tool.name, observed_at: message.created_at });
+                    }
+                    if (!candidate)
+                        continue;
+                    if (!activity || Date.parse(candidate.observed_at ?? "") >= Date.parse(activity.observed_at ?? "1970-01-01"))
+                        activity = candidate;
+                    break;
+                }
+            }
+            catch { /* Retain the persisted last message when local history is unavailable. */ }
+        }
+        return activity;
     }
     listBackends() {
         return this.adapters.list();
@@ -1831,7 +1877,7 @@ export class AgentController {
         if (STOP_INTENT_RUN_STATUSES.has(run.status)) {
             return `run_${run.status}_no_new_work`;
         }
-        if (agent && STOP_INTENT_AGENT_STATUSES.has(agent.status)) {
+        if (agent && this.agentHasStopIntent(agent)) {
             return `agent_${agent.status}_no_new_work`;
         }
         return null;
@@ -2766,6 +2812,9 @@ export class AgentController {
                     : 1
                 : 0;
             let mapped = mapCodexSubagentStatus(input.nativeStatus);
+            if (input.nativeStatus === "interrupted" && current.backend_handle?.recoverable_interrupt === true && !this.hasDurableStopIntent(current)) {
+                mapped = { status: "waiting_for_input", failureReason: null };
+            }
             if (input.nativeStatus === "missing") {
                 const elapsed = Math.max(0, Date.parse(observedAt) - Date.parse(missingSince));
                 const confirmedByRepeatedExactMiss = missingObservationCount >= 2 && elapsed >= EXTERNAL_MISSING_CONFIRMATION_MS;
@@ -2806,7 +2855,7 @@ export class AgentController {
                     (this.samePublicActivity(previous, activity) ? previous?.observed_at : undefined) ?? observedAt;
                 this.saveActivity(current, activity ? { ...activity, observed_at: originalTimestamp } : null);
             }
-            const cancelledInterruptActionIds = TERMINAL_STATUSES.has(projectedStatus)
+            const cancelledInterruptActionIds = TERMINAL_STATUSES.has(mapCodexSubagentStatus(input.nativeStatus).status)
                 ? this.cancelPendingCodexSubagentInterruptsForTerminalSync(current, input.nativeStatus, observedAt)
                 : [];
             const changed = current.status !== projectedStatus ||
@@ -3029,6 +3078,13 @@ export class AgentController {
         return orchestratorActionRef(action);
     }
     enqueueCodexSubagentMessage(agent, message) {
+        const interrupt = this.store.listOrchestratorActions({ agentId: agent.agent_id }).filter(action => action.operation === "interrupt_agent" && action.payload_json.recoverable === true).at(-1);
+        const observed = this.store.getCodexSubagentExternalState(agent.agent_id);
+        const settledInterrupt = observed && TERMINAL_STATUSES.has(mapCodexSubagentStatus(String(observed.native_status)).status) &&
+            String(observed.observed_at) >= (interrupt?.claimed_at ?? interrupt?.created_at ?? "");
+        if (interrupt && ["pending", "claimed", "succeeded"].includes(interrupt.status) && !settledInterrupt) {
+            throw new ControllerError("Native turn interruption is still pending; wait for its observed result before continuing the same agent.", "unsupported_operation");
+        }
         const context = this.bridgeContextForAgent(agent);
         const grant = this.resolveActionBridgeGrant({
             runId: agent.run_id,
@@ -3127,7 +3183,7 @@ export class AgentController {
         }
         return orchestratorActionRef(action);
     }
-    enqueueCodexSubagentInterrupt(agent, idempotencyKey = `interrupt:${agent.agent_id}:${newId("request")}`, causalAction) {
+    enqueueCodexSubagentInterrupt(agent, idempotencyKey = `interrupt:${agent.agent_id}:${newId("request")}`, causalAction, recoverable = false) {
         const context = this.bridgeContextForAgent(agent);
         if (causalAction && !causalAction.originating_bridge_grant_id) {
             throw new ControllerError("Causal native action has no provable originating bridge grant.", "auth_required", { agent_id: agent.agent_id, action_id: causalAction.action_id });
@@ -3195,7 +3251,7 @@ export class AgentController {
                 flowInstanceId: causalFlowInstanceId,
                 stepInstanceId: causalStepInstanceId,
                 operation: "interrupt_agent",
-                payloadJson: { target }
+                payloadJson: { target, ...(recoverable ? { recoverable: true } : {}) }
             }), agent, null);
             if (action.status === "pending" || action.status === "claimed") {
                 return { type: "orchestrator_action_required", action: orchestratorActionRef(action) };
@@ -3360,6 +3416,15 @@ export class AgentController {
     }
     applyOrchestratorActionAcknowledgement(action, eventSink) {
         const agent = this.getAgent(action.agent_id);
+        if (action.operation === "interrupt_agent" && action.payload_json.recoverable === true && !this.hasDurableStopIntent(agent)) {
+            // The native acknowledgement is acceptance, not evidence that its turn
+            // ended. External sync owns that projection; newer work stays untouched.
+            this.recordControllerEvent({ runId: agent.run_id, agentId: agent.agent_id,
+                type: action.status === "failed" ? "agent.delivery_failed" : "agent.status_changed",
+                payload: { status: agent.status, reason: action.status === "failed" ? "turn_interrupt_failed" : "turn_interrupt_accepted", action_id: action.action_id }
+            }, eventSink);
+            return { agent };
+        }
         if (TERMINAL_STATUSES.has(agent.status)) {
             if (this.followupAcknowledgementStartsNewerTurn(action, agent)) {
                 return {
@@ -3543,8 +3608,14 @@ export class AgentController {
     }
     hasDurableStopIntent(agent) {
         const runStatus = this.store.getRun(agent.run_id)?.status;
-        return (STOP_INTENT_AGENT_STATUSES.has(agent.status) ||
+        return (this.agentHasStopIntent(agent) ||
             (runStatus !== undefined && STOP_INTENT_RUN_STATUSES.has(runStatus)));
+    }
+    agentHasStopIntent(agent) {
+        // Attached sessions also observe aborted turns from their original host.
+        // Only an explicit controller cancellation gives that observation stop authority.
+        return STOP_INTENT_AGENT_STATUSES.has(agent.status) &&
+            (agent.backend !== "codex-session" || agent.backend_handle?.cancel_requested === true);
     }
     hasCodexSubagentTarget(agent) {
         return Boolean(recordString(agent.backend_handle, "native_task_path") ??
@@ -4493,7 +4564,7 @@ export class AgentController {
                 model: input.model,
                 expectedArtifacts: input.expectedArtifacts,
                 attachments: input.attachments,
-                metadata: input.metadata
+                metadata: { ...input.metadata, permission_db_path: this.store.db.name }
             });
             let updated;
             if (startAttempt) {
@@ -4861,14 +4932,11 @@ export class AgentController {
         };
     }
     async sendMessage(agentId, message) {
-        const agent = this.getAgent(agentId);
-        if (this.isAttachedParticipant(agent)) {
+        const existing = this.getAgent(agentId);
+        const agent = existing.backend === "codex-session"
+            ? await this.refreshAgentStatus(agentId) : existing;
+        if (this.isAttachedParticipant(agent) && agent.backend !== "codex-session") {
             const adapter = this.adapters.get(agent.backend);
-            if (agent.backend === "codex-session") {
-                const receipt = await adapter.sendMessageWithReceipt(this.requireHandle(agent), message);
-                this.armStatusWatcher(agent);
-                return { agent: await this.refreshAgentStatus(agentId), ...receipt };
-            }
             if (!adapter.stageNotification)
                 throw new ControllerError("Safe notification staging is unavailable.", "unsupported_operation");
             await adapter.stageNotification(this.requireHandle(agent), { message });
@@ -4922,11 +4990,19 @@ export class AgentController {
         const attemptWorkGeneration = acceptedAttempt.agent.work_generation;
         const attemptWorkRevision = acceptedAttempt.agent.work_revision;
         const stopLeaseHeartbeat = this.maintainAcceptedWorkLease(agentId, acceptanceKey);
+        let receipt = { delivered: true };
         try {
-            await adapter.sendMessage(handle, {
+            const input = {
                 message,
-                metadata: { agentToken: this.issueAgentToken(agentId) }
-            });
+                metadata: { agentToken: this.issueAgentToken(agentId),
+                    ...(agent.backend === "codex-session" && this.store.db.name !== ":memory:" ? {
+                        dispatch_fence: { database: this.store.db.name, agent_id: agentId, run_id: agent.run_id }
+                    } : {}) }
+            };
+            if (adapter.sendMessageWithReceipt)
+                receipt = await adapter.sendMessageWithReceipt(handle, input);
+            else
+                await adapter.sendMessage(handle, input);
         }
         catch (error) {
             stopLeaseHeartbeat();
@@ -5006,20 +5082,20 @@ export class AgentController {
         if (completion.attemptOwnedAgent && !completedAfterStop) {
             this.store.touchHeartbeat(agentId, event.created_at);
             this.armStatusWatcher(completion.agent);
-            return { agent: completion.agent, delivered: true };
+            return { agent: completion.agent, ...receipt };
         }
         if (!completedAfterStop) {
             // Another physical attempt advanced the generation while this one was in
             // flight. Its projection owns the card; this completed attempt must not
             // rewrite or compensate that newer work.
-            return { agent: completion.agent, delivered: true };
+            return { agent: completion.agent, ...receipt };
         }
         // A backend may accept the send by reviving a session after shutdown's
         // earlier stop already returned. Logical state preservation is not enough:
         // stop the actual handle again and keep durable state in `stopping` until
         // that compensating cleanup reaches a terminal result.
         const reconciled = await this.reconcileLateNonNativeWorkAfterStop(completion.agent, handle, adapter, "send");
-        return { agent: reconciled, delivered: true };
+        return { agent: reconciled, ...receipt };
     }
     async readLatest(agentId, limit = 1) {
         const agent = this.getAgent(agentId);
@@ -5249,7 +5325,7 @@ export class AgentController {
                 const events = snapshot.data.observed_events;
                 for (const event of events ?? [])
                     pendingEvents.push(this.store.createEvent({ runId: current.run_id, agentId: current.agent_id,
-                        type: event.type, payload: { turn_id: event.turn_id, text: event.text, source: "codex.rollout" } }));
+                        type: event.type, payload: { turn_id: event.turn_id, text: event.text, status: event.status, reason: event.reason, source: "codex.rollout" } }));
                 updated = this.store.updateAgent(current.agent_id, { backendHandle: { ...current.backend_handle, observed_event_index: snapshot.data.observed_event_index } });
             }
             if (changed && (current.backend !== "codex-session" || current.backend_handle?.remote_session || snapshot.status === "blocked" || current.status === "blocked")) {
@@ -5264,6 +5340,11 @@ export class AgentController {
                         data: snapshot.data
                     }
                 }));
+            }
+            for (const request of this.permissions.takeObservations(updated.agent_id)) {
+                pendingEvents.push(this.store.createEvent({ runId: updated.run_id, agentId: updated.agent_id,
+                    type: "agent.status_changed", payload: { status: updated.status, reason: "backend_permission_request_updated",
+                        permission_request_id: request.request_id, permission_state: request.state } }));
             }
             const projectedTerminal = TERMINAL_STATUSES.has(updated.status);
             if (projectedTerminal) {
@@ -5604,15 +5685,82 @@ export class AgentController {
         }
         return prepared;
     }
+    async interruptAgentTurn(agent) {
+        this.assertNewWorkAllowed(agent.run_id, "agent_send_message", agent);
+        const adapter = this.adapters.get(agent.backend);
+        if (adapter.capabilities().requiresOrchestratorAction) {
+            const operation = this.store.immediateTransaction(() => {
+                const current = this.getAgent(agent.agent_id);
+                this.assertNewWorkAllowed(current.run_id, "agent_send_message", current);
+                this.requireHandle(current);
+                const result = this.enqueueCodexSubagentInterrupt(current, undefined, null, true);
+                this.store.updateAgent(current.agent_id, { backendHandle: { ...current.backend_handle, recoverable_interrupt: true } });
+                return result;
+            });
+            this.notifyFlowOwnerOfNativeCleanupActionRef(operation.action);
+            return { ...this.getAgent(agent.agent_id), orchestrator_action: operation.action };
+        }
+        if (!adapter.interrupt)
+            throw new ControllerError(`Backend does not support recoverable turn interruption: ${agent.backend}. No cancellation was performed.`, "unsupported_operation", { backend: agent.backend, agent_id: agent.agent_id });
+        this.requireHandle(agent);
+        if (agent.backend === "codex-thread")
+            agent = this.store.updateAgent(agent.agent_id, {
+                backendHandle: { ...agent.backend_handle, recoverable_interrupt: true }
+            });
+        const handle = this.requireHandle(agent);
+        const acceptanceKey = `interrupt:${agent.agent_id}:${newId("attempt")}`;
+        const accepted = this.store.advanceAgentWorkGenerationForAcceptedWork(agent.agent_id, acceptanceKey, {
+            claimOwnerId: this.controllerInstanceId, leaseExpiresAt: this.acceptedWorkLeaseExpiresAt(),
+            projectStatus: "running", failureReason: null
+        });
+        if (accepted.type !== "accepted") {
+            this.assertNewWorkAllowed(agent.run_id, "agent_send_message", accepted.agent);
+            throw new ControllerError("Interruption could not reserve the current execution.", "tool_error");
+        }
+        const stopLease = this.maintainAcceptedWorkLease(agent.agent_id, acceptanceKey);
+        try {
+            const result = await adapter.interrupt(handle);
+            const completion = this.store.completeAgentAcceptedWorkAttempt({
+                agentId: agent.agent_id, acceptanceKey, claimOwnerId: this.controllerInstanceId,
+                outcome: "succeeded", status: result.status, failureReason: result.failureReason ?? null
+            });
+            // Completion is conditional on this invocation's generation. A newer send
+            // or definitive stop owns the card even if this interrupt finishes later.
+            if (completion.attemptOwnedAgent && !this.hasDurableStopIntent(completion.agent)) {
+                this.emit({ runId: agent.run_id, agentId: agent.agent_id, type: "agent.status_changed",
+                    payload: { status: completion.agent.status, reason: "turn_interrupted", mode: "interrupt" } });
+            }
+            this.armStatusWatcher(completion.agent);
+            return completion.agent;
+        }
+        catch (error) {
+            const completion = this.store.completeAgentAcceptedWorkAttempt({
+                agentId: agent.agent_id, acceptanceKey, claimOwnerId: this.controllerInstanceId,
+                outcome: "ambiguous", status: "unknown", failureReason: "unknown"
+            });
+            this.armStatusWatcher(completion.agent);
+            throw error;
+        }
+        finally {
+            stopLease();
+        }
+    }
     async stopAgent(agentId, mode = "graceful") {
         let agent = this.getAgent(agentId);
-        if (agent.backend === "codex-session") {
-            const adapter = this.adapters.get(agent.backend);
-            await adapter.stop(this.requireHandle(agent), { mode });
-            return this.refreshAgentStatus(agentId);
+        if (mode === "interrupt") {
+            if (this.hasDurableStopIntent(agent))
+                this.assertNewWorkAllowed(agent.run_id, "agent_send_message", agent);
+            if (agent.backend === "codex-session")
+                agent = await this.refreshAgentStatus(agentId);
+            return this.interruptAgentTurn(agent);
         }
-        if (this.isAttachedParticipant(agent))
+        if (this.isAttachedParticipant(agent) && agent.backend !== "codex-session")
             return agent;
+        if (agent.backend === "codex-session") {
+            agent = this.store.updateAgent(agentId, {
+                backendHandle: { ...agent.backend_handle, cancel_requested: true }, status: "stopping"
+            });
+        }
         // Capture intent before this call writes its own transient `stopping`
         // projection. A manual route, run shutdown, or earlier cleanup attempt has
         // already made cleanup durable; an ordinary first-time stop has not. That
@@ -6321,6 +6469,65 @@ export class AgentController {
             tail: text.slice(Math.max(0, text.length - maxChars))
         };
     }
+    getAgentAccess(agentId) {
+        const agent = this.getAgent(agentId), access = this.agentAccess.getAgentAccess(agentId);
+        return ["codex-thread", "codex-cli"].includes(agent.backend) ? access : { ...access, state: "unsupported" };
+    }
+    requestAgentAccess(agentId, policy, expectedRevision) {
+        const agent = this.getAgent(agentId);
+        if (!["codex-thread", "codex-cli"].includes(agent.backend))
+            throw new ControllerError("This backend does not support changing access through this console.", "unsupported_operation");
+        if (this.hasDurableStopIntent(agent) || agent.unregistered_at)
+            throw new ControllerError("The execution is cancelled or unregistered.", "tool_error");
+        if (this.store.db.name === ":memory:")
+            throw new ControllerError("Interactive access requires a persistent controller database.", "unsupported_operation");
+        this.adapters.get(agent.backend).validateInteractiveAccess?.(this.requireHandle(agent));
+        return this.store.immediateTransaction(() => {
+            const access = this.agentAccess.requestAgentAccess(agentId, policy, expectedRevision);
+            if (agent.backend_handle)
+                this.store.updateAgent(agentId, { backendHandle: { ...agent.backend_handle, access_agent_id: agentId, access_db_path: this.store.db.name } });
+            return access;
+        });
+    }
+    /** Worker tokens and self-registered observer roles cannot grant operator authority. */
+    authorizeRunOperator(runId, auth = {}) {
+        this.getRun(runId);
+        if (auth.agentToken !== undefined)
+            throw new ControllerError("Worker tokens cannot approve permissions or edit the canvas.", "auth_required");
+        if (auth.adminKey !== undefined) {
+            if (verifyAdminKey(auth.adminKey))
+                return;
+            throw new ControllerError("Invalid administrator credential.", "auth_required");
+        }
+        const threadId = currentMcpThreadId();
+        const requester = this.store.db.prepare("select thread_id from run_operator_bindings where run_id=?").get(runId);
+        const observed = threadId && this.store.db.prepare(`select 1 from run_observers o join agents a on a.agent_id=o.observer_agent_id
+      where o.run_id=? and o.thread_id=? and a.unregistered_at is null`).get(runId, threadId);
+        if (threadId && requester?.thread_id === threadId && observed)
+            return;
+        throw new ControllerError("Requires this run's original Codex requester or an explicit local administrator credential.", "auth_required");
+    }
+    listPermissions(runId, auth = {}) {
+        this.authorizeRunOperator(runId, auth);
+        return { run_id: runId, requests: this.permissions.list(this.store.listAgents({ runId, includeUnregistered: true }).map(agent => agent.agent_id)) };
+    }
+    decideOperatorPermission(agentId, requestId, decision, auth = {}) {
+        this.authorizeRunOperator(this.getAgent(agentId).run_id, auth);
+        const receipt = this.permissions.list([agentId]).find(request => request.request_id === requestId);
+        // Recover the same recorded decision after completion without sending again.
+        if (receipt?.decision === decision && ["submitting", "sent", "resolved"].includes(receipt.state))
+            return receipt;
+        return this.decidePermission(agentId, requestId, decision);
+    }
+    getCanvasPositions(runId) { return this.canvasPositions.get(runId); }
+    setCanvasPositions(runId, revision, positions) { return this.canvasPositions.set(runId, revision, positions); }
+    decidePermission(agentId, requestId, decision) {
+        const agent = this.getAgent(agentId);
+        const request = this.permissions.get(requestId);
+        if (!request || request.agent_id !== agentId || !permissionOwnerMatches(agent, request) || this.hasDurableStopIntent(agent) || agent.unregistered_at)
+            throw new ControllerError("This permission request no longer belongs to the active execution.", "auth_required");
+        return this.permissions.decide(requestId, agentId, decision);
+    }
     getDashboardSnapshot(runId, scope) {
         const runs = this.store.listConsoleRuns(scope?.threadId);
         if (scope && runId && !runs.some(run => run.run_id === runId)) {
@@ -6352,12 +6559,35 @@ export class AgentController {
         const latestEvents = selectedRunId ? this.listEvents({ runId: selectedRunId, limit: 100 }) : [];
         const usageSnapshots = selectedRunId ? this.listUsageSnapshots({ runId: selectedRunId, limit: 1000 }) : [];
         const latestUsageByAgent = latestUsageSnapshotsByAgent(usageSnapshots);
+        const conversationUsage = new RunConversationUsage(this.store);
+        const conversationWindow = selectedRunId && agents.some(hasRunConversationUsage) ? conversationUsage.window(selectedRunId) : null;
         for (const agent of agents) {
             if (!agent.backend_handle)
                 continue;
-            try {
-                const observation = this.adapters.get(agent.backend).readUsage?.(this.requireHandle(agent));
+            if (conversationWindow && hasRunConversationUsage(agent)) {
+                // Never let a newer lifetime/attachment snapshot override the run's measured interval.
+                latestUsageByAgent.delete(agent.agent_id);
+                const observation = conversationUsage.read(agent, conversationWindow);
                 if (observation)
+                    latestUsageByAgent.set(agent.agent_id, observation);
+                continue;
+            }
+            try {
+                const handle = this.requireHandle(agent);
+                if (handle.data.usage_baseline || handle.data.agent_control_role || handle.data.observation_only) {
+                    const observer = this.store.db.prepare("select created_at from run_observers where observer_agent_id = ?").get(agent.agent_id);
+                    handle.data = { ...handle.data, usage_started_at: observer?.created_at ?? agent.created_at };
+                }
+                const observation = this.adapters.get(agent.backend).readUsage?.(handle);
+                const stored = latestUsageByAgent.get(agent.agent_id);
+                // A later persisted snapshot may omit cache partitions. An exact match
+                // of model and cumulative totals can still use the native breakdown.
+                const sameTotals = observation && stored && observation.model === stored.model &&
+                    ["input_tokens", "output_tokens", "total_tokens"].every(field => {
+                        const key = field;
+                        return typeof observation[key] === "number" && observation[key] === stored[key];
+                    });
+                if (observation && (!stored || Date.parse(observation.captured_at) >= Date.parse(stored.captured_at) || sameTotals))
                     latestUsageByAgent.set(agent.agent_id, {
                         ...observation, usage_id: `adapter:${agent.agent_id}`, agent_id: agent.agent_id, run_id: agent.run_id
                     });
@@ -6391,12 +6621,15 @@ export class AgentController {
                 status_age_ms: Number.isFinite(updated) ? Math.max(0, now - updated) : 0,
                 is_terminal: isTerminal,
                 latest_usage: latestUsageByAgent.get(agent.agent_id) ?? null,
-                activity: this.readActivity(agent)
+                activity: this.readDashboardActivity(agent)
             };
         });
         return {
+            permission_requests: this.permissions.list(agents.map(agent => agent.agent_id)),
+            agent_access: agents.map(agent => this.getAgentAccess(agent.agent_id)),
             generated_at: new Date(now).toISOString(),
             selected_run_id: selectedRunId,
+            canvas_positions: selectedRunId ? this.getCanvasPositions(selectedRunId) : undefined,
             run_observers: selectedRunId ? this.observations.listPublic(selectedRunId) : [],
             runs,
             agents,
@@ -7578,7 +7811,7 @@ export class AgentController {
         };
     }
     async stopAgentForPurge(agentId) {
-        let stopped = await this.stopAgent(agentId, "interrupt");
+        let stopped = await this.stopAgent(agentId, "graceful");
         if (isUnsafeToPurge(stopped)) {
             stopped = await this.stopAgent(agentId, "kill");
         }

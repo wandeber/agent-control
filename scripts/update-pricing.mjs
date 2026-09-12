@@ -54,6 +54,24 @@ export function parseEcbExchangeRate(xml) {
   return { usd_per_eur: rate, source: exchangeSource, updated_at: date };
 }
 
+export function parseZaiRates(markdown, model) {
+  if (!/All prices are in USD\./.test(markdown)) throw new Error("Official Z.ai pricing currency changed; no prices were written.");
+  const sections = markdown.split(/^#{1,6} .+$/m);
+  const tables = sections.map(section => ({ section, rows: section.split("\n").filter(line => line.startsWith("|")).map(line => line.split("|").slice(1, -1).map(cell => cell.trim())) }));
+  const header = ["Model", "Input", "Cached Input", "Cached Input Storage", "Output"];
+  const matches = tables.flatMap(({ section, rows }) => rows.map((row, index) => ({ section, rows, row, index })).filter(({ row }) => row[0]?.toLowerCase() === model.toLowerCase()));
+  if (matches.length !== 1) throw new Error(`Official Z.ai model is missing or ambiguous: ${model}`);
+  const { section, rows, row, index } = matches[0];
+  if (!/^Prices per 1M tokens\.$/m.test(section)) throw new Error("Official Z.ai pricing unit changed; no prices were written.");
+  const tableHeader = rows.slice(0, index).findLast(cells => cells[0] === "Model");
+  if (JSON.stringify(tableHeader) !== JSON.stringify(header) || row.length !== header.length || !["Free", "Limited-time Free"].includes(row[3])) throw new Error("Official Z.ai pricing layout or storage billing changed; no prices were written.");
+  const price = cell => parseRate(cell.replace(/^\\\$/, "$"));
+  const input = price(row[1]);
+  // Storage is not a token-write fee. New cached input retains the ordinary
+  // input rate; refuse future paid storage instead of silently omitting it.
+  return rates(input, price(row[2]), input, price(row[4]));
+}
+
 async function download(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
   if (!response.ok) throw new Error(`Pricing download failed: HTTP ${response.status}`);
@@ -65,15 +83,18 @@ export async function updatePricing(path = fileURLToPath(new URL("../mcp/agent-c
   const catalog = JSON.parse(readFileSync(path, "utf8"));
   const references = catalog.model_references ?? {};
   const sources = [...new Set(Object.values(references).map(reference => reference.source))];
-  const [markdown, exchange, ...pages] = await Promise.all([download(`${catalog.source}.md`), download(exchangeSource), ...sources.map(download)]);
+  const [markdown, exchange, ...pages] = await Promise.all([download(`${catalog.source}.md`), download(exchangeSource), ...sources.map(source => download(source === "https://docs.z.ai/guides/overview/pricing" ? `${source}.md` : source))]);
   const refreshed = parseOpenAIStandardRates(markdown, Object.keys(catalog.models).filter(model => !references[model]));
   for (const [alias, reference] of Object.entries(references)) {
-    if (reference.source !== "https://api-docs.deepseek.com/quick_start/pricing/" || reference.basis !== "Peak API rates") throw new Error(`Unsupported price reference: ${alias}`);
-    refreshed[alias] = parseDeepSeekPeakRates(pages[sources.indexOf(reference.source)], reference.model);
+    const page = pages[sources.indexOf(reference.source)];
+    if (reference.source === "https://api-docs.deepseek.com/quick_start/pricing/" && reference.basis === "Peak API rates") refreshed[alias] = parseDeepSeekPeakRates(page, reference.model);
+    else if (reference.source === "https://docs.z.ai/guides/overview/pricing" && reference.basis === "Z.ai API reference rates") refreshed[alias] = parseZaiRates(page, reference.model);
+    else throw new Error(`Unsupported price reference: ${alias}`);
   }
   catalog.models = refreshed;
   catalog.exchange = parseEcbExchangeRate(exchange);
   catalog.updated_at = new Date().toISOString().slice(0, 10);
+  for (const reference of Object.values(references)) reference.updated_at = catalog.updated_at;
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(catalog, null, 2)}\n`);
   renameSync(temporary, path);

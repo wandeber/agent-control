@@ -1,3 +1,8 @@
+import { AgentController } from "../src/core/controller.js";
+import { SqliteStore } from "../src/storage/sqlite-store.js";
+import { createDefaultAdapterRegistry } from "../src/adapters/registry.js";
+import { withMcpCaller } from "../src/core/caller-context.js";
+import { attachWorkerTool } from "../src/tools/attach.js";
 import { CodexSessionAdapter } from "../src/adapters/codex-session.js";
 import { CodexAppServerClient } from "../src/adapters/codex-thread-adapter.js";
 import Database from "better-sqlite3";
@@ -96,6 +101,61 @@ int main(int argc, char **argv) {
     expect(args).toContain("--sandbox|read-only|");
     expect(JSON.parse(readFileSync(join(dir, "attached-cli", thread, `${id}.json`), "utf8")).state).toBe("completed");
   }, 15000);
+  it("delivers an attached interrupted session's queue once after controller restart", async () => {
+    appendFileSync(rollout, row("event_msg", { type: "turn_aborted" }));
+    vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "attach-test-admin");
+    vi.spyOn(CodexAppServerClient.prototype, "initialize").mockResolvedValue();
+    vi.spyOn(CodexAppServerClient.prototype, "request").mockRejectedValue(new Error("No app-server for this CLI fixture"));
+    const store = new SqliteStore(join(dir, "controller.sqlite"));
+    let controller = new AgentController(store, createDefaultAdapterRegistry());
+    try {
+      const attached = await withMcpCaller({ threadId: "22222222-2222-4222-8222-222222222222" }, () =>
+        attachWorkerTool(controller, { thread_id: thread, profile: "fixture", requester_delivery: "wait" }));
+      expect(attached.agent.status).toBe("waiting_for_input");
+      const receipt = await controller.sendMessage(attached.agent.agent_id, "Continue the same task");
+      expect(receipt).toMatchObject({ delivered: false, queued: true, agent: { status: "running" } });
+      expect(controller.getAgent(attached.agent.agent_id).work_generation).toBeGreaterThan(attached.agent.work_generation);
+      await controller.dispose(); controller = new AgentController(store, createDefaultAdapterRegistry());
+      let result = await controller.waitForRun({ runId: attached.run_id, observerAgentId: attached.observer!.observer_agent_id,
+        cursor: attached.observer!.cursor, timeoutMs: 5000 });
+      for (let i = 0; !result.completion && i < 5; i++) {
+        expect(result.timed_out).toBe(false);
+        controller.acknowledgeRunEvents({ adminKey: "attach-test-admin", runId: attached.run_id, observerAgentId: attached.observer!.observer_agent_id, cursor: result.cursor });
+        result = await controller.waitForRun({ runId: attached.run_id, observerAgentId: attached.observer!.observer_agent_id, cursor: result.cursor, timeoutMs: 5000 });
+      }
+      expect(result.completion?.outcome).toBe("completed");
+      expect(controller.listEvents({ runId: attached.run_id, limit: 100 }).some(event => event.payload.reason === "backend_nonterminal_observed_during_cleanup")).toBe(false);
+      expect(readFileSync(join(dir, "capture"), "utf8").trim().split("\n")).toHaveLength(1);
+      expect(readFileSync(join(dir, "capture"), "utf8")).toContain(`resume|${thread}|`);
+    } finally { await controller.dispose(); store.close(); }
+  }, 10000);
+  it("preserves queued continuations when the attached current turn is interrupted", async () => {
+    await start();
+    const continuity = resolveCliContinuity(thread, undefined, discoverCliWriter(rollout)!);
+    const id = queueCliMessage(continuity, "Continue after interruption");
+    const adapter = new CodexSessionAdapter();
+    await adapter.interrupt({ backend: "codex-session", id: thread, data: { thread_id: thread, cli_continuity: continuity } });
+    await until(() => cliQueueState(thread).pending === 0);
+    expect(JSON.parse(readFileSync(join(dir, "attached-cli", thread, `${id}.json`), "utf8")).state).toBe("completed");
+    expect(readFileSync(join(dir, "capture"), "utf8").trim().split("\n")).toHaveLength(1);
+  }, 10000);
+  it("fences late attached messages against a durable cancellation before dispatch", async () => {
+    appendFileSync(rollout, row("event_msg", { type: "task_complete" }));
+    const continuity = resolveCliContinuity(thread, "fixture");
+    const store = new SqliteStore(join(dir, "controller.sqlite"));
+    const controller = new AgentController(store, createDefaultAdapterRegistry());
+    try {
+      const run = controller.createRun({ title: "Cancelled attachment" });
+      const worker = controller.registerAgent({ runId: run.run_id, backend: "codex-session", title: "Cancelled worker", status: "stopped",
+        backendHandle: { thread_id: thread, cancel_requested: true } });
+      // Simulate a previously accepted sender appending after another controller's cancellation.
+      const id = queueCliMessage(continuity, "Must not run", { database: store.db.name, agent_id: worker.agent_id, run_id: run.run_id });
+      await until(() => cliQueueState(thread).pending === 0);
+      expect(JSON.parse(readFileSync(join(dir, "attached-cli", thread, `${id}.json`), "utf8")).state).toBe("cancelled");
+      expect(existsSync(join(dir, "capture"))).toBe(false);
+      await expect(controller.sendMessage(worker.agent_id, "Must remain cancelled")).rejects.toThrow("Durable stop intent");
+    } finally { await controller.dispose(); store.close(); }
+  }, 10000);
   it("does not replay an uncertain dispatch after supervisor recovery", async () => {
     appendFileSync(rollout, row("event_msg", { type: "task_complete" }));
     const continuity = resolveCliContinuity(thread, "fixture");

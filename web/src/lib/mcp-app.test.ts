@@ -3,6 +3,15 @@ import { McpConsoleNotificationStore } from "./mcp-app";
 import type { DashboardSnapshot } from "./types";
 
 describe("McpConsoleNotificationStore", () => {
+  it("retains flow selection without a dashboard or a run", () => {
+    const store = new McpConsoleNotificationStore();
+    store.applyToolResult({ structuredContent: { console: { panel_id: "flow-panel", screen: "flows", flow_id: "draft", repo_dir: "/project" } } });
+    expect(store.current().snapshot).toBeNull();
+    expect(store.current().console).toMatchObject({ screen: "flows", flow_id: "draft", repo_dir: "/project" });
+    store.applyToolResult({ structuredContent: { console: { panel_id: "flow-panel", screen: "flows", flow_id: "new", repo_dir: "/project", command_id: "new-selection", action: "reuse" } } });
+    expect(store.current().console?.flow_id).toBe("new");
+  });
+
   it("retains the opener id across input notifications and ignores late results from retired panels", () => {
     const store = new McpConsoleNotificationStore();
     const result = (panel_id: string, action?: string) => ({ structuredContent: {

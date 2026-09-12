@@ -1,5 +1,6 @@
 import type {
   DashboardSnapshot,
+  FlowConfigRecord,
   FlowConditionConfigRecord,
   FlowInstanceRecord,
   FlowRecord,
@@ -461,4 +462,25 @@ function humanizeStepId(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+/** Build an authored graph directly; source inspection never needs a fake run. */
+export function buildFlowDefinitionGraph(config: FlowConfigRecord): { nodes: FlowVisualNode[]; edges: FlowVisualEdge[] } {
+  const stepOrder = orderFlowSteps(config.initial_step, config.steps);
+  const nodes = new Map<string, FlowVisualNode>();
+  const edges: FlowVisualEdge[] = [];
+  const virtualIndexes = new Map<VirtualTargetKind, number>();
+  stepOrder.forEach((stepId, index) => {
+    const step = config.steps[stepId]!;
+    nodes.set(stepNodeId(stepId), { id: stepNodeId(stepId), kind: "step", title: humanizeStepId(stepId),
+      subtitle: step.role ?? "Coordinator", description: step.description ?? null, isCurrent: false,
+      position: stepPosition(index), role: step.role ?? null, stepId, latestStep: null, instanceCount: 0,
+      status: "planned", reportValues: reportEnumValues(step), inputCount: Object.keys(step.inputs ?? {}).length,
+      outputCount: Object.keys(step.outputs ?? {}).length });
+  });
+  for (const [stepId, step] of Object.entries(config.steps)) for (const [eventName, action] of Object.entries(step.on ?? {})) {
+    addActionEdges({ action, edges, eventName, nodes, sourceNodeId: stepNodeId(stepId), sourceStepId: stepId,
+      stepIndex: stepOrder.indexOf(stepId), stepOrder, takenTransitions: new Set(), virtualIndexes });
+  }
+  return { nodes: [...nodes.values()], edges };
 }

@@ -54,8 +54,9 @@ export async function attachWorkerTool(controller: AgentController, input: Recor
     });
     agent = await controller.refreshAgentStatus(agent.agent_id);
   }
+  const cancelled = agent.backend_handle?.cancel_requested === true || ["stopping", "stopped"].includes(controller.getRun(owner.runId).status);
   return { run_id: owner.runId, agent, reused, observer, coordinator_observer: coordinatorObserver,
-    capabilities: { observe: true, read_messages: true, send_message: liveControl || (resumable && Boolean(continuity)) || Boolean(continuity), stop: liveControl || Boolean(writer), resume: liveControl || Boolean(continuity) },
+    capabilities: { observe: true, read_messages: true, send_message: !cancelled && (liveControl || (resumable && Boolean(continuity)) || Boolean(continuity)), stop: liveControl || Boolean(writer), resume: !cancelled && (liveControl || Boolean(continuity)), canInterrupt: !cancelled && (liveControl || Boolean(writer)) },
     control: { endpoint: endpoint ?? "configured local app-server", state: liveControl ? "connected" : continuity ? "cli_bridge" : resumable ? "resumable" : "connection_required",
       message_delivery: !liveControl && continuity ? "queued_after_current_turn" : "app_server", cli_configuration_reason: continuityError ?? null,
       reason: liveControl || resumable || continuity ? null : controlError ?? "Connect to the app-server that owns this active session." },

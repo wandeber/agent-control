@@ -2,7 +2,7 @@
 
 import { usageBreakdown } from "@/lib/agent-presentation";
 import type { AgentCost, ExchangeRate, UsageSnapshotRecord } from "@/lib/types";
-import { costLabel, euroCostLabel } from "@/lib/costs";
+import { costAvailabilityLabel, costLabel, euroCostLabel } from "@/lib/costs";
 import { Bot } from "lucide-react";
 import { useId, useState } from "react";
 import { createPortal } from "react-dom";
@@ -35,7 +35,7 @@ export function AgentUsageIcon({ usage, cost, exchange, className }: { usage: Us
           <div className="flex justify-between font-semibold"><span>Approx. EUR</span><span className="tabular-nums">{euroCostLabel(cost.total, exchange)}</span></div>
           <p className="mt-1 text-[10px] text-ink-400">{exchange.source && exchange.updated_at ? `ECB reference · ${exchange.updated_at}` : "Configured exchange rate"}</p>
         </div> : null}
-        {cost.total.partial ? <p className="mt-2 text-ink-400">{cost.rates ? "+ marks a partial estimate." : "No configured price for this model."}</p> : null}
+        {cost.total.partial ? <p className="mt-2 text-ink-400">{costAvailabilityLabel(cost)}</p> : null}
       </div> : null}
     </div>, document.body)}
   </>;

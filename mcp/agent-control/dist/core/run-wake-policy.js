@@ -1,3 +1,4 @@
+import { PermissionRequests, permissionOwnerMatches } from "./permission-requests.js";
 export function sessionObservationKey(agent) {
     return JSON.stringify([agent.work_generation, agent.work_revision, agent.backend_handle]);
 }
@@ -90,6 +91,14 @@ export class RunWakePolicy {
             this.store.listFlowInstances({ runId: observer.run_id }).some(flow => this.store.listFlowStepInstances(flow.flow_instance_id).some(step => step.status === "active" && sameThread(step.agent_id)));
         const needsInput = event.type === "agent.status_changed" && ["waiting_for_input", "blocked"].includes(String(payload.status)) &&
             Boolean(event.agent_id && !["observer", "orchestrator"].includes(this.store.getAgent(event.agent_id)?.role ?? ""));
+        if (event.type === "agent.status_changed" && payload.permission_state === "pending" && typeof payload.permission_request_id === "string") {
+            const request = new PermissionRequests(this.store.db).get(payload.permission_request_id);
+            const agent = event.agent_id ? this.store.getAgent(event.agent_id) : null;
+            if (request?.state !== "pending" || !agent || agent.unregistered_at || request.agent_id !== agent.agent_id || !permissionOwnerMatches(agent, request))
+                return false;
+            const requester = this.store.db.prepare("select thread_id from run_requesters where run_id=?").get(event.run_id ?? observer.run_id);
+            return operational || requester?.thread_id === observer.backend_handle?.thread_id;
+        }
         if (event.type === "flow.notification") {
             if (payload.reason === "coordinator_gate") {
                 const flowId = typeof payload.flow_instance_id === "string" ? payload.flow_instance_id : undefined;
@@ -131,15 +140,15 @@ export class RunWakePolicy {
     /** A conversation attaching at an existing gate must not miss the event that opened it. */
     initialSequence(runId, observer, owners, current) {
         const rows = this.store.db.prepare(`select e.*, o.sequence from events e join event_order o using(event_id)
-      join flow_step_instances s on s.step_instance_id = json_extract(e.payload_json, '$.step_instance_id')
-      where e.run_id in (select value from json_each(?)) and e.type = 'flow.notification' and s.status = 'active'
-        and json_extract(e.payload_json, '$.reason') = 'coordinator_gate' order by o.sequence`).all(JSON.stringify(this.runIds(runId)));
+      left join flow_step_instances s on s.step_instance_id = json_extract(e.payload_json, '$.step_instance_id')
+      where e.run_id in (select value from json_each(?)) and ((e.type = 'flow.notification' and s.status = 'active' and json_extract(e.payload_json, '$.reason') = 'coordinator_gate')
+        or (e.type = 'agent.status_changed' and json_extract(e.payload_json, '$.permission_state') = 'pending')) order by o.sequence`).all(JSON.stringify(this.runIds(runId)));
         for (const row of rows) {
             if (String(row.run_id) !== runId && !this.store.db.prepare("select 1 from run_observers where run_id = ? and thread_id = ?")
                 .get(String(row.run_id), String(observer.backend_handle?.thread_id ?? "")))
                 continue;
-            const event = { event_id: String(row.event_id), run_id: String(row.run_id), agent_id: null,
-                type: "flow.notification", created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) };
+            const event = { event_id: String(row.event_id), run_id: String(row.run_id), agent_id: row.agent_id ? String(row.agent_id) : null,
+                type: String(row.type), created_at: String(row.created_at), payload: JSON.parse(String(row.payload_json)) };
             if (this.wakes(event, observer, owners))
                 return Math.max(0, Number(row.sequence) - 1);
         }

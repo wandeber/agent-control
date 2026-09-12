@@ -12,6 +12,7 @@ export async function launchWorkerTool(controller, input) {
         phase: String(input.phase ?? "task"), role: input.role,
         repo: input.repo_dir ?? process.cwd(), runId: input.run_id,
         profile: input.profile, sandbox: input.sandbox,
+        approvalPolicy: input.approval_policy,
         model: input.model, reasoningEffort: input.reasoning_effort,
         server: input.server, objective: input.objective,
         outputArtifact: input.output_artifact,

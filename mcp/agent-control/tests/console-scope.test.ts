@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,43 @@ function fixture() {
 }
 
 describe("conversation-scoped console", () => {
+  it("opens and edits flow previews with no runs, with panel-bound project scope and durable selection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "console-preview-"));
+    const project = join(root, "project");
+    const dir = join(project, ".agents", "flows", "draft");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "flow.yaml");
+    writeFileSync(path, "id: draft\ninitial_step: start\nsteps:\n  start:\n    prompt: Original\n");
+    const db = join(root, "state.sqlite");
+    const transport = new StdioClientTransport({ command: process.execPath, args: ["--import", "tsx", "src/index.ts"], cwd: resolve("."), env: { ...process.env, AGENT_CONTROL_HOME: root, AGENT_CONTROL_DB: db, AGENT_CONTROL_POLL_INTERVAL_MS: "0" }, stderr: "pipe" });
+    const client = new Client({ name: "flow-preview-test", version: "1" });
+    const call = (name: string, args: Record<string, unknown>, thread = "owner") => client.callTool({ name, arguments: args, _meta: { threadId: thread } });
+    const data = (result: Awaited<ReturnType<typeof call>>) => result.structuredContent as any;
+    try {
+      await client.connect(transport);
+      const opened = data(await call("open_agent_control_console", { screen: "flows", flow_id: "draft", repo_dir: project }));
+      expect(opened.snapshot).toBeUndefined();
+      const panel = opened.console.panel_id;
+      expect(opened.console).toMatchObject({ screen: "flows", flow_id: "draft", repo_dir: project });
+      expect((await call("agent_control_console_flows", { panel_id: panel }, "another")).isError).toBe(true);
+      expect((await call("agent_control_console_flows", {})).isError).toBe(true);
+      const first = data(await call("agent_control_console_flows", { panel_id: panel }));
+      expect(first.preview.definition.config.steps.start.prompt).toBe("Original");
+      writeFileSync(path, "id: draft\ninitial_step: start\nsteps:\n  start:\n    prompt: Edited\n");
+      const edited = data(await call("agent_control_console_flows", { panel_id: panel, repo_dir: root }));
+      expect(edited.preview.project_dir).toBe(project);
+      expect(edited.preview.definition.config.steps.start.prompt).toBe("Edited");
+      const reused = data(await call("reuse_agent_control_console", { screen: "flows", flow_id: "future" }));
+      const delivered = data(await call("agent_control_console_flows", { panel_id: panel, flow_id: "draft" }));
+      expect(delivered.console.command_id).toBe(reused.console.command_id);
+      const acknowledged = data(await call("agent_control_console_flows", { panel_id: panel, command_id: reused.console.command_id }));
+      expect(acknowledged.console).toMatchObject({ screen: "flows", flow_id: "future", repo_dir: project });
+      expect(acknowledged.console.command_id).toBeUndefined();
+      const store = new SqliteStore(db);
+      try { expect(store.listRuns()).toHaveLength(0); expect(store.listAgents()).toHaveLength(0); } finally { store.close(); }
+    } finally { await client.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("never queues a delayed command into a replacement panel", () => {
     const sessions = new ConsoleSessions();
     const oldPanel = sessions.open("thread-a");

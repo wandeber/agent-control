@@ -1,0 +1,15 @@
+import { approvalRuntime } from "./approval-runtime.js";
+import { startControlServer } from "../../src/control-server.js";
+import { startStaticWebServer } from "../../src/cli/web.js";
+import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
+const fixture = await approvalRuntime();
+process.env.AGENT_CONTROL_HOME = fixture.root; process.env.AGENT_CONTROL_DB = fixture.dbPath;
+await fixture.launch(); fixture.emit(); await fixture.controller.refreshAgentStatus(fixture.agent.agent_id);
+const api = await startControlServer({ host: "localhost", port: 0 });
+const web = await startStaticWebServer({ host: "localhost", port: 0, rootDir: resolve("../../web-runtime") });
+api.setUiOrigin(`http://localhost:${(web.address() as AddressInfo).port}`);
+console.log(JSON.stringify({ url: `http://localhost:${(web.address() as AddressInfo).port}/?apiPort=${(api.server.address() as AddressInfo).port}&run_id=${fixture.run.run_id}`, root: fixture.root, agent: fixture.agent.agent_id }));
+let count = 0;
+process.stdin.setEncoding("utf8"); process.stdin.on("data", command => { if (String(command).trim() === "request") fixture.emit(++count); else if (String(command).trim() === "responses") console.log(JSON.stringify(fixture.responses)); });
+process.on("SIGTERM", async () => { await api.close(); await new Promise<void>(done => web.close(() => done())); await fixture.close(); process.exit(0); });

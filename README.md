@@ -224,8 +224,9 @@ through MCP. The console source is a Next.js app, but normal plugin installs run
 the prebuilt static runtime from `web-runtime`; they do not start Next.js dev or
 require a `.next` directory. The console shows runs, agent relationship graphs,
 draggable nodes, pan/zoom/follow graph controls, goals, heartbeats,
-usage/context metrics, artifacts, events, logs, and read-only agent chat/message
-views.
+usage/context metrics, artifacts, events, logs, and agent chat/message views.
+The shared chat presents compact tool activity with expandable commands,
+inputs, results, and errors.
 
 Inside Codex, open the native side-panel console with the MCP tool:
 
@@ -404,6 +405,45 @@ app-server delivery is durable controller plumbing, but may not live-refresh an
 already-open Codex Desktop view. The receiving thread must continue normally
 from the delivered event; it must not try to force-refresh itself through
 native thread tools.
+
+## Interactive Permissions And Agent Access
+
+Managed `codex-cli` and `codex-thread` workers can expose real runtime permission
+requests in both the shared chat and their graph card. Both controls act on the
+same request: review its command, file changes, or permission scope, then approve
+or reject it. Chat places the request beside its exact tool invocation; the graph
+card opens its details from **Review permission**. Access settings are in a
+compact menu. Available choices come from the owning runtime. When Codex offers
+only cancellation as rejection, the control says **Reject & interrupt**;
+the agent remains available for a later continuation. A decision is not resolved
+until the runtime confirms it. Expired or disconnected requests cannot be
+replayed through another connection.
+
+Opt in at worker creation with MCP `worker_launch`'s
+`approval_policy: "on-request"`. Managed CLI workers also support
+`agentctl worker launch --backend codex-cli --approval-policy on-request`.
+The short-lived `agentctl` launch command cannot own a Codex-thread approval
+channel; use MCP launch for that backend. Existing launch defaults stay intact.
+A denial under `never` is not an approval request that can be granted afterward.
+
+Interactive CLI workers use the selected Codex executable's app-server protocol
+under their detached supervisor, retaining the same session UUID, profile,
+provider, and credentials. `codex exec` has no interactive response channel.
+The profile bridge supports model/provider/reasoning and other scalar model
+settings, boolean feature switches, MCP server enablement, and workspace network
+access. Unsupported profile settings, including profile-relative paths, fail
+before dispatch rather than being dropped. Trusted project configuration keeps
+its precedence; changing transport alone does not widen the sandbox.
+
+The **Access** control is available in the same two views for managed Codex
+workers. It records the user's requested sandbox and approval policy separately
+from the policy the runtime actually reports. Changes apply at the next turn,
+after confirmation by that runtime; they do not interrupt current work or alter
+an existing permission request. An existing managed CLI session can enter the
+interactive transport on that next turn without changing its identity. Attached
+sessions and other backends do not acquire this capability merely by appearing
+in the console. Keep requester observation and its event cursor while awaiting
+a decision, and continue the same execution after resolution.
 
 ## Goals
 
@@ -761,7 +801,8 @@ control capabilities without starting a turn. Reattaching can reconnect the same
 card to its endpoint without resetting its usage baseline or observer cursor.
 
 `agent_send_message` steers a loaded active turn or starts another turn on the
-same idle identity; `agent_stop` interrupts through its owning app-server.
+same idle identity. `agent_stop` with `mode: "interrupt"` interrupts only the current
+turn through its owning app-server or verified CLI writer, retaining queued follow-ups.
 Persisted terminal local sessions can resume on that endpoint with their model,
 provider and directory retained. Independently started local `codex exec` writers
 also support a CLI bridge: messages are persisted and queued behind the current
@@ -772,13 +813,26 @@ Pass `profile` only when the original matching profile cannot be discovered.
 
 CLI interruption requires an exclusive writable rollout descriptor, standalone
 `codex exec` executable, PID and matching process birth time, all rechecked
-before SIGINT. Shared app-server/UI processes are never signalled. `agent_stop`
-also cancels pending messages. A detached supervisor keeps queued work alive
+before SIGINT. Shared app-server/UI processes are never signalled.
+`agent_stop` with `graceful` (the default) or `kill` requests definitive cancellation
+and cancels pending messages; a later message cannot revoke that cancellation.
+Recoverable interruption leaves the agent waiting for input and preserves its
+UUID, configuration, artifacts and existing run observer. Continue that same
+agent and resume `run_wait` with the last acknowledged cursor. A detached supervisor keeps queued work alive
 across MCP reloads; a persisted dispatch fence prevents replay after uncertain
 supervisor failure and exposes it for reconciliation. No second writer or
 replacement session is created. Windows and remote control use the owning
 app-server connection. Run shutdown does not stop attached user work; explicit
-`agent_stop` does.
+`agent_stop` does when cancellation is explicitly requested.
+
+Managed `codex-cli` workers also accept busy follow-ups into a durable FIFO queue.
+One detached supervisor dispatches them serially using the persisted session UUID,
+profile, sandbox and worker credential. It rechecks the profile before every turn;
+an interrupted idle worker remains resumable, while a durable cancellation fences
+both queued and late-arriving messages. An interrupted turn is not successful
+completion. The same run observation remains active across continuation and MCP
+restart. A legacy supervisor already running during an update must finish before
+using recoverable interruption; do not replace its session or edit runtime records.
 
 Public rollout events (including completions between reads) and remote
 app-server status support `run_wait`/`run_ack`; observation is restored after
@@ -956,3 +1010,18 @@ Only model and reasoning effort are overridable here. Model fields do not expand
 environment variables; backend/authentication settings remain separate. Use
 `flow-configurator` for deterministic inspection and editing of project model
 preferences in `.agents/models.toml`.
+
+### Permission decisions and shared canvas positions
+
+Managed Codex workers launched with `approval_policy: "on-request"` expose actual native requests through `permission_list` (by `run_id`) and `permission_decide` (`agent_id`, `request_id`, `decision`). Review the complete scope and supported choices first. Decide only within the user's explicit authorization, including a delegation to approve safe, necessary requests. These tools do not change blanket access. `submitting` records the response, `sent` hands it to Codex, and `resolved` confirms native acknowledgement. The same decision can be read again safely; a conflicting or stale decision cannot replace it. Pending requests wake the original conversation through `run_wait`, including when a flow owns the worker. Acknowledge handled events and resume the long wait while work remains.
+
+`canvas_positions_get` returns a run's persisted overrides and revision. `canvas_positions_set` atomically patches `positions: [{agent_id, x, y}]` with `expected_revision`. Coordinates are relative to that run, independent of camera zoom or other displayed runs. Omitted agents keep their positions; derived team/frame nodes cannot be moved through this API. A stale revision requires reading and assessing the new layout before retrying. Dragging and Organize use the same storage; single-run browser layouts are migrated on first use. Access policy stays in the conversation inspector, while pending requests fit directly inside the agent card.
+
+Both APIs authorize the original requester pinned by an administrator-authorized launch or reattachment, using host-supplied MCP identity. Worker tokens and self-registered observers do not confer operator rights. Older runs can be reattached through an authorized `run_observe` to establish the binding. The CLI requires an explicit administrator credential (`AGENT_CONTROL_ADMIN_KEY`); it never silently loads the stored key for these operations. Keep that credential out of prompts and artifacts.
+
+```sh
+agentctl permission list --run RUN_ID
+agentctl permission decide --agent AGENT_ID --request REQUEST_ID --decision approve
+agentctl canvas positions get --run RUN_ID
+agentctl canvas positions set --run RUN_ID --revision 0 --file positions.json
+```

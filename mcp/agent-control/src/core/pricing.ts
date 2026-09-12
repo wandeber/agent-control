@@ -12,7 +12,7 @@ export interface TokenRates {
   output_per_million: number;
 }
 export interface CostAmount { usd: number | null; partial: boolean }
-export interface PriceReference { model: string; source: string; basis: string }
+export interface PriceReference { model: string; source: string; basis: string; updated_at?: string }
 export interface ExchangeRate { usd_per_eur: number; source: string | null; updated_at: string | null }
 export interface CostBreakdown {
   input: CostAmount;

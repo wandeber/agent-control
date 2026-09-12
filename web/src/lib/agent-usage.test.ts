@@ -11,7 +11,7 @@ describe("agent token consumption", () => {
   });
   it("preserves reported zero and partial counts without inventing missing values", () => {
     expect(agentTokenLabel(usage({ input_tokens: 1200, output_tokens: 0 }))).toBe("1,200 in · 0 out tokens");
-    expect(agentTokenLabel(usage({ total_tokens: 1400 }))).toBe("1,400 total tokens");
+    expect(agentTokenLabel(usage({ total_tokens: 1400 }))).toBeNull();
     expect(agentTokenLabel(usage({ input_tokens: -1, output_tokens: NaN }))).toBeNull();
   });
 });

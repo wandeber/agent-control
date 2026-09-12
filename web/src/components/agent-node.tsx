@@ -1,12 +1,13 @@
 "use client";
 
+import { PermissionRequests } from "./permission-request";
 import { AgentChatPreview } from "./agent-chat-preview";
 import { AgentUsageIcon } from "./agent-usage-icon";
 import { agentModelLabel } from "@/lib/agent-presentation";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { MessageSquare, Wrench } from "lucide-react";
 import { STATUS_STYLE } from "@/lib/format";
-import type { AgentRecord } from "@/lib/types";
+import type { AgentRecord, PermissionRequest, AgentAccessSnapshot } from "@/lib/types";
 import type { agentPresentation } from "@/lib/agent-presentation";
 import { StatusDot } from "./ui";
 
@@ -17,6 +18,8 @@ export interface AgentNodeData extends Record<string, unknown> {
   agent: AgentRecord;
   presentation: ReturnType<typeof agentPresentation>;
   selected: boolean;
+  permissionRequests?: PermissionRequest[];
+  access?: AgentAccessSnapshot;
   onSelect: () => void;
 }
 
@@ -32,7 +35,7 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
       aria-pressed={data.selected}
       aria-label={`${data.presentation.title}. ${style.label}${data.presentation.phase ? `. ${data.presentation.phase}` : ""}. ${data.presentation.activity}`}
       onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
+        if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
           event.preventDefault(); event.stopPropagation(); data.onSelect();
         }
       }}
@@ -67,11 +70,12 @@ export function AgentNode({ data }: NodeProps<AgentFlowNode>) {
           {data.presentation.phase}
         </div>
       ) : null}
-      <AgentChatPreview agentId={data.agent.agent_id}><div className="mt-2.5 flex min-w-0 items-center gap-2 border-t border-black/5 pt-2.5 text-xs text-ink-600"
+      <PermissionRequests requests={data.permissionRequests ?? []} compact />
+      {data.presentation.activity ? <AgentChatPreview agentId={data.agent.agent_id}><div className="mt-2.5 flex min-w-0 items-center gap-2 border-t border-black/5 pt-2.5 text-xs text-ink-600"
         data-agent-activity={data.presentation.kind}>
         <ActivityIcon className="size-3.5 shrink-0 text-ink-400" />
         <span className="truncate">{data.presentation.activity}</span>
-      </div></AgentChatPreview>
+      </div></AgentChatPreview> : null}
     </div>
   );
 }

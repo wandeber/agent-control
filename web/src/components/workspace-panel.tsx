@@ -1,5 +1,10 @@
 "use client";
 
+import { mergeToolMessages, permissionsForTool, readToolActivity } from "@/lib/tool-activity";
+import { AgentAccess } from "./agent-access";
+import { PermissionRequests } from "./permission-request";
+import { ToolActivityRow } from "./tool-activity";
+
 import { agentTokenLabel, agentModelLabel } from "@/lib/agent-presentation";
 import { AgentCostLabel } from "./agent-cost-label";
 
@@ -29,7 +34,7 @@ import { compactId, formatDateTime, safeJson } from "@/lib/format";
 import { agentFlowSteps, artifactReferencesFlowStep, eventReferencesFlowStep, flowStepOrdinal } from "@/lib/flow-steps";
 import { buildFlowEvidenceView } from "@/lib/flow-evidence";
 import { shouldTryMcpApp } from "@/lib/mcp-app";
-import type { AgentLogTail, AgentMessage, ArtifactRecord, DashboardSnapshot, EventRecord, FlowStepInstanceRecord } from "@/lib/types";
+import type { AgentLogTail, AgentMessage, ArtifactRecord, DashboardSnapshot, EventRecord, FlowStepInstanceRecord, PermissionRequest } from "@/lib/types";
 import {
   MAX_AGENT_MESSAGE_LIMIT,
   agentLogQueryKey,
@@ -126,6 +131,7 @@ export function WorkspacePanel({
             </div>
           </div>
           <div className="workspace-tabs flex shrink-0 items-center gap-1">
+            <AgentAccess key={agentId} snapshot={snapshot.agent_access?.find(item => item.agent_id === agentId)} />
             <TabButton active={tab === "chat"} icon={MessageSquareText} label="Chat" onClick={() => setTab("chat")} />
             <TabButton active={tab === "events"} icon={ListTree} label="Events" onClick={() => setTab("events")} />
             <TabButton active={tab === "artifacts"} icon={Files} label="Artifacts" onClick={() => setTab("artifacts")} />
@@ -144,6 +150,7 @@ export function WorkspacePanel({
               log={activeLog}
               selectedStep={selectedStep}
               messages={messages.data ?? []}
+              permissions={(snapshot.permission_requests ?? []).filter(request => request.agent_id === agentId)}
               onRequestOlder={onRequestOlderMessages}
               requestedLimit={messageLimit}
               compact
@@ -255,7 +262,8 @@ export function ChatView({
   compact,
   error,
   loading,
-  showSidecar
+  showSidecar,
+  permissions = []
 }: {
   agentId: string | null;
   artifacts: ArtifactRecord[];
@@ -269,6 +277,7 @@ export function ChatView({
   error: Error | null;
   loading: boolean;
   showSidecar: boolean;
+  permissions?: PermissionRequest[];
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const previousAgentRef = useRef<string | null>(null);
@@ -291,6 +300,9 @@ export function ChatView({
   const hiddenBefore = visibleStart;
   const hiddenAfter = Math.max(0, blocks.length - visibleStart - visibleBlocks.length);
   const todoItems = extractTodoItems(blocks);
+  const linkedPermissions = new Set(compact ? visibleBlocks.flatMap(turn => turn.parts.flatMap(part => permissionsForTool(part.metadata, permissions).map(request => request.request_id))) : []);
+  const unlinkedPermissions = permissions.filter(request => !linkedPermissions.has(request.request_id) && ["pending", "submitting", "sent"].includes(request.state));
+  const pendingKey = permissions.filter(request => request.state === "pending").map(request => request.request_id).join(":");
 
   const scheduleScrollToBottom = (behavior: ScrollBehavior = "auto") => {
     // The message list and the Todo overlay both change height after a new
@@ -332,16 +344,20 @@ export function ChatView({
     previousBlockCountRef.current = blocks.length;
   }, [agentId, blocks.length, maxWindowStart, windowStart]);
 
-  if (blocks.length === 0 && error) {
+  useEffect(() => {
+    if (pendingKey && isAtBottomRef.current) scheduleScrollToBottom();
+  }, [pendingKey]);
+
+  if (blocks.length === 0 && error && !unlinkedPermissions.length) {
     // Connection state belongs in the compact header, never over the chat.
     return null;
   }
 
-  if (blocks.length === 0 && loading) {
+  if (blocks.length === 0 && loading && !unlinkedPermissions.length) {
     return <EmptyState detail="Loading messages and runtime output." title="Loading thread" />;
   }
 
-  if (blocks.length === 0) {
+  if (blocks.length === 0 && !unlinkedPermissions.length) {
     return <EmptyState detail="No messages or log tail are available for this agent yet." title="Quiet thread" />;
   }
 
@@ -383,7 +399,7 @@ export function ChatView({
         }}
         ref={scrollRef}
       >
-        <div className="mx-auto flex max-w-4xl flex-col gap-3">
+        <div className="chat-transcript mx-auto flex w-full flex-col gap-3">
           <HistoryWindowControl
             count={hiddenBefore}
             label={hasMoreServerHistory && visibleStart === 0 ? "Load older thread history" : "Show older loaded messages"}
@@ -391,7 +407,7 @@ export function ChatView({
             visible={hiddenBefore > 0 || hasMoreServerHistory}
           />
           {visibleBlocks.map((turn, index) => (
-            <TurnBlock artifacts={artifacts} compact={compact} key={`${turn.id}-${index}`} turn={turn} />
+            <TurnBlock artifacts={artifacts} compact={compact} key={`${turn.id}-${index}`} turn={turn} permissions={permissions} />
           ))}
           <HistoryWindowControl
             count={hiddenAfter}
@@ -399,6 +415,7 @@ export function ChatView({
             onClick={showNewer}
             visible={hiddenAfter > 0}
           />
+          <PermissionRequests requests={unlinkedPermissions} />
         </div>
       </div>
       {showScrollToBottom ? (
@@ -591,7 +608,7 @@ function normalizeMessages(messages: AgentMessage[]): RenderThreadTurn[] {
   const turns: RenderThreadTurn[] = [];
   const turnIndex = new Map<string, RenderThreadTurn>();
 
-  messages.forEach((message, index) => {
+  mergeToolMessages(messages).forEach((message, index) => {
     const role = normalizeRenderRole(message.role);
     const part: RenderMessagePart = {
       id: message.id ?? `message-${index}`,
@@ -696,9 +713,9 @@ function parseLogTail(tail: string): RenderThreadTurn[] {
   });
 }
 
-function TurnBlock({ artifacts, compact, turn }: { artifacts: ArtifactRecord[]; compact: boolean; turn: RenderThreadTurn }) {
+function TurnBlock({ artifacts, compact, turn, permissions }: { artifacts: ArtifactRecord[]; compact: boolean; turn: RenderThreadTurn; permissions: PermissionRequest[] }) {
   if (compact) {
-    return <CodexTurnBlock artifacts={artifacts} turn={turn} />;
+    return <CodexTurnBlock artifacts={artifacts} turn={turn} permissions={permissions} />;
   }
 
   if (turn.role === "user") {
@@ -730,7 +747,7 @@ function TurnBlock({ artifacts, compact, turn }: { artifacts: ArtifactRecord[]; 
  * are bubbles, assistant prose has no repeated role label, and tools or
  * reasoning are compact disclosure rows.
  */
-function CodexTurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn: RenderThreadTurn }) {
+function CodexTurnBlock({ artifacts, turn, permissions }: { artifacts: ArtifactRecord[]; turn: RenderThreadTurn; permissions: PermissionRequest[] }) {
   if (turn.role === "user") {
     return (
       <article className="codex-user-turn">
@@ -746,6 +763,15 @@ function CodexTurnBlock({ artifacts, turn }: { artifacts: ArtifactRecord[]; turn
   return (
     <article className="codex-assistant-turn">
       {turn.parts.map((part, index) => {
+        const tool = readToolActivity(part.metadata);
+        if (tool) {
+          const requests = permissionsForTool(part.metadata, permissions);
+          const waiting = requests.some(request => ["pending", "submitting", "sent"].includes(request.state));
+          return <div key={tool.call_id}>
+            {!waiting && <ToolActivityRow tool={tool} />}
+            <PermissionRequests requests={requests} />
+          </div>;
+        }
         const isTool = part.kind === "tool";
         const isReasoning = part.kind === "reasoning";
         if (!isTool && !isReasoning) {

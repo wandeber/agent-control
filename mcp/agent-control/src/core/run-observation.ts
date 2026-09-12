@@ -27,6 +27,7 @@ const MATCHING_OBSERVER_SUBSCRIPTION = `exists (
 export const DEFAULT_OBSERVER_EVENTS: EventType[] = [...EVENT_TYPES];
 
 export interface ObserveRunInput {
+  authorizeOperator?: boolean; // Internal provenance; never an MCP/CLI argument.
   runId: string;
   threadId?: string;
   title?: string;
@@ -103,7 +104,11 @@ export class RunObservation {
       process.env.AGENT_CONTROL_REQUESTER_THREAD_ID ?? currentCodexThreadId();
     // Headless/non-Codex callers have no conversation to fabricate.
     if (!threadId) return null;
-    return this.observe({ runId, threadId, eventTypes: input.requesterEventTypes,
+    // Child runs inherit only the verified operator of their actual parent.
+    this.store.db.prepare(`insert or ignore into run_operator_bindings(run_id, thread_id)
+      select r.run_id, b.thread_id from runs r join run_operator_bindings b on b.run_id=r.parent_run_id where r.run_id=?`).run(runId);
+    const operator = this.store.db.prepare("select thread_id from run_operator_bindings where run_id=?").get(runId) as { thread_id: string } | undefined;
+    return this.observe({ runId, threadId: operator?.thread_id ?? threadId, authorizeOperator: false, eventTypes: input.requesterEventTypes,
       delivery: input.requesterDelivery, agentToken: input.agentToken,
       adminKey: input.adminKey ?? (caller ? undefined : resolveAdminKey()) });
   }
@@ -195,6 +200,12 @@ export class RunObservation {
         });
       }
       this.store.db.prepare("insert or ignore into run_requesters(run_id, thread_id) values (?, ?)").run(run.run_id, threadId);
+      // Observation alone never grants permission/canvas authority. Only a local
+      // admin-authorized launch or explicit reattachment can pin the operator.
+      if (input.authorizeOperator !== false && !caller && input.adminKey && verifyAdminKey(input.adminKey)) {
+        this.store.db.prepare(`insert or ignore into run_operator_bindings(run_id, thread_id)
+          select run_id, thread_id from run_requesters where run_id=? and thread_id=?`).run(run.run_id, threadId);
+      }
       const start = previous?.start_sequence ?? this.wakePolicy.initialSequence(run.run_id, agent,
         this.observationOwners(agent, run.run_id), this.currentSequence());
       this.store.db.prepare(`insert into run_observers(observer_agent_id, run_id, thread_id, events_json, delivery, start_sequence, created_at)
@@ -398,6 +409,7 @@ function publicEvent(event: EventRecord, owners: string[] = [], notificationStat
   const flow = typeof event.payload.flow_instance_id === "string" ? event.payload.flow_instance_id : undefined;
   return { event_id: event.event_id, run_id: event.run_id, type: event.type, created_at: event.created_at, agent_id: event.agent_id,
     ...compactFlowEvent(event),
+    ...(typeof event.payload.permission_request_id === "string" ? { permission_request_id: event.payload.permission_request_id, permission_state: event.payload.permission_state } : {}),
     ...(event.payload.reason === "coordinator_gate" && event.payload.decision ? {
       decision: Object.fromEntries(Object.entries(event.payload.decision as Record<string, unknown>)
         .filter(([key]) => ["key", "artifact_key", "owner", "authority"].includes(key)))

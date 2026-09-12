@@ -96,9 +96,11 @@ export function browserOpenCommand(url: string, platform = process.platform, wsl
   return ["xdg-open", [url]];
 }
 
-export async function openBrowserConsole(runId?: string, screen: "console" | "subagents" = "console"): Promise<{ url: string }> {
+export async function openBrowserConsole(runId?: string, screen: "console" | "subagents" | "flows" = "console", preview?: { flow_id?: string; repo_dir?: string }): Promise<{ url: string }> {
   const url = new URL(await ensureBrowserConsole());
   if (runId) url.searchParams.set("run_id", runId);
+  if (preview?.flow_id) url.searchParams.set("flow_id", preview.flow_id);
+  if (preview?.repo_dir) url.searchParams.set("repo_dir", preview.repo_dir);
   url.hash = `/${screen}`;
   const [command, args] = browserOpenCommand(url.href);
   await promisify(execFile)(command, args, { timeout: 5000, windowsHide: true });
@@ -110,6 +112,7 @@ async function serve(recordPath: string, instanceId: string): Promise<void> {
   let web;
   try { web = await startStaticWebServer({ host: "localhost", port: 0, rootDir: join(pluginRoot, "web-runtime"), instanceId }); }
   catch (error) { await api.close(); throw error; }
+  api.setUiOrigin(`http://localhost:${(web.address() as AddressInfo).port}`);
   const url = `http://localhost:${(web.address() as AddressInfo).port}/?apiPort=${(api.server.address() as AddressInfo).port}`;
   const temporary = `${recordPath}.${process.pid}.tmp`;
   try {

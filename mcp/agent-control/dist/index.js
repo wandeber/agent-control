@@ -1,3 +1,4 @@
+import { canvasSetSchema } from "./tools/schemas.js";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,8 @@ import { errorToPayload } from "./core/errors.js";
 import { currentCodexThreadId, withMcpCaller } from "./core/caller-context.js";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
 import { loadConsoleSnapshot } from "./console-tools.js";
+import { previewFlowCatalog } from "./core/flow-preview.js";
+import { readCodexSession } from "./adapters/codex-session.js";
 import { ConsoleSessions } from "./console-sessions.js";
 import { openBrowserConsole } from "./browser-console.js";
 import { escapeInlineScript } from "./inline-script.js";
@@ -34,7 +37,24 @@ const MODEL_CONSOLE_META = {
 };
 const consoleSessions = new ConsoleSessions();
 const PANEL_ID_PROPERTY = { panel_id: { type: "string", description: "Panel identity returned when this console was opened." } };
+const FLOW_SELECTION_PROPERTIES = {
+    screen: { type: "string", enum: ["console", "subagents", "flows"], description: "Select Flows to inspect or live-preview a definition without starting a run." },
+    flow_id: { type: "string", description: "Catalog flow ID to preview, including a new flow being authored." },
+    repo_dir: { type: "string", description: "Absolute task project directory for local flows and model overrides. Inferred from the calling thread when omitted." }
+};
 const APP_TOOL_DEFINITIONS = [
+    { name: "agent_control_console_canvas_positions", description: "App-only. Persist a node drag or organize action for a run associated with this panel.",
+        inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, run_id: { type: "string" }, expected_revision: { type: "integer" }, positions: { type: "array", items: { type: "object", properties: { agent_id: { type: "string" }, x: { type: "number" }, y: { type: "number" } }, required: ["agent_id", "x", "y"], additionalProperties: false } } }, required: ["panel_id", "run_id", "expected_revision", "positions"], additionalProperties: false }, _meta: APP_TOOL_META },
+    { name: "agent_control_console_access_request", description: "App-only. Set this agent's explicit access policy for its next turn; never interrupts work or grants the current pending permission.",
+        inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, agent_id: { type: "string" }, revision: { type: "number" }, policy: { type: "object", properties: { sandbox: { type: "string", enum: ["read_only", "workspace", "full_access"] }, approval_policy: { type: "string", enum: ["on-request", "never", "untrusted"] } }, required: ["sandbox", "approval_policy"], additionalProperties: false } }, required: ["panel_id", "agent_id", "revision", "policy"], additionalProperties: false }, _meta: APP_TOOL_META },
+    { name: "agent_control_console_permission_decide", description: "App-only. Submit the user's explicit decision for a live backend permission request in this panel's run.",
+        inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, agent_id: { type: "string" }, request_id: { type: "string" }, decision: { type: "string", enum: ["approve", "reject"] } }, required: ["panel_id", "agent_id", "request_id", "decision"], additionalProperties: false }, _meta: APP_TOOL_META },
+    {
+        name: "agent_control_console_flows",
+        description: "App-only. Read catalog definitions and prompt files in this panel project; never launches work.",
+        inputSchema: { type: "object", properties: { ...PANEL_ID_PROPERTY, flow_id: { type: "string" }, command_id: { type: "string" } }, required: ["panel_id"], additionalProperties: false },
+        _meta: APP_TOOL_META
+    },
     {
         name: "agent_control_console_snapshot",
         description: "App-only. Return the Agent Control dashboard snapshot for the console.",
@@ -91,7 +111,8 @@ const APP_TOOL_DEFINITIONS = [
             properties: {
                 ...PANEL_ID_PROPERTY,
                 run_id: { type: "string" },
-                screen: { type: "string", enum: ["console", "subagents"] }
+                flow_id: { type: "string" },
+                screen: { type: "string", enum: ["console", "subagents", "flows"] }
             },
             required: ["panel_id"],
             additionalProperties: false
@@ -101,10 +122,11 @@ const APP_TOOL_DEFINITIONS = [
 ];
 const OPEN_CONSOLE_TOOL = {
     name: "open_agent_control_console",
-    description: "Open the native Agent Control panel for the calling Codex conversation. Only its associated runs are visible, using the host thread identity automatically. Pin run_id when supplied or follow its latest run. Call this once, then reuse the existing panel. The Full screen button opens the global console in the system browser.",
+    description: "Show a flow before execution with screen: flows, flow_id and the task repo_dir; the view follows source edits without a run. Open the native Agent Control panel for the calling Codex conversation. Only its associated runs are visible, using the host thread identity automatically. Pin run_id when supplied or follow its latest run. Call this once, then reuse the existing panel. The Full screen button opens the global console in the system browser.",
     inputSchema: {
         type: "object",
         properties: {
+            ...FLOW_SELECTION_PROPERTIES,
             run_id: { type: "string", description: "Optional run id to select when opening the console." }
         },
         additionalProperties: false
@@ -113,10 +135,11 @@ const OPEN_CONSOLE_TOOL = {
 };
 const REUSE_CONSOLE_TOOL = {
     name: "reuse_agent_control_console",
-    description: "Reuse and update the already-open Agent Control panel without opening another tab. Optionally pin run_id; use this after the first open_agent_control_console call.",
+    description: "Reuse and update the already-open Agent Control panel without opening another tab. Set screen: flows, flow_id and repo_dir to live-preview source definitions while authoring, without starting work. Optionally pin run_id; use this after the first open_agent_control_console call.",
     inputSchema: {
         type: "object",
         properties: {
+            ...FLOW_SELECTION_PROPERTIES,
             run_id: { type: "string", description: "Optional run id to select in the existing panel." }
         },
         additionalProperties: false
@@ -242,9 +265,11 @@ async function handleConsoleTool(name, input) {
     if (name === "open_agent_control_console") {
         const runId = stringField(input, "run_id");
         const threadId = currentCodexThreadId();
-        const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: threadId ?? null });
-        const session = consoleSessions.open(threadId);
-        const structuredContent = { ...snapshot, console: { ...snapshot.console, panel_id: session.id } };
+        const selection = consoleFlowSelection(input, threadId);
+        const snapshot = selection.screen === "flows" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
+            : await loadConsoleSnapshot(controller, runId, { threadId: threadId ?? null });
+        const session = consoleSessions.open(threadId, selection);
+        const structuredContent = { ...snapshot, console: { ...snapshot.console, ...session.selection, panel_id: session.id } };
         return {
             content: [
                 {
@@ -260,14 +285,17 @@ async function handleConsoleTool(name, input) {
         const runId = stringField(input, "run_id");
         const threadId = currentCodexThreadId();
         const session = consoleSessions.get(threadId);
-        const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
-        const command = consoleSessions.queue(session, "reuse", runId).command;
+        const selection = consoleFlowSelection(input, threadId, session.selection.repo_dir);
+        const snapshot = selection.screen === "flows" ? { console: { requested_run_id: runId ?? null, follow_latest: !runId } }
+            : await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
+        const command = consoleSessions.queue(session, "reuse", runId, selection).command;
         return {
             content: [{ type: "text", text: "Reused Agent Control console." }],
             structuredContent: {
                 ...snapshot,
                 console: {
                     ...snapshot.console,
+                    ...session.selection,
                     panel_id: session.id,
                     action: command.action,
                     command_id: command.command_id
@@ -291,16 +319,43 @@ async function handleConsoleTool(name, input) {
             }
         };
     }
+    if (name === "agent_control_console_flows") {
+        const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+        consoleSessions.acknowledge(session, stringField(input, "command_id"));
+        const preview = previewFlowCatalog(session.selection.repo_dir, stringField(input, "flow_id") ?? session.selection.flow_id);
+        return { content: [{ type: "text", text: "Loaded flow source preview." }], structuredContent: { preview, console: { ...session.selection, ...session.command, panel_id: session.id } } };
+    }
     if (name === "agent_control_console_snapshot") {
         const runId = stringField(input, "run_id");
         const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
         const snapshot = await loadConsoleSnapshot(controller, runId, { threadId: session.threadId });
         consoleSessions.acknowledge(session, stringField(input, "command_id"));
-        const structuredContent = { ...snapshot, console: { ...(session.command ?? snapshot.console), panel_id: session.id } };
+        const structuredContent = { ...snapshot, console: { ...session.selection, ...(session.command ?? snapshot.console), panel_id: session.id } };
         return {
             content: [{ type: "text", text: "Loaded Agent Control dashboard snapshot." }],
             structuredContent
         };
+    }
+    if (name === "agent_control_console_canvas_positions") {
+        const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));
+        const { panel_id, ...args } = input;
+        const parsed = canvasSetSchema.parse(args);
+        if (!store.listConsoleRuns(session.threadId).some(run => run.run_id === parsed.run_id))
+            throw new Error("This run is not associated with this Codex conversation.");
+        return { content: [{ type: "text", text: "Saved canvas positions." }], structuredContent: { canvas_positions: controller.setCanvasPositions(parsed.run_id, parsed.expected_revision, parsed.positions) } };
+    }
+    if (name === "agent_control_console_access_request") {
+        const agentId = requiredStringField(input, "agent_id");
+        assertConsoleAgent(input, agentId);
+        return { content: [{ type: "text", text: "Saved requested access for the next turn." }], structuredContent: { access: controller.requestAgentAccess(agentId, input.policy, numberField(input, "revision", -1)) } };
+    }
+    if (name === "agent_control_console_permission_decide") {
+        const agentId = requiredStringField(input, "agent_id");
+        assertConsoleAgent(input, agentId);
+        const decision = requiredStringField(input, "decision");
+        if (decision !== "approve" && decision !== "reject")
+            throw new Error("Invalid permission decision.");
+        return { content: [{ type: "text", text: "Submitted backend permission decision." }], structuredContent: { permission: controller.decidePermission(agentId, requiredStringField(input, "request_id"), decision) } };
     }
     if (name === "agent_control_console_agent_messages") {
         const agentId = requiredStringField(input, "agent_id");
@@ -325,10 +380,17 @@ async function handleConsoleTool(name, input) {
         const runId = stringField(input, "run_id");
         if (runId)
             controller.getDashboardSnapshot(runId, { threadId: session.threadId });
-        const result = await openBrowserConsole(runId, stringField(input, "screen") === "subagents" ? "subagents" : "console");
+        const result = await openBrowserConsole(runId, stringField(input, "screen") === "flows" ? "flows" : stringField(input, "screen") === "subagents" ? "subagents" : "console", { ...session.selection, flow_id: stringField(input, "flow_id") ?? session.selection.flow_id });
         return { content: [{ type: "text", text: "Opened the global console in the system browser." }], structuredContent: result };
     }
     return null;
+}
+function consoleFlowSelection(input, threadId, previousRepo) {
+    const screen = stringField(input, "screen");
+    const repo = stringField(input, "repo_dir") ?? previousRepo ?? (threadId ? readCodexSession(threadId)?.cwd : undefined);
+    return { ...(screen === "flows" || screen === "console" || screen === "subagents" ? { screen } : {}),
+        ...(stringField(input, "flow_id") ? { flow_id: stringField(input, "flow_id") } : {}),
+        ...(repo ? { repo_dir: resolve(repo) } : {}) };
 }
 function assertConsoleAgent(input, agentId) {
     const session = consoleSessions.forApp(currentCodexThreadId(), stringField(input, "panel_id"));

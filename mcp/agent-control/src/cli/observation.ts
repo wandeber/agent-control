@@ -36,7 +36,8 @@ export function registerObservationCommands(run: Command, deps: CliDeps): void {
     .action((options: { run: string; threadId?: string; title?: string; event: EventType[]; delivery: "wait" | "notify" }) => {
       const auth = deps.authOptions({ allowStoredAdminKey: true });
       deps.output(deps.controller.observeRun({ runId: options.run, threadId: options.threadId, title: options.title,
-        eventTypes: options.event.length ? options.event : undefined, delivery: options.delivery, ...auth }));
+        eventTypes: options.event.length ? options.event : undefined, delivery: options.delivery, ...auth,
+        authorizeOperator: Boolean(deps.authOptions().adminKey) && !auth.agentToken }));
     });
   run.command("wait")
     .description("Wait for subscribed events with a durable cursor. Keep the turn open while work remains; answer user messages and resume this wait. Omit timeout for indefinite waiting, or use 1h.")

@@ -45,9 +45,28 @@ describe("existing Codex session observation", () => {
     const adapter = new CodexSessionAdapter(), handle = { backend: adapter.kind, id: thread, data: first.agent.backend_handle! };
     expect((await adapter.readLatest(handle, { limit: 1 }))[0]?.text).toBe("DONE");
     expect(adapter.readUsage(handle)?.input_tokens).toBe(100);
-    await expect(adapter.stop(handle)).rejects.toThrow("Control endpoint disconnected");
+    expect((await adapter.stop(handle)).status).toBe("stopped");
     appendFileSync(path, row("event_msg", { type: "task_started", turn_id: "turn-2" }));
     expect((await controller.refreshAgentStatus(first.agent.agent_id)).status).toBe("running");
+  });
+  it("reports a local aborted turn as resumable input and wakes the existing control observer", async () => {
+    appendFileSync(path, row("event_msg", { type: "task_started", turn_id: "active" }));
+    const attached = await withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread }));
+    appendFileSync(path, row("event_msg", { type: "turn_aborted", turn_id: "active" }));
+    const result = await controller.waitForRun({ runId: attached.run_id, observerAgentId: attached.observer!.observer_agent_id,
+      cursor: attached.observer!.cursor, timeoutMs: 3000 });
+    expect(result.timed_out).toBe(false);
+    expect(result.completion).toBeNull();
+    expect(controller.getAgent(attached.agent.agent_id).status).toBe("waiting_for_input");
+    expect(controller.listEvents({ runId: attached.run_id, limit: 100 }).some(event => event.payload.reason === "turn_interrupted" && event.payload.status === "waiting_for_input")).toBe(true);
+  });
+  it("interrupts the preferred app-server even while its local rollout still shows an older completed turn", async () => {
+    appendFileSync(path, row("event_msg", { type: "task_complete", turn_id: "old" }));
+    const request = vi.mocked(CodexAppServerClient.prototype.request);
+    request.mockImplementation(async method => method === "thread/read" ? { thread: { id: thread, cwd: home, status: { type: "active" }, turns: [{ id: "new-active", status: "inProgress" }] } } : {});
+    const attached = await withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread, server: "ws://localhost:1234" }));
+    await controller.stopAgent(attached.agent.agent_id, "interrupt");
+    expect(request).toHaveBeenCalledWith("turn/interrupt", { threadId: thread, turnId: "new-active" });
   });
   it("requires readable exact identity before creating a run", async () => {
     await expect(attachWorkerTool(controller, { thread_id: requester })).rejects.toThrow("not readable");
@@ -81,11 +100,11 @@ describe("existing Codex session observation", () => {
     await controller.refreshAgentStatus(attached.agent.agent_id);
     expect(controller.listEvents({ runId: attached.run_id, limit: 100 }).filter(e => e.type === "agent.completed")).toHaveLength(2);
   });
-  it("rejects stop without corrupting the active external worker and skips it during run shutdown", async () => {
+  it("keeps failed interruption recoverable and skips the attached worker during run shutdown", async () => {
     appendFileSync(path, row("event_msg", { type: "task_started" }));
     const attached = await withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread }));
-    await expect(controller.stopAgent(attached.agent.agent_id)).rejects.toThrow("Control endpoint disconnected");
-    expect(controller.getAgent(attached.agent.agent_id).status).toBe("running");
+    await expect(controller.stopAgent(attached.agent.agent_id, "interrupt")).rejects.toThrow("Control endpoint disconnected");
+    expect((await controller.refreshAgentStatus(attached.agent.agent_id)).status).toBe("running");
     await controller.shutdownRun(attached.run_id);
     expect(readCodexSession(thread)?.status).toBe("running");
     expect(controller.listEvents({ runId: attached.run_id, limit: 100 }).some(e => e.type === "agent.failed")).toBe(false);

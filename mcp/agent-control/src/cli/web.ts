@@ -85,7 +85,7 @@ export function registerWebCommands(program: Command, output: (value: unknown) =
           throw new Error(`Agent Control web package not found: ${webDir}`);
         }
 
-        const running = await startControlServer({ host: options.host, port: options.apiPort });
+        const running = await startControlServer({ host: options.host, port: options.apiPort, uiOrigin: `http://localhost:${options.port}` });
         const webUrl =
           options.apiPort === options.port + 1
             ? `http://${options.host}:${options.port}`

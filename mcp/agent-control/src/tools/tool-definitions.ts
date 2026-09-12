@@ -1,3 +1,4 @@
+import { permissionListSchema, permissionDecideSchema, canvasGetSchema, canvasSetSchema } from "./schemas.js";
 import { flowPackagesRequestJsonSchema } from "../core/flow-packages.js";
 import { evidenceRequestJsonSchema } from "../core/evidence/service.js";
 import { AGENT_LINK_TYPES, AGENT_STATUSES, EVENT_TYPES, FLOW_STEP_INSTANCE_STATUSES } from "../core/types.js";
@@ -73,8 +74,14 @@ const requesterProperties = {
 
 const flowIdentityProperties = { flow_instance_id: stringProperty("Flow instance id."), agent_token: stringProperty("Authenticated caller token if the local Codex thread identity is unavailable."), admin_key: stringProperty("Local coordinator administration credential; never place it in prompts or artifacts.") };
 
+const operatorProperties = { admin_key: stringProperty("Explicit local administrator credential. Omit when the host identifies the original requester; never include credentials in prompts."), agent_token: stringProperty("Worker tokens are not operator authorization and will be rejected.") };
+const positionProperties = { agent_id: stringProperty("Agent in this run."), x: numberProperty("Run-local canvas x coordinate."), y: numberProperty("Run-local canvas y coordinate.") };
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
-  { name: "worker_attach", description: "Register an existing Codex session by thread_id without relaunching it. Automatically registers and subscribes the original conversation. Discover the owning app-server through server (local or remote); returns current per-session messaging/interruption/continuation capabilities. Use agent_send_message to steer active turns or continue idle sessions, agent_stop to interrupt. For independently started local CLI work, messages are durably queued until its current turn and exclusive writer finish, then continue the exact UUID/profile. A queued receipt is not delivery or a reply. agent_stop cancels pending messages and interrupts only the reverified exclusive CLI process. Existing active writers are never duplicated. If neither control route is available, reconnect to the owning endpoint or configure the original profile. Keep the conversation turn open and resume run_wait after user interruptions.", inputSchema: objectSchema({ ...requesterProperties,
+  { name: "permission_list", description: "Read real native permission requests, their exact scope, supported choices and delivery state for a run. Original Codex requester or explicit local admin only. Review before deciding; incomplete scope cannot be approved.", inputSchema: objectSchema({ ...operatorProperties, run_id: stringProperty("Run id.") }, ["run_id"]), schema: permissionListSchema },
+  { name: "permission_decide", description: "Submit an authorized approve/reject decision for one real, currently owned native request. Requires user authorization for that scope or an explicit delegation to assess safe requests. Never grants blanket access. Idempotent same decision; conflicting/stale decisions fail. submitting means recorded, sent means handed to Codex, resolved means native acknowledgment. Resume run_wait after handling the event.", inputSchema: objectSchema({ ...operatorProperties, agent_id: stringProperty("Request owner."), request_id: stringProperty("Exact native request id from permission_list."), decision: enumProperty(["approve", "reject"], "Decision for the displayed scope.") }, ["agent_id", "request_id", "decision"]), schema: permissionDecideSchema },
+  { name: "canvas_positions_get", description: "Read persisted per-run agent positions and CAS revision. Empty positions mean automatic layout. Coordinates exclude multi-run frame offsets; only real agent nodes can be positioned. Original requester or explicit local admin only.", inputSchema: objectSchema({ ...operatorProperties, run_id: stringProperty("Run id.") }, ["run_id"]), schema: canvasGetSchema },
+  { name: "canvas_positions_set", description: "Atomically move agent nodes in the shared canvas using the revision returned by canvas_positions_get. Patches listed agents, preserves others. UI refreshes without losing camera or selection. Coordinates are run-local, not viewport pixels. A stale revision requires a fresh read and a deliberate retry.", inputSchema: objectSchema({ ...operatorProperties, run_id: stringProperty("Run id."), expected_revision: numberProperty("Current revision."), positions: { type: "array", minItems: 1, maxItems: 1000, items: objectSchema(positionProperties, ["agent_id", "x", "y"]) } }, ["run_id", "expected_revision", "positions"]), schema: canvasSetSchema },
+  { name: "worker_attach", description: "Register an existing Codex session by thread_id without relaunching it. Automatically registers and subscribes the original conversation. Discover the owning app-server through server (local or remote); returns current per-session messaging/interruption/continuation capabilities. Use agent_send_message to steer active turns or continue idle sessions, agent_stop mode=interrupt to interrupt only the current turn. For independently started local CLI work, messages are durably queued until its current turn and exclusive writer finish, then continue the exact UUID/profile. A queued receipt is not delivery or a reply. agent_stop mode=interrupt preserves queued continuations and signals only the reverified exclusive CLI process; graceful (default) or kill requests definitive cancellation and cancels pending messages. Existing active writers are never duplicated. If neither control route is available, reconnect to the owning endpoint or configure the original profile. Keep the conversation turn open and resume run_wait after user interruptions.", inputSchema: objectSchema({ ...requesterProperties,
     thread_id: stringProperty("Actual existing Codex thread UUID."), title: stringProperty("Optional participant title."),
     server: stringProperty("Owning Codex app-server endpoint, including a configured remote WebSocket endpoint."),
     profile: stringProperty("Original matching CLI profile if it cannot be discovered from the live writer; preserves external provider credentials and configuration."),
@@ -90,7 +97,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "worker_launch",
     description: "Launch an ad hoc worker with any explicitly requested model or configured Codex CLI profile; no flow or predefined flow agent is required. Native default is Codex Luna Max. Automatically creates local coordinator/run identity, registers the original user conversation, subscribes it to all events and starts detached supervision. Return observer contains the cursor for run_wait. No separate login, registration or observe call is needed. Keep this turn open while work remains: use the wait_contract for your own thread (coordinator_observer for a separate executor, observer for the requester), answer user messages in commentary even on another topic, then resume run_wait with the latest processed cursor and a one-hour timeout. Do not rely on notify to wake an ended turn.",
-    inputSchema: objectSchema({ ...requesterProperties, title: stringProperty("Worker title."),
+    inputSchema: objectSchema({ ...requesterProperties, approval_policy: enumProperty(["on-request"], "Interactive permission requests for managed codex-thread or codex-cli workers. Defaults unchanged; CLI uses the same session through its owned app-server transport."), title: stringProperty("Worker title."),
       prompt: stringProperty("Ad hoc task text; choose prompt or prompt_file."), prompt_file: stringProperty("Existing canonical skill prompt file."),
       repo_dir: stringProperty("Repository directory."), run_id: stringProperty("Optional existing run."),
       backend: stringProperty("Default codex-cli when profile is supplied, otherwise codex-thread."), profile: stringProperty("Existing Codex CLI profile, e.g. softec-yoda. Requires codex-cli; its model is preserved unless explicitly overridden."), sandbox: stringProperty("read_only or workspace."), model: stringProperty("Requested model; default Luna only for codex-thread, never overrides a CLI profile."), reasoning_effort: stringProperty("Default max for Luna."),
@@ -442,7 +449,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "agent_send_message",
-    description: "Send a compact message to an agent.",
+    description: "Send a compact message to the exact existing agent. Busy managed or attached Codex CLI sessions queue it behind the current turn; delivered=false, queued=true and message_id confirm acceptance, not delivery or completion. Continue run_wait using the same observer/cursor. Do not cancel a worker merely to send a follow-up.",
     inputSchema: objectSchema(
       {
         agent_id: stringProperty("Agent id."),
@@ -482,12 +489,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "agent_stop",
     description:
-      "Stop one agent, all agents in a run, or all registered agents. Bulk calls await every stop result and retain scoped native actions.",
+      "Stop one agent, all agents in a run, or all registered agents. interrupt is recoverable current-turn interruption: retain the session, context and pending follow-ups, then continue that same agent and run observer. Requires backend canInterrupt; unsupported interruption never falls back to cancellation. graceful (default) and kill are definitive cancellation and block new work. Bulk calls await every result and retain scoped native actions.",
     inputSchema: objectSchema({
       agent_id: stringProperty("Agent id."),
       run_id: stringProperty("Run id."),
       all: booleanProperty("Stop all registered agents."),
-      mode: enumProperty(["graceful", "interrupt", "kill"], "Stop mode.")
+      mode: enumProperty(["graceful", "interrupt", "kill"], "interrupt: recoverable current turn; graceful (default) or kill: definitive cancellation.")
     }),
     schema: agentStopSchema
   },

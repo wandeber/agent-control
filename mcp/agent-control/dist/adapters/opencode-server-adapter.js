@@ -1,3 +1,4 @@
+import { toolActivity } from "../core/tool-activity.js";
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -766,7 +767,8 @@ function normalizeOpenCodePart(rawPart, context) {
                     ...metadata,
                     tool: part.tool,
                     callID: part.callID,
-                    stateStatus: readNested(part, ["state", "status"])
+                    stateStatus: readNested(part, ["state", "status"]),
+                    tool_activity: toolActivity({ tool: part.tool, stateStatus: readNested(part, ["state", "status"]), input: readNested(part, ["state", "input"]), output: readNested(part, ["state", "output"]), error: readNested(part, ["state", "error"]) }, String(part.callID ?? partId))
                 }
             }
         ];

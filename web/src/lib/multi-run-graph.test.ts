@@ -54,3 +54,13 @@ describe("multiple runs on one canvas", () => {
     expect(shifts[0]).toBeGreaterThan(0);
   });
 });
+
+it("keeps a stable origin when moving the only node of a run beside another run", () => {
+  const a = fixture("a"), b = fixture("b"); b.agents = b.agents.slice(1, 2);
+  const single = multiRunLayout([buildRunGraph(b)]).get(b.agents[0].agent_id)!;
+  const before = multiRunLayout([a, b].map(buildRunGraph)).get(b.agents[0].agent_id)!;
+  b.canvas_positions = { run_id: "b", revision: 1, coordinate_space: "run", updated_at: null, positions: [{ agent_id: b.agents[0].agent_id, x: single.x + 100, y: single.y + 70 }] };
+  const after = multiRunLayout([a, b].map(buildRunGraph)).get(b.agents[0].agent_id)!;
+  expect(after.x - before.x).toBe(100); expect(after.y - before.y).toBe(70);
+  expect(multiRunLayout([buildRunGraph(b)]).get(b.agents[0].agent_id)).toEqual({ x: single.x + 100, y: single.y + 70 });
+});

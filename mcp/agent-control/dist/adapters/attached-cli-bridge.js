@@ -87,13 +87,13 @@ function save(path, value) {
     writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
     renameSync(temp, path);
 }
-export function queueCliMessage(continuity, prompt) {
+export function queueCliMessage(continuity, prompt, fence) {
     if (config(continuity.profile).fingerprint !== continuity.fingerprint)
         throw new ControllerError("Codex configuration changed since attachment; reattach after reviewing the same model/provider.", "unsupported_operation");
     const dir = bridgeDir(continuity.thread_id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
-    save(join(dir, `${id}.json`), { id, continuity, prompt, state: "pending" });
+    save(join(dir, `${id}.json`), { id, continuity, prompt, state: "pending", ...(fence ? { dispatch_fence: fence } : {}) });
     ensureCliBridge(continuity.thread_id);
     return id;
 }
@@ -152,6 +152,27 @@ const birth = (pid) => { try {
 catch {
     return "";
 } };
+function withDispatchFence(entry, action) {
+    const fence = entry.dispatch_fence;
+    if (!fence)
+        return action();
+    // Hold the controller's write reservation through spawn. A cancellation
+    // committed before dispatch wins even if the sending MCP process has died.
+    if (!existsSync(fence.database))
+        return undefined;
+    const db = takeLock(fence.database);
+    if (!db)
+        throw new ControllerError("Controller cancellation is being reconciled; dispatch will retry.", "backend_unavailable");
+    try {
+        const allowed = db.prepare(`select 1 from agents a join runs r on r.run_id = a.run_id
+      where a.agent_id = ? and a.run_id = ? and a.unregistered_at is null
+      and a.status not in ('stopping', 'stopped') and r.status not in ('stopping', 'stopped')`).get(fence.agent_id, fence.run_id);
+        return allowed ? action() : undefined;
+    }
+    finally {
+        releaseLock(db);
+    }
+}
 export async function superviseAttachedCli(threadId) {
     const dir = bridgeDir(threadId), lock = join(dir, "supervisor");
     if (!existsSync(dir))
@@ -207,51 +228,59 @@ export async function superviseAttachedCli(threadId) {
                 dispatched = mutateQueue(dir, () => {
                     if (JSON.parse(readFileSync(path, "utf8")).state !== "pending")
                         return undefined;
-                    value.state = "dispatched";
-                    value.baseline = session.lastIndex;
-                    save(path, value);
-                    return new Promise(resolve => {
-                        const child = spawn(value.continuity.executable, args, { cwd: value.continuity.cwd, stdio: ["pipe", "pipe", "pipe"] });
-                        if (child.pid) {
-                            value.writer = { pid: child.pid, started: birth(child.pid) };
-                            save(path, value);
-                        }
-                        child.stdin.on("error", () => { });
-                        child.stdin.end(value.prompt);
-                        let buffer = "", wrongIdentity = false;
-                        child.stdout.on("data", chunk => {
-                            buffer += String(chunk);
-                            const lines = buffer.split("\n");
-                            buffer = lines.pop() ?? "";
-                            for (const line of lines) {
-                                try {
-                                    const event = JSON.parse(line);
-                                    if (event.type === "thread.started" && event.thread_id !== threadId) {
-                                        wrongIdentity = true;
-                                        child.kill("SIGINT");
-                                    }
-                                }
-                                catch { /* Ignore non-JSON diagnostics, never infer acceptance from them. */ }
+                    const accepted = withDispatchFence(value, () => {
+                        value.state = "dispatched";
+                        value.baseline = session.lastIndex;
+                        save(path, value);
+                        return new Promise(resolve => {
+                            const child = spawn(value.continuity.executable, args, { cwd: value.continuity.cwd, stdio: ["pipe", "pipe", "pipe"] });
+                            if (child.pid) {
+                                value.writer = { pid: child.pid, started: birth(child.pid) };
+                                save(path, value);
                             }
+                            child.stdin.on("error", () => { });
+                            child.stdin.end(value.prompt);
+                            let buffer = "", wrongIdentity = false;
+                            child.stdout.on("data", chunk => {
+                                buffer += String(chunk);
+                                const lines = buffer.split("\n");
+                                buffer = lines.pop() ?? "";
+                                for (const line of lines) {
+                                    try {
+                                        const event = JSON.parse(line);
+                                        if (event.type === "thread.started" && event.thread_id !== threadId) {
+                                            wrongIdentity = true;
+                                            child.kill("SIGINT");
+                                        }
+                                    }
+                                    catch { /* Ignore non-JSON diagnostics, never infer acceptance from them. */ }
+                                }
+                            });
+                            child.stderr.on("data", chunk => appendFileSync(join(dir, `${value.id}.log`), chunk, { mode: 0o600 }));
+                            let finished = false;
+                            const finish = (ok) => {
+                                if (finished)
+                                    return;
+                                finished = true;
+                                const observed = readCodexSession(threadId);
+                                const completed = ok && !wrongIdentity && observed?.status === "completed" && observed.lastIndex > (value.baseline ?? -1);
+                                value.state = completed ? "completed" : observed?.status === "stopped" ? "cancelled" : "failed";
+                                if (value.state === "failed")
+                                    value.error = "The exact-session CLI continuation did not produce successful completion evidence.";
+                                value.prompt = "";
+                                save(path, value);
+                                resolve();
+                            };
+                            child.once("error", () => finish(false));
+                            child.once("close", code => finish(code === 0));
                         });
-                        child.stderr.on("data", chunk => appendFileSync(join(dir, `${value.id}.log`), chunk, { mode: 0o600 }));
-                        let finished = false;
-                        const finish = (ok) => {
-                            if (finished)
-                                return;
-                            finished = true;
-                            const observed = readCodexSession(threadId);
-                            const completed = ok && !wrongIdentity && observed?.status === "completed" && observed.lastIndex > (value.baseline ?? -1);
-                            value.state = completed ? "completed" : observed?.status === "stopped" ? "cancelled" : "failed";
-                            if (value.state === "failed")
-                                value.error = "The exact-session CLI continuation did not produce successful completion evidence.";
-                            value.prompt = "";
-                            save(path, value);
-                            resolve();
-                        };
-                        child.once("error", () => finish(false));
-                        child.once("close", code => finish(code === 0));
                     });
+                    if (!accepted) {
+                        value.state = "cancelled";
+                        value.prompt = "";
+                        save(path, value);
+                    }
+                    return accepted;
                 });
             }
             catch (error) {

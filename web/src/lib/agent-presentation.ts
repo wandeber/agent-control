@@ -1,4 +1,3 @@
-import { STATUS_STYLE } from "./format";
 import { agentCost } from "./costs";
 import { latestAgentFlowStep } from "./flow-steps";
 import type { AgentRecord, DashboardSnapshot, UsageSnapshotRecord } from "./types";
@@ -13,12 +12,8 @@ export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecor
   const run = snapshot.runs.find((item) => item.run_id === agent.run_id);
   const generatedCoordinatorTitle = agent.role === "orchestrator" && run && (agent.title === run.title || agent.title === `${run.title} orchestrator`);
   const activity = snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.activity;
-  // An earlier attempt's output must not look like progress on a fresh phase.
-  const fresh = !step || Boolean(activity?.observed_at && Date.parse(activity.observed_at) >= Date.parse(step.created_at));
-  const running = ["starting", "running", "waiting_for_input"].includes(agent.status);
-  const text = activity && fresh ? lastLine(activity.text) : "";
-  const toolPrefix = activity?.state === "running" && running ? "Using tool" : activity?.state === "completed" ? "Tool completed" : activity?.state === "failed" ? "Tool failed" : "Last tool";
-  const summary = lastLine(step?.summary ?? "");
+  // This is the last recorded text, independent of the separate status/phase badges.
+  const text = activity ? lastLine(activity.text) : "";
   return {
     title: generatedCoordinatorTitle ? "Orchestrator" : snapshot.flows.some((flow) => agent.title === `${flow.flow_id}: ${agent.role}`) ? humanize(agent.role ?? "worker") : agent.title,
     phase,
@@ -26,9 +21,7 @@ export function agentPresentation(snapshot: DashboardSnapshot, agent: AgentRecor
     cost: agentCost(snapshot, agent.agent_id),
     exchange: snapshot.costs?.exchange,
     tokens: agentTokenLabel(snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage),
-    activity: (text && activity?.kind === "tool" ? `${toolPrefix} · ${text}` : text) || summary || lastLine((agent.failure_reason ?? "").replaceAll("_", " ")) ||
-      (agent.role === "observer" && running ? "Following run events" : agent.status === "planned" ? "Ready for its turn" :
-        agent.status === "waiting_for_input" ? "Waiting for input" : `${STATUS_STYLE[agent.status].label} · no activity recorded`),
+    activity: text,
     kind: text ? activity!.kind : "status" as const
   };
 }
@@ -60,7 +53,7 @@ export function agentModelLabel(agent: AgentRecord): string {
 /** Missing usage is unknown, not zero. Never substitute context size for consumption. */
 export function agentTokenLabel(usage?: UsageSnapshotRecord | null): string | null {
   if (!usage) return null;
-  const parts = ([['input_tokens', 'in'], ['output_tokens', 'out'], ['total_tokens', 'total']] as const)
+  const parts = ([['input_tokens', 'in'], ['output_tokens', 'out']] as const)
     .flatMap(([key, label]) => {
       const value = usage[key];
       return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -80,7 +73,7 @@ export function modelUsage(snapshot: DashboardSnapshot) {
   const groups = new Map<string, UsageSnapshotRecord[]>();
   for (const agent of snapshot.agents) {
     const usage = snapshot.computed_agents.find((item) => item.agent_id === agent.agent_id)?.latest_usage;
-    if (!usage || !agentTokenLabel(usage)) continue;
+    if (!usage || (!agentTokenLabel(usage) && !agentTotalLabel(usage))) continue;
     const model = usage.model || agent.model || (typeof agent.backend_handle?.resolved_model === "string" ? agent.backend_handle.resolved_model : "Unknown model");
     groups.set(model, [...(groups.get(model) ?? []), usage]);
   }

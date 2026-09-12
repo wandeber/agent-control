@@ -247,7 +247,7 @@ function FlowPhaseNode({ data }: NodeProps<PhaseFlowNode>) {
   );
 }
 
-function PhaseEdgeOverlay({ routes }: { routes: DiagramRoute[] }) {
+export function PhaseEdgeOverlay({ routes }: { routes: DiagramRoute[] }) {
   const [focusedEdge, setFocusedEdge] = useState<string | null>(null);
   return <ViewportPortal><div className="agent-relation-layer">
     <svg aria-hidden="true" className="pointer-events-none absolute left-0 top-0 size-px overflow-visible">
@@ -260,7 +260,7 @@ function PhaseEdgeOverlay({ routes }: { routes: DiagramRoute[] }) {
         const dy = (tip.y - previous.y) / length;
         const arrow = `M ${tip.x},${tip.y} L ${tip.x - dx * 13 - dy * 5},${tip.y - dy * 13 + dx * 5} L ${tip.x - dx * 13 + dy * 5},${tip.y - dy * 13 - dx * 5} Z`;
         return <g opacity={focusedEdge && focusedEdge !== edge.id ? 0.25 : 1} data-flow-edge={edge.id} data-flow-edge-tone={edge.tone === "taken" ? "taken" : "possible"} key={edge.id}>
-          <path d={diagramPath(points)} fill="none" stroke="white" strokeWidth={7} strokeLinejoin="round" />
+          <path d={diagramPath(points)} fill="none" stroke="var(--background)" strokeWidth={7} strokeLinejoin="round" />
           <path data-flow-edge-route="orthogonal" d={diagramPath(points)} fill="none" stroke={color} strokeWidth={focusedEdge === edge.id ? 4.5 : edge.tone === "taken" ? 3.5 : 2.5} strokeLinejoin="round" />
           <path data-edge-arrow="true" d={arrow} fill={color} />
         </g>;

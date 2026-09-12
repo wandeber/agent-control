@@ -41,6 +41,9 @@ interface McpHostContext {
 }
 
 export interface ConsoleSelectionState {
+  screen?: "console" | "subagents" | "flows";
+  flow_id?: string;
+  repo_dir?: string;
   panel_id?: string;
   requested_run_id: string | null;
   follow_latest: boolean;
@@ -110,6 +113,7 @@ export class McpConsoleNotificationStore {
     }
     this.publish({
       console: {
+        ...flowSelectionFields(args),
         requested_run_id: requestedRunId,
         follow_latest: !requestedRunId,
         ...(action ? { action } : {}),
@@ -428,12 +432,19 @@ function parseConsoleSelection(value: unknown): ConsoleSelectionState | null {
   const commandId = nonEmptyString(record.command_id);
   const panelId = nonEmptyString(record.panel_id);
   return {
+    ...flowSelectionFields(record),
     requested_run_id: requestedRunId,
     follow_latest: typeof record.follow_latest === "boolean" ? record.follow_latest : !requestedRunId,
     ...(action ? { action } : {}),
     ...(commandId ? { command_id: commandId } : {}),
     ...(panelId ? { panel_id: panelId } : {})
   };
+}
+
+function flowSelectionFields(record: Record<string, unknown>): Partial<ConsoleSelectionState> {
+  return { ...(record.screen === "flows" || record.screen === "console" || record.screen === "subagents" ? { screen: record.screen } : {}),
+    ...(nonEmptyString(record.flow_id) ? { flow_id: String(record.flow_id) } : {}),
+    ...(nonEmptyString(record.repo_dir) ? { repo_dir: String(record.repo_dir) } : {}) };
 }
 
 function parseHostContext(value: unknown): McpHostContext | null {
