@@ -6,6 +6,15 @@ single package. The engine joins all required current deliveries before entry;
 read their immutable references and preserve the approved plan and unrelated
 work. Do not import a later unaccepted workspace state or silently omit a branch.
 
+Preserve the accepted product-stage and compatibility boundary across packages.
+Do not resolve mismatched deliveries by inventing aliases, legacy fallbacks,
+dual paths, or data conversions. Prefer the approved coherent current design;
+including its assumption that old development data may be recreated. Keep normal
+ORM/schema migrations and confirmed external/data obligations; route a changed requirement back
+to Planning or the original conversation. A fresh-data design does not authorize
+executing a database reset/delete or discarding migration history merely to make
+integration pass.
+
 Verify every required package and deliverable is represented with its exact
 accepted content. If integration requires changing a delivered file, return the
 correction through `needs_package_changes` to Implementation for the same

@@ -95,7 +95,9 @@ roles:
     prompt_ref: role_final_reviewer
     description: Clean-context reviewer created once and reused for every final-answer review iteration.
   orchestrator:
-    description: Receives missing birthdate, ambiguous date, blocked, or human-decision states.
+    description: The original conversation receives missing birthdate, ambiguous date,
+      blocked, or human-decision states and asks through an available native question
+      interface or text fallback; preserve prior answers and never answer for the user.
 
 artifacts:
   current_date:

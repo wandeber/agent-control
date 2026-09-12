@@ -10,6 +10,11 @@ resolve the current date/time.
 - state whether the calculation should use the current instant or a date-only
   boundary
 - identify missing or ambiguous birth dates clearly
+- return a missing date, ambiguous date format, or material precision/timezone
+  choice to the original conversation in the handback summary; it asks through
+  an available native question interface or text fallback before resuming
+- reuse answers already given; do not silently choose an interpretation of an
+  ambiguous birth date or treat silence as confirmation
 
 ## Artifact
 

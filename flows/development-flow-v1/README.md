@@ -8,6 +8,46 @@ decisions, owners, reports,
 execution receipts, and transitions. Models own technical judgment and declared
 impact; identical hashes do not establish semantic independence.
 
+## Product Stage And Questions
+
+The default is a product that has not shipped to production and one coherent
+implementation of current behavior. Plans, implementations, integration, and
+reviews exclude speculative compatibility aliases, old-client conditionals,
+dual reads/writes, legacy fallbacks, old-to-new data format converters, and
+backfills without a preservation requirement. Prefer a design that recreates
+old development data when simpler; existing records alone do not require
+conversion. Normal ORM/schema migrations to apply the change remain appropriate.
+Explicit user requirements and authoritative evidence of real deployed consumers,
+retained data, or public contracts take precedence; each exception identifies
+its obligation and minimum necessary scope. Required schema tooling is distinct
+from old-format data conversion. A fresh-data design authorizes no execution of
+a data reset, removal of migration history, breaking actual external contracts, or unrelated
+cleanup. A database, API, authentication, integration, or migration directory
+alone does not establish production use.
+
+Clarification is proactive: discover unresolved behavior, audience, scope,
+acceptance, and material tradeoffs before selecting a solution or dependent
+implementation. Context and Analysis return `needs_clarification`; Planning
+uses its existing `blocked` notification for a missing user choice. Include the
+question, useful options, and their consequences in the handback summary, not
+only in an artifact. The original conversation asks through a native question
+interface available in its current mode, with direct text as fallback, then
+persists the answer before resuming. Ask about product stage when uncertainty
+would change the plan. If material evidence of valued data or production leaves
+preservation uncertain, ask about loss/recreation versus conversion. Recommend
+the simpler pre-production design when evidence allows, without requiring the
+user to justify it.
+Reuse prior answers, avoid question quotas, and never count silence, timeout,
+or a preselected default as a user decision. Keep independent authorized work
+moving while required decisions remain pending.
+
+Acceptance, Context, Analysis, Plan, and isolated package projections retain
+the confirmed/assumed stage, its basis, data/contract obligations, exceptions,
+and unresolved material questions. Workers cannot decide for the user. Existing
+requester ownership, exact-plan approval, schemas, routes, and evidence gates
+remain unchanged. See [User Questions](../../skills/flow-runner/references/user-questions.md)
+for the common question-interface contract.
+
 ## Phase Contract
 
 | Phase | Authority and inputs | Result / required evidence | Owner | Omission / correction |

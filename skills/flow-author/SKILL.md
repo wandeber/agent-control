@@ -37,6 +37,24 @@ modify an installed plugin cache to create a project flow.
 
 ## Authoring Rules
 
+- Establish desired behavior, scope, acceptance, and material tradeoffs before
+  encoding them as routes. Use [User Questions](../flow-runner/references/user-questions.md)
+  for unresolved user choices, through a native question UI available in the
+  current mode or text fallback. Preserve prior answers; a worker must route
+  missing user decisions to the original conversation rather than choose for it.
+- Software-development flows default to clean pre-production implementation,
+  without hypothetical legacy compatibility or data conversion work. Plans
+  may assume old development data can be recreated when simpler; existing
+  records alone do not require conversion. Keep normal ORM/schema migrations.
+  If valued data or production evidence leaves preservation unresolved, route
+  the loss-versus-conversion choice to the original user. Explicit
+  user requirements and authoritative evidence of production clients, retained
+  data, or public contracts take precedence. Carry that boundary, evidence, and
+  exceptions in acceptance, phase prompts, and isolated package projections;
+  route material uncertainty to the user before the plan. A fresh-data design
+  does not authorize executing a destructive database reset/delete. Preserve
+  migration history, necessary schema tooling, and actual external contracts.
+  Keep this policy conditional for non-software flows.
 - Keep Agent Control generic: do not bake one workflow's result labels into the
   runtime contract.
 - Model real documents as named artifacts referenced from step `inputs` and
@@ -127,6 +145,9 @@ steps:
   runtime state and package conditions use their defined contracts.
 - The config can represent orchestrator-driven flows by using `notify` actions.
 - The config can represent automatic flows by using `transitions` and `to`.
+- Material user questions have a configured handback route and reach the
+  original conversation's available question interface. Isolated workers receive
+  the accepted constraints and cannot approve an unresolved choice themselves.
 - Repo-authored flow files validate with `agentctl flow validate --config-file
   <flow.yaml>`, including prompt file existence relative to that config file.
 - The canonical schema is available with `agentctl flow schema`.

@@ -2,7 +2,10 @@
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
 version: 1.2.2
-description: Development with durable acceptance, same-owner incremental
+description: Clean pre-production development by default, proactive user clarification
+  through the available question interface, evidence-based compatibility exceptions,
+  normal ORM/schema migrations with old development data recreated when simpler,
+  durable acceptance, same-owner incremental
   reviews, exact human plan approval, conditional integration, controlled
   validation, optional UAT, and verified closure with reusable current expert approval.
 initial_step: context
@@ -112,8 +115,9 @@ roles:
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer
   orchestrator:
-    description: Original clarification owner and recorded human decisions; no
-      delegated worker.
+    description: Original conversation owns clarification and recorded human decisions;
+      ask material product, acceptance, and lifecycle questions through an available
+      native question UI or text fallback, preserving prior answers. No delegated worker.
 artifacts:
   context:
     path: "{run_dir}/context.md"
@@ -127,8 +131,9 @@ steps:
   context:
     role: context
     prompt_ref: step_context
-    description: A separate Luna Max context owner discovers repository facts
-      and hands the grounded document to the Astra analyst.
+    description: A separate Luna Max context owner discovers repository facts and
+      product-stage evidence, returning material questions to the original conversation
+      before handing the grounded document to the Astra analyst.
     outputs:
       context:
         artifact: context
@@ -171,8 +176,9 @@ steps:
   analysis:
     role: analyst
     prompt_ref: step_analysis
-    description: Synthesize solution intent from Context and the current acceptance
-      revision.
+    description: Synthesize solution intent from Context and current acceptance;
+      prefer a coherent pre-production design with only confirmed compatibility
+      obligations, returning unresolved user choices before selecting a solution.
     inputs:
       context:
         artifact: context
@@ -267,8 +273,11 @@ steps:
   planning:
     role: planner
     prompt_ref: step_planning
-    description: Write stable work packages, dependencies, complete affected checks,
-      and integration boundaries.
+    description: Plan clean current behavior, stable work packages, dependencies,
+      complete affected checks, and integration boundaries. Carry confirmed client/data
+      obligations into projections; prefer recreating old development data over
+      format conversion unless preservation is required, keep ORM/schema migrations,
+      and ask material user questions before dependent planning.
     requires:
       equals:
         var: decisions.analysis_intent.value
@@ -319,8 +328,9 @@ steps:
   plan_review:
     role: analyst
     prompt_ref: step_plan_review
-    description: The exact analyst reviews the plan and records a strict incremental
-      receipt.
+    description: The exact analyst reviews intent and compatibility scope, rejects
+      speculative legacy work or lost confirmed obligations, and records a strict
+      incremental receipt after material user choices are resolved.
     inputs:
       analysis:
         artifact: analysis
@@ -443,14 +453,16 @@ steps:
         require_current: true
         require_approved: true
         owner_role: analyst
-    description: Record explicit user approval of the exact current plan; unchanged
-      valid approval can be reused.
+    description: Present the exact current plan and record actual user approval,
+      using an available interface only when its tool contract permits approvals;
+      unchanged valid approval can be reused.
     evidence_operations:
       - read_receipt
   implementation:
     role: implementer
     prompt_ref: step_implementation
-    description: Implement inline work or supervise the approved package group; the
+    description: Implement coherent current behavior within the approved compatibility
+      boundary, inline or through the approved package group; the
       engine derives whether consolidation is required.
     requires:
       equals:
@@ -852,7 +864,8 @@ steps:
   implementation_review:
     role: planner
     prompt_ref: step_implementation_review
-    description: The exact planner validates conformance until its first strict approval.
+    description: The exact planner validates plan conformance and its compatibility
+      boundary until the first strict approval; unresolved user choices return to the requester.
     requires:
       all:
         - equals:
@@ -993,8 +1006,9 @@ steps:
         - equals:
             var: state.planner_approved
             value: true
-    description: Apply the recorded user preference, or ask once whether to prepare
-      optional UAT or proceed.
+    description: Apply the recorded user preference, or ask through the available
+      question interface whether to prepare optional UAT or proceed. Never infer a
+      choice from silence or a preselected option.
     evidence_operations:
       - read_receipt
   uat_preparation:
@@ -1144,7 +1158,8 @@ steps:
     role: final_reviewer
     prompt_ref: step_final_review
     description: One independent expert owns the complete first review and every
-      incremental correction review.
+      incremental correction review, checking the clean pre-production default,
+      confirmed compatibility obligations, and unresolved material user choices.
     requires:
       all:
         - equals:

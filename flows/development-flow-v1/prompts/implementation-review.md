@@ -4,6 +4,15 @@ As the exact Plan owner, review the frozen current result against the exact
 approved plan after a verified GREEN complete mechanical gate. Consume those
 receipts; do not rerun checks or perform a second independent expert review.
 
+Check that the result retains the approved clean pre-production design and its
+explicit exceptions. Unplanned legacy branches, compatibility aliases, dual
+paths, or old-format conversion/backfill scope are deviations, as is violating
+confirmed client/data obligations. Accept normal ORM/schema migrations and a
+simpler approved design that recreates old development data; existing records
+alone do not imply preservation. A design assumption does not authorize executing
+a destructive database action. Return an obsolete or ambiguous compatibility decision
+to Planning/the coordinator; do not normalize it as an implementation detail.
+
 Reuse the current validated result checkpoint by receipt reference rather than
 preparing the same immutable checkpoint ID again. The first review covers
 complete plan conformance. On correction, use a

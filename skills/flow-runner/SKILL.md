@@ -26,7 +26,8 @@ Selecting this skill does not authorize launching or changing a flow.
   configuration merely to inspect it. A missing capability is a finding.
 - **Execute or resume:** perform the authorized operation and supervise it to
   its requested completion. Use the launch and turn contracts below. Follow
-  existing decisions; ask only for a missing decision that blocks that work.
+  existing decisions and actively surface unresolved user choices that affect
+  behavior, scope, acceptance, or material tradeoffs before dependent work.
 - **Change a flow:** inspect the current package and apply only the requested
   edits through `flow-author`; validation does not imply permission to run it.
 
@@ -34,6 +35,27 @@ Read relevant contracts once and reuse them while retained. After context loss,
 reload the applicable operation and current durable state rather than every
 reference. User instructions and existing authorization take precedence over
 skill guidelines; preserve actual host restrictions and configured flow gates.
+
+## User Decisions
+
+Follow [User Questions](references/user-questions.md) whenever clarification or
+a configured human choice is needed. Use the available native question UI in
+the current mode; otherwise ask in text. The original requester collects the
+answer, persists it before dependent dispatch, and records only actual user
+decisions. Pass worker questions through this route rather than inventing an
+answer, waiting for an execution failure, or treating silence as consent.
+
+For software flows, carry the product stage and compatibility boundary into
+acceptance and package handoffs. Default to a clean pre-production implementation
+without speculative legacy clients, old-format data converters, or compatibility
+layers. Prefer recreating old development data in the design when simpler;
+existing records alone do not require preservation. Keep normal ORM/schema
+migrations. Honor explicit requirements and authoritative evidence of existing
+obligations; ask
+about loss versus conversion when material evidence of valued data or production
+leaves that decision unresolved. A fresh-data design does not authorize deleting data,
+discarding migration history, or breaking real external contracts. Do not apply
+software lifecycle policy to unrelated workflows.
 
 ## Inputs
 
@@ -500,8 +522,10 @@ keep a model turn open to poll status or repeatedly read worker logs.
 
 The coordinator must not implement a flow step, write step artifacts, or
 generate semantic step reports. Its job is to launch/resume the flow, react to
-configured notifications and blockers, and ask for human/orchestrator decisions
-when the flow configuration asks for them.
+configured notifications and blockers, and obtain unresolved user decisions
+before dependent work, including questions returned by Context or Planning.
+Configured human gates still require their actual owning conversation and
+recorded answer.
 
 Do not use visual links as workflow state. Links can explain relationships, but
 step state, reports, artifacts, and transitions live in the flow instance.

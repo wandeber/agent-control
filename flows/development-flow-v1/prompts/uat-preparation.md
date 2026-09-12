@@ -4,6 +4,10 @@ Prepare only the user-selected acceptance test experience. Use the current
 accepted plan and validated result to make the relevant preview/environment
 available, with concise reproducible steps and expected visible outcomes.
 Prefer the requested platform and any repository or user testing conventions.
+If the required audience, visible outcome, or access choice is unclear, return
+the concrete question to the original conversation before dependent setup.
+Use disposable fixtures where authorized; pre-production does not authorize
+resetting real data or removing migration history to prepare a preview.
 
 Do not introduce implementation changes during preparation. Report
 `implementation_changes_needed` for setup/result defects or `plan_changes_needed`

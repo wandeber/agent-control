@@ -15,6 +15,10 @@ node "$SKILL_DIR/scripts/flow-model-configurator.mjs" set --project /absolute/pr
 The helper uses the same catalog and TOML resolver as launches. It writes only model
 and reasoning preferences into `.agents/models.toml`, preserving other tables.
 Do not duplicate defaults or instructions. Ask only for missing desired choices.
+Follow [User Questions](../flow-runner/references/user-questions.md) for those
+choices: use a native question interface available in the current mode, with
+text fallback. Present the effective options and preserve answers already given;
+do not silently choose a different model or treat an empty result as a selection.
 The project is the task's explicit repository directory, not the MCP process cwd.
 Git subdirectories resolve to the repository root; non-git projects use the nearest
 ancestor `.agents` directory, or the provided directory.

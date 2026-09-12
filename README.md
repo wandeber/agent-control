@@ -140,6 +140,16 @@ plan after the analyst's review. Integration is conditional; mechanical
 validation, the planner's first result approval, optional user testing, expert
 review, and verified closure have separate transition requirements.
 
+The flow defaults to clean pre-production development, with compatibility or
+old-format data conversion only for explicit preservation requirements or confirmed
+obligations. It may plan to recreate old development data when simpler, while
+keeping normal ORM/schema migrations.
+Context and Planning surface material user choices before dependent work; the
+original conversation uses the available native question interface, with text
+fallback. That design default does not authorize executing destructive database
+operations or discarding migration history or actual external contracts. See the
+[product-stage and question contract](flows/development-flow-v1/README.md#product-stage-and-questions).
+
 Use `flow_launch` with `acceptance_context` (CLI: `flow launch
 --acceptance-context`) to initialize the complete accepted contract atomically.
 `flow_context_update` replaces that contract while retaining prior revisions.

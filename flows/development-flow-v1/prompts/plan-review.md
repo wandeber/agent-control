@@ -4,6 +4,16 @@ As the exact Analysis owner, review whether the current Plan preserves accepted
 intent, decisions, invariants, and boundaries. This is not an independent code
 review or an opportunity to redesign the task.
 
+Verify the plan applies the clean pre-production default and carries the stage
+and compatibility boundary into each package. Reject speculative legacy paths,
+old-format converters, or backfills without an explicit preservation requirement
+or authoritative obligation, and reject omitted protection for confirmed consumers/data.
+A simpler plan may recreate old development data; existing records alone do
+not require conversion. Keep normal ORM/schema migrations. A fresh-data design
+is not authorization to execute a destructive database action. Missing material user
+choices return through the configured coordinator route for a question before
+approval; a recommended option or unanswered question is not accepted intent.
+
 Prepare a plan checkpoint through the runtime evidence contract. First review
 is full. On correction, inspect the deterministic section delta and pending
 scope; review changed/dependent sections and all prior findings. Keep stable

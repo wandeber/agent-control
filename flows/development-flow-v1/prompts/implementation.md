@@ -12,6 +12,18 @@ No TDD or one-test-per-requirement policy is implied. Comment non-obvious new
 logic in English. Validate coherent batches with focused checks and preserve
 controlled execution receipts when available.
 
+Use the approved product-stage and compatibility boundary. Default to one clean
+pre-production implementation; do not introduce old-client branches, aliases,
+dual reads/writes, legacy fallbacks, old-format converters, or backfills without
+a preservation requirement. The approved design may recreate old development
+data when simpler; existing records alone do not require conversion. Keep normal
+ORM/schema migrations, required compatibility, actual external contracts,
+confirmed data obligations, and migration history. A fresh-data design does not
+authorize executing a destructive database reset/delete or unrelated cleanup. If new
+evidence changes that boundary, report the plan defect or required user choice
+through the configured route before dependent edits. Do not answer for the user
+or silently add compatibility work to an approved package.
+
 For inline work, make the scoped changes and report normally. For a registered
 external package group, call `flow_packages` operation `launch` to dispatch all
 ready branches in a batch. Keep their pinned owners, worktrees, dependencies,

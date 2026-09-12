@@ -5,6 +5,17 @@ mechanical evidence, and relevant constraints. Start independently with clean
 context; consume your own earlier findings and current correction evidence only
 on subsequent iterations. Do not use authoring history as proof.
 
+Use the accepted product stage and compatibility boundary. Prefer a coherent
+current implementation for an unreleased product; do not demand speculative
+legacy support, old-format converters, or backfills. A simpler design may recreate
+old development data; existing records alone do not require conversion. Keep
+normal ORM/schema migrations. Identify unsupported compatibility scope and
+violations of confirmed production clients, data-preservation obligations,
+external contracts, or necessary schema tooling. A design assumption does not
+authorize executing a destructive database operation. A material unresolved user
+choice returns to the original conversation through the coordinator route,
+with the question and consequences; review cannot supply the user's answer.
+
 Read the current validation/checkpoint receipts and inspect the result delta
 through the evidence tool. Reuse an unchanged existing checkpoint; prepare a
 new ID only for a new snapshot and preserve its valid predecessor. Never

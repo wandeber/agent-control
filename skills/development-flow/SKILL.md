@@ -18,11 +18,46 @@ clarification or create an `orchestrator` worker to impersonate the conversation
 
 Use the request, prior decisions, and applicable constraints to establish goal,
 requested behavior, scope, acceptance criteria, exclusions, and confirmed
-choices. Ask only for unresolved user decisions that materially affect those
-items. Repository facts belong in Context; harmless explicit assumptions and
-technical decisions already delegated to the team need no approval question.
-Group related required questions and wait for answers before dependent work.
-Do not manufacture a requirement to ask about every imaginable interpretation.
+choices. Actively identify and ask about unresolved user decisions that materially
+affect those items before selecting a solution or estimating implementation.
+Do not wait for a blocker to clarify competing interpretations. Follow
+[User Questions](../flow-runner/references/user-questions.md): use a native
+question interface available in the current mode, with text fallback; reuse
+prior answers and wait for required decisions while continuing independent work.
+Repository facts belong in Context; harmless explicit assumptions and technical
+decisions already delegated to the team need no approval question.
+
+## Product Stage And Compatibility
+
+Default to a product that has not shipped to production. Prefer one coherent
+implementation of the intended current behavior. Do not add backward-compatible
+aliases, old-client branches, dual reads/writes, legacy fallbacks, old-to-new data
+format converters, or backfills without a preservation requirement. Old development
+data may be assumed disposable/recreated in the design when that simplifies the
+change; existing records alone do not establish an obligation to convert them.
+Keep normal ORM/schema migrations that apply the change. This default yields to
+explicit user instructions and authoritative evidence of real deployed clients, public
+contracts, or data that must be retained. Preserve necessary current external
+integrations, ordinary reliability handling, and required schema tooling.
+
+When uncertainty about that boundary would change the solution, scope, or data
+handling, Context or the planner returns a concrete question to this conversation
+before planning compatibility work. If there is material evidence of valued data
+or production use and preservation is unresolved, ask whether old data can be
+lost/recreated or must be converted. Recommend the simpler pre-production design
+when evidence allows; do not require the user to justify it or ask routinely
+when the answer is clear.
+Record the stage as confirmed or assumed, its evidence, retained obligations,
+and any explicitly approved compatibility exception in acceptance and handoffs.
+
+This preference authorizes no execution of data deletion/reset, removal of migration
+history, breaking a real external contract, or unrelated cleanup. Planning from fresh
+development data is not permission to execute a destructive database operation;
+execution still requires authorization for that concrete action and target.
+Normal ORM/schema migrations are not legacy data conversions. Production
+status does not require every conceivable compatibility layer either: name the
+actual obligation and bound its implementation. Reviewers reject unsupported
+compatibility scope as well as changes that violate confirmed obligations.
 
 Pass the complete normalized contract as `acceptance_context` at launch; use
 `title` only as a concise run label. Launch persists this context before the
@@ -97,7 +132,8 @@ contract and current revision; never infer approval from a timeout, a worker's
   approval before implementation.
 - **Optional UAT:** apply a preference already stated by the user. Otherwise ask
   once after the first planner approval whether to prepare UAT or continue to
-  final review. Record `prepare` or `skip`. Prepare the environment only when
+  final review through the available question interface. Record `prepare` or
+  `skip`. Prepare the environment only when
   selected, wait for actual user observations, and record the result. Do not
   repeatedly ask on expert corrections or pretend preparation means approval.
 - **No progress:** on the second recurrence of the same underlying issue without

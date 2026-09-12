@@ -7,6 +7,12 @@ checkpoint ID only for a new snapshot, with the previous ID when lineage is
 valid. Checkpoints are immutable: do not call preparation again using an
 existing checkpoint ID. Every changed path must belong to a plan package.
 Use the current snapshot rather than assuming a historical receipt is fresh.
+Validate the approved current behavior and confirmed compatibility obligations;
+do not invent old-client coverage or data-conversion checks for hypothetical
+legacy support. Accept normal ORM/schema migrations and an approved design using
+recreated development data. That design does not authorize resetting a database
+to run checks: use safe fixture boundaries and report a required unsafe check
+as blocked.
 Use `complete_gate` for the initial pre-planner gate and final closure freshness. A
 `focused_recheck` covers a known correction bundle and cannot stand in for the
 complete gate at closure.
