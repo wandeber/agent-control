@@ -8,10 +8,14 @@ import { combineRunSnapshots } from "../lib/run-snapshots";
 import type { DashboardSnapshot, UserQuestionRequest } from "../lib/types";
 const date = (at: number) => new Date(at).toISOString();
 const question = (agent: string): UserQuestionRequest => ({ question_id: agent, agent_id: agent, run_id: agent, agent_title: agent, run_title: `Room ${agent}`, state: "pending", answers: null, answered_at: null, created_at: date(0), request_key: agent, title: "Choose a direction", questions: [{ id: "style", prompt: "Which direction fits your portfolio?", options: [{ id: "light", label: "Light" }, { id: "dark", label: "Dark" }] }] });
-it("shows all pending rooms in one inbox with no implied answer or selection", () => {
-  const html = renderToStaticMarkup(<ConsoleSelectionProvider><QuestionInbox requests={[question("A"), question("B"), { ...question("C"), state: "answered" }]} onSelectAgent={() => {}} /></ConsoleSelectionProvider>);
+it("pages pending rooms one at a time with no implied answer or selection", () => {
+  const html = renderToStaticMarkup(<ConsoleSelectionProvider><QuestionInbox requests={[question("A"), question("B"), { ...question("C"), state: "answered" }]} expanded onExpandedChange={() => {}} onSelectAgent={() => {}} /></ConsoleSelectionProvider>);
   expect(html).toContain("Room A"); expect(html).toContain("Room B"); expect(html).not.toContain("Room C");
   expect(html).not.toContain("checked=");
+  expect(html).toContain('aria-label="Question 1 of 2"');
+  expect(html).toContain('aria-label="Question navigation"');
+  expect(html).toContain('<div><form class="question-card" data-question-id="A"');
+  expect(html).toContain('<div hidden=""><form class="question-card" data-question-id="B"');
   expect(html.match(/Send answer/g)).toHaveLength(2);
   expect(html.match(/<textarea/g)).toHaveLength(2);
 });

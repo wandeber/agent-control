@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronUp, MessageCircleQuestion } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, MessageCircleQuestion } from "lucide-react";
 import { answerUserQuestion } from "@/lib/api";
 import { useConsoleSelection } from "./console-selection";
 import type { UserQuestionAnswers, UserQuestionRequest } from "@/lib/types";
@@ -15,21 +15,40 @@ export function QuestionBadge({ count, avatar = false }: { count: number; avatar
   </span>;
 }
 
-export function QuestionInbox({ requests, onSelectAgent }: { requests: UserQuestionRequest[]; onSelectAgent: (request: UserQuestionRequest) => void }) {
+export function QuestionInbox({ requests, expanded, onExpandedChange, onSelectAgent }: { requests: UserQuestionRequest[]; expanded: boolean; onExpandedChange: (expanded: boolean) => void; onSelectAgent: (request: UserQuestionRequest) => void }) {
   const pending = requests.filter(request => request.state === "pending");
-  const [expanded, setExpanded] = useState(true);
+  const [cursor, setCursor] = useState({ id: pending[0]?.question_id, index: 0 });
+  const selectedIndex = pending.findIndex(request => request.question_id === cursor.id);
+  const page = selectedIndex >= 0 ? selectedIndex : Math.max(0, Math.min(cursor.index, pending.length - 1));
+  const selectedId = pending[page]?.question_id;
+  useEffect(() => {
+    setCursor(previous => previous.id === selectedId && previous.index === page ? previous : { id: selectedId, index: page });
+  }, [selectedId, page]);
   const previousIds = useRef(new Set<string>());
   const pendingIds = pending.map(request => request.question_id).join(":");
   useEffect(() => {
     const next = new Set(pendingIds ? pendingIds.split(":") : []);
-    if ([...next].some(id => !previousIds.current.has(id))) setExpanded(true);
+    if ([...next].some(id => !previousIds.current.has(id))) onExpandedChange(true);
     previousIds.current = next;
-  }, [pendingIds]);
+  }, [pendingIds, onExpandedChange]);
   if (!pending.length) return null;
-  return <aside className="question-inbox" aria-label="Questions from your agents">
-    <header className="question-inbox-heading"><MessageCircleQuestion className="size-4" /><h2>Questions for you</h2><span>{pending.length}</span><button type="button" aria-label={expanded ? "Collapse questions" : "Expand questions"} aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? <ChevronDown className="size-4" /> : <ChevronUp className="size-4" />}</button></header>
+  return <aside className="question-inbox" hidden={!expanded} aria-label="Questions from your agents">
+    <header className="question-inbox-heading">
+      <MessageCircleQuestion className="size-4" /><h2>Questions for you</h2>
+      <nav className="question-inbox-pagination" aria-label="Question navigation">
+        <button type="button" aria-label="Previous question" title="Previous question" disabled={page === 0} onClick={() => setCursor({ id: pending[page - 1].question_id, index: page - 1 })}><ChevronLeft className="size-3.5" /></button>
+        <span aria-label={`Question ${page + 1} of ${pending.length}`}>{page + 1} / {pending.length}</span>
+        <button type="button" aria-label="Next question" title="Next question" disabled={page === pending.length - 1} onClick={() => setCursor({ id: pending[page + 1].question_id, index: page + 1 })}><ChevronRight className="size-3.5" /></button>
+      </nav>
+      <button type="button" aria-label="Collapse questions" aria-expanded={expanded} onClick={() => onExpandedChange(false)}><ChevronDown className="size-4" /></button>
+    </header>
     <p className="sr-only" role="status">{pending.map(request => `${request.agent_title} has a question`).join(". ")}</p>
-    <div className="question-inbox-scroll" hidden={!expanded}><QuestionCards requests={pending} onSelectAgent={onSelectAgent} /></div>
+    <div className="question-inbox-body" hidden={!expanded}>
+      {/* Keep each form mounted so paging and live updates preserve unfinished answers. */}
+      {pending.map((request, index) => <div key={request.question_id} hidden={index !== page}>
+        <QuestionCard request={request} onSelectAgent={onSelectAgent} />
+      </div>)}
+    </div>
   </aside>;
 }
 

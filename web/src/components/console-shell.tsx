@@ -56,6 +56,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
   const [selectedAgentMessageLimit, setSelectedAgentMessageLimit] = useState(INITIAL_AGENT_MESSAGE_LIMIT);
   const [graphMode, setGraphMode] = useState<GraphMode>("flow");
   const [layout, setLayout] = useState<ConsoleLayoutState>(DEFAULT_LAYOUT);
+  const [questionsExpanded, setQuestionsExpanded] = useState(true);
   const [layoutHydrated, setLayoutHydrated] = useState(false);
   const [narrowViewport, setNarrowViewport] = useState(false);
   const [renderedBottomPanel, setRenderedBottomPanel] = useState<BottomPanel>("agent");
@@ -303,7 +304,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
       data-thread-open={threadOpen ? "true" : "false"}
       style={shellStyle}
     >
-      {snapshot ? <QuestionInbox requests={snapshot.user_questions ?? []} onSelectAgent={question => {
+      {snapshot ? <QuestionInbox requests={snapshot.user_questions ?? []} expanded={questionsExpanded} onExpandedChange={setQuestionsExpanded} onSelectAgent={question => {
         if (question.run_id !== snapshot.selected_run_id) { selectionRunRef.current = question.run_id; selectRun(question.run_id); }
         setSelectedAgentId(question.agent_id); setAgentSelectionPinned(true); setGraphMode("agents");
       }} /> : null}
@@ -312,6 +313,7 @@ export function ConsoleShell({ onOpenConversation }: { onOpenConversation: () =>
           connection={agentError ? "offline" : connection}
           inspectorOpen={bottomPanel === "agent"}
           onOpenAgent={() => toggleBottomPanel("agent")}
+          onOpenQuestions={!questionsExpanded && snapshot?.user_questions?.some(question => question.state === "pending") ? () => setQuestionsExpanded(true) : undefined}
           onOpenRuns={toggleRunsPanel}
           run={selectedRun}
           selectionTitle={multipleRuns ? selectionTitle : undefined}

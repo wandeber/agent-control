@@ -1670,11 +1670,25 @@ select {
 /* Shared question cards keep decisions visible without taking over the canvas. */
 .question-badge { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 3px; color: #a16207; background: #fef3c7; border-radius: 7px; padding: 4px; font-size: 10px; font-weight: 700; }
 .question-avatar { width: 32px; height: 32px; box-shadow: 0 0 0 2px #fcd34d; }
-.question-inbox { position: absolute; right: 16px; bottom: 16px; z-index: 80; width: min(400px, calc(100% - 32px)); max-height: min(65dvh, 660px); display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-solid, white); box-shadow: 0 10px 36px #0002; overflow: hidden; }
+/* Pulse the halo only, keeping the text and selected-agent ring steady. */
+[data-agent-card][data-has-question="true"] { animation: question-node-pulse 2.8s ease-in-out infinite; }
+@keyframes question-node-pulse {
+  0%, 100% { box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0 0 3px #fbbf2414, 0 0 8px #fbbf240a; }
+  50% { box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), 0 0 0 4px #fbbf243d, 0 0 18px #fbbf2429; }
+}
+@media (prefers-reduced-motion: reduce) { [data-agent-card][data-has-question="true"] { animation: none; } }
+.question-inbox { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 80; width: min(400px, calc(100% - 32px)); max-height: min(65dvh, 660px); display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-solid, white); box-shadow: 0 10px 36px #0002; overflow: hidden; }
+.question-inbox[hidden] { display: none; }
 .question-inbox-heading { display: flex; flex: none; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--line); color: #a16207; background: #fffbeb; }
 .question-inbox-heading h2 { flex: 1; font-size: 12px; font-weight: 700; }
-.question-inbox-heading > span { font-size: 11px; font-weight: 700; }
-.question-inbox-scroll { overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.question-inbox-pagination > span { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.question-inbox-body { overflow-y: auto; min-height: 0; padding: 14px; overscroll-behavior: contain; }
+.question-inbox-body .question-card { border: 0; padding: 0; border-radius: 0; }
+.question-inbox-pagination { display: flex; flex: none; align-items: center; gap: 4px; }
+.question-inbox-pagination button { display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; padding: 3px; color: inherit; }
+.question-inbox-pagination button:hover:not(:disabled) { background: #a1620714; }
+.question-inbox-pagination button:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
+.question-inbox-pagination button:disabled { opacity: .35; cursor: not-allowed; }
 .question-cards { display: flex; flex-direction: column; min-width: 0; gap: 10px; padding: 10px; }
 .question-card { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--panel-solid, white); color: var(--foreground); overflow-wrap: anywhere; }
 .question-card-owner { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 8px; font-size: 10px; }
@@ -1698,7 +1712,7 @@ select {
 .question-answered { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
 .question-error { margin-bottom: 8px; color: #b91c1c; font-size: 11px; }
 .chat-questions { flex: 0 1 auto; max-height: 48%; min-height: 0; overflow: auto; border-bottom: 1px solid var(--line); }
-@media (max-width: 760px) { .question-inbox { right: 8px; bottom: 8px; width: calc(100% - 16px); max-height: 55dvh; } }
+@media (max-width: 760px) { .question-inbox { bottom: 8px; width: calc(100% - 16px); max-height: 55dvh; } }
 
 .activity-timeline-scroll { overflow-x: auto; padding-bottom: 4px; }
 .activity-timeline-grid { display: grid; grid-template-columns: 170px minmax(0, 1fr); row-gap: 3px; }
