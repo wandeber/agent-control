@@ -550,9 +550,9 @@ async function readRuntime(executable: string, cwd: string, refresh: boolean): P
     const [configResponse, skillsResponse, pluginResponse, modelResponse] = await Promise.all([
       client.request("config/read", { cwd, includeLayers: true }),
       client.request("skills/list", { cwds: [cwd], forceReload: refresh }),
+      // Use Codex's effective catalog; forcing local resurrects legacy curated installs.
       collectPages(client, "plugin/list", {
         cwds: [cwd],
-        marketplaceKinds: ["local"],
         forceRefetch: refresh
       }, "marketplaces"),
       collectPages(client, "model/list", {}, "data")
@@ -575,7 +575,10 @@ async function readRuntime(executable: string, cwd: string, refresh: boolean): P
     for (const marketplace of marketplaces) {
       for (const plugin of array(marketplace.plugins).map(object).filter((entry) => entry.installed === true)) {
         const response = object(await client.request("plugin/read", {
-          pluginName: string(plugin.name),
+          // Remote app aliases differ from the identifier accepted by plugin/read.
+          pluginName: !string(marketplace.path) && string(plugin.remotePluginId)
+            ? string(plugin.remotePluginId)
+            : string(plugin.name),
           ...(string(marketplace.path) ? { marketplacePath: string(marketplace.path) } : {}),
           ...(!string(marketplace.path) && string(marketplace.name)
             ? { remoteMarketplaceName: string(marketplace.name) }

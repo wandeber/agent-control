@@ -293,6 +293,8 @@ describe("configured-agent runtime", () => {
     }, "thread", root)).resolves.toBeUndefined();
     expect(calls.some((entry) => entry.method === "app/list")).toBe(true);
     expect(calls.some((entry) => entry.method === "apps/list")).toBe(false);
+    expect(calls.find((entry) => entry.method === "plugin/list")?.params)
+      .not.toHaveProperty("marketplaceKinds");
     expect(calls.filter((entry) => entry.method === "app/list").map((entry) => entry.params.forceRefetch))
       .toEqual([true, false]);
     expect(calls.find((entry) => entry.method === "mcpServerStatus/list")?.params).toMatchObject({

@@ -89,7 +89,7 @@ export async function verifyConfiguredAgentThread(
     client.request("config/read", { cwd, includeLayers: true }),
     client.request("skills/list", { cwds: [cwd], forceReload: true }),
     collectPages(client, "plugin/list", {
-      cwds: [cwd], marketplaceKinds: ["local"], forceRefetch: true
+      cwds: [cwd], forceRefetch: true
     }, "marketplaces"),
     collectPages(client, "mcpServerStatus/list", { threadId, detail: "toolsAndAuthOnly" }, "data"),
     collectPages(client, "app/list", { threadId, limit: 200, forceRefetch: true }, "data")

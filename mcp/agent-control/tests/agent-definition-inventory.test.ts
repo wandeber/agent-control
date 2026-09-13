@@ -6,22 +6,26 @@ import { loadAgentDefinitionInventory } from "../src/core/agent-definition-inven
 import { REQUIRED_AGENT_CONTROL_PLUGIN } from "../src/core/agent-definitions.js";
 import { AgentDefinitionService } from "../src/agent-definitions.js";
 
-const fixture = vi.hoisted(() => ({ provider: "custom", artworkRoot: "", calls: [] as Array<{ method: string; args: string[] }> }));
+const fixture = vi.hoisted(() => ({ provider: "custom", artworkRoot: "", remotePlugin: false, calls: [] as Array<{ method: string; args: string[]; params?: Record<string, unknown> }> }));
 vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
   CodexAppServerClient: class {
     constructor(_url: string, _token: unknown, readonly options: { args: string[] }) {}
     async initialize() {}
     close() {}
     async closeAndWait() {}
-    async request(method: string) {
+    async request(method: string, params?: { marketplaceKinds?: string[]; pluginName?: string; remoteMarketplaceName?: string }) {
       const args = this.options.args;
-      fixture.calls.push({ method, args });
+      fixture.calls.push({ method, args, params });
       const disabled = args.some(arg => arg.startsWith("plugins="));
       switch (method) {
         case "config/read": return { config: { model_provider: fixture.provider, model: "local-alias", plugins: { [REQUIRED_AGENT_CONTROL_PLUGIN]: { enabled: !disabled } }, model_providers: { custom: {} } } };
         case "skills/list": return { data: [{ skills: [{ name: "Control", path: "/fixture/control/SKILL.md", enabled: !disabled }, ...(fixture.artworkRoot ? [{ name: "Illustrated", path: join(fixture.artworkRoot, "skill/SKILL.md"), interface: { iconSmall: join(fixture.artworkRoot, "skill/icon.svg") } }] : [])] }] };
-        case "plugin/list": return { marketplaces: [{ name: "agent-control", plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "agent-control", installed: true, enabled: true, ...(fixture.artworkRoot ? { source: { path: fixture.artworkRoot }, interface: { composerIcon: null, logo: join(fixture.artworkRoot, "missing.svg"), logoDark: null } } : {}) }] }], nextCursor: null };
-        case "plugin/read": return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }, { name: "Metadata only", path: "/fixture/missing/SKILL.md" }], mcpServers: ["agent_control"] } };
+        case "plugin/list": return { marketplaces: [{ name: "agent-control", plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "agent-control", installed: true, enabled: true, ...(fixture.artworkRoot ? { source: { path: fixture.artworkRoot }, interface: { composerIcon: null, logo: join(fixture.artworkRoot, "missing.svg"), logoDark: null } } : {}) }, ...(params?.marketplaceKinds?.includes("local") ? [{ id: "legacy@old-local", name: "legacy", installed: true, enabled: true }] : [{ id: "legacy@effective-remote", name: "legacy", installed: false, enabled: false }])] }, ...(fixture.remotePlugin ? [{ name: "curated-remote", plugins: [{ id: "app-alias@curated-remote", name: "app-alias", remotePluginId: "plugin_asdk_app_real", installed: true, enabled: false }] }] : [])], nextCursor: null };
+        case "plugin/read": if (params?.remoteMarketplaceName === "curated-remote") {
+          if (params.pluginName !== "plugin_asdk_app_real") throw new Error("Remote plugin not found");
+          return { plugin: { skills: [], mcpServers: [] } };
+        }
+        return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }, { name: "Metadata only", path: "/fixture/missing/SKILL.md" }], mcpServers: ["agent_control"] } };
         case "model/list": return { data: [{ model: args.includes('model_provider="openai"') || fixture.provider === "openai" ? "public-model" : "custom-model", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
         default: throw new Error("Unexpected discovery request: " + method);
       }
@@ -29,9 +33,19 @@ vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
   }
 }));
 const roots: string[] = [];
-afterEach(() => { vi.unstubAllEnvs(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); fixture.calls = []; fixture.artworkRoot = ""; });
+afterEach(() => { vi.unstubAllEnvs(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); fixture.calls = []; fixture.artworkRoot = ""; fixture.remotePlugin = false; });
 
 describe("configured-agent provider inventory", () => {
+  it("resolves remote plugin details using the catalog identifier, including disabled installs", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-inventory-remote-")); roots.push(root);
+    vi.stubEnv("CODEX_HOME", root); fixture.remotePlugin = true;
+    const inventory = await loadAgentDefinitionInventory(root, true, process.execPath);
+    expect(fixture.calls).toContainEqual(expect.objectContaining({ method: "plugin/read", params: {
+      pluginName: "plugin_asdk_app_real", remoteMarketplaceName: "curated-remote"
+    } }));
+    expect(inventory.plugins).toContainEqual(expect.objectContaining({ id: "app-alias@curated-remote", enabled_by_default: false }));
+  });
+
   it("supplies declared plugin and skill artwork to the console without adding image bytes to agent context", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-inventory-icons-")); roots.push(root);
     vi.stubEnv("CODEX_HOME", root); vi.stubEnv("AGENT_CONTROL_HOME", root);
@@ -63,6 +77,7 @@ describe("configured-agent provider inventory", () => {
     const publicProbe = fixture.calls.filter(call => call.args.includes('model_provider="openai"'));
     expect(publicProbe.map(call => call.method)).toEqual(provider === "custom" ? ["model/list"] : []);
     expect(inventory.plugins[0]!.enabled_by_default).toBe(true);
+    expect(inventory.plugins.map(plugin => plugin.id)).toEqual([REQUIRED_AGENT_CONTROL_PLUGIN]);
     expect(inventory.plugins[0]!.bundled_skills).toContainEqual(expect.objectContaining({
       path: "/fixture/missing/SKILL.md", runtime_available: false, enabled_by_default: false
     }));

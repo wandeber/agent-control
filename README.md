@@ -108,7 +108,9 @@ MCPs, and apps from Codex at worker launch. To customize that selection, send
 `capabilities_mode: "custom"` with all three capability arrays from the inventory;
 the editor does this automatically on the first capability change. Model and
 instruction edits retain inheritance. Plugin metadata alone does not establish an
-active skill: inheritance follows Codex's effective `skills/list`. Explicit
+active skill: inheritance follows Codex's effective `skills/list`. Plugin
+discovery and readback use the effective marketplace catalog, including
+remote installations, rather than forcing legacy local marketplace entries. Explicit
 selections and continued snapshots are checked after their own overrides are
 applied, so a globally disabled plugin can still be enabled for one worker. Each worker freezes its effective
 selection, so later global changes do not alter its continued turns.
