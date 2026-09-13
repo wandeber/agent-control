@@ -22,6 +22,54 @@ Agent links are a visual/explanatory layer. They can show parent-child,
 handoff-like, subscription-like, and blocking relationships, but they are not
 the state machine.
 
+## Shared Agent Definitions
+
+A role can reference a shared bundled agent key or a personal agent definition
+UUID. Referenced roles use `codex-cli` and inherit the definition's instructions,
+model, provider, reasoning effort, and capability configuration:
+
+```yaml
+roles:
+  planner:
+    agent_ref: development-planner
+    agent_lifecycle: reuse
+  writer:
+    backend: codex-cli
+    model: my-model
+    model_provider: my-provider
+    reasoning_effort: high
+    prompt: Write the requested documentation.
+```
+
+`agent_ref` cannot be combined with role `prompt`, `prompt_ref`, or `prompt_path`,
+an incompatible backend, or a pre-existing step `agent_id`. Steps may still supply
+their own phase instructions. Inline roles remain supported; `model_provider`
+currently requires `codex-cli` because other adapters cannot retain that override.
+
+Explicit role settings override the shared definition. Project settings in
+`.agents/models.toml` override those role settings for `model`, `model_provider`,
+and `reasoning_effort`. Model settings cannot use environment interpolation.
+
+At start, Agent Control resolves each reference and persists the effective
+definition, catalog revision, and digest internally. Public configuration must
+never include `resolved_agent`. Later phases and explicit owner recovery use the
+persisted definition even if the catalog changes or the agent is removed. A
+repeated start of the same active instance retains that original selection.
+
+Each new worker compiles that definition against the inventory in its actual
+repository or package worktree. A reused owner retains its existing execution
+snapshot. `fresh_per_step`, explicit owner recovery, and new package attempts
+create new execution snapshots from the same pinned definition. Package workers
+support both `codex-cli` and inline `codex-thread` roles.
+
+Read-only phases support `codex-cli` and `codex-thread`. CLI continuation receives
+the current flow and step identities and the requested sandbox; writable phases
+also receive the flow runtime directory for handoff artifacts.
+
+Catalog previews resolve the current definitions into separate `resolved_roles`
+and prompt previews. Their public `config` stays editable, and viewing a preview
+does not modify any running instance.
+
 ## Transitions
 
 Use `on.reported` when a worker has written its required artifacts and reported
@@ -259,7 +307,8 @@ plan includes its manifest digest; delegation does not add another human gate.
 Use an empty manifest when one inline owner is sufficient.
 
 `flow_packages` launches the ready set in a batch and gives each child a scoped
-delivery contract. Package roles currently require the `codex-thread` backend.
+delivery contract. Package roles support `codex-cli` (including shared `agent_ref` definitions)
+and inline `codex-thread` agents.
 The consolidated checkout and Codex-managed worktrees must be clean when a
 nonempty manifest is registered. Worktrees must already exist, share the
 repository/base, and have disjoint declared paths. Delivery capture rejects

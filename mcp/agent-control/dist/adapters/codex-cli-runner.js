@@ -41,13 +41,24 @@ export function enqueueCliJob(dir, job, initial) {
         const exists = existsSync(join(dir, "state.json"));
         if (initial && exists)
             throw unavailable("This CLI worker already has an execution; continue its existing session instead.");
+        const fingerprint = createHash("sha256").update(JSON.stringify(job)).digest("hex");
+        // Keep the fingerprint after clearing terminal prompts so a retried phase
+        // can recover its receipt without redispatching or accepting changed input.
+        if (job.idempotency_key) {
+            const previous = jobs(dir).find(entry => entry.job.idempotency_key === job.idempotency_key);
+            if (previous) {
+                if (previous.fingerprint !== fingerprint)
+                    throw unavailable("CLI flow phase was already queued with different input.");
+                return previous.id;
+            }
+        }
         const state = exists ? stateAt(dir) : { status: "queued", updated_at: new Date().toISOString() };
         if (!initial && !state.thread_id && !["running", "queued"].includes(state.status))
             throw unavailable("CLI worker has no persisted session ID to resume.");
         if (state.status === "running" && !state.turn_id)
             throw unavailable("This turn belongs to an older CLI supervisor; wait for it to finish before continuing.");
         const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
-        saveJob(dir, { id, job, initial, status: "pending" });
+        saveJob(dir, { id, job, fingerprint, initial, status: "pending" });
         writeState(dir, { ...state, status: state.status === "running" ? "running" : "queued", updated_at: new Date().toISOString() });
         return id;
     });

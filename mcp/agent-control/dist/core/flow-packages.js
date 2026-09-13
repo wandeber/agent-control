@@ -269,8 +269,8 @@ export class FlowPackages {
                         fail("Each package needs a distinct Git worktree of the same repository at the approved base commit.");
                     if (git(entry.worktree, "status", "--porcelain", "--untracked-files=all"))
                         fail("Package worktrees must be clean when the manifest is defined.");
-                    if (context.config.roles?.[entry.role]?.backend !== "codex-thread")
-                        fail("Package workers require an explicitly configured codex-thread role.");
+                    if (!["codex-thread", "codex-cli"].includes(context.config.roles?.[entry.role]?.backend ?? ""))
+                        fail("Package workers require an explicitly configured codex-thread or codex-cli role.");
                     roots.add(entry.worktree);
                     for (const path of entry.paths) {
                         if (paths.some(prior => scoped(path, prior) || scoped(prior, path)))

@@ -1,12 +1,52 @@
 # Development Flow v1
 
-Version 1.2.2 aligns phase instructions with executable routes: optional UAT
-documents, plan correction during UAT preparation, and guarded reuse of current
-expert approval after mechanical refresh. The workflow follows HDT's
-responsibility and evidence model. Agent Control owns durable phases,
-decisions, owners, reports,
-execution receipts, and transitions. Models own technical judgment and declared
-impact; identical hashes do not establish semantic independence.
+Version 1.3.0 uses the reusable development agents included in Agent Control.
+The analyst remains a complete inline example, initially identical to the
+bundled Analyst. The workflow follows HDT's responsibility and
+evidence model; HDT stays independent and does not consume this catalog.
+Agent Control owns durable phases, decisions, owners, reports, execution
+receipts, and transitions. Models own technical judgment and declared impact;
+identical hashes do not establish semantic independence.
+
+## Shared Agents And Inline Roles
+
+Six logical roles reference stable keys from [the bundled agent catalog](../../agents/catalog.json).
+The bundled analyst is also available for direct tasks and other flows.
+
+```yaml
+roles:
+  planner:
+    agent_ref: development-planner
+    agent_lifecycle: reuse
+  analyst:
+    backend: codex-cli
+    model: gpt-6-astra
+    model_provider: openai
+    reasoning_effort: xhigh
+    agent_lifecycle: reuse
+    prompt_path: roles/analyst.md
+```
+
+A reference uses a bundled key or a personal definition ID; renaming an agent
+keeps the reference stable. The inline analyst owns its instructions and model
+settings in this flow, so editing the bundled analyst does not change this example.
+Phase prompts remain here because they define this flow's artifacts, reports,
+evidence operations, and transitions. Stable worker instructions live with the
+shared agents instead of being repeated in the flow package.
+
+Bundled models use public OpenAI defaults aligned with HDT. Users can customize
+each agent's model, provider, effort, instructions, and capabilities in Settings
+or through the agent definition tools. The bundle contains no personal plugin,
+skill, MCP, or provider-profile selections. Its workers inherit the effective
+Codex CLI capabilities until the user chooses a per-agent configuration.
+Project `.agents/models.toml` overrides and explicit role model settings remain
+available; project overrides take precedence.
+
+A new flow pins the effective referenced definitions and instructions. Each
+new worker freezes inherited capabilities using its own checkout; continued
+phases retain the same session and execution snapshot. Later catalog edits
+affect new flow instances, not an active flow or its owner recovery. Workers
+use isolated managed Codex CLI processes, including approved work packages.
 
 ## Product Stage And Questions
 
@@ -53,8 +93,8 @@ for the common question-interface contract.
 | Phase | Authority and inputs | Result / required evidence | Owner | Omission / correction |
 | --- | --- | --- | --- | --- |
 | Clarification | User request, prior decisions, applicable constraints | Durable acceptance revision with no unresolved material user choice | Original conversation | Before launch; repository facts go to Context |
-| Context | Acceptance and actual repository | Grounded Context document with source pointers | Separate context researcher, Luna `max` | Refresh only affected factual gaps |
-| Analysis | Acceptance and Context | Solution decisions, invariants, boundaries, risks | Analyst, Astra `xhigh` | Corrections amend decisions; material user ambiguity returns to clarification |
+| Context | Acceptance and actual repository | Grounded Context document with source pointers | Separate context researcher | Refresh only affected factual gaps |
+| Analysis | Acceptance and Context | Solution decisions, invariants, boundaries, risks | Analyst | Corrections amend decisions; material user ambiguity returns to clarification |
 | Analysis intent | Current Analysis and accepted user intent | Recorded content-bound intent decision | Original clarification owner | Narrow intention check; no second technical review |
 | Planning | Intent-approved Analysis | Stable package/section IDs, dependencies, paths, interfaces, affected mechanical gate | Planner | Wrong solution returns to Analysis |
 | Plan intent | Current Plan and Analysis | Strict composed plan-review receipt | Exact analyst | First review full; later changed/dependent sections and findings |
@@ -195,7 +235,7 @@ from an actual user decision; ownership determines which thread may record it.
 
 Model defaults align with HDT: Context Luna `max`, Analyst Astra `xhigh`,
 Planner/Implementer/Integrator/Final reviewer Sol `xhigh`, Validator Luna `high`.
-Override only model/effort per role through `.agents/models.toml` using
+Override model/provider/effort per role through `.agents/models.toml` using
 `[flows.development-flow-v1.<role>]`. Environment model variables are not used.
 
 
@@ -211,7 +251,7 @@ worker cannot bypass it with `integration_needed: false`.
 The same exact-plan decision binds the package-manifest digest. Provision
 parallel worktrees through Codex before registration; runtime launches only the
 registered disjoint worktrees from the same repository/base with configured
-`codex-thread` roles. Package children
+`codex-cli` roles. Package children
 report their delivery, never the parent flow step. The original requester
 remains attached. Empty manifests keep inline work simple, with no child
 launch/acceptance/integration ceremony. One external worktree still requires

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -20,7 +20,7 @@ afterEach(() => {
 function catalog(): AgentDefinitionCatalog {
   const root = mkdtempSync(join(tmpdir(), "agent-definitions-"));
   roots.push(root);
-  return new AgentDefinitionCatalog(join(root, "agents", "catalog.json"));
+  return new AgentDefinitionCatalog(join(root, "agents", "catalog.json"), null);
 }
 
 function editable(name: string): AgentDefinitionEditable {
@@ -161,7 +161,7 @@ describe("personal configured-agent catalog", () => {
     const modulePath = resolve("src/core/agent-definitions.ts");
     const run = (name: string) => new Promise<any>((resolveResult, reject) => {
       const code = `import { AgentDefinitionCatalog } from ${JSON.stringify(modulePath)};
-const store = new AgentDefinitionCatalog(${JSON.stringify(store.path)});
+const store = new AgentDefinitionCatalog(${JSON.stringify(store.path)}, null);
 try { const result = store.configure({operation:"create",expected_revision:${JSON.stringify(revision)},patch:${JSON.stringify(editable(name))}}); console.log(JSON.stringify({ok:true,revision:result.revision})); }
 catch (error) { console.log(JSON.stringify({ok:false,reason:error.reason,details:error.details})); }`;
       const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], {
@@ -182,4 +182,70 @@ catch (error) { console.log(JSON.stringify({ok:false,reason:error.reason,details
     ]);
     expect(store.list().agents).toHaveLength(1);
   }, 15_000);
+});
+
+describe("bundled configured agents", () => {
+  it("exposes seven portable defaults without writing a personal catalog", () => {
+    const root = mkdtempSync(join(tmpdir(), "bundled-agent-list-")); roots.push(root);
+    const store = new AgentDefinitionCatalog(join(root, "agents", "catalog.json"));
+    const result = store.list();
+    expect(result.agents).toHaveLength(7);
+    expect(result.agents.every(agent => agent.capabilities_mode === "inherit" && agent.model_provider === "openai" && agent.bundled_key)).toBe(true);
+    expect(existsSync(store.path)).toBe(false);
+    expect(store.resolve("development-planner").definition.name).toBe("Planner");
+    expect(store.resolve(result.agents[0]!.definition_id).definition).toEqual(result.agents[0]);
+    expect(() => store.resolve("missing-bundled-agent")).toThrow(/not found/);
+  });
+
+  it("stores personal field overrides, inherits bundle updates, and preserves stable references", () => {
+    const root = mkdtempSync(join(tmpdir(), "bundled-agent-update-")); roots.push(root);
+    const bundle = join(root, "bundle");
+    cpSync(resolve("../../agents"), bundle, { recursive: true });
+    const sourceBefore = readFileSync(join(bundle, "catalog.json"), "utf8");
+    const store = new AgentDefinitionCatalog(join(root, "personal", "catalog.json"), bundle);
+    const planner = store.resolve("development-planner");
+    const changed = store.configure({ operation: "update", definition_id: planner.definition.definition_id,
+      expected_revision: planner.revision, patch: { name: "My Planner", model: "personal-model", model_provider: "personal-provider" } });
+    expect(changed.definition.capabilities_mode).toBe("inherit");
+    expect(changed.definition.customized).toBe(true);
+    expect(store.resolve("development-planner").definition.name).toBe("My Planner");
+    const saved = JSON.parse(readFileSync(store.path, "utf8"));
+    expect(saved.agents).toEqual([]);
+    expect(saved.bundled_overrides[planner.definition.definition_id].patch).toEqual({ name: "My Planner", model: "personal-model", model_provider: "personal-provider" });
+    expect(readFileSync(join(bundle, "catalog.json"), "utf8")).toBe(sourceBefore);
+    const instruction = join(bundle, "development", "planner.md");
+    writeFileSync(instruction, readFileSync(instruction, "utf8") + "\nUpdated bundled guidance.\n");
+    const updated = store.resolve("development-planner");
+    expect(updated.revision).not.toBe(changed.revision);
+    expect(updated.definition.instructions).toContain("Updated bundled guidance.");
+    expect(updated.definition.model).toBe("personal-model");
+    expect(() => store.configure({ operation: "update", definition_id: updated.definition.definition_id,
+      expected_revision: changed.revision, patch: { description: "stale" } })).toThrow(/revision conflict/);
+    expect(() => store.delete({ definition_id: updated.definition.definition_id, expected_revision: updated.revision })).toThrow(/cannot be deleted/);
+    const copy = store.configure({ operation: "duplicate", source_id: updated.definition.definition_id,
+      expected_revision: updated.revision, patch: { name: "Planner Copy" } });
+    expect(copy.definition.bundled_key).toBeUndefined();
+    expect(copy.definition.instructions).toBe(updated.definition.instructions);
+    expect(copy.definition.capabilities_mode).toBe("inherit");
+    expect(store.delete({ definition_id: copy.definition.definition_id, expected_revision: copy.revision }).agents).toHaveLength(7);
+  });
+
+  it("does not freeze unchanged bundled fields from a complete editor save", () => {
+    const root = mkdtempSync(join(tmpdir(), "bundled-agent-editor-")); roots.push(root);
+    const store = new AgentDefinitionCatalog(join(root, "personal", "catalog.json"));
+    const selected = store.resolve("development-context");
+    const { definition_id, created_at, updated_at, bundled_key, customized, ...fields } = selected.definition;
+    const result = store.configure({ operation: "update", definition_id, expected_revision: selected.revision,
+      patch: { ...fields, description: "My context researcher", skills_catalog_token_budget: null } });
+    const stored = JSON.parse(readFileSync(store.path, "utf8"));
+    expect(stored.bundled_overrides[definition_id].patch).toEqual({ description: "My context researcher" });
+    expect(() => store.configure({ operation: "update", definition_id, expected_revision: result.revision,
+      patch: { plugins: [...fields.plugins, { id: "extra@example", enabled: true }] } })).toThrow(/capabilities_mode/);
+    expect(() => store.configure({ operation: "update", definition_id, expected_revision: result.revision,
+      patch: { capabilities_mode: "custom", plugins: fields.plugins } })).toThrow(/all|together/);
+    const custom = store.configure({ operation: "update", definition_id, expected_revision: result.revision,
+      patch: { capabilities_mode: "custom", plugins: fields.plugins, skills: fields.skills, mcp_servers: fields.mcp_servers } });
+    expect(store.get({ definitionId: definition_id }).definition.capabilities_mode).toBe("custom");
+    expect(custom.definition.bundled_key).toBe("development-context");
+  });
 });

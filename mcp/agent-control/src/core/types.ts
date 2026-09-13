@@ -585,8 +585,17 @@ export interface FlowPromptReferenceConfig {
 export type FlowAgentLifecycle = "reuse" | "fresh_per_step";
 
 export interface FlowRoleConfig {
+  agent_ref?: string;
+  /** Internal, immutable selection. Never accepted in a public flow config. */
+  resolved_agent?: {
+    definition: import("./agent-definitions.js").AgentDefinition;
+    catalog_revision: string;
+    digest: string;
+    source_role: Omit<FlowRoleConfig, "resolved_agent">;
+  };
   backend?: string;
   model?: string | null;
+  model_provider?: string;
   reasoning_effort?: string | null;
   agent_lifecycle?: FlowAgentLifecycle;
   backend_options?: {

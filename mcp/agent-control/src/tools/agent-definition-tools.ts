@@ -27,8 +27,12 @@ const patch = {
     model: string("Configured model id or alias."),
     model_provider: string("Configured provider id."),
     reasoning_effort: string("Reasoning effort supported by the selected model or validated at launch."),
+    capabilities_mode: { type: "string", enum: ["inherit", "custom"], description: "Inherit general Codex capabilities or use personal selections. Switching to custom requires all three plugins, skills, and mcp_servers arrays from inventory defaults." },
     skills_catalog_token_budget: { type: ["integer", "null"], minimum: 1, maximum: 10000 },
-    plugins: toggle("id"),
+    plugins: { ...toggle("id"), items: {
+      ...toggle("id").items,
+      properties: { ...toggle("id").items.properties, skills: toggle("path"), mcp_servers: toggle("name"), apps: toggle("id") }
+    } },
     skills: toggle("path"),
     mcp_servers: toggle("name")
   },
@@ -36,7 +40,7 @@ const patch = {
 };
 const selector = {
   definition_id: string("Stable configured-agent definition id."),
-  name: string("Exact personal agent name; choose this or definition_id.")
+  name: string("Exact configured agent name; choose this or definition_id.")
 };
 const authority = {
   admin_key: string("Optional explicit local operator credential."),
@@ -46,13 +50,13 @@ const authority = {
 export const AGENT_DEFINITION_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "agent_definition_list",
-    description: "List the ordered personal configured-agent catalog and its compare-and-swap revision.",
+    description: "List bundled and personal configured agents with stable IDs, bundled keys, effective settings, and catalog revision.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     schema: agentDefinitionListSchema
   },
   {
     name: "agent_definition_get",
-    description: "Get one personal configured-agent definition by definition_id or exact normalized name.",
+    description: "Get one bundled or personal configured-agent definition by definition_id or exact normalized name.",
     inputSchema: { type: "object", properties: selector, additionalProperties: false },
     schema: agentDefinitionGetSchema
   },
@@ -67,7 +71,7 @@ export const AGENT_DEFINITION_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "agent_definition_configure",
-    description: "Create, update, duplicate, or reorder one personal configured-agent definition with catalog revision compare-and-swap.",
+    description: "Create or duplicate a personal agent, or update an agent with catalog revision compare-and-swap. Bundled updates are personal overrides. Capability ordering is saved in the three selection arrays; inherit uses general Codex defaults.",
     inputSchema: { type: "object", properties: {
       ...authority,
       operation: { type: "string", enum: ["create", "update", "duplicate"] },

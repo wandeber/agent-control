@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { agentConversationThreadId } from "../src/core/agent-conversation-identity.js";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,20 +11,43 @@ import { loadFlowConfigFile } from "../src/core/flow-config-loader.js";
 import { artifactDigest } from "../src/core/flow-runtime.js";
 import type { FlowPackagesRequest } from "../src/core/flow-packages.js";
 import { resolveAdminKey } from "../src/core/identity.js";
-import { runRuntimeDir } from "../src/core/paths.js";
+import { agentRuntimeDir, runRuntimeDir } from "../src/core/paths.js";
 import type { EvidenceReceipt, EvidenceRequest } from "../src/core/evidence/service.js";
 import { EVENT_TYPES, type AgentAdapter, type AgentHandle, type AgentStatus, type StartAgentInput } from "../src/core/types.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 import { handleTool } from "../src/tools/handlers.js";
 
-// Only model execution is replaced. The actual bundled YAML, controller,
+import { REQUIRED_AGENT_CONTROL_MCP, REQUIRED_AGENT_CONTROL_PLUGIN } from "../src/core/agent-definitions.js";
+import type { AgentDefinitionInventory } from "../src/core/agent-definition-inventory.js";
+
+// Inventory discovery is deterministic; the real configuration compiler runs.
+vi.mock("../src/core/agent-definition-inventory.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/core/agent-definition-inventory.js")>(),
+  loadAgentDefinitionInventory: async (): Promise<AgentDefinitionInventory> => ({
+    inherited_developer_instructions: "", inventory_revision: "fixture", refreshed_at: "2026-09-13T00:00:00.000Z",
+    runtime: { executable: "/fixture/codex", version: "fixture", compatible: true },
+    providers: [{ id: "openai", available: true }],
+    models: ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"].map(id => ({ id, model_provider: "openai", supported_reasoning_efforts: ["high", "xhigh", "max"], available: true, catalog_available: true, run_validation_required: false })),
+    plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "Agent Control", required: true, available: true, enabled_by_default: true, bundled_skills: [], bundled_mcp_servers: [{ name: REQUIRED_AGENT_CONTROL_MCP }], bundled_apps: [] }],
+    skills: [], mcp_servers: [{ name: REQUIRED_AGENT_CONTROL_MCP, required: true, available: true, enabled_by_default: true }], apps: []
+  })
+}));
+
+// Only model execution and host discovery are replaced. The actual bundled YAML, controller,
 // SQLite transitions, canonical HDT provider, and command executor run normally.
 class ScriptedCodex implements AgentAdapter {
-  readonly kind = "codex-thread";
+  constructor(readonly kind = "codex-cli") {}
   starts: StartAgentInput[] = [];
   statuses = new Map<string, AgentStatus>();
   capabilities() { return { canStart: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: true }; }
-  async start(input: StartAgentInput): Promise<AgentHandle> { this.starts.push(input); return { backend: this.kind, id: input.agent.agent_id, data: { thread_id: `fixture-${input.agent.agent_id}` } }; }
+  async start(input: StartAgentInput): Promise<AgentHandle> {
+    this.starts.push(input);
+    if (input.agent.backend_handle) return { backend: this.kind, id: input.agent.agent_id, data: input.agent.backend_handle };
+    const dir = join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "codex-cli");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "state.json"), JSON.stringify({ thread_id: randomUUID(), status: "running", updated_at: new Date().toISOString() }));
+    return { backend: this.kind, id: input.agent.agent_id, data: { dir, cwd: input.agent.repo_dir, ...(input.metadata?.configured_agent ? { snapshot_hash: "fixture-snapshot" } : {}) } };
+  }
   async getStatus(handle: AgentHandle) { return { status: this.statuses.get(handle.id) ?? "running" as const }; }
   async readLatest() { return []; }
   async sendMessage() {}
@@ -39,18 +64,18 @@ let taskPackages: Record<string, string>;
 type PackageSpec = { id: string; title: string; role: string; worktree: string; paths: string[]; deliverables: string[]; depends_on?: string[]; required?: boolean };
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), "ac-default-lifecycle-")); repo = join(root, "repo"); mkdirSync(repo);
+  root = realpathSync(mkdtempSync(join(tmpdir(), "ac-default-lifecycle-"))); repo = join(root, "repo"); mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
   execFileSync("git", ["-C", repo, "config", "user.name", "Flow fixture"]);
   execFileSync("git", ["-C", repo, "config", "user.email", "fixture@example.invalid"]);
   writeFileSync(join(repo, "alpha.txt"), "before\n"); writeFileSync(join(repo, "beta.txt"), "before\n");
   writeFileSync(join(repo, "value.txt"), "before\n"); writeFileSync(join(repo, "unrelated.txt"), "preserved\n");
   execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "baseline"]);
-  vi.stubEnv("AGENT_CONTROL_HOME", join(root, "state")); vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "fixture-admin");
+  vi.stubEnv("AGENT_CONTROL_HOME", join(root, "state")); vi.stubEnv("AGENT_CONTROL_USER_DIR", join(root, "user")); vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "fixture-admin");
   vi.stubEnv("CODEX_THREAD_ID", ""); vi.stubEnv("AGENT_CONTROL_REQUESTER_THREAD_ID", "");
   vi.stubEnv("AC_FIXTURE_VALIDATION_EPOCH", "initial");
   store = new SqliteStore(join(root, "state.sqlite")); adapter = new ScriptedCodex();
-  const registry = new AdapterRegistry(); registry.register(adapter); controller = new AgentController(store, registry);
+  const registry = new AdapterRegistry(); registry.register(adapter); registry.register(new ScriptedCodex("codex-thread")); controller = new AgentController(store, registry);
   coordinator = controller.orchestratorLogin({ adminKey: resolveAdminKey(), title: "Conversation", runTitle: "Update value", repoDir: repo, backend: "codex-thread", backendHandle: { thread_id: "executor-thread" } });
   id = ""; taskPackages = { "value.txt": "work" };
 });
@@ -68,7 +93,7 @@ async function enter(expected: string) {
   expect(current().step_id).toBe(expected);
   const dispatched = await controller.dispatchActiveFlowStep({ flowInstanceId: id, agentToken: coordinator.agent_token });
   expect(dispatched.agent).toBeDefined();
-  vi.stubEnv("CODEX_THREAD_ID", controller.getAgent(dispatched.agent!.agent_id).backend_handle!.thread_id as string);
+  asAgent(dispatched.agent!.agent_id);
   return current();
 }
 function report(result: Record<string, unknown>, artifacts?: Record<string, string>) { return controller.reportFlowStep({ stepInstanceId: current().step_instance_id, status: "completed", result, artifacts, summary: `Fixture ${current().step_id} result` }); }
@@ -180,7 +205,9 @@ function packages(request: FlowPackagesRequest) {
   return controller.executeFlowPackages({ flowInstanceId: id, request });
 }
 function asAgent(agentId: string) {
-  vi.stubEnv("CODEX_THREAD_ID", controller.getAgent(agentId).backend_handle!.thread_id as string);
+  const threadId = agentConversationThreadId(controller.getAgent(agentId));
+  expect(threadId).toBeTruthy();
+  vi.stubEnv("CODEX_THREAD_ID", threadId!);
 }
 
 async function toPackageIntegration() {
@@ -323,6 +350,9 @@ describe("bundled default flow with actual evidence and closure", () => {
     await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
     await validate(); await planner(); const review = await expert(); await close(review);
     expect(adapter.starts).toHaveLength(8);
+    expect(adapter.starts.filter(start => start.metadata?.configured_agent)).toHaveLength(5);
+    expect(adapter.starts.every(start => start.metadata?.model_provider === "openai")).toBe(true);
+    expect(adapter.starts.filter(start => start.agent.role === "analyst").every(start => !start.metadata?.configured_agent)).toBe(true);
     expect(snapshot().runtime!.context).toBe(acceptance);
     expect(snapshot().reports.map(item => item.result_json.conclusion)).toContain("verified");
   }, 60_000);

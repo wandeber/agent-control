@@ -1,4 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { runInteractiveCliTurn } from "../src/adapters/codex-cli-interactive.js";
+import { AgentAccessStore } from "../src/core/agent-access.js";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -105,4 +107,54 @@ it("passes the controller home, database, and worker credential to owned app-ser
   } finally {
     await client.closeAndWait();
   }
+});
+
+it.each(["read_only", "workspace"] as const)("caps a resumed flow %s phase despite broader persisted access", async sandbox => {
+ const dir = temp(), executable = join(dir, 'fixture-codex'), callsPath = join(dir, 'calls.jsonl');
+ const dbPath = join(dir, 'state.sqlite'), db = new Database(dbPath);
+ const access = new AgentAccessStore(db);
+ access.requestAgentAccess('owner', { sandbox: 'full_access', approval_policy: 'on-request' }, 0);
+ // The protocol fixture deliberately returns the old, broader policy on resume.
+ // The next turn must carry the phase boundary explicitly, not echo that policy.
+ writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const lines = require('node:readline').createInterface({input: process.stdin});
+let policy = {type:'workspaceWrite', writableRoots:['/old-root'], networkAccess:false, excludeSlashTmp:true};
+let approval = 'on-request';
+lines.on('line', line => {
+ const request = JSON.parse(line);
+ if (request.id === undefined) return;
+ fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(request) + '\\n');
+ let result = {};
+ if (request.method === 'thread/resume') result = {thread:{id:'same-thread'}, cwd:${JSON.stringify(dir)}, model:'fixture', modelProvider:'local', approvalPolicy:approval, sandbox:policy};
+ if (request.method === 'turn/start') {
+  policy = request.params.sandboxPolicy; approval = request.params.approvalPolicy;
+  result = {turn:{id:'next-turn',status:'completed'}};
+ }
+ process.stdout.write(JSON.stringify({id:request.id,result}) + '\\n');
+});`, { mode: 0o700 });
+ const events: Record<string, unknown>[] = [], threads: string[] = [];
+ try {
+  const result = await runInteractiveCliTurn({ executable, cwd: dir, prompt: 'next phase', model: 'fixture', model_provider: 'local', model_provider_override: 'local',
+   sandbox, approval_policy: 'on-request', agent_id: 'owner', db_path: dbPath,
+   flow_instance_id: 'flow', flow_writable_root: join(dir, 'artifacts') }, {
+    session: 'same-thread', event: event => events.push(event), thread: id => threads.push(id),
+    turn: () => {}, heartbeat: () => {}, stop: () => undefined, dispatch: send => send()
+   });
+  expect(result).toEqual({thread_id:'same-thread',status:'completed'});
+  expect(threads).toEqual(['same-thread']);
+  const calls = readFileSync(callsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(calls.some(call => call.method === 'thread/start')).toBe(false);
+  expect(calls.find(call => call.method === 'thread/resume').params.config).toMatchObject({model_provider:'local'});
+  const turn = calls.filter(call => call.method === 'turn/start');
+  expect(turn).toHaveLength(1);
+  if (sandbox === 'read_only') {
+   expect(turn[0].params).toMatchObject({approvalPolicy:'never',sandboxPolicy:{type:'readOnly'}});
+   expect(turn[0].params.sandboxPolicy).toEqual({type:'readOnly'});
+  } else {
+   expect(turn[0].params.sandboxPolicy).toEqual({type:'workspaceWrite',writableRoots:[dir,join(dir,'artifacts')],networkAccess:false,excludeSlashTmp:true});
+  }
+  expect(access.getAgentAccess('owner')).toMatchObject({state:'pending',effective_revision:null});
+  expect(events.some(event => event.type === 'error')).toBe(false);
+ } finally { db.close(); }
 });

@@ -4,6 +4,7 @@ import { isAbsolute, relative } from "node:path";
 import { getFlowFromCatalog, listFlowCatalog } from "./flow-catalog.js";
 import { parseFlowConfig, resolveStepPromptSources } from "./flow.js";
 import { resolveProjectRoot } from "./project-models.js";
+import { resolveFlowAgentDefinitions } from "./flow-agent-definitions.js";
 /** A source preview has no execution identity and never changes a pinned run. */
 export function previewFlowCatalog(projectDir, flowId) {
     const projectRoot = resolveProjectRoot(projectDir) ?? null;
@@ -15,10 +16,11 @@ export function previewFlowCatalog(projectDir, flowId) {
         try {
             const loaded = getFlowFromCatalog({ flowId: selected.flow_id ?? selected.directory_name, projectDir: projectRoot });
             const config = parseFlowConfig(loaded.config);
+            const resolved = resolveFlowAgentDefinitions(config);
             const roots = [...catalog.catalogs.map(value => value.root_path), ...(projectRoot ? [projectRoot] : [])];
             const prompts = Object.fromEntries(Object.keys(config.steps).map(stepId => [stepId,
-                resolveStepPromptSources(config, stepId).map(source => previewPrompt(source, roots))]));
-            definition = { ...selected, config, prompts };
+                resolveStepPromptSources(resolved, stepId).map(source => previewPrompt(source, roots))]));
+            definition = { ...selected, config, resolved_roles: resolved.roles ?? {}, prompts };
         }
         catch (cause) {
             error = cause instanceof Error ? cause.message : "The flow is not valid yet.";

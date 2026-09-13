@@ -25,7 +25,7 @@ export function resolveProjectRoot(projectDir?: string | null): string | null {
 export function applyProjectModels(config: Record<string, unknown>, projectDir?: string | null): Record<string, unknown> {
   if (record(config.roles)) for (const [role, settings] of Object.entries(config.roles)) {
     if (!record(settings)) continue;
-    for (const field of ["model", "reasoning_effort"]) if (typeof settings[field] === "string" && settings[field].includes("${")) throw new Error(`roles.${role}.${field} cannot use environment interpolation; use .agents/models.toml.`);
+    for (const field of ["model", "model_provider", "reasoning_effort"]) if (typeof settings[field] === "string" && settings[field].includes("${")) throw new Error(`roles.${role}.${field} cannot use environment interpolation; use .agents/models.toml.`);
   }
   const root = resolveProjectRoot(projectDir);
   const path = root && join(root, ".agents", "models.toml");
@@ -44,7 +44,7 @@ export function applyModelPreferences(config: Record<string, unknown>, preferenc
       for (const [role, override] of Object.entries(roles)) {
         if (!record(override)) throw new Error(`Model override ${role} must be a table.`);
         for (const [key, value] of Object.entries(override)) {
-          if (key !== "model" && key !== "reasoning_effort") throw new Error(`Unsupported model override field: ${role}.${key}`);
+          if (key !== "model" && key !== "model_provider" && key !== "reasoning_effort") throw new Error(`Unsupported model override field: ${role}.${key}`);
           if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.includes("${")) throw new Error(`Invalid model override: ${role}.${key}`);
           if (key === "reasoning_effort" && !efforts.has(value)) throw new Error(`Invalid reasoning effort for ${role}.`);
         }

@@ -1,4 +1,7 @@
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { AgentDefinitionCatalog } from "../src/core/agent-definitions.js";
+import { resolveFlowAgentDefinitions } from "../src/core/flow-agent-definitions.js";
 import { describe, expect, it } from "vitest";
 import { loadFlowConfigFile } from "../src/core/flow-config-loader.js";
 import { evaluateCondition, parseFlowConfig, selectTransition } from "../src/core/flow.js";
@@ -107,14 +110,23 @@ describe("development-flow-v1 responsibility and routing parity", () => {
 
   it("keeps only real document artifacts and preserves configured worker models", () => {
     expect(Object.keys(raw.artifacts ?? {}).sort()).toEqual(["analysis", "context", "plan", "uat_guide"]);
-    expect(raw.roles?.analyst).toMatchObject({ backend: "codex-thread", model: "gpt-6-astra", reasoning_effort: "xhigh", agent_lifecycle: "reuse" });
-    expect(raw.roles?.final_reviewer).toMatchObject({ backend: "codex-thread", model: "gpt-5.6-sol", reasoning_effort: "xhigh", agent_lifecycle: "reuse" });
+    const catalog = new AgentDefinitionCatalog(resolve(import.meta.dirname, "missing-personal-catalog.json"));
+    const effective = resolveFlowAgentDefinitions(parseFlowConfig(raw), catalog);
+    expect(raw.roles?.analyst).toMatchObject({ backend: "codex-cli", model: "gpt-6-astra", model_provider: "openai", reasoning_effort: "xhigh", agent_lifecycle: "reuse", prompt_ref: "role_analyst" });
+    expect(raw.roles?.analyst.agent_ref).toBeUndefined();
+    expect(readFileSync(resolve(import.meta.dirname, "../../../flows/development-flow-v1/roles/analyst.md"), "utf8")).toBe(catalog.resolve("development-analyst").definition.instructions);
+    for (const name of ["context", "planner", "implementer", "integrator", "validator", "final_reviewer"]) {
+      expect(raw.roles?.[name]).toEqual({ agent_ref: `development-${name.replaceAll("_", "-")}`, agent_lifecycle: "reuse" });
+      expect(effective.roles?.[name]).toMatchObject({ backend: "codex-cli", model_provider: "openai", resolved_agent: { definition: { capabilities_mode: "inherit" } } });
+    }
+    expect(Object.keys(raw.prompts ?? {}).filter(name => name.startsWith("role_"))).toEqual(["role_analyst"]);
+    expect(effective.roles?.final_reviewer).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
     expect(record.steps.context.role).toBe("context");
     expect(record.steps.analysis.role).toBe("analyst");
     expect(record.steps.plan_review.role).toBe("analyst");
-    expect(raw.roles?.context).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
-    expect(raw.roles?.validator).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "high" });
-    for (const name of ["planner", "implementer", "integrator"]) expect(raw.roles?.[name]).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
+    expect(effective.roles?.context).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
+    expect(effective.roles?.validator).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "high" });
+    for (const name of ["planner", "implementer", "integrator"]) expect(effective.roles?.[name]).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
     expect(record.steps.integration.role).toBe("integrator");
   });
 });

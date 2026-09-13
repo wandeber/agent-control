@@ -79,9 +79,14 @@ export class AgentDefinitionService {
         const parsed = parseInput(agentDefinitionGetSchema, input);
         return this.catalog.get({ definitionId: parsed.definition_id, name: parsed.name });
     }
-    inventory(input) {
+    async inventory(input, includeArtwork = false) {
         const parsed = parseInput(agentDefinitionInventorySchema, input);
-        return loadAgentDefinitionInventory(resolve(parsed.repo_dir ?? process.cwd()), parsed.refresh === true);
+        const inventory = await loadAgentDefinitionInventory(resolve(parsed.repo_dir ?? process.cwd()), parsed.refresh === true);
+        if (includeArtwork)
+            return inventory;
+        // Artwork belongs in the console, not in model-facing MCP/CLI context.
+        const withoutArtwork = ({ icon_url: _light, icon_dark_url: _dark, ...entry }) => entry;
+        return { ...inventory, plugins: inventory.plugins.map(withoutArtwork), skills: inventory.skills.map(withoutArtwork), mcp_servers: inventory.mcp_servers.map(withoutArtwork) };
     }
     configure(input, authority = {}) {
         assertCatalogMutationAuthority(this.controller, authority);

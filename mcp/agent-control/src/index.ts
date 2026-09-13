@@ -421,7 +421,7 @@ async function handleConsoleTool(
       result = await agentDefinitions.inventory({
         ...parsed,
         repo_dir: parsed.repo_dir ?? session.selection.repo_dir
-      });
+      }, true);
     } else if (name === "agent_control_console_agent_definition_configure") {
       result = agentDefinitions.configure(args as ConfigureAgentDefinitionInput, {
         trustedCatalogCapability: true,

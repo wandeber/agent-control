@@ -1,15 +1,22 @@
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { ControllerError } from "./errors.js";
 import { agentDefinitionCatalogPath } from "./paths.js";
 export const REQUIRED_AGENT_CONTROL_PLUGIN = "agent-control@agent-control";
 export const REQUIRED_AGENT_CONTROL_MCP = "agent_control";
-export const pluginSelectionSchema = z.object({ id: z.string().min(1), enabled: z.boolean() }).strict();
 export const skillSelectionSchema = z.object({ path: z.string().min(1), enabled: z.boolean() }).strict();
 export const mcpSelectionSchema = z.object({ name: z.string().min(1), enabled: z.boolean() }).strict();
+export const appSelectionSchema = z.object({ id: z.string().min(1), enabled: z.boolean() }).strict();
+export const pluginSelectionSchema = z.object({
+    id: z.string().min(1), enabled: z.boolean(),
+    skills: z.array(skillSelectionSchema).optional(),
+    mcp_servers: z.array(mcpSelectionSchema).optional(),
+    apps: z.array(appSelectionSchema).optional()
+}).strict();
 export const agentDefinitionSchema = z.object({
     definition_id: z.string().uuid(),
     name: z.string().min(1),
@@ -18,17 +25,22 @@ export const agentDefinitionSchema = z.object({
     model: z.string().min(1),
     model_provider: z.string().min(1),
     reasoning_effort: z.string().min(1),
+    capabilities_mode: z.enum(["inherit", "custom"]).optional(),
     skills_catalog_token_budget: z.number().int().min(1).max(10_000).optional(),
     plugins: z.array(pluginSelectionSchema),
     skills: z.array(skillSelectionSchema),
     mcp_servers: z.array(mcpSelectionSchema),
     created_at: z.string().datetime(),
-    updated_at: z.string().datetime()
+    updated_at: z.string().datetime(),
+    bundled_key: z.string().optional(),
+    customized: z.boolean().optional()
 }).strict();
 export const editableDefinitionSchema = agentDefinitionSchema.omit({
     definition_id: true,
     created_at: true,
-    updated_at: true
+    updated_at: true,
+    bundled_key: true,
+    customized: true
 });
 export const definitionPatchSchema = editableDefinitionSchema.partial().extend({
     skills_catalog_token_budget: z.number().int().min(1).max(10_000).nullable().optional()
@@ -61,7 +73,22 @@ export const deleteAgentDefinitionSchema = z.object({
 }).strict();
 const catalogSchema = z.object({
     schema_version: z.literal(1),
-    agents: z.array(agentDefinitionSchema)
+    agents: z.array(agentDefinitionSchema),
+    bundled_overrides: z.record(z.object({ patch: definitionPatchSchema, updated_at: z.string().datetime() }).strict()).optional()
+}).strict();
+const bundledCatalogSchema = z.object({
+    schema_version: z.literal(1),
+    updated_at: z.string().datetime(),
+    agents: z.array(z.object({
+        key: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+        definition_id: z.string().uuid(),
+        name: z.string().min(1),
+        description: z.string(),
+        model: z.string().min(1),
+        model_provider: z.string().min(1),
+        reasoning_effort: z.string().min(1),
+        instructions_path: z.string().min(1)
+    }).strict())
 }).strict();
 const EMPTY_CATALOG_BYTES = Buffer.from(`${JSON.stringify({ schema_version: 1, agents: [] }, null, 2)}\n`);
 export function normalizeAgentDefinitionName(value) {
@@ -69,21 +96,40 @@ export function normalizeAgentDefinitionName(value) {
 }
 export class AgentDefinitionCatalog {
     path;
-    constructor(path = agentDefinitionCatalogPath()) {
+    bundledRoot;
+    constructor(path = agentDefinitionCatalogPath(), bundledRoot = resolve(fileURLToPath(new URL("../../../../agents", import.meta.url)))) {
         this.path = path;
+        this.bundledRoot = bundledRoot;
     }
     list() {
         const { bytes, document } = this.readDocument();
-        return { ...document, revision: digest(bytes) };
+        const bundled = this.readBundled();
+        const agents = [...bundled.map(definition => {
+                const override = document.bundled_overrides?.[definition.definition_id];
+                return { ...(override ? normalizeDefinition({ ...applyPatch(definition, override.patch), updated_at: override.updated_at }) : definition), customized: Boolean(override) };
+            }), ...document.agents];
+        validateCatalogSemantics(agents, false);
+        return { schema_version: 1, agents, revision: bundled.length ? digest(Buffer.concat([bytes, Buffer.from(JSON.stringify(bundled))])) : digest(bytes) };
+    }
+    /** Flows use stable bundled keys or definition IDs; display names remain editable. */
+    resolve(reference) {
+        const catalog = this.list();
+        const definition = catalog.agents.find(agent => agent.definition_id === reference || agent.bundled_key === reference);
+        if (!definition)
+            throw new ControllerError(`Configured agent reference was not found: ${reference}.`, "not_found");
+        return { revision: catalog.revision, definition };
     }
     get(reference) {
         if (Boolean(reference.definitionId) === Boolean(reference.name)) {
             throw new ControllerError("Provide exactly one of definition_id or name.", "validation");
         }
         const catalog = this.list();
-        const definition = reference.definitionId
-            ? catalog.agents.find((entry) => entry.definition_id === reference.definitionId)
-            : catalog.agents.find((entry) => normalizeAgentDefinitionName(entry.name) === normalizeAgentDefinitionName(reference.name));
+        const matches = reference.definitionId
+            ? catalog.agents.filter((entry) => entry.definition_id === reference.definitionId)
+            : catalog.agents.filter((entry) => normalizeAgentDefinitionName(entry.name) === normalizeAgentDefinitionName(reference.name));
+        if (matches.length > 1)
+            throw new ControllerError("Configured agent name is ambiguous; use definition_id.", "validation", { definition_ids: matches.map(entry => entry.definition_id) });
+        const definition = matches[0];
         if (!definition) {
             throw new ControllerError("Configured agent definition was not found.", "not_found", {
                 ...(reference.definitionId ? { definition_id: reference.definitionId } : { name: reference.name })
@@ -96,7 +142,9 @@ export class AgentDefinitionCatalog {
         return this.withWriteLock(() => {
             const current = this.list();
             assertRevision(input.expected_revision, current.revision);
-            const agents = [...current.agents];
+            const document = this.readDocument().document;
+            const agents = [...document.agents];
+            const overrides = { ...document.bundled_overrides };
             const now = new Date().toISOString();
             let definition;
             if (input.operation === "create") {
@@ -112,22 +160,25 @@ export class AgentDefinitionCatalog {
             else {
                 const referenceId = input.operation === "duplicate" ? input.source_id : input.definition_id;
                 const sourceIndex = agents.findIndex((entry) => entry.definition_id === referenceId);
-                if (sourceIndex < 0) {
+                const source = current.agents.find(entry => entry.definition_id === referenceId);
+                if (!source) {
                     throw new ControllerError("Configured agent definition was not found.", "not_found", {
                         definition_id: referenceId
                     });
                 }
-                const source = agents[sourceIndex];
+                assertCapabilityTransition(source, input.patch);
                 if (input.operation === "duplicate") {
                     const patched = applyPatch(source, input.patch);
                     definition = normalizeDefinition({
                         ...patched,
                         definition_id: randomUUID(),
+                        bundled_key: undefined,
+                        customized: undefined,
                         created_at: now,
                         updated_at: now
                     });
                     assertPosition(input.position, agents.length, true);
-                    agents.splice(input.position ?? sourceIndex + 1, 0, definition);
+                    agents.splice(input.position ?? (sourceIndex < 0 ? agents.length : sourceIndex + 1), 0, definition);
                 }
                 else {
                     definition = normalizeDefinition({
@@ -136,8 +187,21 @@ export class AgentDefinitionCatalog {
                         created_at: source.created_at,
                         updated_at: now
                     });
-                    agents[sourceIndex] = definition;
-                    if (input.position !== undefined) {
+                    if (source.bundled_key) {
+                        if (input.position !== undefined)
+                            throw new ControllerError("Bundled agents cannot be reordered; order their capabilities instead.", "validation");
+                        // Store only the user's choices so new bundled instructions and defaults
+                        // remain visible unless that specific field was customized.
+                        const base = this.readBundled().find(entry => entry.definition_id === source.definition_id);
+                        const patch = bundledDifference(base, definition);
+                        if (Object.keys(patch).length)
+                            overrides[source.definition_id] = { patch, updated_at: now };
+                        else
+                            delete overrides[source.definition_id];
+                    }
+                    else
+                        agents[sourceIndex] = definition;
+                    if (!source.bundled_key && input.position !== undefined) {
                         assertPosition(input.position, agents.length - 1, true);
                         agents.splice(sourceIndex, 1);
                         agents.splice(input.position, 0, definition);
@@ -145,8 +209,18 @@ export class AgentDefinitionCatalog {
                 }
             }
             validateCatalogSemantics(agents);
-            const written = this.writeDocument({ schema_version: 1, agents });
-            return { revision: written.revision, definition, agents: written.agents };
+            const bundled = this.readBundled().map(entry => {
+                const override = overrides[entry.definition_id];
+                return override ? normalizeDefinition({ ...applyPatch(entry, override.patch), updated_at: override.updated_at }) : entry;
+            });
+            const nameChanged = input.operation !== "update" || input.patch.name !== undefined && current.agents.find(entry => entry.definition_id === definition.definition_id)?.name !== definition.name;
+            if (nameChanged && [...bundled, ...agents].some(entry => entry.definition_id !== definition.definition_id && normalizeAgentDefinitionName(entry.name) === normalizeAgentDefinitionName(definition.name))) {
+                throw new ControllerError(`Configured agent name already exists: ${definition.name}.`, "validation");
+            }
+            validateCatalogSemantics([...bundled, ...agents], false);
+            this.writeDocument({ schema_version: 1, agents, ...(Object.keys(overrides).length ? { bundled_overrides: overrides } : {}) });
+            const written = this.list();
+            return { revision: written.revision, definition: written.agents.find(entry => entry.definition_id === definition.definition_id), agents: written.agents };
         });
     }
     delete(rawInput) {
@@ -154,16 +228,40 @@ export class AgentDefinitionCatalog {
         return this.withWriteLock(() => {
             const current = this.list();
             assertRevision(input.expected_revision, current.revision);
-            const index = current.agents.findIndex((entry) => entry.definition_id === input.definition_id);
+            if (current.agents.some(entry => entry.definition_id === input.definition_id && entry.bundled_key)) {
+                throw new ControllerError("Bundled agents cannot be deleted. Customize or duplicate the agent instead.", "validation");
+            }
+            const document = this.readDocument().document;
+            const index = document.agents.findIndex((entry) => entry.definition_id === input.definition_id);
             if (index < 0) {
                 throw new ControllerError("Configured agent definition was not found.", "not_found", {
                     definition_id: input.definition_id
                 });
             }
-            const agents = [...current.agents];
+            const agents = [...document.agents];
             agents.splice(index, 1);
-            const written = this.writeDocument({ schema_version: 1, agents });
+            this.writeDocument({ ...document, agents });
+            const written = this.list();
             return { revision: written.revision, deleted_definition_id: input.definition_id, agents: written.agents };
+        });
+    }
+    readBundled() {
+        if (!this.bundledRoot)
+            return [];
+        const path = resolve(this.bundledRoot, "catalog.json");
+        const source = bundledCatalogSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+        if (new Set(source.agents.map(entry => entry.key)).size !== source.agents.length)
+            throw new ControllerError("Bundled agent keys must be unique.", "validation");
+        return source.agents.map(entry => {
+            const instructionPath = resolve(this.bundledRoot, entry.instructions_path);
+            const localPath = relative(this.bundledRoot, instructionPath);
+            if (isAbsolute(localPath) || localPath === ".." || localPath.startsWith("../") || !instructionPath.endsWith(".md")) {
+                throw new ControllerError("Bundled agent instructions must be Markdown inside its catalog.", "validation");
+            }
+            const { key, instructions_path: _, ...fields } = entry;
+            return normalizeDefinition({ ...fields, instructions: readFileSync(instructionPath, "utf8"),
+                capabilities_mode: "inherit", plugins: [], skills: [], mcp_servers: [],
+                created_at: source.updated_at, updated_at: source.updated_at, bundled_key: key });
         });
     }
     readDocument() {
@@ -214,7 +312,6 @@ export class AgentDefinitionCatalog {
                 unlinkSync(temporary);
             throw error;
         }
-        return { ...validated, revision: digest(bytes) };
     }
     withWriteLock(operation) {
         const directory = dirname(this.path);
@@ -237,17 +334,38 @@ export class AgentDefinitionCatalog {
         }
     }
 }
+function assertCapabilityTransition(source, patch) {
+    const changesSelection = ["plugins", "skills", "mcp_servers"].some(key => patch[key] !== undefined && JSON.stringify(patch[key]) !== JSON.stringify(source[key]));
+    if (source.capabilities_mode === "inherit" && changesSelection && patch.capabilities_mode === undefined) {
+        throw new ControllerError("To customize inherited capabilities, set capabilities_mode to custom and supply all three capability lists from the current inventory.", "validation");
+    }
+    if (source.capabilities_mode === "inherit" && patch.capabilities_mode === "custom" && (!patch.plugins || !patch.skills || !patch.mcp_servers)) {
+        throw new ControllerError("Switching from inherited capabilities requires plugins, skills, and mcp_servers together.", "validation");
+    }
+}
 function applyPatch(source, patch) {
     const next = { ...source, ...patch };
     if (patch.skills_catalog_token_budget === null)
         delete next.skills_catalog_token_budget;
     return next;
 }
+function bundledDifference(base, customized) {
+    const patch = {};
+    for (const key of Object.keys(editableDefinitionSchema.shape)) {
+        if (JSON.stringify(base[key]) !== JSON.stringify(customized[key]))
+            patch[key] = customized[key] ?? null;
+    }
+    return definitionPatchSchema.parse(patch);
+}
 function normalizeDefinition(definition) {
     return parseOrValidation(agentDefinitionSchema, {
         ...definition,
         name: definition.name.normalize("NFKC").trim().replace(/\s+/gu, " "),
-        plugins: ensureRequired(definition.plugins, "id", REQUIRED_AGENT_CONTROL_PLUGIN),
+        plugins: ensureRequired(definition.plugins.map(plugin => ({ ...plugin,
+            ...(plugin.skills ? { skills: uniqueSelections(plugin.skills, "path") } : {}),
+            ...(plugin.mcp_servers ? { mcp_servers: uniqueSelections(plugin.mcp_servers, "name") } : {}),
+            ...(plugin.apps ? { apps: uniqueSelections(plugin.apps, "id") } : {})
+        })), "id", REQUIRED_AGENT_CONTROL_PLUGIN),
         skills: uniqueSelections(definition.skills, "path"),
         mcp_servers: ensureRequired(definition.mcp_servers, "name", REQUIRED_AGENT_CONTROL_MCP)
     });
@@ -269,7 +387,7 @@ function uniqueSelections(items, key) {
         return true;
     });
 }
-function validateCatalogSemantics(agents) {
+function validateCatalogSemantics(agents, uniqueNames = true) {
     const ids = new Set();
     const names = new Set();
     for (const agent of agents) {
@@ -279,7 +397,7 @@ function validateCatalogSemantics(agents) {
         const name = normalizeAgentDefinitionName(agent.name);
         if (!name)
             throw new ControllerError("Configured agent names cannot be blank.", "validation");
-        if (names.has(name))
+        if (uniqueNames && names.has(name))
             throw new ControllerError(`Configured agent name already exists: ${agent.name}.`, "validation");
         names.add(name);
         uniqueSelections(agent.plugins, "id");

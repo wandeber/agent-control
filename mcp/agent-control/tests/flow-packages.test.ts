@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,14 +14,15 @@ import { flowPackagesSchema } from "../src/tools/schemas.js";
 import { TOOL_DEFINITIONS } from "../src/tools/tool-definitions.js";
 
 class Fixture implements AgentAdapter {
-  readonly kind = "codex-thread"; starts: StartAgentInput[] = []; statuses = new Map<string, AgentStatus>(); gate?: Promise<void>;
+  constructor(readonly kind = "codex-thread") {}
+  starts: StartAgentInput[] = []; statuses = new Map<string, AgentStatus>(); gate?: Promise<void>;
   capabilities() { return { canStart: true, canSendMessage: true, canReadLatest: true, canStopGracefully: true, canForceStop: true, canStreamMessages: false, canInspectStatusCheaply: true, canAttachExisting: true }; }
   async start(input: StartAgentInput): Promise<AgentHandle> { this.starts.push(input); if (input.metadata?.package_id && this.gate) await this.gate; this.statuses.set(input.agent.agent_id,"running"); return { backend:this.kind,id:input.agent.agent_id,data:{thread_id:`thread-${input.agent.agent_id}`} }; }
   async getStatus(handle: AgentHandle) { return { status:this.statuses.get(handle.id) ?? "running" as AgentStatus }; }
   async readLatest() { return []; } async sendMessage() {} async stop(handle: AgentHandle) { this.statuses.set(handle.id,"stopped");return {status:"stopped" as const}; } async unregister() {}
 }
 describe("durable work package fork and join", () => {
-  let root: string, repo: string, db: string, controller: AgentController, store: SqliteStore, adapter: Fixture;
+  let root: string, repo: string, db: string, controller: AgentController, store: SqliteStore, adapter: Fixture, cliAdapter: Fixture;
   let owner: ReturnType<AgentController["orchestratorLogin"]>, id: string, parentId: string;
   const git = (cwd:string,...args:string[]) => execFileSync("git",["-C",cwd,...args],{encoding:"utf8"}).trim();
   const request = (value:FlowPackagesRequest, worker=false) => controller.executeFlowPackages({flowInstanceId:id,request:value,...(worker?{}:{agentToken:owner.agent_token})});
@@ -29,7 +30,7 @@ describe("durable work package fork and join", () => {
   function actor(agentId:string) { vi.stubEnv("CODEX_THREAD_ID",`thread-${agentId}`); }
   async function dispatch() { const result = await controller.dispatchActiveFlowStep({flowInstanceId:id,agentToken:owner.agent_token}); actor(result.agent!.agent_id); return result; }
   function report() { const step=controller.getFlowSnapshot(id).steps.find(s=>s.status==="active")!; return controller.reportFlowStep({stepInstanceId:step.step_instance_id,status:"completed"}); }
-  function config():FlowConfig { return {id:"packages",policy:{strict:true,plan_artifact:"plan",work_packages:{approval_decision:"plan",manifest_step:"review",execution_step:"implementation",integration_step:"integration"}},initial_step:"draft",roles:{planner:{backend:"codex-thread"},implementer:{backend:"codex-thread",model:"gpt-5.6-luna",reasoning_effort:"max"}},artifacts:{plan:{path:join(repo,"plan.md")}},steps:{
+  function config():FlowConfig { return {id:"packages",policy:{strict:true,plan_artifact:"plan",work_packages:{approval_decision:"plan",manifest_step:"review",execution_step:"implementation",integration_step:"integration"}},initial_step:"draft",roles:{package_writer:{backend:"codex-cli",model:"fixture",model_provider:"custom",reasoning_effort:"high",prompt:"Inline package policy"},planner:{backend:"codex-thread"},implementer:{backend:"codex-thread",model:"gpt-5.6-luna",reasoning_effort:"max"}},artifacts:{plan:{path:join(repo,"plan.md")}},steps:{
     draft:{role:"planner",outputs:{plan:{artifact:"plan",required:true}},on:{completed:{to:"review"}}},
     review:{role:"planner",on:{completed:{to:"approval"}}},
     approval:{execution:"coordinator",decision:{key:"plan",artifact_key:"plan"},on:{completed:{to:"implementation"}}},
@@ -42,7 +43,7 @@ describe("durable work package fork and join", () => {
     git(repo,"init","-q");git(repo,"config","user.email","fixture@example.invalid");git(repo,"config","user.name","Fixture");
     writeFileSync(join(repo,"plan.md"),"# Plan\n\n<!-- hdt-section: packages -->\n## Packages\n\nUpdate a and b independently.\n");writeFileSync(join(repo,"a.txt"),"a\n");writeFileSync(join(repo,"b.txt"),"b\n");git(repo,"add",".");git(repo,"commit","-qm","base");
     for(const branch of ["a","b"]) git(repo,"worktree","add","--quiet","--detach",join(root,branch),"HEAD");
-    adapter=new Fixture();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);controller=new AgentController(store,adapters);
+    adapter=new Fixture();store=new SqliteStore(db);const adapters=new AdapterRegistry();adapters.register(adapter);cliAdapter=new Fixture("codex-cli");adapters.register(cliAdapter);controller=new AgentController(store,adapters);
     owner=controller.orchestratorLogin({adminKey:"fixture",title:"Owner",runTitle:"Implement approved packages",repoDir:repo,backend:"codex-thread",backendHandle:{thread_id:"owner-thread"}});
     const started=controller.startFlow({config:config(),runId:owner.run.run_id,agentToken:owner.agent_token,requesterThreadId:"original-user"});id=started.instance.flow_instance_id;
     await dispatch();report();await dispatch();
@@ -59,6 +60,19 @@ describe("durable work package fork and join", () => {
     const result=await request({operation:"deliver",package_id:name,attempt:branch.attempt,summary:`Delivered ${name}`},true);return result.branches[name]!.delivery!;
   }
   async function accept(names:string[]) { for(const name of names)adapter.statuses.set(group().branches[name]!.agent_id!,"completed"); return request({operation:"accept",deliveries:names.map(name=>({package_id:name,delivery_id:group().branches[name]!.delivery!.delivery_id})),reason:"Delivery meets its assigned package."}); }
+  it("launches inline CLI packages with their own worktree and flow metadata", async () => {
+    await approve(entries().map(entry => ({ ...entry, role: "package_writer" })));
+    await request({ operation: "launch" });
+    expect(cliAdapter.starts).toHaveLength(2);
+    for (const launch of cliAdapter.starts) {
+      expect(launch.agent.repo_dir).toBe(realpathSync(join(root, String(launch.metadata?.package_id))));
+      expect(launch.metadata).toMatchObject({ flow_instance_id: id, sandbox: "workspace", model_provider: "custom", reasoning_effort: "high" });
+      expect(launch.metadata?.flow_step_instance_id).toBeTypeOf("string");
+      expect(launch.metadata).not.toHaveProperty("step_instance_id");
+      expect(launch.metadata).not.toHaveProperty("configured_agent");
+      expect(launch.prompt).toContain("Inline package policy");
+    }
+  });
   it("binds scope before exact approval and preserves the inline path",async()=>{
     await request({operation:"define",packages:[]});report();const snapshot=controller.getFlowSnapshot(id);
     expect(()=>controller.recordFlowDecision({flowInstanceId:id,key:"plan",value:"approved",reason:"Approved",expectedRevision:snapshot.runtime!.revision,artifactDigest:artifactDigest(join(repo,"plan.md")),agentToken:owner.agent_token})).toThrow(/manifest digest/);

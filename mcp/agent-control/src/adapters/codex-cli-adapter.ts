@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControllerError } from "../core/errors.js";
 import { agentRuntimeDir } from "../core/paths.js";
@@ -20,7 +20,7 @@ import {
   type CompiledAgentConfiguration
 } from "../core/agent-definition-inventory.js";
 
-interface Data { dir: string; cwd: string; profile?: string; model?: string; model_provider?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; executable?: string; resolved_model?: string; logFile?: string; access_agent_id?: string; access_db_path?: string; approval_policy?: "on-request"; snapshot_hash?: string; definition_id?: string; definition_name?: string; }
+interface Data { dir: string; cwd: string; profile?: string; model?: string; model_provider?: string; model_provider_override?: string; sandbox: string; reasoning_effort?: string; profile_hash?: string; executable?: string; resolved_model?: string; logFile?: string; access_agent_id?: string; access_db_path?: string; approval_policy?: "on-request"; snapshot_hash?: string; definition_id?: string; definition_name?: string; flow_instance_id?: string; step_instance_id?: string; flow_writable_root?: string; }
 const unsupported = (message: string) => new ControllerError(message, "unsupported_operation");
 function configuredAgent(value: unknown): CompiledAgentConfiguration | undefined {
   if (value === undefined) return undefined;
@@ -57,6 +57,27 @@ export class CodexCliAdapter implements AgentAdapter {
     readInteractiveProfile(data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined, data.profile_hash);
   }
   async start(input: StartAgentInput): Promise<AgentHandle> {
+    const flowId = input.metadata?.flow_instance_id;
+    const stepId = input.metadata?.step_instance_id ?? input.metadata?.flow_step_instance_id;
+    const flow = flowId !== undefined || stepId !== undefined;
+    if (flow && (typeof flowId !== "string" || !flowId.trim() || typeof stepId !== "string" || !stepId.trim())) {
+      throw unsupported("CLI flow execution requires flow_instance_id and step_instance_id.");
+    }
+    if (flow && !["workspace", "read_only"].includes(String(input.metadata?.sandbox))) {
+      throw unsupported("CLI flow execution requires an explicit phase sandbox.");
+    }
+    const modelProvider = input.metadata?.model_provider;
+    if (modelProvider !== undefined && (typeof modelProvider !== "string" || !modelProvider.trim())) {
+      throw unsupported("Invalid Codex model provider.");
+    }
+    const writableRoot = input.metadata?.flow_writable_root;
+    if (writableRoot !== undefined && (!flow || typeof writableRoot !== "string" || !isAbsolute(writableRoot))) {
+      throw unsupported("CLI flow_writable_root requires a flow phase and an absolute path.");
+    }
+    if (input.agent.backend_handle) {
+      if (!flow) throw unsupported("This CLI worker already has an execution; continue its existing session instead.");
+      return this.continueFlow(input, flowId as string, stepId as string);
+    }
     const configured = configuredAgent(input.metadata?.configured_agent);
     if (!configured && input.attachments?.length) throw unsupported("codex-cli does not support attachments; configure a Codex profile instead.");
     if (input.server) throw unsupported("codex-cli does not support a server override; configure a Codex profile instead.");
@@ -66,14 +87,20 @@ export class CodexCliAdapter implements AgentAdapter {
     if (!["workspace", "read_only"].includes(String(sandbox))) throw unsupported("codex-cli sandbox must be read_only or workspace.");
     if (configured && profile) throw unsupported("Configured agents cannot also select a mutable Codex profile.");
     const data: Data = { dir: join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "codex-cli"), cwd: input.agent.repo_dir ?? process.cwd(), profile: profile as string | undefined,
-      model: input.model ?? input.agent.model ?? undefined, sandbox: sandbox === "read_only" ? "read-only" : "workspace-write", reasoning_effort: input.metadata?.reasoning_effort as string | undefined };
+      model: configured?.model ?? input.model ?? input.agent.model ?? undefined, sandbox: sandbox === "read_only" ? "read-only" : "workspace-write", reasoning_effort: input.metadata?.reasoning_effort as string | undefined };
+    if (flow) {
+      data.flow_instance_id = flowId as string;
+      data.step_instance_id = stepId as string;
+      if (data.sandbox === "workspace-write" && typeof writableRoot === "string") data.flow_writable_root = resolve(writableRoot);
+    }
     mkdirSync(data.dir, { recursive: true, mode: 0o700 });
     if (existsSync(join(data.dir, "state.json"))) throw unsupported("This CLI worker already has an execution; continue its existing session instead.");
     if (data.profile) data.profile_hash = this.profileHash(data.profile);
     // Presentation only: never turn the profile's model into a CLI override.
     const identity = this.profileIdentity(data.profile);
     data.resolved_model = configured?.model ?? data.model ?? identity.model;
-    data.model_provider = configured?.model_provider ?? identity.provider;
+    data.model_provider = configured?.model_provider ?? (modelProvider as string | undefined) ?? identity.provider;
+    if (!configured && typeof modelProvider === "string") data.model_provider_override = modelProvider;
     data.reasoning_effort = configured?.reasoning_effort ?? data.reasoning_effort;
     data.logFile = join(data.dir, "stderr.log");
     data.executable = configured?.executable ?? process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex";
@@ -92,7 +119,30 @@ export class CodexCliAdapter implements AgentAdapter {
       data.definition_id = configured.definition_id;
       data.definition_name = configured.definition_name;
     }
-    await this.launch(data, input.prompt ?? "", true, input.agentToken, input.attachments ?? []);
+    await this.launch(data, input.prompt ?? "", true, input.agentToken, input.attachments ?? [], flow);
+    return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
+  }
+  private async continueFlow(input: StartAgentInput, flowId: string, stepId: string): Promise<AgentHandle> {
+    const previous = input.agent.backend_handle as unknown as Data;
+    if (previous.dir !== join(agentRuntimeDir(input.agent.run_id, input.agent.agent_id), "codex-cli") ||
+        resolve(previous.cwd) !== resolve(input.agent.repo_dir ?? process.cwd()) || previous.flow_instance_id !== flowId) {
+      throw unsupported("CLI flow continuation does not match the existing execution owner.");
+    }
+    if (input.server || input.metadata?.configured_agent !== undefined ||
+        (input.model !== undefined && input.model !== (previous.model ?? previous.resolved_model)) ||
+        (input.metadata?.model_provider !== undefined && input.metadata.model_provider !== previous.model_provider) ||
+        (input.metadata?.profile !== undefined && input.metadata.profile !== previous.profile) ||
+        (input.metadata?.reasoning_effort !== undefined && input.metadata.reasoning_effort !== previous.reasoning_effort) ||
+        (input.metadata?.approval_policy !== undefined && input.metadata.approval_policy !== previous.approval_policy)) {
+      throw unsupported("CLI flow continuation must retain its frozen execution configuration.");
+    }
+    if (!previous.snapshot_hash && input.attachments?.length) throw unsupported("codex-cli does not support attachments; configure a Codex profile instead.");
+    this.state(previous);
+    const data: Data = { ...previous, step_instance_id: stepId,
+      sandbox: input.metadata?.sandbox === "read_only" ? "read-only" : "workspace-write",
+      flow_writable_root: input.metadata?.sandbox === "workspace" && typeof input.metadata.flow_writable_root === "string"
+        ? resolve(input.metadata.flow_writable_root) : undefined };
+    await this.launch(data, input.prompt ?? "", false, input.agentToken, input.attachments ?? [], true);
     return { backend: this.kind, id: input.agent.agent_id, data: { ...data } };
   }
   private profileIdentity(profile?: string): { model?: string; provider?: string } {
@@ -113,10 +163,12 @@ export class CodexCliAdapter implements AgentAdapter {
     if (!existsSync(path)) throw unsupported("A persisted Codex profile file is required for managed CLI continuity.");
     return createHash("sha256").update(readFileSync(path)).digest("hex");
   }
-  private async launch(data: Data, prompt: string, initial: boolean, agentToken?: string, attachments: string[] = []): Promise<string> {
+  private async launch(data: Data, prompt: string, initial: boolean, agentToken?: string, attachments: string[] = [], flowStart = false): Promise<string> {
     if (data.profile && this.profileHash(data.profile) !== data.profile_hash) throw unsupported("Codex profile changed since launch; review its model/provider before continuing.");
     const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", data.sandbox, "-c", 'approval_policy="never"'];
+    if (data.flow_writable_root && data.sandbox === "workspace-write") args.push("--add-dir", data.flow_writable_root);
     if (data.profile) args.push("--profile", data.profile);
+    if (data.model_provider_override) args.push("-c", `model_provider=${JSON.stringify(data.model_provider_override)}`);
     if (data.model) args.push("--model", data.model);
     if (data.reasoning_effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(data.reasoning_effort)}`);
     const profilePath = data.profile ? join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), `${data.profile}.config.toml`) : undefined;
@@ -132,10 +184,12 @@ export class CodexCliAdapter implements AgentAdapter {
     if (interactiveRequested || (existsSync(join(data.dir, "state.json")) && this.state(data).transport === "app-server")) readInteractiveProfile(profilePath, data.profile_hash);
     if (agentToken) writeFileSync(join(data.dir, "credential"), agentToken, { mode: 0o600 });
     const job: CliJob = { executable: data.executable ?? process.env.AGENT_CONTROL_CODEX_CLI_BIN ?? "codex", args, cwd: data.cwd, prompt,
+      ...(flowStart ? { idempotency_key: JSON.stringify([data.flow_instance_id, data.step_instance_id]) } : {}),
       ...(profilePath ? { profile_path: profilePath, profile_hash: data.profile_hash } : {}),
       ...(data.access_agent_id && data.access_db_path ? { interactive: { agent_id: data.access_agent_id, db_path: data.access_db_path,
-        model: data.model, model_provider: data.model_provider, reasoning_effort: data.reasoning_effort,
+        model: data.model, model_provider: data.model_provider, model_provider_override: data.model_provider_override, reasoning_effort: data.reasoning_effort,
         sandbox: data.sandbox === "read-only" ? "read_only" as const : "workspace" as const, approval_policy: data.approval_policy,
+        ...(data.flow_instance_id ? { flow_instance_id: data.flow_instance_id, flow_writable_root: data.flow_writable_root } : {}),
         attachments, snapshot_path: snapshotPath, snapshot_hash: data.snapshot_hash } } : {}) };
     const messageId = enqueueCliJob(data.dir, job, initial);
     // Each contender uses a process-owned lock. Enqueue and dispatch share a

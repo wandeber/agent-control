@@ -92,9 +92,11 @@ export const flowConfigJsonSchema = {
             type: "object",
             additionalProperties: false,
             properties: {
+                agent_ref: { type: "string", minLength: 1, description: "Stable bundled agent key or personal definition UUID. Resolved once when the flow starts." },
                 backend: { type: "string", minLength: 1 },
                 model: { type: ["string", "null"] },
-                reasoning_effort: { type: ["string", "null"], description: "Codex-thread reasoning effort. Omit or clear to inherit the Codex default." },
+                model_provider: { type: "string", minLength: 1 },
+                reasoning_effort: { type: ["string", "null"], description: "Codex reasoning effort. Referenced agents inherit their definition unless overridden." },
                 agent_lifecycle: {
                     type: "string",
                     enum: ["reuse", "fresh_per_step"],
@@ -120,7 +122,8 @@ export const flowConfigJsonSchema = {
                 prompt: { type: "string", minLength: 1 },
                 prompt_ref: { type: "string", minLength: 1 },
                 prompt_path: { type: "string", minLength: 1 }
-            }
+            },
+            allOf: [{ if: { required: ["agent_ref"] }, then: { properties: { backend: { const: "codex-cli" } }, not: { anyOf: [{ required: ["prompt"] }, { required: ["prompt_ref"] }, { required: ["prompt_path"] }] } } }]
         },
         artifactReference: {
             type: "object",

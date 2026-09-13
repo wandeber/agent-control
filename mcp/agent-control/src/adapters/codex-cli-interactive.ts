@@ -22,6 +22,7 @@ export interface InteractiveCliJob {
   profile_hash?: string;
   model?: string;
   model_provider?: string;
+  model_provider_override?: string;
   reasoning_effort?: string;
   sandbox: "read_only" | "workspace";
   approval_policy?: "on-request";
@@ -30,6 +31,8 @@ export interface InteractiveCliJob {
   attachments?: string[];
   snapshot_path?: string;
   snapshot_hash?: string;
+  flow_instance_id?: string;
+  flow_writable_root?: string;
 }
 export interface InteractiveTurnControl {
   session?: string;
@@ -81,6 +84,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
   let threadId = control.session, turnId: string | undefined;
   let expectedPolicy: ReturnType<typeof accessTurnOverrides>;
   let requestRevision = 0;
+  let requestedPolicy: ReturnType<typeof accessTurnOverrides> | undefined;
   let interrupted = false;
   let closing = false;
   let turnFinished = false;
@@ -98,7 +102,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     if (!threadId) return;
     access.confirmAgentAccess(job.agent_id, requestRevision, { approval_policy: response.approvalPolicy,
       sandbox_policy: response.sandboxPolicy ?? response.sandbox, thread_id: threadId }, {
-        ...expectedPolicy, ...(response.cwd === job.cwd ? { implicitCwd: job.cwd } : {})
+        ...(requestedPolicy ?? expectedPolicy), ...(response.cwd === job.cwd ? { implicitCwd: job.cwd } : {})
       });
   };
   const notification = (message: { method: string; params?: unknown }) => {
@@ -131,11 +135,18 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     const profile = configured ? {} : readInteractiveProfile(job.profile_path, job.profile_hash);
     const loaded = Object.keys(profile).length ? await startup(client.request("config/read", { cwd: job.cwd, includeLayers: true })) : {};
     const config = interactiveProfileOverrides(profile, loaded);
+    if (!configured && job.model_provider_override) config.model_provider = job.model_provider_override;
     if (!configured && job.reasoning_effort) config.model_reasoning_effort = job.reasoning_effort;
     const requested = access.getAgentAccess(job.agent_id);
     requestRevision = requested.revision;
-    const policy: AccessPolicy = requested.requested ?? { sandbox: job.sandbox, approval_policy: job.approval_policy ?? "never" };
-    expectedPolicy = accessTurnOverrides(policy, job.cwd);
+    // Flow phases own their sandbox boundary. A previous user access choice
+    // cannot widen a later review turn or enable approval-based escalation.
+    const phasePolicy: AccessPolicy = { sandbox: job.sandbox,
+      approval_policy: job.sandbox === "read_only" ? "never" : job.approval_policy ?? "never" };
+    const policy: AccessPolicy = job.flow_instance_id ? phasePolicy
+      : requested.requested ?? { sandbox: job.sandbox, approval_policy: job.approval_policy ?? "never" };
+    expectedPolicy = accessTurnOverrides(policy, job.cwd, job.flow_instance_id ? job.flow_writable_root : undefined);
+    if (job.flow_instance_id && requested.requested) requestedPolicy = accessTurnOverrides(requested.requested, job.cwd);
     const params = { ...(control.session ? { threadId: control.session } : {}), cwd: job.cwd, config,
       ...(job.model ? { model: job.model } : {}), approvalPolicy: expectedPolicy.approvalPolicy,
       ...(!control.session && configured ? { developerInstructions: configured.developer_instructions } : {}),
@@ -152,7 +163,19 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
       const inventory = await loadAgentDefinitionInventory(job.cwd, false, configured.executable);
       await verifyConfiguredAgentThread(client, configured, inventory, response, actualId, job.cwd);
     }
-    if (!requested.requested) {
+    if (job.flow_instance_id) {
+      if (policy.sandbox === "workspace") {
+        // Keep the runtime's network/tmp restrictions, but replace writable
+        // roots with those of this phase instead of inheriting earlier roots.
+        const sandbox = record(response.sandbox);
+        expectedPolicy.sandboxPolicy = { ...expectedPolicy.sandboxPolicy,
+          networkAccess: sandbox.type === "workspaceWrite" && sandbox.networkAccess === true,
+          ...(sandbox.type === "workspaceWrite" && typeof sandbox.excludeTmpdirEnvVar === "boolean"
+            ? { excludeTmpdirEnvVar: sandbox.excludeTmpdirEnvVar } : {}),
+          ...(sandbox.type === "workspaceWrite" && typeof sandbox.excludeSlashTmp === "boolean"
+            ? { excludeSlashTmp: sandbox.excludeSlashTmp } : {}) };
+      }
+    } else if (!requested.requested) {
       if (typeof record(response.sandbox).type !== "string") throw new Error("Codex did not confirm the existing sandbox; no prompt was sent.");
       // Transport selection must retain profile/base network and filesystem
       // restrictions. Only an explicit per-agent access choice selects a preset.

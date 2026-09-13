@@ -9,14 +9,16 @@ import {
 } from "../src/core/flow-config-loader.js";
 import { parseFlowConfig, resolveFlowAgentLifecycle } from "../src/core/flow.js";
 import { flowConfigJsonSchema } from "../src/core/flow-config-schema.js";
+import { resolveFlowAgentDefinitions } from "../src/core/flow-agent-definitions.js";
+import { AgentDefinitionCatalog } from "../src/core/agent-definitions.js";
 
 describe("flow config loader", () => {
   it("loads role-specific Codex defaults while keeping discovery separate from analysis", () => {
     for (const name of ["development-flow-v1", "demo-age-duration"]) {
-      const config = parseFlowConfig(loadFlowConfigFile(resolve(import.meta.dirname, "../../../flows", name, "flow.yaml"), { env: {} }));
+      const config = resolveFlowAgentDefinitions(parseFlowConfig(loadFlowConfigFile(resolve(import.meta.dirname, "../../../flows", name, "flow.yaml"), { env: {} })), new AgentDefinitionCatalog(resolve(import.meta.dirname, "missing-personal-catalog.json")));
       for (const [role, settings] of Object.entries(config.roles ?? {})) {
         if (role === "orchestrator") continue;
-        expect(settings.backend).toBe("codex-thread");
+        expect(settings.backend).toBe(name === "development-flow-v1" ? "codex-cli" : "codex-thread");
         if (role === "final_reviewer" || (name === "development-flow-v1" && ["planner", "implementer", "integrator"].includes(role))) {
           expect(settings.model).toBe("gpt-5.6-sol");
           expect(settings.reasoning_effort).toBe("xhigh");

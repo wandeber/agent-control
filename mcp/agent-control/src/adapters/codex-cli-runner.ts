@@ -8,9 +8,9 @@ import { ControllerError } from "../core/errors.js";
 import { AgentAccessStore } from "../core/agent-access.js";
 import { runInteractiveCliTurn, type InteractiveCliJob } from "./codex-cli-interactive.js";
 
-export interface CliJob { executable: string; args: string[]; cwd: string; prompt: string; profile_path?: string; profile_hash?: string; interactive?: Omit<InteractiveCliJob, "executable" | "cwd" | "prompt" | "profile_path" | "profile_hash">; }
+export interface CliJob { idempotency_key?: string; executable: string; args: string[]; cwd: string; prompt: string; profile_path?: string; profile_hash?: string; interactive?: Omit<InteractiveCliJob, "executable" | "cwd" | "prompt" | "profile_path" | "profile_hash">; }
 export interface CliState { status: "running" | "queued" | "waiting_for_input" | "completed" | "failed" | "stopped" | "blocked"; thread_id?: string; turn_id?: string; runtime_turn_id?: string; transport?: "app-server"; updated_at: string; exit_code?: number | null; }
-interface QueuedJob { id: string; job: CliJob; initial: boolean; status: "pending" | "dispatched" | "completed" | "failed" | "interrupted" | "cancelled"; }
+interface QueuedJob { fingerprint?: string; id: string; job: CliJob; initial: boolean; status: "pending" | "dispatched" | "completed" | "failed" | "interrupted" | "cancelled"; }
 export function writeState(dir: string, state: CliState): void { save(join(dir, "state.json"), state); }
 function save(path: string, value: unknown): void {
   const temp = `${path}.${randomUUID()}.tmp`;
@@ -34,11 +34,21 @@ export function enqueueCliJob(dir: string, job: CliJob, initial: boolean): strin
     if (existsSync(join(dir, "cancelled"))) throw unavailable("CLI worker was cancelled; no new work may be queued.");
     const exists = existsSync(join(dir, "state.json"));
     if (initial && exists) throw unavailable("This CLI worker already has an execution; continue its existing session instead.");
+    const fingerprint = createHash("sha256").update(JSON.stringify(job)).digest("hex");
+    // Keep the fingerprint after clearing terminal prompts so a retried phase
+    // can recover its receipt without redispatching or accepting changed input.
+    if (job.idempotency_key) {
+      const previous = jobs(dir).find(entry => entry.job.idempotency_key === job.idempotency_key);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw unavailable("CLI flow phase was already queued with different input.");
+        return previous.id;
+      }
+    }
     const state: CliState = exists ? stateAt(dir) : { status: "queued", updated_at: new Date().toISOString() };
     if (!initial && !state.thread_id && !["running", "queued"].includes(state.status)) throw unavailable("CLI worker has no persisted session ID to resume.");
     if (state.status === "running" && !state.turn_id) throw unavailable("This turn belongs to an older CLI supervisor; wait for it to finish before continuing.");
     const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
-    saveJob(dir, { id, job, initial, status: "pending" });
+    saveJob(dir, { id, job, fingerprint, initial, status: "pending" });
     writeState(dir, { ...state, status: state.status === "running" ? "running" : "queued", updated_at: new Date().toISOString() });
     return id;
   });

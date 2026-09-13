@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { CodexAppServerClient } from "../adapters/codex-thread-adapter.js";
+import { capabilityIcon } from "./capability-icons.js";
 import {
   REQUIRED_AGENT_CONTROL_MCP,
   REQUIRED_AGENT_CONTROL_PLUGIN,
@@ -15,6 +16,8 @@ import { ControllerError } from "./errors.js";
 type JsonObject = Record<string, any>;
 
 interface CapabilityBase {
+  icon_url?: string;
+  icon_dark_url?: string;
   required: boolean;
   available: boolean;
   enabled_by_default: boolean;
@@ -25,8 +28,8 @@ export interface PluginInventory extends CapabilityBase {
   name: string;
   description?: string;
   version?: string;
-  bundled_skills: Array<{ path: string; name: string }>;
-  bundled_mcp_servers: Array<{ name: string; root_transport?: boolean }>;
+  bundled_skills: Array<{ path: string; name: string; enabled_by_default?: boolean }>;
+  bundled_mcp_servers: Array<{ name: string; root_transport?: boolean; enabled_by_default?: boolean }>;
   bundled_apps: Array<{ id: string; name: string }>;
 }
 
@@ -96,7 +99,7 @@ interface RuntimeRead {
   config: JsonObject;
   skills: JsonObject;
   plugins: JsonObject;
-  models: JsonObject;
+  modelCatalogs: Array<{ provider: string; models: JsonObject }>;
   pluginDetails: Map<string, JsonObject>;
   appMetadata: JsonObject[];
 }
@@ -139,6 +142,7 @@ export function compileAgentConfiguration(
   inventory: AgentDefinitionInventory,
   repoDir: string
 ): CompiledAgentConfiguration {
+  const inherit = definition.capabilities_mode === "inherit";
   const model = inventory.models.find((entry) =>
     entry.id === definition.model && entry.model_provider === definition.model_provider
   );
@@ -153,20 +157,20 @@ export function compileAgentConfiguration(
     );
   }
 
-  const selectedPlugins = new Map(definition.plugins.map((entry) => [entry.id, entry.enabled]));
+  const selectedPlugins = new Map((inherit ? inventory.plugins.map(entry => ({ id: entry.id, enabled: entry.enabled_by_default })) : definition.plugins).map((entry) => [entry.id, entry.enabled]));
   selectedPlugins.set(REQUIRED_AGENT_CONTROL_PLUGIN, true);
   for (const [id, enabled] of selectedPlugins) {
     if (enabled && !inventory.plugins.some((entry) => entry.id === id && entry.available)) {
       throw capabilityUnavailable("plugin", id);
     }
   }
-  const selectedSkills = new Map(definition.skills.map((entry) => [entry.path, entry.enabled]));
+  const selectedSkills = new Map((inherit ? inventory.skills.map(entry => ({ path: entry.path, enabled: entry.enabled_by_default })) : definition.skills).map((entry) => [entry.path, entry.enabled]));
   for (const [path, enabled] of selectedSkills) {
     if (enabled && !inventory.skills.some((entry) => entry.path === path && entry.available)) {
       throw capabilityUnavailable("skill", path);
     }
   }
-  const selectedMcp = new Map(definition.mcp_servers.map((entry) => [entry.name, entry.enabled]));
+  const selectedMcp = new Map((inherit ? inventory.mcp_servers.map(entry => ({ name: entry.name, enabled: entry.enabled_by_default })) : definition.mcp_servers).map((entry) => [entry.name, entry.enabled]));
   selectedMcp.set(REQUIRED_AGENT_CONTROL_MCP, true);
   for (const [name, enabled] of selectedMcp) {
     if (enabled && !inventory.mcp_servers.some((entry) => entry.name === name && entry.available)) {
@@ -175,8 +179,16 @@ export function compileAgentConfiguration(
   }
 
   const inventoryPluginById = new Map(inventory.plugins.map((entry) => [entry.id, entry]));
+  const customPlugins = new Map((inherit ? [] : definition.plugins).map(plugin => [plugin.id, plugin]));
+  for (const selection of customPlugins.values()) {
+    if (!selection.enabled) continue;
+    const plugin = inventoryPluginById.get(selection.id);
+    for (const skill of selection.skills ?? []) if (skill.enabled && !plugin?.bundled_skills.some(item => item.path === skill.path)) throw capabilityUnavailable("skill", skill.path);
+    for (const server of selection.mcp_servers ?? []) if (server.enabled && !plugin?.bundled_mcp_servers.some(item => item.name === server.name)) throw capabilityUnavailable("mcp_server", server.name);
+    for (const app of selection.apps ?? []) if (app.enabled && !plugin?.bundled_apps.some(item => item.id === app.id)) throw capabilityUnavailable("plugin", selection.id, "Bundled app " + app.id + " is unavailable.");
+  }
   const pluginIds = orderedUnique([
-    ...definition.plugins.filter((entry) => inventoryPluginById.has(entry.id)).map((entry) => entry.id),
+    ...(inherit ? [] : definition.plugins.filter((entry) => inventoryPluginById.has(entry.id)).map((entry) => entry.id)),
     ...inventory.plugins.map((entry) => entry.id).sort()
   ]);
   const plugins = pluginIds.map((id) => {
@@ -187,24 +199,24 @@ export function compileAgentConfiguration(
       required: id === REQUIRED_AGENT_CONTROL_PLUGIN || inventoryPluginById.get(id)?.required === true,
       bundled_skills: (inventoryPluginById.get(id)?.bundled_skills ?? []).map((skill) => ({
         ...skill,
-        enabled
+        enabled: enabled && (inherit ? skill.enabled_by_default !== false : customPlugins.get(id)?.skills?.some(item => item.path === skill.path && item.enabled) ?? true)
       }))
     };
   });
   const pluginEnabled = new Map(plugins.map((entry) => [entry.id, entry.enabled]));
   const skillPaths = orderedUnique([
-    ...definition.skills.filter((entry) => inventory.skills.some((skill) => skill.path === entry.path))
-      .map((entry) => entry.path),
+    ...(inherit ? [] : definition.skills.filter((entry) => inventory.skills.some((skill) => skill.path === entry.path))
+      .map((entry) => entry.path)),
     ...inventory.skills.map((entry) => entry.path).sort()
   ]);
   const skills = skillPaths.map((path) => ({ path, enabled: selectedSkills.get(path) === true }));
-  const bundledMcp = new Map<string, { pluginId: string; rootTransport: boolean }>();
+  const bundledMcp = new Map<string, { pluginId: string; rootTransport: boolean; enabledByDefault: boolean }>();
   const bundledApps = new Map<string, { name: string; pluginIds: string[] }>();
   for (const configuredPlugin of plugins) {
     const plugin = inventoryPluginById.get(configuredPlugin.id);
     if (!plugin) continue;
     for (const server of plugin.bundled_mcp_servers) {
-      bundledMcp.set(server.name, { pluginId: plugin.id, rootTransport: server.root_transport === true });
+      bundledMcp.set(server.name, { pluginId: plugin.id, rootTransport: server.root_transport === true, enabledByDefault: server.enabled_by_default !== false });
     }
     for (const app of plugin.bundled_apps) {
       const bundle = bundledApps.get(app.id) ?? { name: app.name, pluginIds: [] };
@@ -214,7 +226,7 @@ export function compileAgentConfiguration(
   }
   const knownMcpNames = new Set([...bundledMcp.keys(), ...inventory.mcp_servers.map((entry) => entry.name)]);
   const mcpNames = orderedUnique([
-    ...definition.mcp_servers.filter((entry) => knownMcpNames.has(entry.name)).map((entry) => entry.name),
+    ...(inherit ? [] : definition.mcp_servers.filter((entry) => knownMcpNames.has(entry.name)).map((entry) => entry.name)),
     ...bundledMcp.keys(),
     ...inventory.mcp_servers.map((entry) => entry.name).sort()
   ]);
@@ -223,7 +235,7 @@ export function compileAgentConfiguration(
     return {
       name,
       enabled: name === REQUIRED_AGENT_CONTROL_MCP ||
-        (bundle ? pluginEnabled.get(bundle.pluginId) === true : selectedMcp.get(name) === true),
+        (bundle ? pluginEnabled.get(bundle.pluginId) === true && (inherit ? bundle.enabledByDefault : customPlugins.get(bundle.pluginId)?.mcp_servers?.some(item => item.name === name && item.enabled) ?? true) : selectedMcp.get(name) === true),
       ...(bundle ? { plugin_id: bundle.pluginId, ...(bundle.rootTransport ? { root_transport: true } : {}) } : {})
     };
   });
@@ -235,13 +247,13 @@ export function compileAgentConfiguration(
     return {
       id,
       name: bundle?.name ?? entry?.name ?? id,
-      enabled: bundle ? bundle.pluginIds.some((pluginId) => pluginEnabled.get(pluginId) === true) : false,
+      enabled: bundle ? bundle.pluginIds.some((pluginId) => pluginEnabled.get(pluginId) === true && (inherit ? entry?.enabled_by_default === true : customPlugins.get(pluginId)?.apps?.some(item => item.id === id && item.enabled) ?? true)) : inherit && entry?.enabled_by_default === true,
       ...(bundle ? { plugin_ids: bundle.pluginIds } : {})
     };
   });
   for (const [id, bundle] of bundledApps) {
     const enabledOwner = bundle.pluginIds.find((pluginId) => pluginEnabled.get(pluginId) === true);
-    if (!inventoryAppById.get(id)?.available && enabledOwner) {
+    if (!inventoryAppById.get(id)?.available && enabledOwner && apps.some(app => app.id === id && app.enabled)) {
       throw capabilityUnavailable("plugin", enabledOwner, "Bundled app " + id + " is unavailable.");
     }
   }
@@ -546,6 +558,16 @@ async function readRuntime(executable: string, cwd: string, refresh: boolean): P
       collectPages(client, "model/list", {}, "data")
     ]);
     const config = object(object(configResponse).config);
+    const provider = string(config.model_provider) || "openai";
+    const modelCatalogs = [{ provider, models: modelResponse }];
+    if (provider !== "openai") {
+      // A personal default provider must not hide the public Codex agent defaults.
+      // Probe that provider in a separate process; keep capability discovery on
+      // the user's effective configuration and never rewrite their config.
+      const models = await withAppServer(executable, cwd, ['model_provider="openai"'],
+        client => collectPages(client, "model/list", {}, "data"));
+      modelCatalogs.push({ provider: "openai", models });
+    }
     const skills = array(object(skillsResponse).data).flatMap((entry) => array(object(entry).skills));
     const marketplaces = array(pluginResponse.marketplaces).map(object);
     const pluginRows = marketplaces.flatMap((entry) => array(entry.plugins).map(object));
@@ -579,7 +601,7 @@ async function readRuntime(executable: string, cwd: string, refresh: boolean): P
       config: object(configResponse),
       skills: object(skillsResponse),
       plugins: pluginResponse,
-      models: modelResponse,
+      modelCatalogs,
       pluginDetails,
       appMetadata
     };
@@ -596,8 +618,12 @@ function buildInventory(executable: string, cwd: string, raw: RuntimeRead): Agen
   const bundledMcpNames = new Set(plugins.flatMap((entry) => entry.bundled_mcp_servers.map((server) => server.name)));
   const mcpConfig = object(config.mcp_servers);
   for (const plugin of plugins) {
+    for (const skill of plugin.bundled_skills) {
+      skill.enabled_by_default = skills.find(entry => string(entry.path) === skill.path)?.enabled !== false;
+    }
     for (const server of plugin.bundled_mcp_servers) {
       if (hasMcpTransport(object(mcpConfig[server.name]))) server.root_transport = true;
+      server.enabled_by_default = object(object(object(config.plugins)[plugin.id]).mcp_servers)[server.name]?.enabled !== false && object(mcpConfig[server.name]).enabled !== false;
     }
   }
   const mcpNames = Object.keys(mcpConfig).filter((name) => !bundledMcpNames.has(name));
@@ -616,18 +642,18 @@ function buildInventory(executable: string, cwd: string, raw: RuntimeRead): Agen
   for (const profile of configuredProfileModels()) addConfiguredModel(profile);
   const defaultProvider = string(config.model_provider) || "openai";
   const providerConfig = object(config.model_providers);
-  const providerIds = new Set([defaultProvider, ...Object.keys(providerConfig), ...configuredModels.map((entry) => entry.provider)]);
-  const nativeModels = array(raw.models.data).map(object).map((row) => ({
+  const providerIds = new Set([defaultProvider, ...raw.modelCatalogs.map(catalog => catalog.provider), ...Object.keys(providerConfig), ...configuredModels.map((entry) => entry.provider)]);
+  const nativeModels = raw.modelCatalogs.flatMap(catalog => array(catalog.models.data).map(object).map((row) => ({
     id: string(row.model) || string(row.id),
     ...(string(row.displayName) ? { display_name: string(row.displayName) } : {}),
-    model_provider: defaultProvider,
+    model_provider: catalog.provider,
     supported_reasoning_efforts: array(row.supportedReasoningEfforts)
       .map((effort) => string(object(effort).reasoningEffort))
       .filter(Boolean),
     available: row.hidden !== true,
     catalog_available: true,
     run_validation_required: false
-  })).filter((entry) => entry.id);
+  }))).filter((entry) => entry.id);
   for (const configured of configuredModels) {
     if (!nativeModels.some((entry) => entry.id === configured.model && entry.model_provider === configured.provider)) {
       nativeModels.push({
@@ -662,6 +688,7 @@ function buildInventory(executable: string, cwd: string, raw: RuntimeRead): Agen
       name: string(entry.name) || basename(dirname(string(entry.path))),
       ...(string(entry.description) ? { description: string(entry.description) } : {}),
       ...(string(entry.scope) ? { scope: string(entry.scope) } : {}),
+      icon_url: capabilityIcon([object(entry.interface).iconSmall, object(entry.interface).iconLarge], [dirname(string(entry.path))]),
       required: false,
       available: true,
       enabled_by_default: entry.enabled !== false
@@ -681,7 +708,7 @@ function buildInventory(executable: string, cwd: string, raw: RuntimeRead): Agen
         id,
         name: string(metadata?.name) || manifestApp?.name || id,
         available: Boolean(metadata),
-        enabled_by_default: object(appConfig[id]).enabled !== false
+        enabled_by_default: (object(appConfig[id]).enabled ?? object(appConfig._default).enabled) !== false
       };
     }).sort((left, right) => left.name.localeCompare(right.name))
   };
@@ -692,9 +719,13 @@ function pluginInventory(row: JsonObject, skills: JsonObject[], detail?: JsonObj
   const name = string(row.name);
   if (!id || !name || row.installed !== true) return null;
   const manifest = manifestInfo(row, skills, detail);
+  const roots = [installedPluginRoot(row), pluginRoot(row)].filter((root): root is string => Boolean(root));
+  const artwork = [object(row.interface), object(object(detail?.summary).interface), object(roots[0] ? readJson(join(roots[0], ".codex-plugin", "plugin.json")).interface : {})];
   const required = id === REQUIRED_AGENT_CONTROL_PLUGIN;
   return {
     id,
+    icon_url: capabilityIcon(artwork.flatMap(entry => [entry.composerIcon, entry.logo]), roots),
+    icon_dark_url: capabilityIcon(artwork.map(entry => entry.logoDark), roots),
     name: string(object(row.interface).displayName) || name,
     ...(string(object(row.interface).shortDescription)
       ? { description: string(object(row.interface).shortDescription) }

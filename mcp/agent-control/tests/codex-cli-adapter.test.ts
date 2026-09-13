@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, expect, it } from "vitest";
-import { appendFileSync, existsSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentController } from "../src/core/controller.js";
@@ -22,7 +22,7 @@ console.log(JSON.stringify({type:'turn.completed'}));
 setTimeout(()=>process.exit(0),input.includes('slow')?15000:150);
 });`,{mode:0o700});
 });
-afterEach(()=>{process.env=previous;rmSync(dir,{recursive:true,force:true});});
+afterEach(()=>{vi.restoreAllMocks();process.env=previous;rmSync(dir,{recursive:true,force:true});});
 const input=()=>({agent:{agent_id:'agent_test',run_id:'run_test',repo_dir:dir},prompt:'poem',metadata:{profile:'softec-yoda',sandbox:'read_only'}} as any);
 async function terminal(adapter: CodexCliAdapter, handle: any) {for(let i=0;i<100;i++){const state=await adapter.getStatus(handle);if(!['running','queued'].includes(state.status))return state;await new Promise(r=>setTimeout(r,50));}throw Error('timeout');}
 it('persists profile-only launch, restores plan/messages and resumes exact session',async()=>{
@@ -285,4 +285,84 @@ it('preserves reused item IDs across raw CLI turns and merges only same-turn upd
   {thread_id:'native-thread',turn_id:'native-turn-one',item_id:'item_0'},
   {thread_id:'native-thread',turn_id:'native-turn-two',item_id:'item_0'}
  ]);
+});
+
+const flowInput = (step: string, sandbox = "workspace") => ({ ...input(),
+ metadata: { ...input().metadata, flow_instance_id: "flow-one", step_instance_id: step, sandbox,
+  flow_writable_root: join(dir, "flow-artifacts") } });
+it('resumes flow phases exactly once with phase sandboxes and durable deduplication after completion', async () => {
+ const adapter = new CodexCliAdapter(), first = await adapter.start(flowInput('plan'));
+ await terminal(adapter, first);
+ const next = { ...flowInput('review', 'read_only'), agent: { ...input().agent, backend_handle: first.data }, prompt: 'review' };
+ const [second, duplicate] = await Promise.all([adapter.start(next), new CodexCliAdapter().start(next)]);
+ expect(second.id).toBe(first.id); expect(duplicate.data).toEqual(second.data);
+ await terminal(adapter, second);
+ await new CodexCliAdapter().start({ ...next, agent: { ...next.agent, backend_handle: second.data } });
+ await terminal(adapter, second);
+ const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+ expect(calls).toHaveLength(2);
+ expect(calls[0].args).toContain('--add-dir');
+ expect(calls[1].args).toContain('read-only'); expect(calls[1].args).not.toContain('--add-dir');
+ expect(calls[1].args.slice(-3)).toEqual(['resume', '11111111-1111-1111-1111-111111111111', '-']);
+ expect(second.data.flow_writable_root).toBeUndefined();
+ await expect(adapter.start({ ...next, prompt: 'different prompt' })).rejects.toThrow('different input');
+ await expect(adapter.start({ ...next, metadata: { ...next.metadata, flow_instance_id: 'different-flow' } })).rejects.toThrow('owner');
+ await expect(adapter.start({ ...next, model: 'changed' })).rejects.toThrow('frozen');
+ await expect(adapter.start({ ...next, metadata: { sandbox: 'workspace' } })).rejects.toThrow('already has');
+ await expect(adapter.start({ ...next, metadata: { ...next.metadata, sandbox: undefined } })).rejects.toThrow('explicit phase sandbox');
+ await adapter.stop(second, { mode: 'kill' });
+ await expect(adapter.start(next)).rejects.toThrow('cancelled');
+});
+it('queues a flow phase with user followups and preserves FIFO through interruption', async () => {
+ const adapter = new CodexCliAdapter(), first = await adapter.start({ ...flowInput('plan'), prompt: 'slow' });
+ await until(() => Boolean(JSON.parse(readFileSync(join(String(first.data.dir), 'state.json'), 'utf8')).thread_id));
+ await adapter.sendMessage(first, { message: 'user followup' });
+ const next = { ...flowInput('review', 'read_only'), agent: { ...input().agent, backend_handle: first.data }, prompt: 'phase review' };
+ const second = await adapter.start(next);
+ await adapter.start(next);
+ await adapter.interrupt(first);
+ expect((await terminal(adapter, second)).status).toBe('completed');
+ const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+ expect(calls.map(call => call.input)).toEqual(['slow', 'user followup', 'phase review']);
+ expect(calls[2].args).toContain('read-only');
+});
+it('freezes configured identity and snapshot across phases without recompiling the definition', async () => {
+ const adapter = new CodexCliAdapter();
+ const launch = vi.spyOn(adapter as any, 'launch').mockResolvedValue('fixture-job');
+ const configured = { snapshot_version: 1, definition_id: 'definition', definition_name: 'Frozen', model: 'frozen-model',
+  model_provider: 'frozen-provider', reasoning_effort: 'high', executable: '/fixture/codex', repo_dir: dir,
+  plugins: [{ id: 'frozen-plugin', enabled: true }], skills: [], mcp_servers: [], apps: [], app_server_overrides: [] };
+ const first = await adapter.start({ ...flowInput('plan'), metadata: { ...flowInput('plan').metadata,
+  step_instance_id: undefined, flow_step_instance_id: 'plan',
+  profile: undefined, configured_agent: configured, permission_db_path: join(dir, 'fixture.sqlite') } });
+ const snapshotPath = join(String(first.data.dir), '..', 'configured-agent-snapshot.json');
+ const snapshot = readFileSync(snapshotPath, 'utf8');
+ expect(first.data).toMatchObject({ model: 'frozen-model', resolved_model: 'frozen-model', model_provider: 'frozen-provider' });
+ writeFileSync(join(String(first.data.dir), 'state.json'), JSON.stringify({ status: 'completed', thread_id: 'same', updated_at: new Date().toISOString() }));
+ const next = { ...flowInput('review', 'read_only'), agent: { ...input().agent, model: 'catalog-changed', backend_handle: first.data },
+  metadata: { ...flowInput('review', 'read_only').metadata, profile: undefined } };
+ const second = await adapter.start(next);
+ expect(second.data).toMatchObject({ snapshot_hash: first.data.snapshot_hash, model: 'frozen-model',
+  model_provider: 'frozen-provider', executable: '/fixture/codex', reasoning_effort: 'high' });
+ expect(readFileSync(snapshotPath, 'utf8')).toBe(snapshot);
+ expect(launch.mock.calls[1]?.[2]).toBe(false);
+ await expect(adapter.start({ ...next, metadata: { ...next.metadata, configured_agent: configured } })).rejects.toThrow('frozen');
+ expect(readdirSync(join(String(first.data.dir), '..')).filter(path => path.includes('snapshot'))).toEqual(['configured-agent-snapshot.json']);
+});
+
+it('applies an explicit inline provider and freezes it across phases', async () => {
+ writeFileSync(join(dir, 'config.toml'), 'model_provider="personal-provider"\n');
+ const adapter = new CodexCliAdapter();
+ const initial = { ...flowInput('plan'), model: 'fixture-model', metadata: { ...flowInput('plan').metadata,
+  profile: undefined, model_provider: 'openai', reasoning_effort: 'xhigh' } };
+ const first = await adapter.start(initial); await terminal(adapter, first);
+ const next = { ...initial, agent: { ...input().agent, backend_handle: first.data }, prompt: 'review',
+  metadata: { ...initial.metadata, step_instance_id: 'review', sandbox: 'read_only' } };
+ const second = await adapter.start(next); await terminal(adapter, second);
+ expect(second.data.model_provider).toBe('openai');
+ const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+ expect(calls).toHaveLength(2);
+ expect(calls.every(call => call.args.includes('model_provider="openai"'))).toBe(true);
+ expect(calls.every(call => call.args.includes('model_reasoning_effort="xhigh"'))).toBe(true);
+ await expect(adapter.start({ ...next, metadata: { ...next.metadata, model_provider: 'different' } })).rejects.toThrow('frozen');
 });

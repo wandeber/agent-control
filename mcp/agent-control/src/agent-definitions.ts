@@ -101,9 +101,13 @@ export class AgentDefinitionService {
     return this.catalog.get({ definitionId: parsed.definition_id, name: parsed.name });
   }
 
-  inventory(input: z.infer<typeof agentDefinitionInventorySchema>) {
+  async inventory(input: z.infer<typeof agentDefinitionInventorySchema>, includeArtwork = false) {
     const parsed = parseInput(agentDefinitionInventorySchema, input);
-    return loadAgentDefinitionInventory(resolve(parsed.repo_dir ?? process.cwd()), parsed.refresh === true);
+    const inventory = await loadAgentDefinitionInventory(resolve(parsed.repo_dir ?? process.cwd()), parsed.refresh === true);
+    if (includeArtwork) return inventory;
+    // Artwork belongs in the console, not in model-facing MCP/CLI context.
+    const withoutArtwork = <T extends { icon_url?: string; icon_dark_url?: string }>({ icon_url: _light, icon_dark_url: _dark, ...entry }: T) => entry;
+    return { ...inventory, plugins: inventory.plugins.map(withoutArtwork), skills: inventory.skills.map(withoutArtwork), mcp_servers: inventory.mcp_servers.map(withoutArtwork) };
   }
 
   configure(

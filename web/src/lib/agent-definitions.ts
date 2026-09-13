@@ -1,6 +1,9 @@
 export interface PluginSelection {
   id: string;
   enabled: boolean;
+  skills?: SkillSelection[];
+  mcp_servers?: McpSelection[];
+  apps?: Array<{ id: string; enabled: boolean }>;
 }
 
 export interface SkillSelection {
@@ -22,6 +25,9 @@ export interface AgentDefinition {
   model_provider: string;
   reasoning_effort: string;
   skills_catalog_token_budget?: number;
+  capabilities_mode?: "inherit" | "custom";
+  readonly bundled_key?: string;
+  readonly customized?: boolean;
   plugins: PluginSelection[];
   skills: SkillSelection[];
   mcp_servers: McpSelection[];
@@ -29,7 +35,7 @@ export interface AgentDefinition {
   updated_at: string;
 }
 
-export type AgentDefinitionEditable = Omit<AgentDefinition, "definition_id" | "created_at" | "updated_at">;
+export type AgentDefinitionEditable = Omit<AgentDefinition, "definition_id" | "created_at" | "updated_at" | "bundled_key" | "customized">;
 export type AgentDefinitionPatch = Partial<Omit<AgentDefinitionEditable, "skills_catalog_token_budget">> & {
   skills_catalog_token_budget?: number | null;
 };
@@ -83,6 +89,8 @@ export interface AgentDefinitionLaunchResult {
 }
 
 interface InventoryCapabilityBase {
+  icon_url?: string;
+  icon_dark_url?: string;
   required: boolean;
   available: boolean;
   enabled_by_default: boolean;
@@ -93,8 +101,8 @@ export interface PluginInventory extends InventoryCapabilityBase {
   name: string;
   description?: string;
   version?: string;
-  bundled_skills: Array<{ path: string; name: string }>;
-  bundled_mcp_servers: Array<{ name: string }>;
+  bundled_skills: Array<{ path: string; name: string; enabled_by_default?: boolean }>;
+  bundled_mcp_servers: Array<{ name: string; enabled_by_default?: boolean }>;
   bundled_apps: Array<{ id: string; name: string }>;
 }
 
@@ -119,6 +127,7 @@ export interface AgentDefinitionInventoryResult {
   plugins: PluginInventory[];
   skills: SkillInventory[];
   mcp_servers: McpInventory[];
+  apps?: Array<{ id: string; name: string; available: boolean; enabled_by_default: boolean }>;
 }
 
 export interface AgentModelInventory {
@@ -136,6 +145,8 @@ export interface CapabilityRow {
   name: string;
   description?: string;
   meta?: string;
+  icon_url?: string;
+  icon_dark_url?: string;
   enabled: boolean;
   required: boolean;
   available: boolean;
@@ -165,6 +176,7 @@ export function editableAgent(definition: AgentDefinition): AgentDefinitionEdita
     model: definition.model,
     model_provider: definition.model_provider,
     reasoning_effort: definition.reasoning_effort,
+    capabilities_mode: definition.capabilities_mode ?? "custom",
     ...(definition.skills_catalog_token_budget === undefined ? {} : { skills_catalog_token_budget: definition.skills_catalog_token_budget }),
     plugins: definition.plugins,
     skills: definition.skills,
@@ -179,7 +191,7 @@ export function completeAgentPatch(definition: AgentDefinition): AgentDefinition
   };
 }
 
-export function changedAgentPatch(current: AgentDefinition, baseline: AgentDefinition): AgentDefinitionPatch {
+export function changedAgentPatch(current: AgentDefinition, baseline: AgentDefinition, remote = baseline): AgentDefinitionPatch {
   const patch: AgentDefinitionPatch = {};
   if (current.name !== baseline.name) patch.name = current.name;
   if (current.description !== baseline.description) patch.description = current.description;
@@ -188,9 +200,17 @@ export function changedAgentPatch(current: AgentDefinition, baseline: AgentDefin
   if (current.model_provider !== baseline.model_provider) patch.model_provider = current.model_provider;
   if (current.reasoning_effort !== baseline.reasoning_effort) patch.reasoning_effort = current.reasoning_effort;
   if (current.skills_catalog_token_budget !== baseline.skills_catalog_token_budget) patch.skills_catalog_token_budget = current.skills_catalog_token_budget ?? null;
-  if (!sameOrderedSelections(current.plugins, baseline.plugins)) patch.plugins = current.plugins;
-  if (!sameOrderedSelections(current.skills, baseline.skills)) patch.skills = current.skills;
-  if (!sameOrderedSelections(current.mcp_servers, baseline.mcp_servers)) patch.mcp_servers = current.mcp_servers;
+  const modeChanged = (current.capabilities_mode ?? "custom") !== (baseline.capabilities_mode ?? "custom");
+  const capabilitiesChanged = !sameOrderedSelections(current.plugins, baseline.plugins)
+    || !sameOrderedSelections(current.skills, baseline.skills)
+    || !sameOrderedSelections(current.mcp_servers, baseline.mcp_servers);
+  // Crossing modes requires one complete snapshot; within custom mode, preserve
+  // unrelated capability categories that another session edited.
+  const snapshotRequired = modeChanged || (capabilitiesChanged && (current.capabilities_mode ?? "custom") !== (remote.capabilities_mode ?? "custom"));
+  if (modeChanged || capabilitiesChanged) patch.capabilities_mode = current.capabilities_mode ?? "custom";
+  if (snapshotRequired || !sameOrderedSelections(current.plugins, baseline.plugins)) patch.plugins = current.plugins;
+  if (snapshotRequired || !sameOrderedSelections(current.skills, baseline.skills)) patch.skills = current.skills;
+  if (snapshotRequired || !sameOrderedSelections(current.mcp_servers, baseline.mcp_servers)) patch.mcp_servers = current.mcp_servers;
   return patch;
 }
 
@@ -275,7 +295,10 @@ export function selectReasoningEffort(model: AgentModelInventory | undefined, cu
 
 export function pluginRows(definition: AgentDefinition, inventory: AgentDefinitionInventoryResult): CapabilityRow[] {
   const items = new Map(inventory.plugins.map(item => [item.id, item]));
-  const saved = definition.plugins.map(selection => {
+  const selections = definition.capabilities_mode === "inherit"
+    ? inventory.plugins.map(item => ({ id: item.id, enabled: item.enabled_by_default }))
+    : definition.plugins;
+  const saved = selections.map(selection => {
     const item = items.get(selection.id);
     items.delete(selection.id);
     const bundled = item ? [
@@ -287,6 +310,8 @@ export function pluginRows(definition: AgentDefinition, inventory: AgentDefiniti
       id: selection.id,
       name: item?.name ?? selection.id,
       description: item?.description,
+      icon_url: item?.icon_url,
+      icon_dark_url: item?.icon_dark_url,
       meta: [item?.version, bundled].filter(Boolean).join(" · ") || undefined,
       enabled: item?.required ? true : selection.enabled,
       required: item?.required ?? false,
@@ -297,6 +322,8 @@ export function pluginRows(definition: AgentDefinition, inventory: AgentDefiniti
     id: item.id,
     name: item.name,
     description: item.description,
+    icon_url: item.icon_url,
+    icon_dark_url: item.icon_dark_url,
     meta: item.version,
     enabled: item.required,
     required: item.required,
@@ -306,15 +333,19 @@ export function pluginRows(definition: AgentDefinition, inventory: AgentDefiniti
 
 export function skillRows(definition: AgentDefinition, inventory: AgentDefinitionInventoryResult): CapabilityRow[] {
   return mergeRows(
-    definition.skills.map(item => ({ id: item.path, enabled: item.enabled })),
-    inventory.skills.map(item => ({ id: item.path, name: item.name, description: item.description, meta: item.scope, required: item.required, available: item.available }))
+    definition.capabilities_mode === "inherit"
+      ? inventory.skills.map(item => ({ id: item.path, enabled: item.enabled_by_default }))
+      : definition.skills.map(item => ({ id: item.path, enabled: item.enabled })),
+    inventory.skills.map(item => ({ id: item.path, name: item.name, description: item.description, icon_url: item.icon_url, icon_dark_url: item.icon_dark_url, meta: item.scope, required: item.required, available: item.available }))
   );
 }
 
 export function mcpRows(definition: AgentDefinition, inventory: AgentDefinitionInventoryResult): CapabilityRow[] {
   return mergeRows(
-    definition.mcp_servers.map(item => ({ id: item.name, enabled: item.enabled })),
-    inventory.mcp_servers.map(item => ({ id: item.name, name: item.display_name ?? item.name, required: item.required, available: item.available }))
+    definition.capabilities_mode === "inherit"
+      ? inventory.mcp_servers.map(item => ({ id: item.name, enabled: item.enabled_by_default }))
+      : definition.mcp_servers.map(item => ({ id: item.name, enabled: item.enabled })),
+    inventory.mcp_servers.map(item => ({ id: item.name, name: item.display_name ?? item.name, icon_url: item.icon_url, icon_dark_url: item.icon_dark_url, required: item.required, available: item.available }))
   );
 }
 
@@ -331,6 +362,8 @@ function mergeRows(
       name: item?.name ?? selection.id,
       description: item?.description,
       meta: item?.meta,
+      icon_url: item?.icon_url,
+      icon_dark_url: item?.icon_dark_url,
       enabled: item?.required ? true : selection.enabled,
       required: item?.required ?? false,
       available: item?.available ?? false
@@ -343,4 +376,46 @@ export function capabilitySelections(kind: "plugins" | "skills" | "mcp_servers",
   if (kind === "plugins") return rows.map(row => ({ id: row.id, enabled: row.required || row.enabled }));
   if (kind === "skills") return rows.map(row => ({ path: row.id, enabled: row.required || row.enabled }));
   return rows.map(row => ({ name: row.id, enabled: row.required || row.enabled }));
+}
+
+export function inheritAgentCapabilities(definition: AgentDefinition): AgentDefinition {
+  return { ...definition, capabilities_mode: "inherit", plugins: [], skills: [], mcp_servers: [] };
+}
+
+function inheritedPluginSelections(inventory: AgentDefinitionInventoryResult): PluginSelection[] {
+  const apps = new Map(inventory.apps?.map(app => [app.id, app]));
+  return inventory.plugins.map(plugin => {
+    const selection: PluginSelection = { id: plugin.id, enabled: plugin.required || plugin.enabled_by_default };
+    // Disabled plugins retain normal defaults when enabled later. Only freeze
+    // child overrides for plugins whose inherited capabilities are active now.
+    if (!selection.enabled) return selection;
+    if (plugin.bundled_skills.length) selection.skills = plugin.bundled_skills.map(skill => ({ path: skill.path, enabled: skill.enabled_by_default ?? true }));
+    if (plugin.bundled_mcp_servers.length) selection.mcp_servers = plugin.bundled_mcp_servers.map(server => ({ name: server.name, enabled: server.enabled_by_default ?? true }));
+    if (plugin.bundled_apps.length) selection.apps = plugin.bundled_apps.map(app => ({ id: app.id, enabled: apps.get(app.id)?.enabled_by_default ?? true }));
+    return selection;
+  });
+}
+
+export function replaceAgentCapabilities(
+  definition: AgentDefinition,
+  inventory: AgentDefinitionInventoryResult,
+  kind: "plugins" | "skills" | "mcp_servers",
+  rows: CapabilityRow[]
+): AgentDefinition {
+  // A first toggle or reorder freezes the entire inherited inventory so the
+  // untouched categories retain their effective enablement and order.
+  const next = definition.capabilities_mode === "inherit" ? {
+    ...definition,
+    capabilities_mode: "custom" as const,
+    plugins: inheritedPluginSelections(inventory),
+    skills: capabilitySelections("skills", skillRows(definition, inventory)) as SkillSelection[],
+    mcp_servers: capabilitySelections("mcp_servers", mcpRows(definition, inventory)) as McpSelection[]
+  } : definition;
+  const selections = capabilitySelections(kind, rows);
+  if (kind === "plugins") {
+    const previous = new Map(next.plugins.map(plugin => [plugin.id, plugin]));
+    return { ...next, plugins: (selections as PluginSelection[]).map(plugin => ({ ...previous.get(plugin.id), ...plugin })) };
+  }
+  if (kind === "skills") return { ...next, skills: selections as SkillSelection[] };
+  return { ...next, mcp_servers: selections as McpSelection[] };
 }

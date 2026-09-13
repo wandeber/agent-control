@@ -9,7 +9,11 @@ export interface FlowCatalogEntry {
   description: string | null; version: string | null; valid: boolean; error: string | null;
 }
 export interface FlowPromptPreview { scope: "role" | "step"; owner_id: string; path?: string; text: string | null; error: string | null }
-export interface FlowDefinition extends FlowCatalogEntry { config: FlowConfigRecord; prompts: Record<string, FlowPromptPreview[]> }
+export interface FlowDefinition extends FlowCatalogEntry {
+  config: FlowConfigRecord;
+  resolved_roles?: Record<string, NonNullable<FlowConfigRecord["roles"]>[string] & { model_provider?: string }>;
+  prompts: Record<string, FlowPromptPreview[]>;
+}
 export interface FlowPreview {
   project_dir: string | null; selected_flow_id: string | null; flows: FlowCatalogEntry[];
   catalogs: Array<{ catalog_id: string; name: string; root_path: string }>;

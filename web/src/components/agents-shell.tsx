@@ -28,14 +28,15 @@ import {
 import {
   AgentDefinitionApiError,
   applyAgentPatch,
-  capabilitySelections,
   changedAgentPatch,
   createAgentDraft,
   editableAgent,
   filterCapabilityRows,
   hasAgentPatch,
+  inheritAgentCapabilities,
   mcpRows,
   pluginRows,
+  replaceAgentCapabilities,
   selectAgentModel,
   skillRows,
   uniqueAgentName,
@@ -43,10 +44,7 @@ import {
   type AgentDefinition,
   type AgentDefinitionConfigureResult,
   type AgentDefinitionInventoryResult,
-  type CapabilityRow,
-  type McpSelection,
-  type PluginSelection,
-  type SkillSelection
+  type CapabilityRow
 } from "@/lib/agent-definitions";
 import { AgentDefinitionSaveQueue, flushDeferredAgentSaves, saveDefinitionUpdate, type AgentSaveState } from "@/lib/agent-definition-save-queue";
 import { useConsoleSelection } from "./console-selection";
@@ -198,7 +196,7 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
         const localDraft = local.get(remoteAgent.definition_id);
         const confirmed = baseline.get(remoteAgent.definition_id);
         if (!localDraft || !confirmed) return remoteAgent;
-        const patch = changedAgentPatch(localDraft, confirmed);
+        const patch = changedAgentPatch(localDraft, confirmed, remoteAgent);
         if (hasAgentPatch(patch)) retryIds.add(remoteAgent.definition_id);
         else dirtyIds.current.delete(remoteAgent.definition_id);
         return applyAgentPatch(remoteAgent, patch);
@@ -303,7 +301,7 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
   };
 
   const deleteAgent = async () => {
-    if (!catalog || !selected) return;
+    if (!catalog || !selected || selected.bundled_key) return;
     setActionBusy(true);
     try {
       const result = await deleteAgentDefinition(selected.definition_id, catalog.revision);
@@ -376,7 +374,7 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
   const blocked = actionBusy || saveState !== "saved";
   // Section navigation stays available while inventory loads or needs a retry.
   if (!catalog || !inventory) return <SettingsLayout section="agents" onSelect={navigateSettings}>
-    {loading && !catalog ? <ScreenState icon={<Bot size={34} />} title="Loading personal agents…" detail="Reading the catalog and current Codex inventory." />
+    {loading && !catalog ? <ScreenState icon={<Bot size={34} />} title="Loading agents…" detail="Reading the catalog and current Codex inventory." />
       : <ScreenState icon={<Unplug size={34} />} title="Agents unavailable" detail={issue?.message ?? "The catalog could not be loaded."} action={<button className="agent-secondary-button" onClick={() => void loadInitial()}>Try again</button>} />}
   </SettingsLayout>;
 
@@ -385,17 +383,17 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
       {orphanedDrafts.length ? <div className="agent-orphaned-drafts" role="alert"><AlertTriangle size={16} /><div><strong>{orphanedDrafts.length === 1 ? "A local draft was deleted elsewhere" : `${orphanedDrafts.length} local drafts were deleted elsewhere`}</strong><p>The edited data is preserved here and has not been written back under a stale ID.</p>{orphanedDrafts.map(draft => <div className="agent-orphaned-row" key={draft.definition_id}><span>{draft.name}</span><button className="agent-secondary-button" disabled={blocked} onClick={() => void recoverDeletedDraft(draft)}>Restore as new</button></div>)}</div></div> : null}
       {selected ? <>
         <header className="agent-editor-header">
-          <div className="agent-editor-title"><button type="button" className="settings-back" aria-label="Back to agents" onClick={showList}><ArrowLeft size={17} /><span>Agents</span></button><span className="agent-avatar agent-avatar-large"><Bot size={19} /></span><div><span className="agents-eyebrow">Reusable configuration</span><h2>{selected.name}</h2></div></div>
+          <div className="agent-editor-title"><button type="button" className="settings-back" aria-label="Back to agents" onClick={showList}><ArrowLeft size={17} /><span>Agents</span></button><span className="agent-avatar agent-avatar-large"><Bot size={19} /></span><h2>{selected.name}</h2></div>
           <div className="agent-editor-actions">
             <SaveStatus state={saveState} />
             <button className="agent-primary-button" type="button" disabled={actionBusy || launching} onClick={() => { setLaunchOpen(true); setDeleteConfirm(false); setLaunchError(null); }}><Play size={13} />Run</button>
             <button className="agent-secondary-button" type="button" disabled={blocked} onClick={() => void duplicateAgent()}><Copy size={14} />Copy</button>
-            <button className="agent-icon-button agent-danger-button" type="button" aria-label={`Delete ${selected.name}`} title={`Delete ${selected.name}`} disabled={blocked} onClick={() => { setDeleteConfirm(true); setLaunchOpen(false); }}><Trash2 size={15} /></button>
+            {!selected.bundled_key ? <button className="agent-icon-button agent-danger-button" type="button" aria-label={`Delete ${selected.name}`} title={`Delete ${selected.name}`} disabled={blocked} onClick={() => { setDeleteConfirm(true); setLaunchOpen(false); }}><Trash2 size={15} /></button> : null}
           </div>
         </header>
 
         {launchOpen ? <div className="agent-launch" role="dialog" aria-label={`Run ${selected.name}`}><div className="agent-launch-heading"><div><strong>Run {selected.name}</strong><p>{projectDir ?? "Current Agent Control project"}</p></div><button className="agent-secondary-button" disabled={launching} onClick={() => setLaunchOpen(false)}>Cancel</button></div><textarea autoFocus value={launchPrompt} aria-label="Task prompt" placeholder="Describe the task for this agent…" onChange={event => { setLaunchPrompt(event.target.value); setLaunchError(null); }} />{launchError ? <p className="agent-launch-error" role="alert">{launchError}</p> : null}<div className="agent-launch-footer"><span>Uses the saved provider, model, effort, and capabilities.</span><button className="agent-primary-button" disabled={launching || !launchPrompt.trim()} onClick={() => void launchAgent()}>{launching ? <span className="agent-spinner" /> : <Play size={13} />}{launching ? "Starting…" : "Start agent"}</button></div></div> : null}
-        {deleteConfirm ? <div className="agent-confirm" role="alertdialog" aria-label={`Delete ${selected.name}`}><div><strong>Delete “{selected.name}”?</strong><p>This removes the saved definition. Existing workers are unchanged.</p></div><div><button className="agent-secondary-button" onClick={() => setDeleteConfirm(false)}>Cancel</button><button className="agent-primary-button agent-delete-confirm" disabled={blocked} onClick={() => void deleteAgent()}>Delete agent</button></div></div> : null}
+        {deleteConfirm && !selected.bundled_key ? <div className="agent-confirm" role="alertdialog" aria-label={`Delete ${selected.name}`}><div><strong>Delete “{selected.name}”?</strong><p>This removes the saved definition. Existing workers are unchanged.</p></div><div><button className="agent-secondary-button" onClick={() => setDeleteConfirm(false)}>Cancel</button><button className="agent-primary-button agent-delete-confirm" disabled={blocked} onClick={() => void deleteAgent()}>Delete agent</button></div></div> : null}
         {issue ? <IssueBanner issue={issue} onRetry={issue.autosave && !issue.conflict ? () => { setIssue(null); queue.retry(); } : undefined} onRefresh={() => void refreshAndReapply()} /> : null}
         {!inventory.runtime.compatible ? <div className="agent-runtime-warning" role="status"><AlertTriangle size={16} /><span><strong>Unsupported Codex runtime</strong>{inventory.runtime.compatibility_reason ? ` — ${inventory.runtime.compatibility_reason}` : ""}</span></div> : null}
         {unavailableEnabled ? <div className="agent-runtime-warning" role="status"><AlertTriangle size={16} /><span>{unavailableEnabled} enabled {unavailableEnabled === 1 ? "capability is" : "capabilities are"} unavailable. Disable or restore them before launching this agent.</span></div> : null}
@@ -404,8 +402,7 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
           <section className="agent-form-section" aria-labelledby="agent-identity-heading">
             <div className="agent-section-heading"><div><span className="agents-eyebrow">Identity</span><h3 id="agent-identity-heading">Instructions and model</h3></div><button className="agent-secondary-button" type="button" disabled={refreshing || queue.saving} onClick={() => void refreshAndReapply()}>{refreshing ? <span className="agent-spinner" /> : <RefreshCw size={14} />}Refresh inventory</button></div>
             <div className="agent-form-grid">
-              <Field label="Name" className="agent-field-name"><input value={selected.name} aria-label="Agent name" onChange={event => updateSelected(agent => ({ ...agent, name: event.target.value }))} /></Field>
-              <Field label="Description" className="agent-field-description"><input value={selected.description} aria-label="Agent description" placeholder="What this agent is best at" onChange={event => updateSelected(agent => ({ ...agent, description: event.target.value }))} /></Field>
+              <Field label="Name" className="agent-field-full"><input value={selected.name} aria-label="Agent name" onChange={event => updateSelected(agent => ({ ...agent, name: event.target.value }))} /></Field>
               <Field label="Provider"><select value={selected.model_provider} aria-label="Model provider" onChange={event => {
                 const providerId = event.target.value;
                 const nextModel = inventory.models.find(model => (model.available || model.run_validation_required) && model.model_provider === providerId) ?? inventory.models.find(model => model.model_provider === providerId);
@@ -425,6 +422,7 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
                     if (effort !== selected.reasoning_effort) updateSelected(agent => ({ ...agent, reasoning_effort: effort }), true);
                   }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
                 : <select value={selected.reasoning_effort} aria-label="Reasoning effort" onChange={event => updateSelected(agent => ({ ...agent, reasoning_effort: event.target.value }), true)}>{effortsFor(inventory, selected).map(effort => <option key={effort} value={effort}>{effort}</option>)}</select>}</Field>
+              <Field label="Description" className="agent-field-full agent-field-description"><textarea rows={2} value={selected.description} aria-label="Agent description" placeholder="What this agent is best at" onChange={event => updateSelected(agent => ({ ...agent, description: event.target.value }))} /></Field>
               <Field label="Instructions" className="agent-field-full"><textarea value={selected.instructions} aria-label="Agent instructions" placeholder="Describe how this agent should work…" onChange={event => updateSelected(agent => ({ ...agent, instructions: event.target.value }))} /></Field>
             </div>
             <details className="agent-advanced"><summary>Advanced</summary><div><Field label="Skill catalog token budget" hint="Optional · 1–10,000"><input type="number" min={1} max={10000} value={selected.skills_catalog_token_budget ?? ""} placeholder="Inherited" aria-label="Skill catalog token budget" onChange={event => {
@@ -435,6 +433,10 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
 
           <section className="agent-capabilities" aria-labelledby="agent-capabilities-heading">
             <div className="agent-section-heading"><div><span className="agents-eyebrow">Capabilities</span><h3 id="agent-capabilities-heading">Available to this agent</h3></div><span className="agent-inventory-meta">{formatRuntimeVersion(inventory.runtime.version)} · {formatRefreshTime(inventory.refreshed_at)}</span></div>
+            <div className="agent-capability-mode">
+              <span>{selected.capabilities_mode === "inherit" ? "Inheriting plugins, skills, and MCP from Codex CLI. Editing a capability creates a custom selection." : "Custom capability selection."}</span>
+              {selected.capabilities_mode !== "inherit" ? <button className="agent-secondary-button" type="button" disabled={actionBusy} onClick={() => updateSelected(inheritAgentCapabilities, true)}>Inherit from Codex</button> : null}
+            </div>
             <div className="agent-capability-tabs" role="tablist" aria-label="Agent capabilities">
               {(["plugins", "skills", "mcp_servers"] as const).map(kind => {
                 const rows = rowsFor(kind, selected, inventory);
@@ -451,23 +453,27 @@ export function AgentsShell({ onNavigate }: { onNavigate: (section: SettingsSect
               rows={rowsFor(tab, selected, inventory)}
               query={capabilityQuery}
               disabled={actionBusy}
-              onChange={rows => updateSelected(agent => replaceCapabilities(agent, tab, rows), true)}
+              onChange={rows => updateSelected(agent => replaceAgentCapabilities(agent, inventory, tab, rows), true)}
             />
           </section>
         </div>
-      </> : <section className="settings-catalog agent-scroll" aria-label="Personal agent catalog"><div className="settings-catalog-inner">
+      </> : <section className="settings-catalog agent-scroll" aria-label="Agent catalog"><div className="settings-catalog-inner">
         <header className="settings-catalog-heading"><div><h1>Agents</h1><p>Reusable agents, each with their own instructions and capabilities.</p></div><button className="agent-primary-button" type="button" disabled={blocked} onClick={() => void createAgent()}><Plus size={15} />Create agent</button></header>
         {issue ? <IssueBanner issue={issue} onRetry={issue.autosave && !issue.conflict ? () => { setIssue(null); queue.retry(); } : undefined} onRefresh={() => void refreshAndReapply()} /> : null}
         <div className="settings-catalog-toolbar"><label className="settings-search"><Search size={15} /><input aria-label="Search agents" placeholder="Search agents" value={query} onChange={event => setQuery(event.target.value)} /></label><span>{catalog.agents.length} {catalog.agents.length === 1 ? "agent" : "agents"}</span>{saveState !== "saved" ? <SaveStatus state={saveState} /> : null}</div>
-        <div className="settings-entry-list">
-          {filteredAgents.map(agent => {
+        {(["Included", "Custom"] as const).map(group => {
+          const agents = filteredAgents.filter(agent => Boolean(agent.bundled_key) === (group === "Included"));
+          if (!agents.length) return null;
+          return <section key={group} className="settings-catalog-group" aria-label={`${group} agents`}><h2>{group}</h2><div className="settings-entry-list">
+          {agents.map(agent => {
             const model = inventory.models.find(item => item.id === agent.model && item.model_provider === agent.model_provider);
             return <article key={agent.definition_id} className="settings-entry">
               <button type="button" className="settings-entry-main" onClick={() => setSelectedId(agent.definition_id)}><span className="agent-avatar agent-avatar-large" aria-hidden="true"><Bot size={19} /></span><span className="settings-entry-copy"><span className="settings-entry-title"><strong title={agent.name}>{agent.name}</strong><small>{model?.display_name ?? agent.model ?? "Provider default"}{agent.reasoning_effort ? ` · ${agent.reasoning_effort}` : ""}</small></span><span className="settings-entry-description">{agent.description}</span></span></button>
               <button type="button" className="agent-secondary-button" aria-label={`Configure ${agent.name}`} onClick={() => setSelectedId(agent.definition_id)}>Configure</button>
             </article>;
           })}
-        </div>
+          </div></section>;
+        })}
         {!filteredAgents.length ? <div className="settings-list-empty">{query ? "No matching agents." : "Create your first agent to choose its model, instructions, and plugins."}</div> : null}
       </div></section>}
     </section>
@@ -496,7 +502,7 @@ function CapabilityList({ kind, rows, query, disabled, onChange }: { kind: Capab
       const index = rows.findIndex(candidate => candidate.id === row.id);
       const toggleDisabled = disabled || row.required || (!row.available && !row.enabled);
       return <div className="agent-capability-row" data-available={row.available} key={row.id}>
-        <span className="agent-capability-icon" aria-hidden="true">{kind === "plugins" ? <Sparkles size={15} /> : kind === "skills" ? <Bot size={15} /> : <Server size={15} />}</span>
+        <CapabilityIcon kind={kind} row={row} />
         <div className="agent-capability-copy"><div><strong>{row.name}</strong>{row.required ? <span className="agent-row-badge"><LockKeyhole size={10} />Required</span> : null}{!row.available ? <span className="agent-row-badge agent-row-unavailable">Unavailable</span> : null}</div><p>{row.description || row.id}</p>{row.meta ? <small>{row.meta}</small> : null}</div>
         <div className="agent-row-order">
           <button type="button" aria-label={`Move ${row.name} up`} title={filtered ? "Clear search to reorder" : "Move up"} disabled={disabled || filtered || index === 0} onClick={() => move(index, -1)}><ArrowUp size={13} /></button>
@@ -506,6 +512,19 @@ function CapabilityList({ kind, rows, query, disabled, onChange }: { kind: Capab
       </div>;
     })}
   </div>;
+}
+
+function CapabilityIcon({ kind, row }: { kind: CapabilityTab; row: CapabilityRow }) {
+  const [failedSources, setFailedSources] = useState<string[]>([]);
+  const light = row.icon_url && !failedSources.includes(row.icon_url) ? row.icon_url : undefined;
+  const dark = row.icon_dark_url && !failedSources.includes(row.icon_dark_url) ? row.icon_dark_url : light;
+  const fallback = kind === "plugins" ? <Sparkles size={15} /> : kind === "skills" ? <Bot size={15} /> : <Server size={15} />;
+  const renderIcon = (src: string | undefined) => src
+    ? <img src={src} alt="" width={26} height={26} loading="lazy" decoding="async" onError={() => setFailedSources(previous => previous.includes(src) ? previous : [...previous, src])} />
+    : fallback;
+  return <span className="agent-capability-icon" data-artwork={Boolean(light ?? dark)} data-themed={Boolean(light && dark && light !== dark)} aria-hidden="true">
+    {dark && light && dark !== light ? <><span className="agent-capability-icon-light">{renderIcon(light)}</span><span className="agent-capability-icon-dark">{renderIcon(dark)}</span></> : renderIcon(light ?? dark)}
+  </span>;
 }
 
 function SaveStatus({ state }: { state: AgentSaveState }) {
@@ -522,13 +541,6 @@ function ScreenState({ icon, title, detail, action }: { icon: React.ReactNode; t
 
 function rowsFor(kind: CapabilityTab, definition: AgentDefinition, inventory: AgentDefinitionInventoryResult): CapabilityRow[] {
   return kind === "plugins" ? pluginRows(definition, inventory) : kind === "skills" ? skillRows(definition, inventory) : mcpRows(definition, inventory);
-}
-
-function replaceCapabilities(definition: AgentDefinition, kind: CapabilityTab, rows: CapabilityRow[]): AgentDefinition {
-  const selections = capabilitySelections(kind, rows);
-  if (kind === "plugins") return { ...definition, plugins: selections as PluginSelection[] };
-  if (kind === "skills") return { ...definition, skills: selections as SkillSelection[] };
-  return { ...definition, mcp_servers: selections as McpSelection[] };
 }
 
 function effortsFor(inventory: AgentDefinitionInventoryResult, definition: AgentDefinition): string[] {

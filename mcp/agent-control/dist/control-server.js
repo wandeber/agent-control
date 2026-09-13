@@ -342,7 +342,7 @@ async function handleAgentDefinitionApi(service, controller, request, response, 
         sendJson(response, 200, await service.inventory({
             repo_dir: url.searchParams.get("repo_dir") ?? undefined,
             refresh: url.searchParams.get("refresh") === "true"
-        }));
+        }, true));
         return;
     }
     if (request.method === "POST" && url.pathname === `${base}/configure`) {

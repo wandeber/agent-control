@@ -30,7 +30,7 @@ export function applyProjectModels(config, projectDir) {
         for (const [role, settings] of Object.entries(config.roles)) {
             if (!record(settings))
                 continue;
-            for (const field of ["model", "reasoning_effort"])
+            for (const field of ["model", "model_provider", "reasoning_effort"])
                 if (typeof settings[field] === "string" && settings[field].includes("${"))
                     throw new Error(`roles.${role}.${field} cannot use environment interpolation; use .agents/models.toml.`);
         }
@@ -56,7 +56,7 @@ export function applyModelPreferences(config, preferences) {
                 if (!record(override))
                     throw new Error(`Model override ${role} must be a table.`);
                 for (const [key, value] of Object.entries(override)) {
-                    if (key !== "model" && key !== "reasoning_effort")
+                    if (key !== "model" && key !== "model_provider" && key !== "reasoning_effort")
                         throw new Error(`Unsupported model override field: ${role}.${key}`);
                     if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.includes("${"))
                         throw new Error(`Invalid model override: ${role}.${key}`);

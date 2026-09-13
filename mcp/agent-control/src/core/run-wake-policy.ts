@@ -1,4 +1,5 @@
 import { PermissionRequests, permissionOwnerMatches } from "./permission-requests.js";
+import { agentConversationThreadId } from "./agent-conversation-identity.js";
 import type { SqliteStore } from "../storage/sqlite-store.js";
 import type { AgentRecord, EventRecord } from "./types.js";
 import type { FlowRuntimeState } from "./flow-runtime.js";
@@ -84,10 +85,13 @@ export class RunWakePolicy {
 
   wakes(event: EventRecord, observer: AgentRecord, owners: string[]): boolean {
     const payload = event.payload;
+    const observerThreadId = agentConversationThreadId(observer);
     const sameThread = (id: string | null | undefined) => {
       const agent = id ? this.store.getAgent(id) : null;
-      return Boolean(agent && !agent.unregistered_at && agent.backend_handle?.thread_id &&
-        agent.backend_handle.thread_id === observer.backend_handle?.thread_id);
+      // CLI owners expose their verified thread in supervisor state, while the
+      // passive observer stores that thread on its handle. Both identify the
+      // same coordinator for control events such as package delivery.
+      return Boolean(agent && observerThreadId && agentConversationThreadId(agent) === observerThreadId);
     };
     const operational = owners.length > 0 || sameThread(this.store.getRun(observer.run_id)?.created_by_agent_id) ||
       this.store.listFlowInstances({ runId: observer.run_id }).some(flow =>
@@ -117,9 +121,7 @@ export class RunWakePolicy {
         const owner = decision?.owner ?? "orchestrator";
         const binding = flowId ? this.runtime(flowId)?.decision_owners?.[owner] : undefined;
         if (binding) {
-          const identity = this.store.getAgent(binding);
-          return binding === observer.agent_id || owners.includes(binding) || Boolean(identity?.backend_handle?.thread_id &&
-            identity.backend_handle.thread_id === observer.backend_handle?.thread_id);
+          return binding === observer.agent_id || owners.includes(binding) || sameThread(binding);
         }
         if (owner === "requester") {
           const requester = this.store.db.prepare("select thread_id from run_requesters where run_id = ?").get(event.run_id ?? observer.run_id) as { thread_id: string } | undefined;

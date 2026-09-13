@@ -62,7 +62,17 @@ modify an installed plugin cache to create a project flow.
   runtime records; do not create Markdown files only to transport structured data.
 - Model reusable prompts as named resources under top-level `prompts`, then
   reference them from roles or steps with `prompt_ref`.
-- Use literal role `model` and `reasoning_effort` defaults. Project overrides
+- Reuse a configured agent with `agent_ref: <bundled-key-or-definition-id>`.
+  Discover entries through `agent_definition_list`; bundled keys make repository
+  flows portable, while personal UUIDs identify user-specific definitions.
+  References select the Codex CLI backend and inherit the definition's stable
+  instructions and settings. Do not combine a reference with role `prompt`,
+  `prompt_ref`, or `prompt_path`, or an incompatible backend. Keep phase
+  contracts on steps. Inline roles remain first-class; the development flow
+  keeps its analyst inline as a complete example.
+- Use literal inline-role `model`, `model_provider`, and `reasoning_effort`
+  defaults. A referenced role may explicitly override those fields. The current
+  provider override is supported by `codex-cli`. Project overrides
   belong in `.agents/models.toml`; model fields reject environment interpolation.
   Backend/connection environment placeholders remain supported.
 - Prefer Markdown prompt files for stable instructions:
@@ -113,8 +123,9 @@ prompts:
     path: prompts/steps/analysis.md
 roles:
   analyst:
-    backend: ${DEVFLOW_ANALYST_BACKEND:-codex-thread}
+    backend: codex-cli
     model: gpt-5.6-luna
+    model_provider: openai
     reasoning_effort: max
     prompt_ref: analyst_role
 artifacts:
@@ -133,10 +144,17 @@ steps:
         notify: orchestrator
 ```
 
+For a shared role, replace the inline `analyst` fields with
+`agent_ref: development-analyst` and remove the unused role prompt resource.
+The step prompt and artifact contract stay in the flow.
+
 ## Quality Checklist
 
 - `initial_step` exists in `steps`.
 - Every role/step `prompt_ref` exists in `prompts`.
+- Every `agent_ref` resolves in the effective catalog. References contain no
+  inline role prompt or incompatible backend; resolved snapshots are runtime
+  data and must never be authored into a flow file.
 - Every prompt `path` or role/step `prompt_path` points to a `.md` file.
 - Every input/output artifact reference exists in `artifacts`.
 - Every `to` target exists in `steps`.
@@ -177,7 +195,13 @@ trusted `evidence_valid` result flag or duplicate the provider in prompt code.
 A flow needing strict authored review must retain the exact owner or block for
 explicit recovery; review-only prose must not be described as a technical sandbox.
 
-Pin effective config and prompts for a run. Continued owners receive changes
+Pin effective config, referenced definitions, and prompts for a run. Personal
+definition edits affect future flows. Inherited capabilities are resolved when
+each worker starts in its actual repository or worktree; continuations retain
+that execution snapshot. Do not include personal plugin, skill, or MCP
+selections in a portable bundled definition.
+
+Continued owners receive phase changes
 and relevant references, with a full refresh only when continuity is uncertain.
 Describe optional user testing and single-review preferences explicitly. Normal
 correction loops collect findings in batches; repeated underlying problems
@@ -187,7 +211,7 @@ without progress return to a concrete user decision, never timeout approval.
 
 Use `policy.work_packages` to bind the package lifecycle to a flow's existing
 approval decision, manifest step, execution step, and integration step. Define
-required package IDs, configured `codex-thread` roles, disjoint literal paths,
+required package IDs, configured `codex-cli` or `codex-thread` roles, disjoint literal paths,
 deliverables, dependencies,
 and provisioned Codex worktrees through the runtime package contract before the
 same exact-plan decision. An empty manifest represents inline execution.

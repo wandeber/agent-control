@@ -1,6 +1,6 @@
 ---
 name: configured-agents
-description: Discover, configure, or invoke reusable Agent Control agents by name. Use when the user asks which saved agents are available, requests an agent such as the analyst or video editor, or wants to create, copy, reorder, edit, or delete an agent and its model, instructions, plugins, skills, or MCP settings.
+description: Discover, configure, or invoke reusable Agent Control agents by name. Use when the user asks which saved agents are available, requests an agent such as the analyst or video editor, or wants to create, copy, edit, or delete an agent and configure its model, instructions, or ordered plugins, skills, and MCP settings.
 ---
 
 # Configured Agents
@@ -8,6 +8,9 @@ description: Discover, configure, or invoke reusable Agent Control agents by nam
 Resolve saved agent identities through Agent Control. A saved definition contains
 instructions, a Codex model/provider/reasoning selection, and ordered capability
 settings. An execution is a separate worker created from that definition.
+The catalog combines agents bundled with Agent Control and personal agents;
+never assume a fresh installation has an empty catalog. Bundled development
+agents are available without copying flow prompts or changing HDT.
 
 ## Resolve The Requested Operation
 
@@ -39,25 +42,46 @@ installation. Ordinary toggles and edits do not need another inventory read.
 Prefer the plugin control for capabilities that belong to a plugin. Bundled
 skills and MCP servers are managed with that plugin; standalone controls cover
 only independent capabilities. Agent Control itself is required infrastructure.
-New agents start with optional capabilities disabled. Enable what the user
-requested using returned IDs, skill paths, and MCP names.
+Bundled agents use `capabilities_mode: "inherit"`: new workers take the enabled
+plugins, skills, MCP servers, and apps from the general Codex CLI configuration.
+Personal agents may instead use a custom selection. Model, provider, and
+reasoning remain explicit, editable settings. Enable requested capabilities
+using returned IDs, skill paths, and MCP names.
 
 Use the shared tools:
 
 | Operation | Tool and fields |
 | --- | --- |
 | Create | `agent_definition_configure`, `operation: "create"`, `expected_revision`, `patch` |
-| Edit or reorder | `agent_definition_configure`, `operation: "update"`, `definition_id`, `expected_revision`, `patch`, optional zero-based `position` |
+| Edit | `agent_definition_configure`, `operation: "update"`, `definition_id`, `expected_revision`, `patch` |
 | Copy | `agent_definition_configure`, `operation: "duplicate"`, `source_id`, `expected_revision`, `patch` |
 | Delete | `agent_definition_delete`, `definition_id`, `expected_revision` |
 
 Take `expected_revision` from the latest catalog read or successful mutation.
 The editable patch accepts `name`, `description`, `instructions`, `model`,
-`model_provider`, `reasoning_effort`, `skills_catalog_token_budget`, and ordered
-`plugins`, `skills`, and `mcp_servers` arrays. Plugin entries use `{id, enabled}`;
+`model_provider`, `reasoning_effort`, `capabilities_mode`,
+`skills_catalog_token_budget`, and ordered
+`plugins`, `skills`, and `mcp_servers` arrays. Plugin entries use `{id, enabled}` with optional ordered `skills`,
+`mcp_servers`, and `apps` child selections using the same identity/toggle shape;
 skills use `{path, enabled}`; MCP servers use `{name, enabled}`. A supplied array
 replaces that whole saved array, including disabled entries. Omitted fields stay
 unchanged; a null budget removes the override. The optional budget is 1–10,000.
+
+To customize inherited capabilities, materialize all three `plugins`, `skills`,
+and `mcp_servers` arrays from the current inventory defaults and submit them
+together with `capabilities_mode: "custom"`. Preserve required infrastructure
+and the other categories when changing only one capability. For currently
+enabled plugins, also preserve each bundled child's inventory enablement in its
+nested selections so an unrelated edit cannot re-enable a disabled child.
+Omitted child arrays use the plugin's ordinary all-enabled selection; supplied
+arrays select only their enabled entries. Set
+`capabilities_mode: "inherit"` to return to general defaults. Editing a name,
+model, or instructions alone must retain the current capability mode.
+
+Bundled entries expose read-only `bundled_key` and `customized` metadata. Updates
+are personal field overrides; do not write those metadata fields or edit the
+installed bundle. Bundled agents can be customized or duplicated, not deleted.
+Use stable definition IDs for tools and stable bundled keys for portable flows.
 
 After a revision conflict, reread and reconcile only the intended change against
 the current definition before retrying. Do not replay a stale whole definition
@@ -115,6 +139,21 @@ commentary when useful and reattach to the wait. Subscription notifications
 cannot reliably wake an ended Codex turn. Do not replace waits with polling or
 a monitoring automation. Finish when all supervised work has settled and its
 outcome is known, or when the user explicitly pauses or cancels supervision.
+
+## Reuse From A Flow
+
+A flow role can select `agent_ref: development-planner` or another returned
+`bundled_key`; a personal definition ID works on that user's installation.
+Keep phase-specific instructions on the step. Do not combine `agent_ref` with
+role `prompt`, `prompt_ref`, or `prompt_path`. An inline role remains supported
+with its own Codex backend, model, provider, effort, and instructions.
+`development-flow-v1` demonstrates both forms: its analyst is inline and its
+other workers reference the shared catalog.
+
+The flow pins the selected definition at creation. Each new worker compiles its
+capabilities for its actual repository; continuations keep that worker's frozen
+selection. Definition edits affect future flows, not a running flow's owners.
+Use `$flow-author` for flow authoring and the ordinary flow runner for execution.
 
 ## CLI And Missing Capabilities
 

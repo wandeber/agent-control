@@ -214,7 +214,7 @@ export class FlowPackages {
       for (const entry of manifest) {
         if (!registered.includes(entry.worktree) || entry.worktree === realpathSync(context.repo) || roots.has(entry.worktree) || realpathSync(git(entry.worktree, "rev-parse", "--show-toplevel")) !== entry.worktree || repositoryIdentity(entry.worktree) !== common || git(entry.worktree, "rev-parse", "HEAD") !== base) fail("Each package needs a distinct Git worktree of the same repository at the approved base commit.");
         if (git(entry.worktree, "status", "--porcelain", "--untracked-files=all")) fail("Package worktrees must be clean when the manifest is defined.");
-        if (context.config.roles?.[entry.role]?.backend !== "codex-thread") fail("Package workers require an explicitly configured codex-thread role.");
+        if (!["codex-thread", "codex-cli"].includes(context.config.roles?.[entry.role]?.backend ?? "")) fail("Package workers require an explicitly configured codex-thread or codex-cli role.");
         roots.add(entry.worktree);
         for (const path of entry.paths) { if (paths.some(prior => scoped(path, prior) || scoped(prior, path))) fail("Parallel package write paths must be disjoint."); paths.push(path); }
         if (entry.deliverables.some(path => !entry.paths.some(prefix => scoped(path, prefix)))) fail("Package deliverables must be inside its approved write scope.");

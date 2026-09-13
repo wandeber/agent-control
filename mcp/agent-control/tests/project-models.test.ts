@@ -35,6 +35,13 @@ it("rejects model environment interpolation for file and direct object inputs", 
  expect(()=>applyProjectModels({...base,roles:{analyst:{model:'${MODEL-default}'}}})).toThrow(/environment interpolation/);
 });
 
+it("overrides providers without interpolating them from the environment", () => {
+ writeFileSync(join(root,".agents/models.toml"),'[flows.example.analyst]\nmodel_provider="custom"');
+ expect(applyProjectModels(base, root)).toMatchObject({roles:{analyst:{model_provider:"custom",model:"base"}}});
+ expect(()=>parseFlowConfigText('id: bad\nroles:\n  analyst:\n    model_provider: ${PROVIDER-default}')).toThrow(/environment interpolation/);
+ expect(()=>applyProjectModels({...base,roles:{analyst:{model_provider:'${PROVIDER-default}'}}})).toThrow(/environment interpolation/);
+});
+
 it("pins project model settings at launch and never rereads them for a running instance", async () => {
  vi.stubEnv("AGENT_CONTROL_HOME", join(root, "state")); vi.stubEnv("AGENT_CONTROL_ADMIN_KEY", "test-admin"); vi.stubEnv("CODEX_THREAD_ID", "");
  const { controller, store } = createController(join(root, "state.db"));

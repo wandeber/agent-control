@@ -16,7 +16,7 @@ export function parseFlowConfigText(text, options = {}) {
         for (const [roleId, role] of Object.entries(parsed.roles)) {
             if (!isRecord(role))
                 continue;
-            for (const field of ["model", "reasoning_effort"]) {
+            for (const field of ["model", "model_provider", "reasoning_effort"]) {
                 if (typeof role[field] === "string" && role[field].includes("${")) {
                     throw new Error(`roles.${roleId}.${field} cannot use environment interpolation; use .agents/models.toml.`);
                 }

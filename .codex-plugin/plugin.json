@@ -1,6 +1,6 @@
 {
   "name": "agent-control",
-  "version": "0.2.20",
+  "version": "0.2.21",
   "description": "Local agent control plane for reusable configured agents, declarative flows, Codex orchestration, supervision, and live inspection through MCP, CLI, and a native console.",
   "author": {
     "name": "wandeber",

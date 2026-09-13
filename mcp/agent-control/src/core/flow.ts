@@ -137,8 +137,10 @@ const codexSubagentOptionsSchema = z.object({
 });
 
 const roleSchema = z.object({
+  agent_ref: z.string().trim().min(1).optional(),
   backend: z.string().min(1).optional(),
   model: z.string().nullable().optional(),
+  model_provider: z.string().trim().min(1).optional(),
   reasoning_effort: z.string().nullable().optional(),
   agent_lifecycle: z.enum(["reuse", "fresh_per_step"]).optional(),
   backend_options: z
@@ -210,8 +212,15 @@ function assertSupportedCodexSubagentOptions(value: unknown): void {
       continue;
     }
     const role = roleValue as Record<string, unknown>;
-    if (role.reasoning_effort && role.backend !== "codex-thread") {
-      throw new ControllerError("reasoning_effort is only supported by the codex-thread backend; clear it to inherit native settings.", "unsupported_operation", {
+    if ("resolved_agent" in role) throw new ControllerError("resolved_agent is internal and cannot be supplied in a public flow config.", "tool_error", { role: roleId });
+    if ("agent_ref" in role) {
+      if (["prompt", "prompt_ref", "prompt_path"].some(key => key in role)) throw new ControllerError("agent_ref cannot be combined with role prompt, prompt_ref, or prompt_path.", "tool_error", { role: roleId });
+      if (role.backend !== undefined && role.backend !== "codex-cli") throw new ControllerError("agent_ref requires the codex-cli backend.", "unsupported_operation", { role: roleId, backend: role.backend });
+    }
+    const backend = role.backend ?? (role.agent_ref ? "codex-cli" : undefined);
+    if (role.model_provider && backend !== "codex-cli") throw new ControllerError("model_provider is only supported by codex-cli roles.", "unsupported_operation", { role: roleId });
+    if (role.reasoning_effort && backend !== "codex-thread" && backend !== "codex-cli") {
+      throw new ControllerError("reasoning_effort is only supported by the codex-thread and codex-cli backends; clear it to inherit native settings.", "unsupported_operation", {
         role: roleId, backend: role.backend ?? null
       });
     }
@@ -308,6 +317,7 @@ export function validateFlowConfigReferences(config: FlowConfig): void {
   const artifactIds = new Set(Object.keys(config.artifacts ?? {}));
   for (const [stepId, step] of Object.entries(config.steps)) {
     const roleConfig = step.role ? config.roles?.[step.role] : undefined;
+    if (step.agent_id && roleConfig?.agent_ref) throw new ControllerError("A referenced flow role cannot use a pre-existing step agent_id.", "tool_error", { step_id: stepId, role: step.role });
     if (step.agent_id && resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) === "fresh_per_step") {
       throw new ControllerError(
         "A fresh_per_step role cannot use a persistent step agent_id.",
@@ -438,7 +448,9 @@ export function resolveStepPromptSources(config: FlowConfig, stepId: string): Ar
   }
   const sources: Array<Record<string, unknown>> = [];
   const roleConfig = step.role ? config.roles?.[step.role] : undefined;
-  const rolePrompt = roleConfig ? resolvePromptSource(config, "role", step.role!, roleConfig) : null;
+  const rolePrompt = roleConfig?.resolved_agent
+    ? { scope: "role", owner_id: step.role!, agent_ref: roleConfig.agent_ref, text: roleConfig.resolved_agent.definition.instructions }
+    : roleConfig ? resolvePromptSource(config, "role", step.role!, roleConfig) : null;
   const stepPrompt = resolvePromptSource(config, "step", stepId, step);
   if (rolePrompt) {
     sources.push(rolePrompt);

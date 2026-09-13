@@ -8,10 +8,11 @@ The UI shows reported tokens and estimated USD costs per agent and per model,
 with a run total in Run Info. Prices are bundled for offline use and can be
 overridden globally or per project. See [token costs and pricing configuration](docs/pricing.md).
 
-Default workers and bundled flow roles use Codex (`codex-thread`) with
-`gpt-5.6-luna` and `max` reasoning. Existing explicit Codex selections, such as
-the development-v1 final reviewer, are preserved. OpenCode is an optional backend
-that requires an explicit backend and provider/model choice.
+Standalone workers default to Codex with `gpt-5.6-luna` and `max` reasoning.
+The bundled development agents use managed Codex CLI with public OpenAI models
+selected by role, and inherit the user's general capabilities. The development
+flow references these agents while keeping its analyst inline. OpenCode remains
+an optional backend with an explicit backend and provider/model choice.
 
 Standalone workers do not require a flow or a predefined flow agent. Use
 `worker_launch` with `backend: "codex-cli"` and an explicit model, or a configured
@@ -52,7 +53,7 @@ Console remain execution views, and returning to Settings restores its last
 section. A direct flow link or MCP request with `flow_id` opens that flow's
 details without starting a run.
 
-The **Settings → Agents** section (`#/agents`) manages a personal catalog of reusable agents.
+The **Settings → Agents** section (`#/agents`) combines bundled development agents with a personal catalog of reusable agents.
 Each definition has its own name, description, developer instructions, Codex
 model/provider/reasoning selection, and ordered plugins, standalone skills, and
 standalone MCP servers. Open Settings from any console screen, or use
@@ -65,13 +66,22 @@ The editor supports create, copy, delete, search, task launch, and ordering each
 agent's plugins, skills, and MCP servers.
 Toggles update immediately and save through a serialized queue; changing a switch
 does not reload Codex's inventory. Required Agent Control infrastructure stays
-enabled. New definitions start with optional capabilities disabled. Plugin-owned
+enabled. New personal definitions start with optional capabilities disabled;
+bundled agents inherit the effective Codex CLI configuration until customized. Plugin-owned
 skills and MCPs are grouped under their plugin rather than shown as independent
 switches. The optional advanced skill catalog budget maps to
 `skills.max_context_tokens` (1–10,000).
 
-Definitions live in `~/.agent-control/agents/catalog.json`, under the configured
-Agent Control home. Each capability array's order is preserved
+Bundled definitions and their stable keys live in [agents/catalog.json](agents/catalog.json).
+Their instructions are shared by direct tasks and flows. Public OpenAI model
+defaults are aligned with HDT; HDT remains a separate workflow. The bundle
+contains no personal plugin, skill, MCP, or provider-profile settings.
+
+Personal definitions and per-field bundled overrides live in
+`~/.agent-control/agents/catalog.json`, under the configured Agent Control home.
+Editing a bundled agent never changes the installed package. Unchanged bundled
+fields continue receiving source updates. Bundled agents can be customized or
+copied; only personal definitions can be deleted. Each capability array's order is preserved
 in the file and compiled settings. This is deterministic saved order, not a
 guarantee that Codex prioritizes those skills in its initial context.
 
@@ -92,6 +102,20 @@ uses `/api/control/agent-definitions`. Mutations use compare-and-swap revisions
 and atomic persistence. A supplied capability array replaces the complete saved
 array; omitted patch fields remain unchanged. Catalog writes require local
 operator authority. Worker/run credentials cannot edit the shared catalog.
+
+`capabilities_mode: "inherit"` uses the effective enabled plugins, skills,
+MCPs, and apps from Codex at worker launch. To customize that selection, send
+`capabilities_mode: "custom"` with all three capability arrays from the inventory;
+the editor does this automatically on the first capability change. Model and
+instruction edits retain inheritance. Each worker freezes its effective
+selection, so later global changes do not alter its continued turns.
+
+Flows reference a stable bundled key or personal definition ID with
+`roles.<role>.agent_ref`. They can mix shared agents and inline roles in the
+same flow. [Development Flow v1](flows/development-flow-v1/README.md) references
+six shared agents and keeps its analyst inline as a complete example. A new
+flow pins referenced definitions; subsequent catalog edits affect future
+instances, while phase prompts, artifacts, and routing remain flow-owned.
 
 Use `$configured-agents` for requests such as "which agents are available?",
 "create a video editor with these plugins", or "ask the analyst to investigate
@@ -205,9 +229,9 @@ require installing Agent Settings.
 
 ## Development Flow Evidence
 
-The bundled `development-flow-v1` version 1.2.3 records the current accepted
-contract before dispatch, preserves Context and Analysis with the same analyst,
-checks intent with the clarification owner, and requires approval of the exact
+The bundled `development-flow-v1` version 1.3.0 records the current accepted
+contract before dispatch, gathers context with a dedicated researcher and hands
+it to the analyst, checks intent with the clarification owner, and requires approval of the exact
 plan after the analyst's review. Integration is conditional; mechanical
 validation, the planner's first result approval, optional user testing, expert
 review, and verified closure have separate transition requirements.

@@ -53,6 +53,7 @@ describe("configured-agent transports", () => {
       "agent_definition_launch"
     ]);
     const configure = definitions.find((tool) => tool.name === "agent_definition_configure")!;
+    expect((configure.inputSchema as any).properties.patch.properties.capabilities_mode.enum).toEqual(["inherit", "custom"]);
     expect(configure.schema.parse({ operation: "duplicate", source_id: "11111111-1111-4111-8111-111111111111",
       expected_revision: "0".repeat(64), patch: { name: "Copy" } })).toMatchObject({ source_id: expect.any(String) });
     expect(() => configure.schema.parse({ operation: "duplicate", source_definition_id: "11111111-1111-4111-8111-111111111111",
@@ -76,7 +77,9 @@ describe("configured-agent transports", () => {
       expect((await fetch(base, { headers: { ...headers, "sec-fetch-site": "cross-site" } })).status).toBe(403);
 
       const listed = await (await fetch(base, { headers })).json() as any;
-      expect(listed).toMatchObject({ schema_version: 1, agents: [] });
+      expect(listed).toMatchObject({ schema_version: 1 });
+      expect(listed.agents).toHaveLength(7);
+      expect(listed.agents.every((agent: any) => agent.bundled_key)).toBe(true);
       const configuredResponse = await fetch(`${base}/configure`, {
         method: "POST",
         headers,
@@ -123,7 +126,7 @@ describe("configured-agent transports", () => {
       const panelId = (opened.structuredContent as any).console.panel_id;
       expect((opened.structuredContent as any).console.screen).toBe("agents");
       const listed = await call("agent_control_console_agent_definition_list", { panel_id: panelId });
-      expect((listed.structuredContent as any).agents).toEqual([]);
+      expect((listed.structuredContent as any).agents).toHaveLength(7);
       const configured = await call("agent_control_console_agent_definition_configure", {
         panel_id: panelId,
         operation: "create",

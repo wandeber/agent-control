@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { AgentDefinitionSaveQueue, flushDeferredAgentSaves } from "./agent-definition-save-queue";
-import type { AgentDefinition, AgentDefinitionConfigureResult } from "./agent-definitions";
+import { AgentDefinitionSaveQueue, flushDeferredAgentSaves, saveDefinitionUpdate } from "./agent-definition-save-queue";
+import { inheritAgentCapabilities, type AgentDefinition, type AgentDefinitionConfigureResult } from "./agent-definitions";
 
 describe("AgentDefinitionSaveQueue", () => {
   it("serializes saves and coalesces edits made while a save is in flight", async () => {
@@ -34,6 +34,42 @@ describe("AgentDefinitionSaveQueue", () => {
     second.resolve(result("rev-3", "Latest"));
     await idle;
     expect(queue.busy).toBe(false);
+  });
+
+  it.each([false, true])("flushes the newest capability snapshot without metadata (return to inherit: %s)", async returnToInheritance => {
+    const first = deferred<AgentDefinitionConfigureResult>();
+    const requests: ReturnType<typeof saveDefinitionUpdate>[] = [];
+    const queue = new AgentDefinitionSaveQueue("rev-1", {
+      save: async (draft, revision) => {
+        requests.push(saveDefinitionUpdate(draft, revision));
+        if (requests.length === 1) return first.promise;
+        return { revision: "rev-3", definition: draft, agents: [draft] };
+      },
+      onSaved: vi.fn(), onError: vi.fn(), onStateChange: vi.fn()
+    });
+    const inherited = { ...inheritAgentCapabilities(definition("Included")), bundled_key: "research", customized: false };
+    const custom: AgentDefinition = {
+      ...inherited, capabilities_mode: "custom",
+      plugins: [{ id: "second", enabled: false }, { id: "first", enabled: true }],
+      skills: [{ path: "skill.md", enabled: true }], mcp_servers: [{ name: "mcp", enabled: true }]
+    };
+    queue.enqueue(inherited);
+    queue.enqueue(custom);
+    const latest = { ...(returnToInheritance ? inheritAgentCapabilities(custom) : custom), instructions: "Typed before navigating away" };
+    const timers = new Map([[latest.definition_id, setTimeout(() => { throw new Error("Timer should have been flushed"); }, 420)]]);
+    flushDeferredAgentSaves(timers, () => latest, draft => queue.enqueue(draft));
+    const idle = queue.whenIdle();
+    first.resolve({ revision: "rev-2", definition: inherited, agents: [inherited] });
+    await idle;
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.expected_revision).toBe("rev-2");
+    expect(requests[1]?.patch).toMatchObject({
+      capabilities_mode: returnToInheritance ? "inherit" : "custom",
+      instructions: latest.instructions, plugins: latest.plugins, skills: latest.skills, mcp_servers: latest.mcp_servers
+    });
+    expect(requests[1]?.patch).not.toHaveProperty("bundled_key");
+    expect(requests[1]?.patch).not.toHaveProperty("customized");
+    expect(timers.size).toBe(0);
   });
 
   it("pauses after an error and retries the newest preserved draft after rebasing", async () => {

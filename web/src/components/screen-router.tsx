@@ -48,9 +48,11 @@ export function ScreenRouter() {
           {/* Fragment routes keep the single embedded MCP resource loaded.
               Every screen is eagerly bundled, and only the active one mounts. */}
           <div className="screen-navigation-actions"><ConnectionIndicator /><RefreshButton />
-            {screen !== "subagents" ? <button className="screen-navigation-link" onClick={() => navigate("subagents")} type="button"><Users className="size-4" />Subagents</button> : null}
-            {!fullConsole ? <button className="screen-navigation-link" onClick={() => navigate("console")} type="button">Full Console</button> : null}
-            <button className="screen-navigation-link" aria-current={settings ? "page" : undefined} onClick={() => navigate(lastSettingsSection.current)} type="button"><Settings className="size-4" />Settings</button>
+            <div className="screen-navigation-group" role="group" aria-label="Console views">
+              {screen !== "subagents" ? <button className="screen-navigation-link" onClick={() => navigate("subagents")} type="button"><Users className="size-4" />Subagents</button> : null}
+              {!fullConsole ? <button className="screen-navigation-link" onClick={() => navigate("console")} type="button">Full Console</button> : null}
+            </div>
+            <button className="screen-navigation-link" aria-label="Settings" title="Settings" aria-current={settings ? "page" : undefined} onClick={() => navigate(lastSettingsSection.current)} type="button"><Settings className="size-4" /></button>
             <BrowserConsoleButton screen={screen} />
           </div>
         </nav>

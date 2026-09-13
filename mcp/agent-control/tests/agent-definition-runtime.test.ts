@@ -1,3 +1,5 @@
+import { replaceAgentCapabilities, skillRows } from "../../../web/src/lib/agent-definitions.js";
+import { agentDefinitionSchema } from "../src/core/agent-definitions.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,6 +80,66 @@ function definition(): AgentDefinition {
 }
 
 describe("configured-agent runtime", () => {
+  it("inherits effective Codex capabilities at launch and freezes them across continuations", () => {
+    const current = inventory("/project");
+    current.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled_by_default = false;
+    current.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_mcp_servers[0]!.enabled_by_default = false;
+    current.apps.push({ id: "standalone-app", name: "Standalone", available: true, enabled_by_default: true });
+    const inherited = { ...definition(), capabilities_mode: "inherit" as const };
+    const compiled = compileAgentConfiguration(inherited, "revision", current, "/project");
+    expect(compiled.plugins.find(plugin => plugin.id === "selected@plugins")!.enabled).toBe(false);
+    expect(compiled.plugins.find(plugin => plugin.id === "off@plugins")!.enabled).toBe(true);
+    expect(compiled.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled).toBe(false);
+    expect(compiled.mcp_servers.find(server => server.name === "off_mcp")!.enabled).toBe(false);
+    expect(compiled.skills.find(skill => skill.path === "/standalone/SKILL.md")!.enabled).toBe(true);
+    expect(compiled.mcp_servers.find(server => server.name === "standalone_mcp")!.enabled).toBe(true);
+    expect(compiled.apps.find(app => app.id === "standalone-app")!.enabled).toBe(true);
+    const changed = structuredClone(current);
+    changed.plugins.forEach(plugin => { plugin.enabled_by_default = !plugin.enabled_by_default; });
+    changed.skills[0]!.enabled_by_default = false;
+    changed.mcp_servers.find(server => server.name === "standalone_mcp")!.enabled_by_default = false;
+    changed.apps.find(app => app.id === "standalone-app")!.enabled_by_default = false;
+    const resumed = refreshCompiledAgentConfiguration(compiled, changed);
+    expect(resumed.plugins.map(({ id, enabled }) => ({ id, enabled }))).toEqual(compiled.plugins.map(({ id, enabled }) => ({ id, enabled })));
+    expect(resumed.skills).toEqual(compiled.skills);
+    expect(resumed.mcp_servers).toEqual(compiled.mcp_servers);
+    expect(resumed.apps.map(({ id, enabled }) => ({ id, enabled }))).toEqual(compiled.apps.map(({ id, enabled }) => ({ id, enabled })));
+    expect(compileAgentConfiguration(inherited, "revision", changed, "/project").skills[0]!.enabled).toBe(false);
+    expect(compileAgentConfiguration({ ...inherited, capabilities_mode: "custom" }, "revision", current, "/project").plugins.find(plugin => plugin.id === "selected@plugins")!.enabled).toBe(true);
+  });
+
+  it("ignores unavailable inherited apps that the user has disabled", () => {
+    const current = inventory("/project");
+    current.plugins.find(plugin => plugin.id === "selected@plugins")!.enabled_by_default = true;
+    current.apps.find(app => app.id === "selected-app")!.available = false;
+    const inherited = compileAgentConfiguration({ ...definition(), capabilities_mode: "inherit" }, "revision", current, "/project");
+    expect(inherited.apps.find(app => app.id === "selected-app")!.enabled).toBe(false);
+    expect(() => compileAgentConfiguration(definition(), "revision", current, "/project")).toThrow(/unavailable/);
+    expect(() => refreshCompiledAgentConfiguration(inherited, current)).not.toThrow();
+  });
+
+  it("preserves disabled plugin children through an editor customization, persistence, and continuation", () => {
+    const current = inventory("/project");
+    const plugin = current.plugins.find(plugin => plugin.id === "off@plugins")!;
+    plugin.bundled_skills[0]!.enabled_by_default = false;
+    plugin.bundled_mcp_servers[0]!.enabled_by_default = false;
+    current.apps.find(app => app.id === "off-app")!.enabled_by_default = false;
+    const inherited = { ...definition(), capabilities_mode: "inherit" as const };
+    const edited = replaceAgentCapabilities(inherited, current, "skills", skillRows(inherited, current).map(row => ({ ...row, enabled: false })));
+    const persisted = agentDefinitionSchema.parse(JSON.parse(JSON.stringify(edited)));
+    const compiled = compileAgentConfiguration(persisted, "revision", current, "/project");
+    expect(compiled.skills[0]!.enabled).toBe(false);
+    expect(compiled.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled).toBe(false);
+    expect(compiled.mcp_servers.find(server => server.name === "off_mcp")!.enabled).toBe(false);
+    expect(compiled.apps.find(app => app.id === "off-app")!.enabled).toBe(false);
+    const refreshed = refreshCompiledAgentConfiguration(compiled, current);
+    expect(refreshed.mcp_servers).toEqual(compiled.mcp_servers);
+    expect(refreshed.apps.map(({ id, enabled }) => ({ id, enabled }))).toEqual(compiled.apps.map(({ id, enabled }) => ({ id, enabled })));
+    const missing = structuredClone(persisted);
+    missing.plugins.find(plugin => plugin.id === "off@plugins")!.skills = [{ path: "/not-in-plugin/SKILL.md", enabled: true }];
+    expect(() => compileAgentConfiguration(missing, "revision", current, "/project")).toThrow(/unavailable/);
+  });
+
   it("compiles a closed allowlist, frozen instructions, and plugin-scoped MCP settings", () => {
     const root = mkdtempSync(join(tmpdir(), "configured-runtime-")); roots.push(root);
     vi.stubEnv("AGENT_CONTROL_HOME", root);

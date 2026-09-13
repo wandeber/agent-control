@@ -26,7 +26,8 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
   useEffect(() => { setStepId(null); setTab("instructions"); }, [flowKey]);
   const selectedStep = definition && stepId && definition.config.steps[stepId] ? stepId : definition?.config.initial_step ?? null;
   const step = selectedStep ? definition?.config.steps[selectedStep] : null;
-  const role = step?.role ? definition?.config.roles?.[step.role] : null;
+  const sourceRole = step?.role ? definition?.config.roles?.[step.role] : null;
+  const role = step?.role ? definition?.resolved_roles?.[step.role] ?? sourceRole : null;
   const prompts = selectedStep ? definition?.prompts[selectedStep] ?? [] : [];
   const phaseCount = Object.keys(definition?.config.steps ?? {}).length;
   const agentCount = Object.keys(definition?.config.roles ?? {}).length;
@@ -60,7 +61,7 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
         return <section key={catalog.catalog_id} className="settings-catalog-group"><h2>{catalog.name}</h2><div className="settings-entry-list">{entries.map(flow => {
           const id = flow.flow_id ?? flow.directory_name;
           return <button key={flow.config_path} type="button" className="settings-entry settings-flow-entry" onClick={() => chooseFlow(id)}>
-            <span className="agent-avatar agent-avatar-large" aria-hidden="true"><Workflow size={19} /></span><span className="settings-entry-copy"><span className="settings-entry-title"><strong title={id}>{id}</strong>{!flow.valid ? <small>Draft in progress</small> : null}</span><span className="settings-entry-description">{flow.description ?? (flow.valid ? "Flow definition" : "Draft in progress")}</span></span><span className="settings-entry-open">View flow<ChevronRight size={15} /></span>
+            <span className="agent-avatar agent-avatar-large" aria-hidden="true"><Workflow size={19} /></span><span className="settings-entry-copy"><span className="settings-entry-title"><strong title={id}>{id}</strong>{!flow.valid ? <small>Draft in progress</small> : null}</span><span className="settings-entry-description">{flow.description ?? (flow.valid ? "Flow definition" : "Draft in progress")}</span></span><ChevronRight className="settings-entry-open" size={15} aria-hidden="true" />
           </button>;
         })}</div></section>;
       })}
@@ -86,7 +87,7 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
             <Relations definition={definition} stepId={selectedStep!} onSelect={setStepId} />
             <section><h3>Inputs</h3>{Object.keys(step?.inputs ?? {}).length ? Object.entries(step!.inputs!).map(([key, value]) => <p key={key}>{key} → {value.artifact}{value.required ? " · required" : ""}</p>) : <p className="flow-muted">No declared inputs.</p>}</section>
             <section><h3>Outputs</h3>{Object.keys(step?.outputs ?? {}).length ? Object.entries(step!.outputs!).map(([key, value]) => <p key={key}>{key} → {value.artifact}{value.required ? " · required" : ""}</p>) : <p className="flow-muted">No declared outputs.</p>}</section>
-          </div> : <div className="flow-instructions" role="tabpanel"><section><h3><FileText size={15} /> Flow source</h3><p className="flow-file-path">{definition.config_path}</p><p className="flow-muted">Effective configuration includes project model overrides. Editing these sources does not change an existing run.</p><pre>{JSON.stringify({ phase: step, agent: role }, null, 2)}</pre></section></div>}
+          </div> : <div className="flow-instructions" role="tabpanel"><section><h3><FileText size={15} /> Flow source</h3><p className="flow-file-path">{definition.config_path}</p><p className="flow-muted">Source configuration includes project model overrides. Editing these sources does not change an existing run.</p><pre>{JSON.stringify({ phase: step, agent: sourceRole }, null, 2)}</pre></section></div>}
         </aside>
       </div> : <div className="flow-preview-empty"><Workflow size={36} /><p>{connection === "connecting" ? "Loading flows…" : connection === "offline" ? "Offline" : "Your flow will appear here as Codex creates it."}</p><span>Project flows live in .agents/flows/&lt;flow-id&gt;/flow.yaml</span></div>}
       <footer className="flow-preview-footer"><span>{projectDir ?? data?.project_dir ?? "Shared flow catalogs"}</span><span>{definition ? `${phaseCount} ${phaseCount === 1 ? "phase" : "phases"} · ${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : "No run required"}</span></footer>
@@ -134,7 +135,7 @@ function DefinitionGraph({ definition, selectedStepId, onSelect }: { definition:
     const positions = flowDiagramPositions(model.nodes);
     setNodes(previous => model.nodes.map(node => {
       const step = node.stepId ? definition.config.steps[node.stepId] : undefined;
-      const role = node.role ? definition.config.roles?.[node.role] : undefined;
+      const role = node.role ? definition.resolved_roles?.[node.role] ?? definition.config.roles?.[node.role] : undefined;
       return { id: node.id, type: "definition", position: previous.find(value => value.id === node.id)?.position ?? positions.get(node.id)!,
         data: { ...node, chosen: node.stepId === selectedStepId, choose: () => { if (node.stepId) onSelect(node.stepId); },
           modelLabel: step?.execution === "coordinator" ? (step.decision?.authority === "user" ? "User decision" : "Coordinator") : `${role?.model ?? "Provider default"}${role?.reasoning_effort ? ` · ${role.reasoning_effort}` : ""}` } };

@@ -3,10 +3,12 @@ import { UserQuestions } from "./user-questions.js";
 import { CanvasPositionStore } from "./canvas-positions.js";
 import { RunConversationUsage, hasRunConversationUsage } from "./run-conversation-usage.js";
 import { currentMcpThreadId } from "./caller-context.js";
+import { agentConversationThreadId } from "./agent-conversation-identity.js";
 import { AgentAccessStore } from "./agent-access.js";
 import { PermissionRequests, permissionOwnerMatches } from "./permission-requests.js";
 import { sessionObservationKey } from "./run-wake-policy.js";
 import { applyProjectModels } from "./project-models.js";
+import { compileFlowAgent, flowAgentRepoDir, flowSourceConfig, resolveFlowAgentDefinitions } from "./flow-agent-definitions.js";
 import { buildRunCosts } from "./pricing.js";
 import { readCodexSession } from "../adapters/codex-session.js";
 import { FlowPackages, flowPackagesRequestSchema } from "./flow-packages.js";
@@ -306,7 +308,9 @@ export class AgentController {
         return this.adapters.list();
     }
     validateFlowConfig(config) {
-        return { valid: true, config: parseFlowConfig(config) };
+        const parsed = parseFlowConfig(config);
+        resolveFlowAgentDefinitions(parsed);
+        return { valid: true, config: parsed };
     }
     listFlowCatalog(input = {}) {
         return listFlowCatalog({ query: input.query, projectDir: input.projectDir });
@@ -372,7 +376,7 @@ export class AgentController {
     }
     startFlow(input) {
         const projectDir = input.runId ? this.getRun(input.runId, { agentToken: input.agentToken ?? undefined }).repo_dir : input.repoDir;
-        const config = pinFlowConfig(parseFlowConfig(applyProjectModels(input.config, projectDir)));
+        let config = pinFlowConfig(parseFlowConfig(applyProjectModels(input.config, projectDir)));
         const caller = input.agentToken ? this.requireAgentToken(input.agentToken) : null;
         const requiresNativeBridge = flowUsesCodexSubagents(config);
         const persistBridgeCredentialLocally = input.bridgeCredentialDelivery === "local";
@@ -382,6 +386,8 @@ export class AgentController {
         if (requiresNativeBridge && persistBridgeCredentialLocally && !this.credentialStore) {
             throw new ControllerError("Local bridge credential delivery requires a configured local credential store.", "tool_error", { backend: CODEX_SUBAGENT_BACKEND });
         }
+        if (!input.runId)
+            config = resolveFlowAgentDefinitions(config);
         const run = input.runId
             ? this.getRun(input.runId, { agentToken: input.agentToken ?? undefined })
             : this.createRun({
@@ -430,6 +436,8 @@ export class AgentController {
                 };
             }
         }
+        if (input.runId)
+            config = resolveFlowAgentDefinitions(config);
         const pendingEvents = [];
         const initialized = this.store.transaction(() => {
             const flow = this.store.createFlow(config);
@@ -528,7 +536,12 @@ export class AgentController {
         if (!threadId)
             return null;
         const matches = this.store.listAgents().filter(agent => !agent.unregistered_at && (!expectedIds || expectedIds.includes(agent.agent_id)) &&
-            (agent.backend_handle?.thread_id === threadId || (agent.backend === CODEX_SUBAGENT_BACKEND && agent.backend_handle?.native_agent_id === threadId)));
+            agentConversationThreadId(agent) === threadId);
+        // A CLI package coordinator also has a passive observation record. That
+        // cursor is not a second worker identity and must not hide its own questions.
+        const workers = matches.filter(agent => !isPassiveObserver(agent));
+        if (workers.length > 0)
+            return workers.length === 1 ? workers[0] : null;
         return matches.length === 1 ? matches[0] : null;
     }
     requireFlowCoordinator(instance, input) {
@@ -571,11 +584,11 @@ export class AgentController {
                     throw new ControllerError("The package coordinator attempt belongs to obsolete acceptance.", "tool_error");
                 return caller.agent_id;
             },
-            register: (context, entry) => { const role = context.config.roles[entry.role]; const { agent_token: _secret, ...agent } = this.registerAgent({ runId: context.runId, backend: role.backend, title: `${entry.title} (${entry.id})`, role: entry.role, objective: entry.title, repoDir: entry.worktree, model: role.model }); this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: agent.agent_id, type: "parent_child", label: entry.id }); return agent; },
+            register: (context, entry) => { const role = context.config.roles[entry.role]; const { agent_token: _secret, ...agent } = this.registerAgent({ runId: context.runId, backend: role.backend, title: `${entry.title} (${entry.id})`, role: entry.role, objective: entry.title, repoDir: flowAgentRepoDir(role, entry.worktree), model: role.model }); this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: agent.agent_id, type: "parent_child", label: entry.id }); return agent; },
             start: async (context, entry, branch) => {
                 const state = this.flowRuntime.get(context.flowId);
                 const role = context.config.roles[entry.role];
-                const rolePrompt = role.prompt ?? (role.prompt_ref ? context.config.prompts?.[role.prompt_ref]?.text : "") ?? "";
+                const rolePrompt = role.resolved_agent ? "" : role.prompt ?? (role.prompt_ref ? context.config.prompts?.[role.prompt_ref]?.text : undefined) ?? (role.prompt_path ? readFileSync(role.prompt_path, "utf8") : "");
                 const dependencies = entry.depends_on.map(id => ({ package_id: id, delivery: state.packages?.branches[id]?.delivery }));
                 const prompt = [rolePrompt, "You own one approved work package, not the parent flow phase. Do not call flow_step_report, route phases, approve packages, or spawn workers. Use the assigned worktree and write only its declared paths. Read the bound plan and dependency delivery snapshots before working. Do not alter the source dependency worktrees or integration checkout.",
                     JSON.stringify({ objective: state.context, flow_instance_id: context.flowId, package: entry, attempt: branch.attempt, plan_path: context.planPath, plan_revision: context.planRevision, dependencies, correction: state.correction, retry_reason: branch.reason, previous_delivery: branch.prior_attempts?.at(-1)?.delivery }),
@@ -583,7 +596,7 @@ export class AgentController {
                     JSON.stringify({ flow_instance_id: context.flowId, request: { operation: "deliver", package_id: entry.id, attempt: branch.attempt, summary: "Brief delivery result." } }), STRICT_FLOW_CAPABILITY_FAILURE].join("\n\n");
                 this.ensureRequester(context.runId);
                 this.createAgentLinkIfMissing({ runId: context.runId, sourceAgentId: context.parentAgentId, targetAgentId: branch.agent_id, type: "parent_child", label: entry.id });
-                return this.startAgent({ agentId: branch.agent_id, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", ...(role.reasoning_effort ? { reasoning_effort: role.reasoning_effort } : {}), phase: context.policy.execution_step, parent_agent_id: context.parentAgentId, package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
+                return this.startAgent({ agentId: branch.agent_id, prompt, model: role.model ?? undefined, metadata: { sandbox: "workspace", flow_writable_root: runRuntimeDir(context.runId), flow_instance_id: context.flowId, flow_step_instance_id: this.store.listFlowStepInstances(context.flowId).find(step => step.status === "active")?.step_instance_id, ...(role.model_provider ? { model_provider: role.model_provider } : {}), ...(role.reasoning_effort ? { reasoning_effort: role.reasoning_effort } : {}), phase: context.policy.execution_step, parent_agent_id: context.parentAgentId, package_flow_instance_id: context.flowId, package_id: entry.id, package_attempt: branch.attempt } });
             },
             agent: id => this.getAgent(id), refresh: async (id) => { const agent = await this.refreshAgentStatus(id); this.packageRuntime().reconcile(agent); return agent; }, stop: id => this.stopAgent(id),
             verifyResult: (context, id) => new EvidenceService({ rootDir: join(runRuntimeDir(context.runId), "evidence") }).verifyResultManifestSync(this.evidenceContext(this.getFlowInstanceOrThrow(context.flowId), "package-integration", "integration"), id),
@@ -603,7 +616,7 @@ export class AgentController {
         const requesterId = this.flowRuntime.get(flowId)?.decision_owners?.requester ?? null;
         const expected = [instance.orchestrator_agent_id, context.parentAgentId, requesterId];
         const caller = this.flowCaller(auth.agentToken, expected);
-        const threadId = caller?.backend === "codex-thread" ? caller.backend_handle?.thread_id : null;
+        const threadId = caller ? agentConversationThreadId(caller) : null;
         if (!caller || !expected.includes(caller.agent_id) || typeof threadId !== "string" || !threadId)
             throw new ControllerError("Package supervision requires the actual launching Codex conversation identity.", "auth_required");
         // Register before dispatch so even a fast first delivery is in this
@@ -612,7 +625,7 @@ export class AgentController {
         for (const branch of Object.values(this.flowRuntime.get(flowId)?.packages?.branches ?? {}))
             if (branch.agent_id)
                 this.packageRuntime().reconcile(this.getAgent(branch.agent_id));
-        return { ...this.observeRun({ runId: context.runId, threadId, title: `Package coordinator: ${caller.title}`, eventTypes: [...EVENT_TYPES], delivery: "wait", adminKey: resolveAdminKey() }), wait_contract: packageWaitContract(flowId) };
+        return { ...this.observeRun({ runId: context.runId, threadId, title: `Package coordinator: ${caller.title}`, eventTypes: [...EVENT_TYPES], delivery: "wait", authorizeOperator: false, adminKey: resolveAdminKey() }), wait_contract: packageWaitContract(flowId) };
     }
     async executeFlowPackages(input) {
         const request = flowPackagesRequestSchema.parse(input.request);
@@ -669,7 +682,7 @@ export class AgentController {
                 throw new ControllerError("Another worker owns the active phase; recover the missing owner after that work reaches a handoff.", "tool_error");
             const { agent_token: _privateToken, ...replacement } = this.registerAgent({ runId: instance.run_id, backend: roleConfig.backend,
                 title: declaredFlowAgentTitle(`${flow.flow_id}/${instance.flow_instance_id}/recovery-${state.revision + 1}`, input.role),
-                role: input.role, objective: state.context ?? this.getRun(instance.run_id).title, repoDir: this.getRun(instance.run_id).repo_dir,
+                role: input.role, objective: state.context ?? this.getRun(instance.run_id).title, repoDir: flowAgentRepoDir(roleConfig, this.getRun(instance.run_id).repo_dir),
                 model: roleConfig.model, status: "planned", ...(input.agentToken ? { agentToken: input.agentToken } : { adminKey: input.adminKey ?? undefined }) });
             for (const active of activeSteps)
                 this.store.updateFlowStepInstance(active.step_instance_id, { status: "cancelled", summary: `Explicit owner recovery: ${input.reason}`, completedAt: nowIso() });
@@ -993,7 +1006,7 @@ export class AgentController {
         if (resolveFlowAgentLifecycle(roleConfig?.agent_lifecycle) !== "reuse") {
             return null;
         }
-        if (flow.config.policy?.strict)
+        if (flow.config.policy?.strict || roleConfig?.agent_ref)
             return this.flowRuntime.get(instance.flow_instance_id)?.owners[stepConfig.role ?? stepId] ?? null;
         return (this.findDeclaredFlowAgent(instance.run_id, flow.flow_id, stepConfig.role, roleConfig?.backend)?.agent_id ?? null);
     }
@@ -1297,7 +1310,7 @@ export class AgentController {
                 role: stepConfig.role
             });
         }
-        if (stepConfig.sandbox === "read_only" && backend !== "codex-thread")
+        if (stepConfig.sandbox === "read_only" && backend !== "codex-thread" && backend !== "codex-cli")
             throw new ControllerError("This backend cannot enforce the configured read-only step sandbox.", "unsupported_operation");
         this.adapters.get(backend);
         const run = this.getRun(snapshot.instance.run_id);
@@ -1428,8 +1441,11 @@ export class AgentController {
                 metadata: {
                     flow_instance_id: snapshot.instance.flow_instance_id,
                     step_instance_id: activeStep.step_instance_id,
+                    flow_step_instance_id: activeStep.step_instance_id,
                     step_id: activeStep.step_id,
-                    ...(stepConfig.sandbox ? { sandbox: stepConfig.sandbox, flow_writable_root: runRuntimeDir(snapshot.instance.run_id) } : {}),
+                    ...(stepConfig.sandbox || backend === "codex-cli" ? { sandbox: stepConfig.sandbox ?? "workspace" } : {}),
+                    ...(stepConfig.sandbox !== "read_only" ? { flow_writable_root: runRuntimeDir(snapshot.instance.run_id) } : {}),
+                    ...(roleConfig?.model_provider ? { model_provider: roleConfig.model_provider } : {}),
                     ...(roleConfig?.reasoning_effort ? { reasoning_effort: roleConfig.reasoning_effort } : {})
                 },
                 agentToken: input.agentToken,
@@ -4013,7 +4029,7 @@ export class AgentController {
                         title,
                         role,
                         objective: input.run.title,
-                        repoDir: input.run.repo_dir,
+                        repoDir: flowAgentRepoDir(roleConfig, input.run.repo_dir),
                         model: roleConfig?.model,
                         // Never pass or copy a backend handle here. A fresh lifecycle is
                         // an Agent Control identity boundary and a backend context boundary.
@@ -4022,7 +4038,7 @@ export class AgentController {
                     agent = created;
                 }
             }
-            else if (input.snapshot.flow.config.policy?.strict) {
+            else if (input.snapshot.flow.config.policy?.strict || roleConfig?.agent_ref) {
                 const ownerId = this.flowRuntime.get(input.snapshot.instance.flow_instance_id)?.owners[role ?? step.step_id];
                 if (!ownerId)
                     throw new ControllerError("The flow role has no pinned owner; explicit recovery is required.", "tool_error");
@@ -4039,7 +4055,7 @@ export class AgentController {
                             title: declaredFlowAgentTitle(input.snapshot.flow.flow_id, role ?? step.step_id),
                             role,
                             objective: input.run.title,
-                            repoDir: input.run.repo_dir,
+                            repoDir: flowAgentRepoDir(roleConfig, input.run.repo_dir),
                             model: roleConfig?.model,
                             agentToken: input.agentToken
                         });
@@ -4142,7 +4158,7 @@ export class AgentController {
             if (!roleConfig?.backend) {
                 continue;
             }
-            const existing = input.config.policy?.strict ? null : this.findDeclaredFlowAgent(input.run.run_id, input.flowId, role, roleConfig.backend);
+            const existing = input.config.policy?.strict || roleConfig.agent_ref ? null : this.findDeclaredFlowAgent(input.run.run_id, input.flowId, role, roleConfig.backend);
             if (existing) {
                 roleAgents.set(role, existing);
                 continue;
@@ -4150,10 +4166,10 @@ export class AgentController {
             const planned = this.registerAgent({
                 runId: input.run.run_id,
                 backend: roleConfig.backend,
-                title: declaredFlowAgentTitle(input.config.policy?.strict ? `${input.flowId}/${input.instanceId}` : input.flowId, role),
+                title: declaredFlowAgentTitle(input.config.policy?.strict || roleConfig.agent_ref ? `${input.flowId}/${input.instanceId}` : input.flowId, role),
                 role,
                 objective: input.run.title,
-                repoDir: input.run.repo_dir,
+                repoDir: flowAgentRepoDir(roleConfig, input.run.repo_dir),
                 model: roleConfig.model,
                 status: "planned",
                 agentToken: input.agentToken
@@ -4520,6 +4536,17 @@ export class AgentController {
                         ...this.getAgent(agent.agent_id),
                         start_state: startStateFromAttemptPhase(claim.attempt.phase)
                     };
+                }
+            }
+            // Resolve only persisted flow state here. Catalog changes cannot affect a
+            // later phase, recovery owner, or package worker of an existing instance.
+            if (flowInstanceId && !agent.backend_handle) {
+                const flow = this.getFlowOrThrow(this.getFlowInstanceOrThrow(flowInstanceId).flow_record_id);
+                const role = agent.role ? flow.config.roles?.[agent.role] : undefined;
+                if (role?.agent_ref) {
+                    if (!agent.repo_dir)
+                        throw new ControllerError("Referenced flow workers require a repository directory.", "tool_error");
+                    input = { ...input, metadata: { ...input.metadata, configured_agent: await compileFlowAgent(role, agent.repo_dir) } };
                 }
             }
             const statusChanged = agent.status !== "starting" || agent.failure_reason !== null;
@@ -6871,7 +6898,8 @@ export class AgentController {
                 continue;
             }
             const record = source;
-            if (priorOwnedStep && record.scope === "role")
+            // Shared instructions already belong to the immutable developer snapshot.
+            if (record.scope === "role" && (priorOwnedStep || record.agent_ref))
                 continue;
             const label = [record.scope, record.owner_id, record.prompt_ref].filter(Boolean).join(":");
             if (typeof record.text === "string") {
@@ -7352,7 +7380,7 @@ export class AgentController {
             if ((flow.version ?? null) !== (config.version ?? null)) {
                 continue;
             }
-            if ((config.policy?.strict || flow.config.policy?.strict) && digest(flow.config) !== digest(config))
+            if ((config.policy?.strict || flow.config.policy?.strict) && digest(flowSourceConfig(flow.config)) !== digest(config))
                 throw new ControllerError("The active flow is pinned to different configuration or prompt bytes; explicit migration is required.", "tool_error");
             return { flow, instance };
         }
