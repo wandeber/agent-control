@@ -4,23 +4,13 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PACKAGE_DIR="$SCRIPT_DIR"
 
-ensure_deps() {
-  if [ ! -d "$PACKAGE_DIR/node_modules" ] || [ ! -e "$PACKAGE_DIR/node_modules/@modelcontextprotocol" ]; then
-    pnpm --dir "$PACKAGE_DIR" install --frozen-lockfile --silent >/dev/null
-  fi
-  current_abi="$(node -p 'process.versions.modules')"
-  abi_file="$PACKAGE_DIR/node_modules/.agent-control-node-abi"
-  if [ ! -f "$abi_file" ] || [ "$(cat "$abi_file")" != "$current_abi" ]; then
-    pnpm --dir "$PACKAGE_DIR" rebuild better-sqlite3 --silent >/dev/null
-    printf '%s\n' "$current_abi" > "$abi_file"
-  fi
-}
-
-ensure_deps
+# Each process loads an immutable SQLite addon for its own Node ABI.
+NODE_BIN="$(node -p 'process.execPath')"
+AGENT_CONTROL_SQLITE_BINDING="$("$NODE_BIN" "$PACKAGE_DIR/runtime/bootstrap.mjs")"
+export AGENT_CONTROL_SQLITE_BINDING
 
 if [ -f "$PACKAGE_DIR/dist/index.js" ]; then
-  exec node "$PACKAGE_DIR/dist/index.js"
+  exec "$NODE_BIN" "$PACKAGE_DIR/dist/index.js"
 fi
 
-PATH="$PACKAGE_DIR/node_modules/.bin:$PATH"
-exec tsx "$PACKAGE_DIR/src/index.ts"
+exec "$NODE_BIN" "$PACKAGE_DIR/node_modules/tsx/dist/cli.mjs" "$PACKAGE_DIR/src/index.ts"

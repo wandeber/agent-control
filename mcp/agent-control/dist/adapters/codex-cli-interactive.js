@@ -1,4 +1,5 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
+import { workerError } from "../core/errors.js";
 import { CodexAppServerClient } from "./codex-thread-adapter.js";
 import { attachApprovalBroker } from "./codex-approval-broker.js";
 import { AgentAccessStore, accessTurnOverrides } from "../core/agent-access.js";
@@ -228,8 +229,9 @@ export async function runInteractiveCliTurn(job, control) {
         return await done;
     }
     catch (error) {
-        control.event({ type: "error", message: error instanceof Error ? error.message : "Interactive Codex failed." });
-        return { thread_id: threadId, status: "failed" };
+        const diagnostic = workerError(error);
+        control.event({ type: "error", ...diagnostic });
+        return { thread_id: threadId, status: "failed", error: diagnostic };
     }
     finally {
         closing = true;

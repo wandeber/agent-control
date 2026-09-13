@@ -28,6 +28,22 @@ describe("existing Codex session observation", () => {
     store = new SqliteStore(join(home, "state.sqlite")); controller = new AgentController(store, createDefaultAdapterRegistry());
   });
   afterEach(async () => { await controller.dispose(); store.close(); vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(home, { recursive: true, force: true }); });
+  it("never queues or resumes a Desktop archive through legacy CLI continuity", async () => {
+    writeFileSync(path, row("session_meta", { id: thread, cwd: home, source: "vscode", originator: "Codex Desktop", model_provider: "openai" }) +
+      row("turn_context", { model: "yoda" }) + row("event_msg", { type: "task_complete" }));
+    const request = vi.mocked(CodexAppServerClient.prototype.request);
+    request.mockResolvedValue({ thread: { id: thread, status: { type: "notLoaded" } } });
+    const attached = await withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread }));
+    expect(attached.capabilities.send_message).toBe(false);
+    expect(attached.control.state).toBe("connection_required");
+    expect(attached.control.cli_configuration_reason).toContain("not a verified CLI session");
+    const adapter = new CodexSessionAdapter();
+    await expect(adapter.sendMessage({ backend: "codex-session", id: thread, data: {
+      thread_id: thread, cli_configuration_valid: true, cli_continuity: { thread_id: thread }, prefer_app_server: false
+    } }, { message: "Must not start" })).rejects.toThrow("does not own the active session");
+    expect(request.mock.calls.some(([method]) => ["thread/resume", "turn/start"].includes(method))).toBe(false);
+  });
+
   it("attaches an active session once and returns completion events without launching any work", async () => {
     appendFileSync(path, row("event_msg", { type: "task_started", turn_id: "turn-1" }));
     const attach = (extra = {}) => withMcpCaller({ threadId: requester }, () => attachWorkerTool(controller, { thread_id: thread, ...extra }));
@@ -125,6 +141,7 @@ describe("existing Codex session observation", () => {
     expect(request.mock.calls.some(([method]) => method === "thread/start" || method === "thread/resume")).toBe(false);
   });
   it("refuses a duplicate writer at an unrelated endpoint and resumes only after terminal evidence", async () => {
+    writeFileSync(path, row("session_meta", { id: thread, source: "exec", cwd: home, model_provider: "openai" }) + row("turn_context", { model: "yoda" }));
     appendFileSync(path, row("event_msg", { type: "task_started" }));
     const request = vi.mocked(CodexAppServerClient.prototype.request);
     request.mockImplementation(async method => method === "thread/read" ? { thread: { id: thread, modelProvider: "softec", status: { type: "notLoaded" } } } : {});

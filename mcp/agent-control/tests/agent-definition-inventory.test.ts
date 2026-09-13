@@ -21,7 +21,7 @@ vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
         case "config/read": return { config: { model_provider: fixture.provider, model: "local-alias", plugins: { [REQUIRED_AGENT_CONTROL_PLUGIN]: { enabled: !disabled } }, model_providers: { custom: {} } } };
         case "skills/list": return { data: [{ skills: [{ name: "Control", path: "/fixture/control/SKILL.md", enabled: !disabled }, ...(fixture.artworkRoot ? [{ name: "Illustrated", path: join(fixture.artworkRoot, "skill/SKILL.md"), interface: { iconSmall: join(fixture.artworkRoot, "skill/icon.svg") } }] : [])] }] };
         case "plugin/list": return { marketplaces: [{ name: "agent-control", plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "agent-control", installed: true, enabled: true, ...(fixture.artworkRoot ? { source: { path: fixture.artworkRoot }, interface: { composerIcon: null, logo: join(fixture.artworkRoot, "missing.svg"), logoDark: null } } : {}) }] }], nextCursor: null };
-        case "plugin/read": return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }], mcpServers: ["agent_control"] } };
+        case "plugin/read": return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }, { name: "Metadata only", path: "/fixture/missing/SKILL.md" }], mcpServers: ["agent_control"] } };
         case "model/list": return { data: [{ model: args.includes('model_provider="openai"') || fixture.provider === "openai" ? "public-model" : "custom-model", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
         default: throw new Error("Unexpected discovery request: " + method);
       }
@@ -63,6 +63,12 @@ describe("configured-agent provider inventory", () => {
     const publicProbe = fixture.calls.filter(call => call.args.includes('model_provider="openai"'));
     expect(publicProbe.map(call => call.method)).toEqual(provider === "custom" ? ["model/list"] : []);
     expect(inventory.plugins[0]!.enabled_by_default).toBe(true);
+    expect(inventory.plugins[0]!.bundled_skills).toContainEqual(expect.objectContaining({
+      path: "/fixture/missing/SKILL.md", runtime_available: false, enabled_by_default: false
+    }));
+    expect(inventory.plugins[0]!.bundled_skills).toContainEqual(expect.objectContaining({
+      path: "/fixture/control/SKILL.md", runtime_available: true, enabled_by_default: true
+    }));
     expect(fixture.calls.filter(call => call.method === "config/write")).toEqual([]);
   });
 });

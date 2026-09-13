@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 import { parse } from "smol-toml";
 import { defaultControlHome } from "../core/paths.js";
 import { ControllerError } from "../core/errors.js";
-import { readCodexSession } from "./codex-session.js";
-import { hasRolloutWriter, type CliWriter } from "./cli-writer.js";
+import { readCodexSession, isCliSession } from "./codex-session.js";
+import { hasRolloutWriter, discoverCliWriter, type CliWriter } from "./cli-writer.js";
 
 export interface CliContinuity { thread_id: string; cwd: string; model: string; profile?: string; fingerprint: string; executable: string; effort?: string; approval_policy?: string; sandbox_policy?: Record<string, unknown> }
 export interface DispatchFence { database: string; agent_id: string; run_id: string; }
@@ -43,7 +43,9 @@ function config(profile?: string) {
 export function resolveCliContinuity(threadId: string, requestedProfile?: string, writer?: CliWriter | null): CliContinuity {
   if (process.platform === "win32") throw new Error("Use the owning app-server endpoint for Windows CLI control.");
   const session = readCodexSession(threadId);
+  if (!isCliSession(session)) throw new ControllerError("This session is not a verified CLI session. Use Codex Desktop messaging or connect its owning app-server.", "unsupported_operation");
   if (!session?.cwd || !session.model || !session.modelProvider) throw new Error("Persistent model, provider and directory are required to continue the existing CLI identity.");
+  if (!writer && hasRolloutWriter(session.path)) throw new ControllerError("The current rollout writer is not an exclusive CLI process. Connect its owning app-server.", "unsupported_operation");
   if (requestedProfile && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(requestedProfile)) throw new Error("Invalid Codex profile name.");
   if (requestedProfile && writer?.profile && requestedProfile !== writer.profile) throw new Error("The requested profile differs from the running session's original profile.");
   const profile = requestedProfile ?? writer?.profile;
@@ -69,6 +71,7 @@ function save(path: string, value: QueuedMessage) {
   writeFileSync(temp, JSON.stringify(value), { mode: 0o600 }); renameSync(temp, path);
 }
 export function queueCliMessage(continuity: CliContinuity, prompt: string, fence?: DispatchFence) {
+  if (!isCliSession(readCodexSession(continuity.thread_id))) throw new ControllerError("CLI continuation cannot control this session. Reattach through its owning app-server.", "unsupported_operation");
   if (config(continuity.profile).fingerprint !== continuity.fingerprint) throw new ControllerError("Codex configuration changed since attachment; reattach after reviewing the same model/provider.", "unsupported_operation");
   const dir = bridgeDir(continuity.thread_id); mkdirSync(dir, { recursive: true, mode: 0o700 });
   const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
@@ -87,13 +90,13 @@ export function cliQueueState(threadId: string) {
     uncertain: latest?.state === "uncertain" ? 1 : 0, failed: latest?.state === "failed" ? 1 : 0 };
 }
 
-export function cancelQueuedCliMessages(threadId: string): number {
+export function cancelQueuedCliMessages(threadId: string, messageId?: string, reason?: string): number {
   const dir = bridgeDir(threadId); let cancelled = 0;
   if (!existsSync(dir)) return cancelled;
   mutateQueue(dir, () => {
     for (const file of readdirSync(dir).filter(f => f.endsWith(".json"))) {
       const path = join(dir, file), value = JSON.parse(readFileSync(path, "utf8")) as QueuedMessage;
-      if (value.state === "pending") { value.state = "cancelled"; value.prompt = ""; save(path, value); cancelled++; }
+      if (value.state === "pending" && (messageId === undefined || value.id === messageId)) { if (reason) value.error = reason; value.state = "cancelled"; value.prompt = ""; save(path, value); cancelled++; }
     }
   });
   return cancelled;
@@ -144,6 +147,19 @@ export async function superviseAttachedCli(threadId: string) {
       if (value.state === "dispatched") {
         // A crash after the dispatch fence has uncertain acceptance. Never resend it.
         value.state = "uncertain"; value.error = "The previous supervisor stopped after dispatch; inspect the exact session before retrying."; save(path, value); break;
+      }
+      if (session && (!isCliSession(session) || !discoverCliWriter(session.path) && hasRolloutWriter(session.path))) {
+        try { mutateQueue(dir, () => {
+          const current = JSON.parse(readFileSync(path, "utf8")) as QueuedMessage;
+          if (current.state !== "pending") return;
+          current.state = "failed";
+          current.error = "CLI continuation cannot control this session. Use its owning app-server or Codex Desktop messaging.";
+          save(path, current);
+        }); } catch (error) {
+          if (!(error instanceof ControllerError && error.reason === "backend_unavailable")) throw error;
+          await pause();
+        }
+        continue;
       }
       if (!session || !["completed", "stopped", "failed"].includes(session.status) || hasRolloutWriter(session.path)) { await pause(); continue; }
       if (config(value.continuity.profile).fingerprint !== value.continuity.fingerprint) { value.state = "failed"; value.error = "Codex configuration changed before continuation."; save(path, value); continue; }

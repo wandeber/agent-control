@@ -1,6 +1,6 @@
 import { toolActivity } from "../core/tool-activity.js";
 import { readCodexSession, sessionUsage } from "./codex-session.js";
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { AgentAccessStore } from "../core/agent-access.js";
 import { PermissionRequests } from "../core/permission-requests.js";
 import { readInteractiveProfile } from "./codex-interactive-profile.js";
@@ -234,7 +234,7 @@ export class CodexCliAdapter implements AgentAdapter {
       finally { db.close(); }
     }
     return { status: permissionId ? "waiting_for_input" : state.status, updatedAt: state.updated_at,
-      data: { thread_id: state.thread_id, exit_code: state.exit_code, ...(permissionId ? { permission_request_id: permissionId, reason: "backend_permission_request" } : {}) } };
+      data: { thread_id: state.thread_id, exit_code: state.exit_code, ...(state.error ? { error: state.error, reason: state.error.reason } : {}), ...(permissionId ? { permission_request_id: permissionId, reason: "backend_permission_request" } : {}) } };
   }
   readUsage(handle: AgentHandle): AgentUsageObservation | null {
     const data = handle.data as unknown as Data;

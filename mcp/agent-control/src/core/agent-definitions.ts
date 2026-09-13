@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,

@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 import { parse } from "smol-toml";
 import { defaultControlHome } from "../core/paths.js";
 import { ControllerError } from "../core/errors.js";
-import { readCodexSession } from "./codex-session.js";
-import { hasRolloutWriter } from "./cli-writer.js";
+import { readCodexSession, isCliSession } from "./codex-session.js";
+import { hasRolloutWriter, discoverCliWriter } from "./cli-writer.js";
 const home = () => process.env.CODEX_HOME ?? join(homedir(), ".codex");
 const bridgeDir = (id) => join(defaultControlHome(), "attached-cli", id);
 function takeLock(path) {
@@ -55,8 +55,12 @@ export function resolveCliContinuity(threadId, requestedProfile, writer) {
     if (process.platform === "win32")
         throw new Error("Use the owning app-server endpoint for Windows CLI control.");
     const session = readCodexSession(threadId);
+    if (!isCliSession(session))
+        throw new ControllerError("This session is not a verified CLI session. Use Codex Desktop messaging or connect its owning app-server.", "unsupported_operation");
     if (!session?.cwd || !session.model || !session.modelProvider)
         throw new Error("Persistent model, provider and directory are required to continue the existing CLI identity.");
+    if (!writer && hasRolloutWriter(session.path))
+        throw new ControllerError("The current rollout writer is not an exclusive CLI process. Connect its owning app-server.", "unsupported_operation");
     if (requestedProfile && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(requestedProfile))
         throw new Error("Invalid Codex profile name.");
     if (requestedProfile && writer?.profile && requestedProfile !== writer.profile)
@@ -88,6 +92,8 @@ function save(path, value) {
     renameSync(temp, path);
 }
 export function queueCliMessage(continuity, prompt, fence) {
+    if (!isCliSession(readCodexSession(continuity.thread_id)))
+        throw new ControllerError("CLI continuation cannot control this session. Reattach through its owning app-server.", "unsupported_operation");
     if (config(continuity.profile).fingerprint !== continuity.fingerprint)
         throw new ControllerError("Codex configuration changed since attachment; reattach after reviewing the same model/provider.", "unsupported_operation");
     const dir = bridgeDir(continuity.thread_id);
@@ -112,7 +118,7 @@ export function cliQueueState(threadId) {
     return { pending: messages.filter(m => m && ["pending", "dispatched"].includes(m.state)).length,
         uncertain: latest?.state === "uncertain" ? 1 : 0, failed: latest?.state === "failed" ? 1 : 0 };
 }
-export function cancelQueuedCliMessages(threadId) {
+export function cancelQueuedCliMessages(threadId, messageId, reason) {
     const dir = bridgeDir(threadId);
     let cancelled = 0;
     if (!existsSync(dir))
@@ -120,7 +126,9 @@ export function cancelQueuedCliMessages(threadId) {
     mutateQueue(dir, () => {
         for (const file of readdirSync(dir).filter(f => f.endsWith(".json"))) {
             const path = join(dir, file), value = JSON.parse(readFileSync(path, "utf8"));
-            if (value.state === "pending") {
+            if (value.state === "pending" && (messageId === undefined || value.id === messageId)) {
+                if (reason)
+                    value.error = reason;
                 value.state = "cancelled";
                 value.prompt = "";
                 save(path, value);
@@ -195,6 +203,24 @@ export async function superviseAttachedCli(threadId) {
                 value.error = "The previous supervisor stopped after dispatch; inspect the exact session before retrying.";
                 save(path, value);
                 break;
+            }
+            if (session && (!isCliSession(session) || !discoverCliWriter(session.path) && hasRolloutWriter(session.path))) {
+                try {
+                    mutateQueue(dir, () => {
+                        const current = JSON.parse(readFileSync(path, "utf8"));
+                        if (current.state !== "pending")
+                            return;
+                        current.state = "failed";
+                        current.error = "CLI continuation cannot control this session. Use its owning app-server or Codex Desktop messaging.";
+                        save(path, current);
+                    });
+                }
+                catch (error) {
+                    if (!(error instanceof ControllerError && error.reason === "backend_unavailable"))
+                        throw error;
+                    await pause();
+                }
+                continue;
             }
             if (!session || !["completed", "stopped", "failed"].includes(session.status) || hasRolloutWriter(session.path)) {
                 await pause();

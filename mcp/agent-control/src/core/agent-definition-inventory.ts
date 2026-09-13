@@ -28,7 +28,7 @@ export interface PluginInventory extends CapabilityBase {
   name: string;
   description?: string;
   version?: string;
-  bundled_skills: Array<{ path: string; name: string; enabled_by_default?: boolean }>;
+  bundled_skills: Array<{ path: string; name: string; runtime_available?: boolean; enabled_by_default?: boolean }>;
   bundled_mcp_servers: Array<{ name: string; root_transport?: boolean; enabled_by_default?: boolean }>;
   bundled_apps: Array<{ id: string; name: string }>;
 }
@@ -619,7 +619,11 @@ function buildInventory(executable: string, cwd: string, raw: RuntimeRead): Agen
   const mcpConfig = object(config.mcp_servers);
   for (const plugin of plugins) {
     for (const skill of plugin.bundled_skills) {
-      skill.enabled_by_default = skills.find(entry => string(entry.path) === skill.path)?.enabled !== false;
+      // Plugin metadata describes installed content. Only skills/list proves
+      // that this executable exposes a skill in the effective session catalog.
+      const runtimeSkill = skills.find(entry => string(entry.path) === skill.path);
+      skill.runtime_available = Boolean(runtimeSkill);
+      skill.enabled_by_default = Boolean(runtimeSkill) && runtimeSkill!.enabled !== false;
     }
     for (const server of plugin.bundled_mcp_servers) {
       if (hasMcpTransport(object(mcpConfig[server.name]))) server.root_transport = true;
@@ -801,7 +805,7 @@ function manifestInfo(row: JsonObject, skills: JsonObject[], detail?: JsonObject
 
 async function qualifyRuntime(inventory: AgentDefinitionInventory, cwd: string): Promise<void> {
   const candidates = inventory.plugins.filter((entry) =>
-    entry.enabled_by_default && entry.bundled_skills.length > 0
+    entry.enabled_by_default && entry.bundled_skills.some(skill => skill.enabled_by_default)
   );
   const candidate = candidates.find((entry) => !entry.required) ?? candidates[0];
   if (!candidate) {

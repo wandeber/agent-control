@@ -1,7 +1,7 @@
 import { resolveCliContinuity } from "../adapters/attached-cli-bridge.js";
 import { discoverCliWriter, hasRolloutWriter } from "../adapters/cli-writer.js";
 import { inspectSessionControl } from "../adapters/session-control.js";
-import { readCodexSession, sessionBaseline } from "../adapters/codex-session.js";
+import { readCodexSession, sessionBaseline, isCliSession } from "../adapters/codex-session.js";
 import { ControllerError } from "../core/errors.js";
 import { resolveAdminKey } from "../core/identity.js";
 import { observeLaunchCoordinator, prepareLaunchOwner } from "../core/launch-context.js";
@@ -27,7 +27,7 @@ export async function attachWorkerTool(controller, input) {
         throw new ControllerError("The existing Codex session is not readable locally or through its owning app-server. Supply server for the owning host; do not relaunch it.", "backend_unavailable");
     const baseline = session ? sessionBaseline(threadId) : null;
     const liveControl = Boolean(controlled && controlled.status.type !== "notLoaded" && !endpoint?.startsWith("stdio"));
-    const resumable = Boolean(controlled && !endpoint?.startsWith("stdio") && session && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status));
+    const resumable = Boolean(controlled && !endpoint?.startsWith("stdio") && session && isCliSession(session) && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status));
     const writer = session ? discoverCliWriter(session.path) : null;
     let continuity;
     let continuityError;

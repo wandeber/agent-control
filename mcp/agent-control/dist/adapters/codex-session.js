@@ -3,7 +3,7 @@ import { cancelQueuedCliMessages, cliQueueState, ensureCliBridge, queueCliMessag
 import { discoverCliWriter, hasRolloutWriter, interruptCliWriter } from "./cli-writer.js";
 import { CodexThreadAdapter } from "./codex-thread-adapter.js";
 import { controlExistingSession } from "./session-control.js";
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -129,6 +129,8 @@ export function readCodexSession(threadId) {
                 matched = true;
                 session.cwd = p.cwd;
                 session.modelProvider = p.model_provider;
+                session.source = p.source;
+                session.originator = p.originator;
             }
             if (row.type === "turn_context" && typeof p.model === "string") {
                 session.model = p.model;
@@ -189,6 +191,11 @@ export function readCodexSession(threadId) {
     catch {
         return null;
     }
+}
+/** Desktop archives require their owning app-server, never a generic CLI resume. */
+export function isCliSession(session) {
+    return Boolean(session && !/desktop|vscode/i.test(session.originator ?? "") &&
+        ["cli", "exec"].includes(session.source ?? ""));
 }
 export function sessionUsage(handle) {
     const session = readCodexSession(String(handle.data.thread_id ?? ""));
@@ -257,14 +264,14 @@ export class CodexSessionAdapter {
     async start() { throw this.unsupported(); }
     controlHandle(handle) {
         const session = handle.data.remote_session ? null : readCodexSession(String(handle.data.thread_id));
-        return { ...handle, data: { ...handle.data, safe_to_resume: Boolean(session && handle.data.cli_configuration_valid !== false && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status)),
+        return { ...handle, data: { ...handle.data, safe_to_resume: Boolean(session && isCliSession(session) && handle.data.cli_configuration_valid === true && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status)),
                 model: session?.model ?? handle.data.model, model_provider: session?.modelProvider ?? handle.data.model_provider, cwd: session?.cwd ?? handle.data.cwd } };
     }
     async sendMessage(handle, message) {
         await this.sendMessageWithReceipt(handle, message);
     }
     async sendMessageWithReceipt(handle, message) {
-        if (handle.data.cli_continuity && !handle.data.prefer_app_server) {
+        if (handle.data.cli_continuity && !handle.data.prefer_app_server && isCliSession(readCodexSession(String(handle.data.thread_id)))) {
             const id = queueCliMessage(handle.data.cli_continuity, message.message, message.metadata?.dispatch_fence);
             return { delivered: false, queued: true, message_id: id, orchestrator_action: null };
         }
@@ -298,11 +305,11 @@ export class CodexSessionAdapter {
         }
         const session = readCodexSession(String(handle.data.thread_id));
         const queue = cliQueueState(String(handle.data.thread_id));
-        if (queue.pending)
+        if (queue.pending && isCliSession(session))
             ensureCliBridge(String(handle.data.thread_id));
         // Missing final evidence is unknown, never a fabricated completion or interruption.
         const after = typeof handle.data.observed_event_index === "number" ? handle.data.observed_event_index : -1;
-        return { status: this.observedStatus(queue.uncertain || queue.failed ? "blocked" : queue.pending ? "running" : session?.status ?? "unknown", handle), updatedAt: session?.updatedAt,
+        return { status: this.observedStatus(queue.uncertain || queue.failed ? "blocked" : queue.pending ? isCliSession(session) ? "running" : "blocked" : session?.status ?? "unknown", handle), updatedAt: session?.updatedAt,
             data: { queued_messages: queue, observed_events: session?.events.filter(event => event.index > after).map(event => event.type === "agent.stopped" && !handle.data.cancel_requested
                     ? { ...event, type: "agent.status_changed", status: "waiting_for_input", reason: "turn_interrupted" } : event) ?? [], observed_event_index: session?.lastIndex ?? after } };
     }

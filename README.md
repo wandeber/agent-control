@@ -107,7 +107,10 @@ operator authority. Worker/run credentials cannot edit the shared catalog.
 MCPs, and apps from Codex at worker launch. To customize that selection, send
 `capabilities_mode: "custom"` with all three capability arrays from the inventory;
 the editor does this automatically on the first capability change. Model and
-instruction edits retain inheritance. Each worker freezes its effective
+instruction edits retain inheritance. Plugin metadata alone does not establish an
+active skill: inheritance follows Codex's effective `skills/list`. Explicit
+selections and continued snapshots are checked after their own overrides are
+applied, so a globally disabled plugin can still be enabled for one worker. Each worker freezes its effective
 selection, so later global changes do not alter its continued turns.
 
 Flows reference a stable bundled key or personal definition ID with
@@ -137,6 +140,27 @@ existing workers keep their snapshot. The initiating conversation remains in
 the returned renewable wait/ack lifecycle until its supervised work settles.
 Global Codex configuration and credentials are not copied or rewritten.
 
+
+## Runtime Startup and Updates
+
+The CLI and MCP launchers prepare SQLite outside the active dependency tree and
+load a validated addon from `~/.cache/agent-control/native`, keyed by dependency
+version, platform, architecture, and Node ABI. Node 22 and Node 24 can run in
+parallel without rebuilding each other's addon. Missing or damaged binaries are
+repaired on startup; failed preparation reports its command diagnostics on stderr.
+A source build requires Python and a C/C++ build toolchain when no prebuilt addon
+exists. The MCP startup budget allows up to 180 seconds for cold preparation;
+warm starts reuse the validated cache. `AGENT_CONTROL_NATIVE_CACHE` can select an isolated cache for validation.
+
+After updating the marketplace and plugin, reopen Codex or start a fresh task to
+load the new MCP process and schemas. An already loaded older server can reject
+new catalog fields even while the updated `agentctl` reads them successfully.
+Do not remove saved agent overrides to work around an older server.
+
+Desktop sessions require their owning app-server or native Codex messaging.
+They cannot be continued through a generic CLI archive. Attachment reports
+control as unavailable when that owner cannot be reached; queued messages retain
+their delivery ID and are not proof of delivery or an active model turn.
 
 ## Codex Marketplace
 

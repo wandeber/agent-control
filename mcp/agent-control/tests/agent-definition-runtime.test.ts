@@ -80,6 +80,24 @@ function definition(): AgentDefinition {
 }
 
 describe("configured-agent runtime", () => {
+  it("inherits effective skills but preserves explicit configuration across global changes", () => {
+    const current = inventory("/project");
+    const plugin = current.plugins.find(plugin => plugin.id === "off@plugins")!;
+    plugin.bundled_skills[0] = { ...plugin.bundled_skills[0]!, runtime_available: false, enabled_by_default: false };
+    const inherited = { ...definition(), capabilities_mode: "inherit" as const };
+    const compiled = compileAgentConfiguration(inherited, "revision", current, "/project");
+    expect(compiled.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled).toBe(false);
+    const explicit = { ...definition(), plugins: [{ id: "off@plugins", enabled: true, skills: [{ path: "/off/SKILL.md", enabled: true }] }] };
+    expect(compileAgentConfiguration(explicit, "revision", current, "/project").plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled).toBe(true);
+    const old = compileAgentConfiguration(inherited, "revision", inventory("/project"), "/project");
+    const hash = compiledSnapshotHash(old);
+    // A global toggle must not rewrite the frozen per-process choice. Its actual
+    // availability is verified after applying those overrides, before turn/start.
+    const refreshed = refreshCompiledAgentConfiguration(old, current);
+    expect(refreshed.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled).toBe(true);
+    expect(compiledSnapshotHash(old)).toBe(hash);
+  });
+
   it("inherits effective Codex capabilities at launch and freezes them across continuations", () => {
     const current = inventory("/project");
     current.plugins.find(plugin => plugin.id === "off@plugins")!.bundled_skills[0]!.enabled_by_default = false;

@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { randomUUID } from "node:crypto";
 import { PermissionRequests } from "../core/permission-requests.js";
 /** Keep the requesting connection alive; a restart/disconnect invalidates unanswerable requests. */

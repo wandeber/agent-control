@@ -1,4 +1,5 @@
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
+import { workerError } from "../core/errors.js";
 import { CodexAppServerClient } from "./codex-thread-adapter.js";
 import { attachApprovalBroker } from "./codex-approval-broker.js";
 import { AgentAccessStore, accessTurnOverrides, type AccessPolicy } from "../core/agent-access.js";
@@ -48,7 +49,7 @@ export interface InteractiveTurnControl {
 const record = (value: unknown): Record<string, any> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 
 /** The detached CLI supervisor owns this RPC connection for the whole turn. */
-export async function runInteractiveCliTurn(job: InteractiveCliJob, control: InteractiveTurnControl): Promise<{ thread_id?: string; status: "completed" | "failed" | "waiting_for_input" }> {
+export async function runInteractiveCliTurn(job: InteractiveCliJob, control: InteractiveTurnControl): Promise<{ thread_id?: string; status: "completed" | "failed" | "waiting_for_input"; error?: ReturnType<typeof workerError> }> {
   const hasSnapshot = Boolean(job.snapshot_path || job.snapshot_hash);
   if (hasSnapshot && (!job.snapshot_path || !job.snapshot_hash)) {
     throw new Error("Configured-agent snapshot binding is incomplete.");
@@ -223,8 +224,9 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     }, 100);
     return await done;
   } catch (error) {
-    control.event({ type: "error", message: error instanceof Error ? error.message : "Interactive Codex failed." });
-    return { thread_id: threadId, status: "failed" };
+    const diagnostic = workerError(error);
+    control.event({ type: "error", ...diagnostic });
+    return { thread_id: threadId, status: "failed", error: diagnostic };
   } finally {
     closing = true;
     if (timer) clearInterval(timer);

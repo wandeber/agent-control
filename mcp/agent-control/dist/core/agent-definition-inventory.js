@@ -482,7 +482,11 @@ function buildInventory(executable, cwd, raw) {
     const mcpConfig = object(config.mcp_servers);
     for (const plugin of plugins) {
         for (const skill of plugin.bundled_skills) {
-            skill.enabled_by_default = skills.find(entry => string(entry.path) === skill.path)?.enabled !== false;
+            // Plugin metadata describes installed content. Only skills/list proves
+            // that this executable exposes a skill in the effective session catalog.
+            const runtimeSkill = skills.find(entry => string(entry.path) === skill.path);
+            skill.runtime_available = Boolean(runtimeSkill);
+            skill.enabled_by_default = Boolean(runtimeSkill) && runtimeSkill.enabled !== false;
         }
         for (const server of plugin.bundled_mcp_servers) {
             if (hasMcpTransport(object(mcpConfig[server.name])))
@@ -664,7 +668,7 @@ function manifestInfo(row, skills, detail) {
     return { root, skills: pluginSkills, mcpServers, apps };
 }
 async function qualifyRuntime(inventory, cwd) {
-    const candidates = inventory.plugins.filter((entry) => entry.enabled_by_default && entry.bundled_skills.length > 0);
+    const candidates = inventory.plugins.filter((entry) => entry.enabled_by_default && entry.bundled_skills.some(skill => skill.enabled_by_default));
     const candidate = candidates.find((entry) => !entry.required) ?? candidates[0];
     if (!candidate) {
         throw new ControllerError("Codex executable could not be qualified because no enabled plugin skill is available for the isolation probe.", "unsupported_runtime", { executable: inventory.runtime.executable, version: inventory.runtime.version });

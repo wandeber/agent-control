@@ -1,5 +1,5 @@
 import { AgentAccessStore, accessTurnOverrides } from "../core/agent-access.js";
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { PermissionRequests } from "../core/permission-requests.js";
 import { attachApprovalBroker } from "./codex-approval-broker.js";
 import { toolActivity } from "../core/tool-activity.js";

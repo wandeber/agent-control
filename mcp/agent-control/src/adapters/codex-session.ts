@@ -3,7 +3,7 @@ import { cancelQueuedCliMessages, cliQueueState, ensureCliBridge, queueCliMessag
 import { discoverCliWriter, hasRolloutWriter, interruptCliWriter } from "./cli-writer.js";
 import { CodexThreadAdapter } from "./codex-thread-adapter.js";
 import { controlExistingSession } from "./session-control.js";
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -11,7 +11,7 @@ import { ControllerError } from "../core/errors.js";
 import type { AgentAdapter, AgentHandle, AgentMessage, AgentMessageInput, AgentStatus, AgentUsageObservation, StopOptions } from "../core/types.js";
 
 interface Session {
-  id: string; path: string; cwd?: string; model: string | null; modelProvider?: string; effort?: string; approvalPolicy?: string; sandboxPolicy?: Record<string, unknown>; status: AgentStatus; updatedAt: string;
+  id: string; path: string; source?: string; originator?: string; cwd?: string; model: string | null; modelProvider?: string; effort?: string; approvalPolicy?: string; sandboxPolicy?: Record<string, unknown>; status: AgentStatus; updatedAt: string;
   messages: AgentMessage[]; usage: AgentUsageObservation | null; usageSamples: AgentUsageObservation[];
   events: Array<{ index: number; type: "agent.started" | "agent.completed" | "agent.stopped" | "agent.message"; turn_id?: string; text?: string }>;
   lastIndex: number;
@@ -106,7 +106,7 @@ export function readCodexSession(threadId: string): Session | null {
       const p = row.payload;
       if (!p) continue;
       session.lastIndex = index;
-      if (row.type === "session_meta") { if (p.id !== threadId) return null; matched = true; session.cwd = p.cwd; session.modelProvider = p.model_provider; }
+      if (row.type === "session_meta") { if (p.id !== threadId) return null; matched = true; session.cwd = p.cwd; session.modelProvider = p.model_provider; session.source = p.source; session.originator = p.originator; }
       if (row.type === "turn_context" && typeof p.model === "string") { session.model = p.model; session.effort = p.effort; session.approvalPolicy = p.approval_policy; session.sandboxPolicy = p.sandbox_policy; }
       if (row.type === "event_msg") {
         if (p.type === "task_started") session.status = "running";
@@ -146,6 +146,12 @@ export function readCodexSession(threadId: string): Session | null {
     cache.set(key, { signature, session });
     return session;
   } catch { return null; }
+}
+
+/** Desktop archives require their owning app-server, never a generic CLI resume. */
+export function isCliSession(session: { source?: string; originator?: string } | null): boolean {
+  return Boolean(session && !/desktop|vscode/i.test(session.originator ?? "") &&
+    ["cli", "exec"].includes(session.source ?? ""));
 }
 
 export function sessionUsage(handle: AgentHandle): AgentUsageObservation | null {
@@ -209,14 +215,14 @@ export class CodexSessionAdapter implements AgentAdapter {
   async start(): Promise<AgentHandle> { throw this.unsupported(); }
   private controlHandle(handle: AgentHandle) {
     const session = handle.data.remote_session ? null : readCodexSession(String(handle.data.thread_id));
-    return { ...handle, data: { ...handle.data, safe_to_resume: Boolean(session && handle.data.cli_configuration_valid !== false && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status)),
+    return { ...handle, data: { ...handle.data, safe_to_resume: Boolean(session && isCliSession(session) && handle.data.cli_configuration_valid === true && !hasRolloutWriter(session.path) && ["completed", "stopped", "failed"].includes(session.status)),
       model: session?.model ?? handle.data.model, model_provider: session?.modelProvider ?? handle.data.model_provider, cwd: session?.cwd ?? handle.data.cwd } };
   }
   async sendMessage(handle: AgentHandle, message: { message: string }): Promise<void> {
     await this.sendMessageWithReceipt(handle, message);
   }
   async sendMessageWithReceipt(handle: AgentHandle, message: AgentMessageInput) {
-    if (handle.data.cli_continuity && !handle.data.prefer_app_server) {
+    if (handle.data.cli_continuity && !handle.data.prefer_app_server && isCliSession(readCodexSession(String(handle.data.thread_id)))) {
       const id = queueCliMessage(handle.data.cli_continuity as unknown as CliContinuity, message.message, message.metadata?.dispatch_fence as DispatchFence | undefined);
       return { delivered: false as const, queued: true, message_id: id, orchestrator_action: null };
     }
@@ -248,10 +254,10 @@ export class CodexSessionAdapter implements AgentAdapter {
     }
     const session = readCodexSession(String(handle.data.thread_id));
     const queue = cliQueueState(String(handle.data.thread_id));
-    if (queue.pending) ensureCliBridge(String(handle.data.thread_id));
+    if (queue.pending && isCliSession(session)) ensureCliBridge(String(handle.data.thread_id));
     // Missing final evidence is unknown, never a fabricated completion or interruption.
     const after = typeof handle.data.observed_event_index === "number" ? handle.data.observed_event_index : -1;
-    return { status: this.observedStatus(queue.uncertain || queue.failed ? "blocked" : queue.pending ? "running" : session?.status ?? "unknown", handle), updatedAt: session?.updatedAt,
+    return { status: this.observedStatus(queue.uncertain || queue.failed ? "blocked" : queue.pending ? isCliSession(session) ? "running" : "blocked" : session?.status ?? "unknown", handle), updatedAt: session?.updatedAt,
       data: { queued_messages: queue, observed_events: session?.events.filter(event => event.index > after).map(event =>
         event.type === "agent.stopped" && !handle.data.cancel_requested
           ? { ...event, type: "agent.status_changed", status: "waiting_for_input", reason: "turn_interrupted" } : event) ?? [], observed_event_index: session?.lastIndex ?? after } };

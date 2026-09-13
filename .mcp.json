@@ -9,7 +9,8 @@
       "cwd": ".",
       "tool_timeout_sec": 3700,
       "env": {},
-      "note": "Local agent controller MCP. State defaults to $HOME/.agent-control/state.sqlite and artifacts/logs stay outside target repositories."
+      "note": "Local agent controller MCP. State defaults to $HOME/.agent-control/state.sqlite and artifacts/logs stay outside target repositories.",
+      "startup_timeout_sec": 180
     }
   }
 }

@@ -107,7 +107,7 @@ export function registerAgentDefinitionCommands(program: Command, deps: CliDeps)
         attachments: options.file,
         watch: options.watch,
         requester_thread_id: options.requesterThreadId,
-        requester_event_types: options.requesterEvent,
+        requester_event_types: options.requesterEvent?.length ? options.requesterEvent : undefined,
         requester_delivery: options.requesterDelivery,
         admin_key: auth.adminKey,
         agent_token: auth.agentToken

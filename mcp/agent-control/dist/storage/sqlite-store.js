@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database from "./database.js";
 import { initializeQuestionSchema } from "./question-schema.js";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";

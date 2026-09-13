@@ -1,15 +1,15 @@
 /** Detached supervisor: serializes turns and preserves exact-session continuation. */
-import Database from "better-sqlite3";
+import Database from "../storage/database.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ControllerError } from "../core/errors.js";
+import { ControllerError, workerError } from "../core/errors.js";
 import { AgentAccessStore } from "../core/agent-access.js";
 import { runInteractiveCliTurn, type InteractiveCliJob } from "./codex-cli-interactive.js";
 
 export interface CliJob { idempotency_key?: string; executable: string; args: string[]; cwd: string; prompt: string; profile_path?: string; profile_hash?: string; interactive?: Omit<InteractiveCliJob, "executable" | "cwd" | "prompt" | "profile_path" | "profile_hash">; }
-export interface CliState { status: "running" | "queued" | "waiting_for_input" | "completed" | "failed" | "stopped" | "blocked"; thread_id?: string; turn_id?: string; runtime_turn_id?: string; transport?: "app-server"; updated_at: string; exit_code?: number | null; }
+export interface CliState { status: "running" | "queued" | "waiting_for_input" | "completed" | "failed" | "stopped" | "blocked"; thread_id?: string; turn_id?: string; runtime_turn_id?: string; transport?: "app-server"; updated_at: string; exit_code?: number | null; error?: ReturnType<typeof workerError>; }
 interface QueuedJob { fingerprint?: string; id: string; job: CliJob; initial: boolean; status: "pending" | "dispatched" | "completed" | "failed" | "interrupted" | "cancelled"; }
 export function writeState(dir: string, state: CliState): void { save(join(dir, "state.json"), state); }
 function save(path: string, value: unknown): void {
@@ -49,7 +49,7 @@ export function enqueueCliJob(dir: string, job: CliJob, initial: boolean): strin
     if (state.status === "running" && !state.turn_id) throw unavailable("This turn belongs to an older CLI supervisor; wait for it to finish before continuing.");
     const id = `${Date.now()}-${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}`;
     saveJob(dir, { id, job, fingerprint, initial, status: "pending" });
-    writeState(dir, { ...state, status: state.status === "running" ? "running" : "queued", updated_at: new Date().toISOString() });
+    writeState(dir, { ...state, error: state.status === "running" ? state.error : undefined, status: state.status === "running" ? "running" : "queued", updated_at: new Date().toISOString() });
     return id;
   });
 }
@@ -103,7 +103,7 @@ export async function supervise(dir: string): Promise<void> {
         }
         next.status = "dispatched"; saveJob(dir, next);
         const args = [...next.job.args, ...(session ? ["resume", session] : []), "-"];
-        writeState(dir, { ...state, status: "running", turn_id: next.id, runtime_turn_id: undefined, updated_at: new Date().toISOString() });
+        writeState(dir, { ...state, error: undefined, status: "running", turn_id: next.id, runtime_turn_id: undefined, updated_at: new Date().toISOString() });
         appendFileSync(join(dir, "events.jsonl"), JSON.stringify({ type: "agent_control.prompt", text: next.job.prompt, created_at: new Date().toISOString() }) + "\n", { mode: 0o600 });
         let interactive = state.transport === "app-server" || Boolean(
           next.job.interactive?.approval_policy || next.job.interactive?.snapshot_path
@@ -159,13 +159,14 @@ async function runInteractiveTurn(dir: string, entry: QueuedJob, session?: strin
       const status = cancelled ? "stopped" : result.status;
       event({ type: "agent_control.turn_finished", status });
       writeState(dir, { status: !cancelled && jobs(dir).some(job => job.status === "pending") ? "queued" : status,
-        thread_id: result.thread_id, transport: "app-server", exit_code: result.status === "completed" ? 0 : null, updated_at: new Date().toISOString() });
+        thread_id: result.thread_id, ...(result.error ? { error: result.error } : {}), transport: "app-server", exit_code: result.status === "completed" ? 0 : null, updated_at: new Date().toISOString() });
     });
   } catch (error) {
     // Unconfirmed process cleanup leaves the invocation claimed; another
     // supervisor must not start a competing writer for this session.
-    locked(dir, () => writeState(dir, { ...stateAt(dir), status: "blocked", updated_at: new Date().toISOString() }));
-    event({ type: "error", message: error instanceof Error ? error.message : "Interactive CLI ownership could not be released." });
+    const diagnostic = workerError(error);
+    locked(dir, () => writeState(dir, { ...stateAt(dir), status: "blocked", error: diagnostic, updated_at: new Date().toISOString() }));
+    event({ type: "error", ...diagnostic });
     throw error;
   } finally { clearInterval(heartbeatTimer); process.off("SIGTERM", terminate); process.off("SIGINT", terminate); }
 }

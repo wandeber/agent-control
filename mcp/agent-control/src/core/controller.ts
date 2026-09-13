@@ -6534,6 +6534,9 @@ export class AgentController {
       payload: {
         direction: "outbound",
         size: message.length,
+        delivered: receipt.delivered,
+        queued: "queued" in receipt ? receipt.queued : false,
+        message_id: "message_id" in receipt ? receipt.message_id : null,
         completed_after_stop: completedAfterStop,
         superseded_by_newer_work:
           !completion.attemptOwnedAgent && !completedAfterStop,

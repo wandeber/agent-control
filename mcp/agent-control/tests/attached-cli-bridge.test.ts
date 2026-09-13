@@ -27,7 +27,7 @@ describe.skipIf(!supported)("existing CLI process control and durable continuati
     dir = mkdtempSync(join(tmpdir(), "ac-cli-bridge-")); mkdirSync(join(dir, "sessions"));
     vi.stubEnv("CODEX_HOME", dir); vi.stubEnv("AGENT_CONTROL_HOME", dir);
     rollout = join(dir, "sessions", `rollout-${thread}.jsonl`);
-    writeFileSync(rollout, row("session_meta", { id: thread, cwd: dir, model_provider: "fixture-provider" }) + row("turn_context", { model: "fixture-model", effort: "high", approval_policy: "never", sandbox_policy: { type: "read-only" } }) + row("event_msg", { type: "task_started" }));
+    writeFileSync(rollout, row("session_meta", { id: thread, source: "exec", cwd: dir, model_provider: "fixture-provider" }) + row("turn_context", { model: "fixture-model", effort: "high", approval_policy: "never", sandbox_policy: { type: "read-only" } }) + row("event_msg", { type: "task_started" }));
     writeFileSync(join(dir, "fixture.config.toml"), 'model = "fixture-model"\nmodel_provider = "fixture-provider"\n');
     executable = join(dir, "codex");
     const source = join(dir, "fixture.c");
@@ -70,6 +70,28 @@ int main(int argc, char **argv) {
     child = spawn(executable, ["exec", "--profile", "fixture"], { env: { ...process.env, ...extra }, stdio: ["ignore", "pipe", "ignore"] });
     await new Promise<void>((resolve, reject) => { child!.stdout!.once("data", () => resolve()); child!.once("error", reject); });
   }
+  it("rejects Desktop provenance and retires an old pending message without dispatch", async () => {
+    const continuity = resolveCliContinuity(thread, "fixture");
+    writeFileSync(rollout, row("session_meta", { id: thread, source: "vscode", originator: "Codex Desktop", cwd: dir, model_provider: "fixture-provider" }) +
+      row("turn_context", { model: "fixture-model" }) + row("event_msg", { type: "task_complete" }));
+    expect(() => resolveCliContinuity(thread, "fixture")).toThrow("not a verified CLI session");
+    expect(() => queueCliMessage(continuity, "Must not dispatch")).toThrow("cannot control this session");
+    const queue = join(dir, "attached-cli", thread); mkdirSync(queue, { recursive: true });
+    writeFileSync(join(queue, "legacy.json"), JSON.stringify({ id: "legacy", continuity, prompt: "Do not replay", state: "pending" }));
+    await superviseAttachedCli(thread);
+    expect(JSON.parse(readFileSync(join(queue, "legacy.json"), "utf8"))).toMatchObject({ state: "failed", error: expect.stringContaining("cannot control this session") });
+    expect(existsSync(join(dir, "capture"))).toBe(false);
+  });
+
+  it("cancels only a specified pending message while preserving its replacement evidence", () => {
+    const queue = join(dir, "attached-cli", thread); mkdirSync(queue, { recursive: true });
+    for (const id of ["superseded", "keep"]) writeFileSync(join(queue, id + ".json"), JSON.stringify({ id, state: "pending", prompt: "Follow-up" }));
+    expect(cancelQueuedCliMessages(thread, "")).toBe(0);
+    expect(cancelQueuedCliMessages(thread, "superseded", "Delivered natively")).toBe(1);
+    expect(JSON.parse(readFileSync(join(queue, "superseded.json"), "utf8"))).toMatchObject({ state: "cancelled", prompt: "", error: "Delivered natively" });
+    expect(JSON.parse(readFileSync(join(queue, "keep.json"), "utf8"))).toMatchObject({ state: "pending", prompt: "Follow-up" });
+  });
+
   it("signals only the exclusive exec writer after rechecking PID, start time and rollout FD", async () => {
     await start(); const writer = discoverCliWriter(rollout)!;
     expect(writer).toMatchObject({ pid: child!.pid, executable: realpathSync(executable), profile: "fixture" });

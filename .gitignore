@@ -1,5 +1,8 @@
 node_modules/
 .agent-control-node-abi
+.runtime-deps.lock*
+.deps-stage-*
+.deps-previous-*
 
 # Build outputs regenerated from source.
 web/.next/
