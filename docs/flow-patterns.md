@@ -457,13 +457,20 @@ fallback. Hosts without a conversation must supply a real requester identity;
 headless operations never fabricate one. Reusing a run preserves its observer
 filters and does not replace the original requester with a nested executor.
 
-The default MCP `wait` mode uses `run_wait` with renewable
-`timeout_ms: 3600000` waits (`--timeout 1h` in the CLI). The bundled Codex MCP
+The default MCP `wait` mode uses `run_wait` with `timeout_ms: 3600000` (one
+hour) on initial entry and every reentry (`--timeout 1h` in the CLI). A shorter
+timeout requires an explicit user request or discretion to choose it. Do not
+lengthen the normal one-hour timeout without a user instruction or a concrete
+reason within granted discretion. The bundled Codex MCP
 configuration sets `tool_timeout_sec: 3700`; verify the effective client
 deadline on other hosts. Omitting an internal timeout cannot override a client
 cap. Indefinite waiting is supported only through the CLI/internal runtime or
 a host whose unlimited wait support has been explicitly verified.
-Consume the batch, retain its new cursor, and resume the long wait. Timeout is
+One hour is the minimum configured timeout absent that user exception, not a
+minimum elapsed wait: matching actionable events, failures, blockers and
+completion return early. Inspect errors and outcomes, take the authorized next
+action, and ask the user if their intervention is needed. Consume and ACK the
+complete batch, retain its processed cursor, and resume with the accepted timeout policy. Timeout is
 not completion. Preserve the last processed cursor when reusing a launch.
 When the user asks something else, answer in commentary and resume event waiting
 in the same open turn. Do not cancel or forget the original work. Retain each
@@ -474,8 +481,13 @@ pauses or cancels supervision. Do not relay routine activity or create monitorin
 automations. The model stays in a pending tool call between actionable events.
 
 `observer.wait_contract` on launch and `wait_contract` on open event/timeout
-responses provide `run_wait` arguments with a one-hour timeout. A shorter wide
-timeout such as 30 minutes must still fit the verified client deadline. Reusable
+responses provide `run_wait` arguments with the normal one-hour timeout. Reapply
+any explicit user timeout policy on each reentry. If the host cannot sustain
+one hour, report the limitation rather than quietly shortening the wait without
+user authorization. Outer async yields and UI responsiveness do not change the
+inner timeout: resume the existing pending wrapper cell instead of starting
+another `run_wait`. Only an actual interruption or returned result ends that
+pending call; a wrapper yield alone does not. Reusable
 wait contracts omit the cursor so the next call uses the durable processed
 position; the event batch provides a cursor and explicit ACK contract.
 Acknowledge only after processing that batch. After

@@ -1104,8 +1104,22 @@ Explicit filters and delivery choices survive repeated launches.
 While any supervised work remains, keep the Codex turn open. Respond to new
 user messages in commentary, even on another topic, then resume `run_wait` with
 the last processed cursor. Preserve all active runs and their separate cursors.
-Use one-hour waits, or 30 minutes if the host requires it, and renew a timed-out
-wait. An optional localized status sentence can say: "The <flow> flow is still
+Use `timeout_ms: 3600000` (one hour) as the normal conversational timeout on
+initial entry and every reentry. Do not use a shorter timeout unless the user
+explicitly requests it or grants discretion to choose; do not lengthen it without
+a user instruction or a concrete reason within that discretion. Preserve the
+accepted timeout policy after messages, handled events, errors and timeouts.
+The one-hour minimum is a configured timeout, not a minimum elapsed wait:
+matching actionable events, failures, blockers and completion return early.
+Inspect the outcome, take the authorized next action, and ask the user when needed.
+
+Outer async tool yields and UI responsiveness do not lower the inner timeout.
+If `functions.exec` yields a running cell, resume it with `functions.wait`;
+do not start another `run_wait` while that call is pending. After an actual
+interruption, reattach to the same run/observer and durable processed cursor.
+An event or error is not an implicit ACK: acknowledge only a fully handled
+delivery. Report a host deadline below one hour rather than silently adopting
+short waits without user authorization. An optional localized status sentence can say: "The <flow> flow is still
 running; I am continuing to wait." Notifications cannot reliably reactivate an
 ended turn, even if delivery succeeds. Finish only when all supervised work is
 resolved or the user explicitly pauses or cancels supervision.

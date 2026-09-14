@@ -338,8 +338,12 @@ and descendant run, including outstanding goals and native actions. One
 An observation closing is not proof of success. Acknowledge a handled delivery
 with its `ack_contract`; a timeout or cancelled wait does not acknowledge events.
 
-The default delivery mode is `wait`. Use renewable one-hour MCP waits below the
-effective client deadline. The bundled Codex server declares
+The default delivery mode is `wait`. Use `timeout_ms: 3600000` (one hour) as
+the normal conversational timeout. A shorter value requires an explicit user
+request or explicit permission to choose the timeout. Do not lengthen it merely
+because the host supports more: depart from one hour only for a user instruction
+or a concrete reason within granted discretion. Preserve that accepted policy on reentry after user messages,
+handled events, errors, and actual timeouts. The bundled Codex server declares
 `tool_timeout_sec: 3700`, leaving headroom for `timeout_ms: 3600000`:
 
 ```bash
@@ -350,15 +354,26 @@ agentctl run wait \
   --timeout 1h
 ```
 
-The MCP equivalent is `run_wait` with `timeout_ms: 3600000`. Indefinite waits
-are limited to the CLI/internal runtime or a host whose support was explicitly
-verified. A server-side timeout cannot override a shorter client deadline;
-verify the effective client configuration when changing hosts. A shorter wide
-wait, such as 30 minutes, is valid only when it fits that verified deadline.
-Process each returned batch, acknowledge it explicitly, and renew the long wait
-after a timeout. A timeout does not imply completion.
-If the host interrupts or caps a tool call, resume from the last acknowledged
-cursor rather than polling worker status or replaying earlier events. Stop that
+One hour is the minimum configured timeout, not a minimum elapsed wait. Matching decisions,
+failures, blockers, and aggregate completion return early under the selected
+wake policy. Inspect the event or error, take the authorized next action, and
+ask the user when their intervention is needed. After handling the complete
+event batch, acknowledge it explicitly and renew the wait under the accepted timeout policy while work
+remains. Timeout, tool error, and cancellation do not acknowledge events or stop
+workers.
+
+Keep the inner `run_wait` timeout separate from outer tool execution and UI
+responsiveness. For example, if `functions.exec` yields a running cell, retain
+it and use `functions.wait` to resume that same pending call. A wrapper yield
+is not a run timeout: do not launch a duplicate wait or use repeated 60-second
+waits without the user's explicit timeout exception. Answer new user messages in commentary; if they
+interrupt the call, reattach to the same run and observer with the durable
+processed cursor and the accepted timeout policy. If it is still pending, resume it.
+
+Indefinite waits remain available for explicit CLI/internal use. Verify the
+effective client deadline when changing hosts; a server timeout cannot extend
+it. If the host cannot sustain at least one hour, report the transport limitation
+rather than silently using a shorter fallback without user authorization. Stop that
 observation on user cancellation, `closed`, or its selected completion condition;
 continue supervising any remaining runs before considering a final response.
 

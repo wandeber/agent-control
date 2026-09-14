@@ -128,14 +128,25 @@ continue a conversation.
 
 Immediately enter the returned `run_wait` contract after launch. Use `observer`
 for the original conversation or `coordinator_observer` for a separate executing
-thread. Each keeps its own processed cursor. Use one-hour waits, or 30 minutes
-when required by the host, and explicitly `run_ack` after handling each complete
+thread. Each keeps its own processed cursor. Use `timeout_ms: 3600000` (one
+hour) as the normal value; a shorter timeout requires an explicit user request
+or permission to choose it. Do not lengthen it without a user instruction or a
+concrete reason within granted discretion. Preserve the
+accepted policy after user messages, handled events, errors, and timeouts.
+This is a minimum configured timeout, not a minimum elapsed wait: actionable failures, blockers, decisions and
+completion return early. Outer async yields or UI responsiveness do not shorten
+it; resume the same pending wrapper call, without creating duplicate waits.
+Report a host deadline below one hour instead of silently shortening the wait
+without user authorization.
+Explicitly `run_ack` after handling each complete
 event batch. Request all event wakeups only when the user wants individual
 updates; durable subscription and wake filtering are different settings.
 
 Keep the turn open while any supervised work remains pending. After user
 steering, a question on another topic, an event, or a timeout, respond in
-commentary when useful and reattach to the wait. Subscription notifications
+commentary when useful and reattach to the same run and observer with the
+durable processed cursor and the accepted timeout policy if the call returned
+or was interrupted; otherwise resume its existing pending call. Subscription notifications
 cannot reliably wake an ended Codex turn. Do not replace waits with polling or
 a monitoring automation. Finish when all supervised work has settled and its
 outcome is known, or when the user explicitly pauses or cancels supervision.

@@ -70,6 +70,7 @@ describe("run control wait", () => {
 
   it("keeps a one-hour MCP call pending through routine events and returns the requester decision", async () => {
     const observation = observe(run().run_id);
+    expect(observation.wait_contract.arguments.timeout_ms).toBe(3_600_000);
     const pending = handleTool(controller, "run_wait", observation.wait_contract.arguments);
     let returned = false;
     void pending.then(() => { returned = true; });
@@ -81,6 +82,27 @@ describe("run control wait", () => {
     expect(result.events.map((event: EventRecord) => event.event_id)).toEqual([decision.event_id]);
     expect(result.events[0].decision).toEqual({ key: "plan_approval", owner: "requester", authority: "user" });
     expect(result.completion).toBeNull();
+    expect(result.wait_contract.arguments).toEqual(observation.wait_contract.arguments);
+  });
+
+  it("returns a failure before the one-hour timeout and preserves the wait policy for remaining work", async () => {
+    const observation = observe(run().run_id);
+    const failed = worker(observation.run_id);
+    worker(observation.run_id);
+    const pending = handleTool(controller, "run_wait", observation.wait_contract.arguments);
+    store.updateAgent(failed.agent_id, { status: "failed" });
+    const failure = emit(observation.run_id, "agent.failed", { reason: "backend unavailable" }, failed.agent_id);
+    const result = await pending as any;
+    expect(result.events.map((event: EventRecord) => event.event_id)).toEqual([failure.event_id]);
+    expect(result).toMatchObject({ timed_out: false, completion: null });
+    const ack = await handleTool(controller, "run_ack", result.ack_contract.arguments) as any;
+    expect(ack.wait_contract.arguments).toEqual(observation.wait_contract.arguments);
+    expect(ack.wait_contract.arguments).not.toHaveProperty("cursor");
+    const decision = gate(observation.run_id, "requester");
+    const resumed = await handleTool(controller, "run_wait", ack.wait_contract.arguments) as any;
+    expect(resumed.events.map((event: EventRecord) => event.event_id)).toEqual([decision.event_id]);
+    expect(resumed.wait_contract.arguments.timeout_ms).toBe(3_600_000);
+    expect(stopped).not.toHaveBeenCalled();
   });
 
   it("filters before limit=1 and ACK covers excluded activity without replaying the handled decision", async () => {
@@ -198,7 +220,9 @@ describe("run control wait", () => {
     await expect(pending).rejects.toThrow("User asks another question");
     const decision = gate(observation.run_id, "requester");
     release({ status: "running" });
-    expect((await wait(observation)).events.map(event => event.event_id)).toEqual([decision.event_id]);
+    const resumed = await handleTool(controller, "run_wait", observation.wait_contract.arguments) as any;
+    expect(resumed.events.map((event: EventRecord) => event.event_id)).toEqual([decision.event_id]);
+    expect(resumed.wait_contract.arguments).toEqual(observation.wait_contract.arguments);
     expect(stopped).not.toHaveBeenCalled();
     expect(sent).not.toHaveBeenCalled();
   });

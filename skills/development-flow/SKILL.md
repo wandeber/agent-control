@@ -87,12 +87,20 @@ invalidates the dependent approvals; unchanged valid approval is reusable.
    coordinator decisions. Do not write worker artifacts or reconstruct reports.
 
 Keep the launching turn open while any supervised work remains. Use `run_wait`
-with the last processed cursor and renewable one-hour MCP waits below the
-client deadline. The bundled Codex server allows 3,700 seconds for a one-hour
-wait. Use indefinite waits only in the CLI/internal runtime or on a host whose
-support is explicitly verified; an internal timeout cannot extend a client
-deadline. Answer new user messages in commentary,
-including other topics, then resume the wait. Preserve every active run and
+with `timeout_ms: 3600000` (one hour) on initial entry and reentry. Only an explicit
+user request for a shorter timeout or permission to choose it allows a lower
+value. Do not lengthen it without a user instruction or a concrete reason within
+granted discretion. Preserve that accepted
+policy. This is a minimum configured timeout, not a minimum elapsed wait:
+actionable events, failures, blockers and completion return early. The bundled
+Codex server allows 3,700 seconds for the default one-hour call.
+Outer async yields and UI responsiveness do not shorten the inner timeout;
+follow `flow-runner` to resume the same pending call without duplicates. Report
+a host deadline below one hour instead of silently shortening the wait without
+user authorization.
+Answer new user messages in commentary, including other topics. If the call
+was interrupted, resume the same run and observer with the durable processed
+cursor and the accepted timeout policy; otherwise resume the existing call. Preserve every active run and
 independent cursor. Notification delivery cannot reliably awaken an ended Codex
 turn. The same rule applies to a separate coordinator with pending supervision.
 A concise update may end with a localized sentence such as: "The development
