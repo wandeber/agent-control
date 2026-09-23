@@ -124,7 +124,7 @@ prompts:
 roles:
   analyst:
     backend: codex-cli
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     model_provider: openai
     reasoning_effort: max
     prompt_ref: analyst_role

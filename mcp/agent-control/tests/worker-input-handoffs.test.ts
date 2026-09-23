@@ -24,9 +24,9 @@ describe("worker launch input handoffs", () => {
       "--prompt-file", CANONICAL_PROMPT_FILE, "--phase", "analysis",
       "--output-artifact", OUTPUT_ARTIFACT, "--no-watch"
     ], { from: "user" });
-    expect(harness.registerAgent).toHaveBeenCalledWith(expect.objectContaining({ backend: "codex-thread", model: "gpt-5.6-luna" }));
+    expect(harness.registerAgent).toHaveBeenCalledWith(expect.objectContaining({ backend: "codex-thread", model: "gpt-6-luna" }));
     expect(harness.startAgent).toHaveBeenCalledWith(expect.objectContaining({
-      model: "gpt-5.6-luna", metadata: { reasoning_effort: "max" }, server: undefined
+      model: "gpt-6-luna", metadata: { reasoning_effort: "max" }, server: undefined
     }));
   });
 

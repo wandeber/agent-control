@@ -181,12 +181,12 @@ describe("agent definition presentation", () => {
       ...inventory,
       models: [
         { id: "gpt-6-astra", model_provider: "openai", supported_reasoning_efforts: ["medium", "max"], available: true, catalog_available: true, run_validation_required: false },
-        { id: "gpt-5.6-luna", model_provider: "openai", supported_reasoning_efforts: ["low", "max"], available: true, catalog_available: true, run_validation_required: false }
+        { id: "gpt-6-luna", model_provider: "openai", supported_reasoning_efforts: ["low", "max"], available: true, catalog_available: true, run_validation_required: false }
       ],
       providers: [{ id: "openai", available: true }]
     };
     const draft = createAgentDraft(withLuna, [definition]);
-    expect([draft.model_provider, draft.model, draft.reasoning_effort]).toEqual(["openai", "gpt-5.6-luna", "max"]);
+    expect([draft.model_provider, draft.model, draft.reasoning_effort]).toEqual(["openai", "gpt-6-luna", "max"]);
     expect(definition.model).toBe("model-1");
   });
 

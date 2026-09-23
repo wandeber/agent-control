@@ -35,6 +35,7 @@ const DEFAULT_UNIX_SOCKET_PATH = join(process.env.HOME ?? "", ".codex/app-server
 const connectionRecovery = new ConnectionRecovery();
 const TURN_START_TIMEOUT_MS = 3_000;
 const ROLLOUT_COMPATIBILITY_ERROR = /does not start with session metadata/i;
+const PAGINATED_HISTORY_ERROR = /paginated threads do not support thread\/read\(includeTurns=true\)/i;
 
 const CAPABILITIES: AgentCapabilities = {
   canInterrupt: true,
@@ -480,10 +481,10 @@ async function startTurnOnLoadedThread(
   let preserveActivePolicy = false;
   if (accessStore) {
     try {
-      const current = await client.request("thread/read", { threadId: data.thread_id, includeTurns: true }) as { thread?: ThreadRecord };
+      const current = await readThreadThroughClient(client, data);
       // A continuation can steer an active turn. Keep its current permissions;
       // requested changes belong to the next actual turn boundary.
-      preserveActivePolicy = !current.thread || current.thread.status.type === "active" || latestTurnOf(current.thread)?.status === "inProgress";
+      preserveActivePolicy = current.status.type === "active" || latestTurnOf(current)?.status === "inProgress";
     } catch { preserveActivePolicy = true; }
     if (preserveActivePolicy) overrides = null;
   }
@@ -582,11 +583,37 @@ async function readThread(data: CodexThreadHandleData, allowHistoryFallback = fa
 }
 
 async function readThreadThroughClient(client: CodexAppServerClient, data: CodexThreadHandleData): Promise<ThreadRecord> {
+  try {
+    const result = await client.request("thread/read", { threadId: data.thread_id, includeTurns: true });
+    return readThreadFromResponse(result, "thread/read");
+  } catch (error) {
+    if (!(error instanceof Error) || !PAGINATED_HISTORY_ERROR.test(error.message)) throw error;
+  }
+  // Newer Codex histories require explicit pagination. Reading must never resume
+  // the worker, and every page is needed to preserve chronological message order.
   const result = await client.request("thread/read", {
     threadId: data.thread_id,
-    includeTurns: true
+    includeTurns: false
   });
-  return readThreadFromResponse(result, "thread/read");
+  const thread = readThreadFromResponse(result, "thread/read");
+  const turns: TurnRecord[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.request("thread/turns/list", {
+      threadId: data.thread_id, limit: 50, sortDirection: "asc", itemsView: "full", cursor
+    }) as { data?: TurnRecord[]; nextCursor?: string | null };
+    if (!Array.isArray(page.data) || (page.nextCursor != null && typeof page.nextCursor !== "string")) {
+      throw new ControllerError("Invalid Codex thread/turns/list response.", "tool_error");
+    }
+    turns.push(...page.data);
+    cursor = page.nextCursor ?? undefined;
+    if (cursor !== undefined) {
+      if (seenCursors.has(cursor)) throw new ControllerError("Codex thread/turns/list repeated a cursor.", "tool_error");
+      seenCursors.add(cursor);
+    }
+  } while (cursor !== undefined);
+  return { ...thread, turns };
 }
 
 async function resumeThread(client: CodexAppServerClient, data: CodexThreadHandleData): Promise<ThreadRecord> {
@@ -727,7 +754,7 @@ export class CodexAppServerClient {
     // needs to keep a long transcript stream in memory.
     await this.request("initialize", {
       clientInfo: { name: "agent-control", title: "Agent Control", version: "0.1.0" },
-      capabilities: null
+      capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
   }

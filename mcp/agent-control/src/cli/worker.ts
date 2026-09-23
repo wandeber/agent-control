@@ -241,8 +241,8 @@ export async function launchWorker(options: WorkerLaunchOptions, deps: CliDeps):
   assertReadableFiles([...inputArtifacts.map((artifact) => artifact.path), ...attachments]);
 
   const agentId = options.agentId ?? options.agent;
-  const model = options.model ?? (!agentId && options.backend === "codex-thread" ? "gpt-5.6-luna" : undefined);
-  const reasoningEffort = options.reasoningEffort ?? (options.backend === "codex-thread" && model === "gpt-5.6-luna" ? "max" : undefined);
+  const model = options.model ?? (!agentId && options.backend === "codex-thread" ? "gpt-6-luna" : undefined);
+  const reasoningEffort = options.reasoningEffort ?? (options.backend === "codex-thread" && (model === "gpt-6-luna" || model === "gpt-5.6-luna") ? "max" : undefined);
   const owner = prepareLaunchOwner(deps.controller, { title: options.runTitle ?? options.title, repoDir,
     runId: options.runId ?? options.run ?? (agentId ? deps.controller.getAgent(agentId).run_id : undefined),
     agentToken: options.agentToken ?? auth.agentToken, adminKey: auth.adminKey, requesterThreadId: options.requesterThreadId });

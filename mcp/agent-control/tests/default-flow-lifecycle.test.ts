@@ -27,7 +27,7 @@ vi.mock("../src/core/agent-definition-inventory.js", async importOriginal => ({
     inherited_developer_instructions: "", inventory_revision: "fixture", refreshed_at: "2026-09-13T00:00:00.000Z",
     runtime: { executable: "/fixture/codex", version: "fixture", compatible: true },
     providers: [{ id: "openai", available: true }],
-    models: ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"].map(id => ({ id, model_provider: "openai", supported_reasoning_efforts: ["high", "xhigh", "max"], available: true, catalog_available: true, run_validation_required: false })),
+    models: ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"].map(id => ({ id, model_provider: "openai", supported_reasoning_efforts: ["high", "xhigh", "max"], available: true, catalog_available: true, run_validation_required: false })),
     plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "Agent Control", required: true, available: true, enabled_by_default: true, bundled_skills: [], bundled_mcp_servers: [{ name: REQUIRED_AGENT_CONTROL_MCP }], bundled_apps: [] }],
     skills: [], mcp_servers: [{ name: REQUIRED_AGENT_CONTROL_MCP, required: true, available: true, enabled_by_default: true }], apps: []
   })

@@ -120,13 +120,13 @@ describe("development-flow-v1 responsibility and routing parity", () => {
       expect(effective.roles?.[name]).toMatchObject({ backend: "codex-cli", model_provider: "openai", resolved_agent: { definition: { capabilities_mode: "inherit" } } });
     }
     expect(Object.keys(raw.prompts ?? {}).filter(name => name.startsWith("role_"))).toEqual(["role_analyst"]);
-    expect(effective.roles?.final_reviewer).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
+    expect(effective.roles?.final_reviewer).toMatchObject({ model: "gpt-6-sol", reasoning_effort: "xhigh" });
     expect(record.steps.context.role).toBe("context");
     expect(record.steps.analysis.role).toBe("analyst");
     expect(record.steps.plan_review.role).toBe("analyst");
-    expect(effective.roles?.context).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "max" });
-    expect(effective.roles?.validator).toMatchObject({ model: "gpt-5.6-luna", reasoning_effort: "high" });
-    for (const name of ["planner", "implementer", "integrator"]) expect(effective.roles?.[name]).toMatchObject({ model: "gpt-5.6-sol", reasoning_effort: "xhigh" });
+    expect(effective.roles?.context).toMatchObject({ model: "gpt-6-luna", reasoning_effort: "max" });
+    expect(effective.roles?.validator).toMatchObject({ model: "gpt-6-luna", reasoning_effort: "high" });
+    for (const name of ["planner", "implementer", "integrator"]) expect(effective.roles?.[name]).toMatchObject({ model: "gpt-6-sol", reasoning_effort: "xhigh" });
     expect(record.steps.integration.role).toBe("integrator");
   });
 });

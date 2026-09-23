@@ -18,6 +18,8 @@ describe("CodexThreadAdapter", () => {
   let oldStdioCommand: string | undefined;
   let oldCompatibilityCommand: string | undefined;
   let oldRequestLog: string | undefined;
+  let paginatedPages: Array<{ data: unknown[]; nextCursor: string | null }> | undefined;
+  let historyReadError: string | undefined;
 
   function wireMockServer(
     target: WebSocketServer,
@@ -47,6 +49,16 @@ describe("CodexThreadAdapter", () => {
           return;
         }
         if (message.method === "initialized") {
+          return;
+        }
+        if (message.method === "thread/turns/list" && paginatedPages) {
+          const index = message.params.cursor === undefined ? 0 : Number(message.params.cursor);
+          socket.send(JSON.stringify({ id: message.id, result: paginatedPages[index] }));
+          return;
+        }
+        if (message.method === "thread/read" && message.params.includeTurns && (paginatedPages || historyReadError)) {
+          socket.send(JSON.stringify({ id: message.id, error: { code: -32600,
+            message: historyReadError ?? "paginated threads do not support thread/read(includeTurns=true)" } }));
           return;
         }
         if (message.method === "thread/start") {
@@ -165,6 +177,8 @@ describe("CodexThreadAdapter", () => {
     oldRequestLog = process.env.REQUEST_LOG;
     requests = [];
     authHeaders = [];
+    paginatedPages = undefined;
+    historyReadError = undefined;
     server = new WebSocketServer({ port: 0 });
     await new Promise<void>((resolve) => server.once("listening", resolve));
     const address = server.address() as AddressInfo;
@@ -217,6 +231,40 @@ describe("CodexThreadAdapter", () => {
       expect(requests.filter((request) => request.method === "thread/read")).toHaveLength(2);
       expect(requests.some((request) => ["thread/start", "turn/start", "thread/resume"].includes(request.method))).toBe(false);
     } finally { clock.mockRestore(); }
+  });
+
+  it("reads every paginated history page in order without resuming the worker", async () => {
+    paginatedPages = [
+      { data: [{ id: "older", status: "completed", items: [{ id: "a", type: "agentMessage", text: "Earlier" }] }], nextCursor: "1" },
+      { data: [{ id: "latest", status: "failed", items: [{ id: "b", type: "agentMessage", text: "Latest" }] }], nextCursor: null }
+    ];
+    const adapter = new CodexThreadAdapter();
+    const handle: AgentHandle = { backend: "codex-thread", id: "thread-1", data: { thread_id: "thread-1", app_server_url: appServerUrl } };
+    expect((await adapter.readLatest(handle, { limit: 2 })).map(message => message.text)).toEqual(["Earlier", "Latest"]);
+    expect((await adapter.readLatest(handle, { limit: 1 })).map(message => message.text)).toEqual(["Latest"]);
+    expect(await adapter.getStatus(handle)).toMatchObject({ status: "failed", data: { latestTurnId: "latest" } });
+    expect(requests.find(request => request.method === "initialize")?.params.capabilities).toEqual({ experimentalApi: true });
+    expect(requests.filter(request => request.method === "thread/turns/list").map(request => request.params)).toEqual(
+      Array.from({ length: 3 }, () => [
+        { threadId: "thread-1", limit: 50, sortDirection: "asc", itemsView: "full" },
+        { threadId: "thread-1", limit: 50, sortDirection: "asc", itemsView: "full", cursor: "1" }
+      ]).flat()
+    );
+    expect(requests.some(request => ["thread/start", "thread/resume", "turn/start"].includes(request.method))).toBe(false);
+  });
+
+  it("does not hide unrelated history read errors behind pagination", async () => {
+    historyReadError = "permission denied";
+    const adapter = new CodexThreadAdapter();
+    await expect(adapter.readLatest({ backend: "codex-thread", id: "thread-1", data: { thread_id: "thread-1", app_server_url: appServerUrl } }, { limit: 1 })).rejects.toThrow("permission denied");
+    expect(requests.some(request => request.method === "thread/turns/list")).toBe(false);
+  });
+
+  it("rejects repeated history cursors instead of looping or returning partial history", async () => {
+    paginatedPages = [{ data: [], nextCursor: "1" }, { data: [], nextCursor: "1" }];
+    const adapter = new CodexThreadAdapter();
+    await expect(adapter.readLatest({ backend: "codex-thread", id: "thread-1", data: { thread_id: "thread-1", app_server_url: appServerUrl } }, { limit: 1 })).rejects.toThrow("repeated a cursor");
+    expect(requests.filter(request => request.method === "thread/turns/list")).toHaveLength(2);
   });
 
   it("resumes an unloaded thread before starting a new turn", async () => {

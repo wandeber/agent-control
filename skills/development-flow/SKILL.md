@@ -161,12 +161,12 @@ contract and current revision; never infer approval from a timeout, a worker's
 
 ## Phase And Evidence Policy
 
-Context uses a separate Luna `max` researcher. Analysis uses Astra `xhigh`, and
+Context uses a separate GPT-6 Luna `max` researcher. Analysis uses Astra `xhigh`, and
 the same analyst reviews the plan. The exact planner reviews implementation until
 its first approval. Integration consolidates external deliveries, including a
 single worktree; already consolidated inline work skips that phase.
 Mechanical Validation is a separate no-edit phase. The independent expert starts
-with clean context on Sol `xhigh` and remains the same owner through corrections.
+with clean context on GPT-6 Sol `xhigh` and remains the same owner through corrections.
 
 The first planner approval is permanent history; expert or UAT corrections go
 through affected validation and back to the same expert without another planner

@@ -8,7 +8,7 @@ The UI shows reported tokens and estimated USD costs per agent and per model,
 with a run total in Run Info. Prices are bundled for offline use and can be
 overridden globally or per project. See [token costs and pricing configuration](docs/pricing.md).
 
-Standalone workers default to Codex with `gpt-5.6-luna` and `max` reasoning.
+Standalone workers default to Codex with `gpt-6-luna` and `max` reasoning.
 The bundled development agents use managed Codex CLI with public OpenAI models
 selected by role, and inherit the user's general capabilities. The development
 flow references these agents while keeping its analyst inline. OpenCode remains
@@ -987,7 +987,7 @@ for an existing canonical prompt. Workflow callers can still require a report:
 agentctl worker launch \
   --backend codex-thread \
   --repo /path/to/repo \
-  --model gpt-5.6-luna \
+  --model gpt-6-luna \
   --reasoning-effort max \
   --title "Implementation" \
   --phase implementation \
@@ -1148,7 +1148,7 @@ Relative prompt files resolve from their selected package. No MCP restart is nee
 
 ```toml
 [flows.development-flow-v1.planner]
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 reasoning_effort = "xhigh"
 ```
 

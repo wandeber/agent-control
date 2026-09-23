@@ -20,13 +20,13 @@ describe("flow config loader", () => {
         if (role === "orchestrator") continue;
         expect(settings.backend).toBe(name === "development-flow-v1" ? "codex-cli" : "codex-thread");
         if (role === "final_reviewer" || (name === "development-flow-v1" && ["planner", "implementer", "integrator"].includes(role))) {
-          expect(settings.model).toBe("gpt-5.6-sol");
+          expect(settings.model).toBe("gpt-6-sol");
           expect(settings.reasoning_effort).toBe("xhigh");
         } else if (name === "development-flow-v1" && role === "analyst") {
           expect(settings.model).toBe("gpt-6-astra");
           expect(settings.reasoning_effort).toBe("xhigh");
         } else {
-          expect(settings.model).toBe("gpt-5.6-luna");
+          expect(settings.model).toBe("gpt-6-luna");
           expect(settings.reasoning_effort).toBe(name === "development-flow-v1" && role === "validator" ? "high" : "max");
         }
       }

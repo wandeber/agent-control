@@ -252,7 +252,7 @@ function normalizeAgentName(value: string): string {
 }
 
 export function createAgentDraft(inventory: AgentDefinitionInventoryResult, agents: AgentDefinition[]): AgentDefinitionEditable {
-  const preferredModel = inventory.models.find(item => item.id === "gpt-5.6-luna" && item.model_provider === "openai" && item.available && item.supported_reasoning_efforts.includes("max"));
+  const preferredModel = inventory.models.find(item => item.id === "gpt-6-luna" && item.model_provider === "openai" && item.available && item.supported_reasoning_efforts.includes("max"));
   const model = preferredModel ?? inventory.models.find(item => item.available);
   const provider = inventory.providers.find(item => item.id === model?.model_provider && item.available)
     ?? inventory.providers.find(item => item.available);

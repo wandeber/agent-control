@@ -42,6 +42,19 @@ describe("token cost estimates", () => {
 });
 
 describe("pricing configuration and run aggregation", () => {
+  it.each([
+    ["gpt-6-sol", { input_per_million: 2, cached_input_per_million: .2, cache_write_input_per_million: 2.5, output_per_million: 10 }, .71],
+    ["gpt-6-luna", { input_per_million: .1, cached_input_per_million: .01, cache_write_input_per_million: .125, output_per_million: .5 }, .0355]
+  ] as const)("prices %s at its Standard API rate without losing historical model rates", (model, expectedRates, expectedTotal) => {
+    const home = temp();
+    const result = buildRunCosts([agent("new", { model })], new Map([["new", usage({ model })]]), null, home);
+    expect(result.agents[0]?.rates).toEqual(expectedRates);
+    expect(result.total.total.partial).toBe(false);
+    expect(result.total.total.usd).toBeCloseTo(expectedTotal);
+    expect(loadPricing(null, home).models["gpt-5.6-sol"]?.output_per_million).toBe(20);
+    expect(loadPricing(null, home).models["gpt-5.6-luna"]?.output_per_million).toBe(1.2);
+  });
+
   it("serves identical costs across refreshes and applies edited project rates through the real dashboard", async () => {
     const root = temp(); vi.stubEnv("AGENT_CONTROL_HOME", root); mkdirSync(join(root, ".agents"));
     const store = new SqliteStore(":memory:"), controller = new AgentController(store, createDefaultAdapterRegistry());

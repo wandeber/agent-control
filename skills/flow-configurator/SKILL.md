@@ -9,7 +9,7 @@ Use the deterministic runtime helper, relative to this skill directory:
 
 ```bash
 node "$SKILL_DIR/scripts/flow-model-configurator.mjs" list --project /absolute/project --flow development-flow-v1
-node "$SKILL_DIR/scripts/flow-model-configurator.mjs" set --project /absolute/project --flow development-flow-v1 --set planner.model=gpt-5.6-sol --set planner.reasoning_effort=xhigh
+node "$SKILL_DIR/scripts/flow-model-configurator.mjs" set --project /absolute/project --flow development-flow-v1 --set planner.model=gpt-6-sol --set planner.reasoning_effort=xhigh
 ```
 
 The helper uses the same catalog and TOML resolver as launches. It writes only model
@@ -25,7 +25,7 @@ ancestor `.agents` directory, or the provided directory.
 
 ```toml
 [flows.development-flow-v1.planner]
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 reasoning_effort = "xhigh"
 ```
 
