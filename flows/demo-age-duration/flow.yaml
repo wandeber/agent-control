@@ -89,7 +89,7 @@ roles:
     description: Turns the verified duration into a compact answer for the user.
   final_reviewer:
     backend: ${DEMO_AGE_FINAL_REVIEW_BACKEND:-codex-thread}
-    model: gpt-6-sol
+    model: gpt-6.1-sol
     reasoning_effort: xhigh
     agent_lifecycle: reuse
     prompt_ref: role_final_reviewer

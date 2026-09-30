@@ -166,7 +166,7 @@ the same analyst reviews the plan. The exact planner reviews implementation unti
 its first approval. Integration consolidates external deliveries, including a
 single worktree; already consolidated inline work skips that phase.
 Mechanical Validation is a separate no-edit phase. The independent expert starts
-with clean context on GPT-6 Sol `xhigh` and remains the same owner through corrections.
+with clean context on GPT-6.1 Sol `xhigh` and remains the same owner through corrections.
 
 The first planner approval is permanent history; expert or UAT corrections go
 through affected validation and back to the same expert without another planner

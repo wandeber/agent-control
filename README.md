@@ -1148,7 +1148,7 @@ Relative prompt files resolve from their selected package. No MCP restart is nee
 
 ```toml
 [flows.development-flow-v1.planner]
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 reasoning_effort = "xhigh"
 ```
 

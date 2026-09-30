@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-09-23T00:00:00.000Z",
+  "updated_at": "2026-09-30T00:00:00.000Z",
   "agents": [
     {
       "key": "development-context",
@@ -27,7 +27,7 @@
       "definition_id": "0393a9f4-da96-5a4e-998d-1801d751a087",
       "name": "Planner",
       "description": "Create an executable plan and validate implementation against that plan.",
-      "model": "gpt-6-sol",
+      "model": "gpt-6.1-sol",
       "model_provider": "openai",
       "reasoning_effort": "xhigh",
       "instructions_path": "development/planner.md"
@@ -37,7 +37,7 @@
       "definition_id": "68d9b6c3-932a-516f-a54d-5080cb1aebe1",
       "name": "Implementer",
       "description": "Implement scoped changes and prepare optional user testing.",
-      "model": "gpt-6-sol",
+      "model": "gpt-6.1-sol",
       "model_provider": "openai",
       "reasoning_effort": "xhigh",
       "instructions_path": "development/implementer.md"
@@ -47,7 +47,7 @@
       "definition_id": "7a90f1ac-3348-5055-83e0-78e0208e8290",
       "name": "Integrator",
       "description": "Consolidate accepted deliveries while preserving scope and unrelated work.",
-      "model": "gpt-6-sol",
+      "model": "gpt-6.1-sol",
       "model_provider": "openai",
       "reasoning_effort": "xhigh",
       "instructions_path": "development/integrator.md"
@@ -67,7 +67,7 @@
       "definition_id": "e317dd91-d2ed-5cbb-8c6b-c12307f5bab8",
       "name": "Final Reviewer",
       "description": "Independently review the complete result and follow corrections to resolution.",
-      "model": "gpt-6-sol",
+      "model": "gpt-6.1-sol",
       "model_provider": "openai",
       "reasoning_effort": "xhigh",
       "instructions_path": "development/final-reviewer.md"

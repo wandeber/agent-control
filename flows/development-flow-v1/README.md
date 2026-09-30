@@ -233,8 +233,8 @@ Decision `owner: requester` preserves the original conversation separately
 from the executing coordinator. `authority` distinguishes coordinator judgment
 from an actual user decision; ownership determines which thread may record it.
 
-Model defaults align with HDT: Context Luna `max`, Analyst Astra `xhigh`,
-Planner/Implementer/Integrator/Final reviewer Sol `xhigh`, Validator Luna `high`.
+Model defaults align with HDT: Context GPT-6 Luna `max`, Analyst Astra `xhigh`,
+Planner/Implementer/Integrator/Final reviewer GPT-6.1 Sol `xhigh`, Validator GPT-6 Luna `high`.
 Override model/provider/effort per role through `.agents/models.toml` using
 `[flows.development-flow-v1.<role>]`. Environment model variables are not used.
 
