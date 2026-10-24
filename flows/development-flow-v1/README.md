@@ -1,6 +1,6 @@
 # Development Flow v1
 
-Version 1.3.0 uses the reusable development agents included in Agent Control.
+Version 1.3.3 uses the reusable development agents included in Agent Control.
 The analyst remains a complete inline example, initially identical to the
 bundled Analyst. The workflow follows HDT's responsibility and
 evidence model; HDT stays independent and does not consume this catalog.
@@ -95,26 +95,24 @@ for the common question-interface contract.
 | Clarification | User request, prior decisions, applicable constraints | Durable acceptance revision with no unresolved material user choice | Original conversation | Before launch; repository facts go to Context |
 | Context | Acceptance and actual repository | Grounded Context document with source pointers | Separate context researcher | Refresh only affected factual gaps |
 | Analysis | Acceptance and Context | Solution decisions, invariants, boundaries, risks | Analyst | Corrections amend decisions; material user ambiguity returns to clarification |
-| Analysis intent | Current Analysis and accepted user intent | Recorded content-bound intent decision | Original clarification owner | Narrow intention check; no second technical review |
-| Planning | Intent-approved Analysis | Stable package/section IDs, dependencies, paths, interfaces, affected mechanical gate | Planner | Wrong solution returns to Analysis |
+| Planning | Completed Analysis and current acceptance | Stable package/section IDs, dependencies, paths, interfaces, affected mechanical gate | Planner | Wrong solution returns to Analysis |
 | Plan intent | Current Plan and Analysis | Strict composed plan-review receipt | Exact analyst | First review full; later changed/dependent sections and findings |
 | Human plan approval | Exact analyst-approved Plan and registered package manifest | One recorded user decision bound to both digests | Original conversation | Reuse valid explicit approval; changed plan repeats analyst and human gates |
 | Implementation | Exact approved plan/projections, registered packages, and causal corrections | All required current deliveries accepted, no active branches, focused check evidence | Implementer | Broken plan returns to Planning; only scoped changes |
 | Integration | Exact accepted delivery group and approved interfaces | Verified binding of the group to the consolidated current result | Dedicated integrator | Required for every nonempty external package group; skipped for inline work |
-| Focused validation | Known correction bundle and affected boundaries | Controlled narrow recheck receipts | Validator, no-edit | Only on correction; cannot satisfy complete closure |
-| Complete validation | Current checkpoint and complete affected closure | GREEN controlled/reused receipts with paths, consumers, mandatory gates, risks | Validator, no-edit | Run once per relevant coherent result; failures return as a bundle |
-| Implementation intent | GREEN complete gate and exact approved Plan | Strict conformance receipt and first-approval milestone | Exact planner | Skip after first approval unless explicitly requested again |
+| Validation | Current checkpoint, pending corrections, and complete affected closure | Accepted controlled receipts with paths, consumers, mandatory gates, risks | Validator, no-edit | Initial work and corrections use this same phase; unresolved failures return as a bundle |
+| Implementation intent | Accepted complete gate and exact approved Plan | Strict conformance receipt and first-approval milestone | Exact planner | Skip after first approval unless explicitly requested again |
 | UAT choice | Existing user preference or one concise question | Recorded `prepare` / `skip` | Original conversation | Apply already expressed preference without asking again |
-| UAT preparation | Validated result and selected experience | Structured access/steps; optional useful guide; no product edits | Implementer | Only when selected; result defects return to Implementation, plan defects to Planning |
-| UAT observation | User's actual observations | Recorded acceptance, correction, explicit skip, or blocker | Original conversation | Preparation and elapsed time never imply approval |
+| UAT | Validated result and selected experience | Access/steps, optional guide, and actual user observations | Implementer; original conversation records the answer | One phase prepares and waits; each attempt requires its own recorded acceptance, correction, skip, or blocker |
 | Independent review | Current acceptance, exact Plan, result, mechanical evidence | Strict full/incremental expert receipt with complete finding dispositions | New independent expert first; exact same expert thereafter | Earliest useful correction route; no automatic second review under single-review instruction |
 | Closure | Current expert + complete validation evidence and earlier gates | Provider-verified closure receipt bound to unchanged result | Runtime verification requested by coordinator | Stale mechanical evidence returns to Validation; unchanged approved result can reuse the expert receipt |
 
 Context has its own researcher; Analysis and plan-intent review share the exact
-analyst. The clarification-owner
-analysis-intent gate is retained as an additional user-intent safeguard. There
-is one independent heavy reviewer. Coordinator decision steps are separate
-flow states without delegated workers.
+analyst. A ready Analysis proceeds directly to Planning without coordinator
+review or approval. Context resolves material user questions early; Analysis
+can ask further questions before committing to a solution. There is one
+independent heavy reviewer. Coordinator decision steps are separate flow
+states without delegated workers.
 
 ## Corrections And Reuse
 
@@ -186,10 +184,12 @@ snapshots and sanitizes controlled output. Technical no-edit capability must be
 reported separately from instructions to avoid editing.
 
 Use the `flow_evidence` top-level `key` to register final receipt aliases:
-`plan_review`, `implementation_review`, `final_review`, `validation`,
-`focused_validation`, and `closure`. Preparation/delta receipts use separate
-keys and cannot replace a final approval alias. Controlled checks use
-`coverage.validation_mode: focused` or `complete_gate`.
+`plan_review`, `implementation_review`, `final_review`, `validation`, and
+`closure`. Preparation/delta receipts and optional diagnostic receipts use
+separate keys and cannot replace a final approval alias. Within Validation,
+controlled checks may use `coverage.validation_mode: focused` for diagnosis;
+its final report requires `complete_gate` evidence. No separate focused phase
+or mandatory focused pass is required.
 
 A report contains a compact `result.evidence_receipt_id` when its selected route
 requires evidence. The runtime binds the receipt's actor, gate, flow, acceptance,
@@ -202,14 +202,27 @@ Use tests that protect material behavior and reuse adequate coverage. No TDD,
 mandatory RED phase, one test per requirement, or duplicate higher-level suite
 is implied. Do not add production seams solely for tests without justification.
 
-Validate coherent batches. Focused rechecks diagnose known failures; complete
-gates cover affected packages, transitive consumers, mandatory checks, and
-material risks. Resolve reusable expensive checks together, execute misses,
+Validate coherent batches in one Validation phase, including after corrections.
+Use focused rechecks when useful to diagnose known failures; complete evidence
+covers affected packages, transitive consumers, mandatory checks, and material
+risks. Preserve pending findings and checkpoint lineage across returns to this
+phase; a partial check does not mark the whole result validated. Resolve reusable expensive checks together, execute misses,
 and join required outcomes. Reuse requires exact declared identity, intact
 GREEN results, non-volatility, and verified provenance. Do not create extra
 checks or records solely to populate a cache. Parallel execution is appropriate
 only for disjoint mutable resources; keep shared ports, databases, locks, and
 build outputs sequential.
+
+Complete-run test failures that all pass in isolation do not block progress or
+require another complete run. `validation_resolve_isolated_tests` combines the
+original complete failed receipt with executed passing focused receipts for the
+same result. Its `accepted_with_isolated_test_passes` conclusion can advance
+through the normal guarded routes; raw command failures and exit codes remain
+unchanged. The canonical resolution contract requires every failed case to have
+passing isolated evidence. No new waiver or root-cause proof is required. Do not
+weaken assertions or skip tests; missing coverage, non-test failures and failures
+that persist in isolation still need resolution. This is separate from caching
+GREEN command receipts and never turns failed executions into reusable passes.
 
 ## Coordinator Operation
 
@@ -263,7 +276,7 @@ complete input identity can be enforced. Otherwise the evidence service falls
 back to exact-result reuse. Cross-worktree portability is not a guaranteed
 optimization; use the returned effective reuse mode and provenance.
 
-Planner `record_review` supplies its current passed complete validation receipt
+Planner `record_review` supplies its current accepted complete validation receipt
 in `source_receipt_ids`. The service derives the mechanical-report fingerprint;
 the semantic draft must not invent it. A readable historical receipt provides
 lineage and findings, not authority to satisfy a current gate.

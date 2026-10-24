@@ -337,6 +337,7 @@ export interface UserQuestionRequest {
   title: string; request_key: string; questions: UserQuestionItem[];
   state: "pending" | "answered" | "cancelled"; answers: UserQuestionAnswers | null;
   created_at: string; answered_at: string | null;
+  flow_context?: { flow_instance_id: string; step_instance_id: string; step_id: string };
 }
 
 export interface PermissionRequest {

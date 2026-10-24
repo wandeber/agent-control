@@ -24,6 +24,7 @@ export interface UserQuestionRequest extends UserQuestionContent {
   question_id: string; run_id: string; agent_id: string; agent_title: string; run_title: string;
   state: "pending" | "answered" | "cancelled"; answers: UserQuestionAnswers | null;
   created_at: string; answered_at: string | null;
+  flow_context?: { flow_instance_id: string; step_instance_id: string; step_id: string };
 }
 type Row = { record_json: string; state: UserQuestionRequest["state"]; answers_json: string | null; answered_at: string | null };
 type Emit = (input: { runId: string; agentId: string; type: EventType; payload: Record<string, unknown> }) => unknown;
@@ -68,7 +69,13 @@ export class UserQuestions {
         if (record.title !== parsed.title || JSON.stringify(record.questions) !== JSON.stringify(parsed.questions)) throw new ControllerError("This request_key already identifies a different question.", "tool_error");
         return this.get(record.question_id);
       }
+      // Bind once at creation: reused agents and retries must not move a question
+      // to whichever phase happens to be active when the console reads it.
+      const origins = this.store.listFlowInstances({ runId: agent.run_id }).flatMap(flow =>
+        this.store.listFlowStepInstances(flow.flow_instance_id).filter(step => step.agent_id === agent.agent_id && step.status === "active"));
+      const origin = origins.length === 1 ? origins[0] : undefined;
       const record: UserQuestionRequest = { ...parsed, question_id: newId("question"), run_id: agent.run_id, agent_id: agent.agent_id,
+        ...(origin ? { flow_context: { flow_instance_id: origin.flow_instance_id, step_instance_id: origin.step_instance_id, step_id: origin.step_id } } : {}),
         agent_title: agent.title, run_title: run.title, state: "pending", answers: null, created_at: nowIso(), answered_at: null };
       this.store.db.prepare("insert into user_questions (question_id,run_id,agent_id,generation,request_key,record_json,state,created_at) values (?,?,?,?,?,?,?,?)")
         .run(record.question_id, record.run_id, record.agent_id, current.work_generation, record.request_key, JSON.stringify(record), record.state, record.created_at);

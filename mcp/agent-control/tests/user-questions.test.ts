@@ -30,6 +30,26 @@ function worker(title = "Design", run = controller.createRun({ title, ...auth })
 const answers = { style: { option_ids: ["light"], text: "Keep the typography calm." } };
 
 describe("durable user questions", () => {
+  it("pins the originating phase and attempt across reused agents and retries", async () => {
+    const w = worker();
+    const definition = store.createFlow({ id: "questions", initial_step: "analysis", steps: { analysis: {}, review: {} } });
+    const flow = store.createFlowInstance({ flowRecordId: definition.flow_record_id, runId: w.run.run_id });
+    const analysis = store.createFlowStepInstance({ flowInstanceId: flow.flow_instance_id, stepId: "analysis", agentId: w.agent.agent_id });
+    const first = (await controller.askUserQuestion(w.input)).question;
+    expect(first.flow_context).toEqual({ flow_instance_id: flow.flow_instance_id, step_instance_id: analysis.step_instance_id, step_id: "analysis" });
+    store.updateFlowStepInstance(analysis.step_instance_id, { status: "completed" });
+    const review = store.createFlowStepInstance({ flowInstanceId: flow.flow_instance_id, stepId: "review", agentId: w.agent.agent_id });
+    expect((await controller.askUserQuestion(w.input)).question.flow_context).toEqual(first.flow_context);
+    const next = (await controller.askUserQuestion({ ...w.input, request_key: "review-choice" })).question;
+    expect(next.flow_context?.step_instance_id).toBe(review.step_instance_id);
+    expect(controller.getUserQuestion(first.question_id, auth).flow_context).toEqual(first.flow_context);
+  });
+
+  it("leaves questions without a unique active phase unbound", async () => {
+    const w = worker();
+    expect((await controller.askUserQuestion(w.input)).question.flow_context).toBeUndefined();
+  });
+
   it("returns the actual answer to a waiting worker without starting another turn", async () => {
     const w = worker(), send = vi.spyOn(controller, "sendMessage");
     const wait = controller.askUserQuestion({ ...w.input, wait: true, timeout_ms: 2000 });

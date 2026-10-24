@@ -6,7 +6,9 @@ import { loadAgentDefinitionInventory } from "../src/core/agent-definition-inven
 import { REQUIRED_AGENT_CONTROL_PLUGIN } from "../src/core/agent-definitions.js";
 import { AgentDefinitionService } from "../src/agent-definitions.js";
 
-const fixture = vi.hoisted(() => ({ provider: "custom", artworkRoot: "", remotePlugin: false, calls: [] as Array<{ method: string; args: string[]; params?: Record<string, unknown> }> }));
+const fixture = vi.hoisted(() => ({ provider: "custom", artworkRoot: "", remotePlugin: false, appReadFails: false,
+  pluginHooks: [] as unknown, omitSurfaceMetadata: false,
+  calls: [] as Array<{ method: string; args: string[]; params?: Record<string, unknown> }> }));
 vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
   CodexAppServerClient: class {
     constructor(_url: string, _token: unknown, readonly options: { args: string[] }) {}
@@ -18,14 +20,17 @@ vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
       fixture.calls.push({ method, args, params });
       const disabled = args.some(arg => arg.startsWith("plugins="));
       switch (method) {
-        case "config/read": return { config: { model_provider: fixture.provider, model: "local-alias", plugins: { [REQUIRED_AGENT_CONTROL_PLUGIN]: { enabled: !disabled } }, model_providers: { custom: {} } } };
+        case "config/read": return { config: { model_provider: fixture.provider, model: "local-alias", plugins: { [REQUIRED_AGENT_CONTROL_PLUGIN]: { enabled: !disabled } }, model_providers: { custom: {} }, ...(fixture.appReadFails ? { apps: { "optional-app": { enabled: true } } } : {}) } };
+        case "app/read": throw new Error("Optional app metadata unavailable");
         case "skills/list": return { data: [{ skills: [{ name: "Control", path: "/fixture/control/SKILL.md", enabled: !disabled }, ...(fixture.artworkRoot ? [{ name: "Illustrated", path: join(fixture.artworkRoot, "skill/SKILL.md"), interface: { iconSmall: join(fixture.artworkRoot, "skill/icon.svg") } }] : [])] }] };
         case "plugin/list": return { marketplaces: [{ name: "agent-control", plugins: [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, name: "agent-control", installed: true, enabled: true, ...(fixture.artworkRoot ? { source: { path: fixture.artworkRoot }, interface: { composerIcon: null, logo: join(fixture.artworkRoot, "missing.svg"), logoDark: null } } : {}) }, ...(params?.marketplaceKinds?.includes("local") ? [{ id: "legacy@old-local", name: "legacy", installed: true, enabled: true }] : [{ id: "legacy@effective-remote", name: "legacy", installed: false, enabled: false }])] }, ...(fixture.remotePlugin ? [{ name: "curated-remote", plugins: [{ id: "app-alias@curated-remote", name: "app-alias", remotePluginId: "plugin_asdk_app_real", installed: true, enabled: false }] }] : [])], nextCursor: null };
         case "plugin/read": if (params?.remoteMarketplaceName === "curated-remote") {
           if (params.pluginName !== "plugin_asdk_app_real") throw new Error("Remote plugin not found");
-          return { plugin: { skills: [], mcpServers: [] } };
+          return { plugin: { skills: [], mcpServers: [],
+            ...(fixture.omitSurfaceMetadata ? {} : { hooks: fixture.pluginHooks, scheduledTasks: null }) } };
         }
-        return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }, { name: "Metadata only", path: "/fixture/missing/SKILL.md" }], mcpServers: ["agent_control"] } };
+          return { plugin: { skills: [{ name: "Control", path: "/fixture/control/SKILL.md" }, { name: "Metadata only", path: "/fixture/missing/SKILL.md" }], mcpServers: ["agent_control"],
+            ...(fixture.omitSurfaceMetadata ? {} : { hooks: fixture.pluginHooks, scheduledTasks: null }) } };
         case "model/list": return { data: [{ model: args.includes('model_provider="openai"') || fixture.provider === "openai" ? "public-model" : "custom-model", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
         default: throw new Error("Unexpected discovery request: " + method);
       }
@@ -33,9 +38,28 @@ vi.mock("../src/adapters/codex-thread-adapter.js", () => ({
   }
 }));
 const roots: string[] = [];
-afterEach(() => { vi.unstubAllEnvs(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); fixture.calls = []; fixture.artworkRoot = ""; fixture.remotePlugin = false; });
+afterEach(() => { vi.unstubAllEnvs(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); fixture.calls = []; fixture.artworkRoot = ""; fixture.remotePlugin = false; fixture.appReadFails = false; fixture.pluginHooks = []; fixture.omitSurfaceMetadata = false; });
 
 describe("configured-agent provider inventory", () => {
+  it.each([
+    ["unknown hook shape", "./hooks.json", false, ["hooks"]],
+    ["incomplete metadata", [], true, ["plugin_metadata"]]
+  ])("keeps %s fail-closed", async (_label, hooks, omit, expected) => {
+    const root = mkdtempSync(join(tmpdir(), "agent-inventory-surface-")); roots.push(root);
+    vi.stubEnv("CODEX_HOME", root); fixture.pluginHooks = hooks; fixture.omitSurfaceMetadata = omit;
+    const inventory = await loadAgentDefinitionInventory(root, true, process.execPath);
+    expect(inventory.plugins[0]?.unverified_runtime_surfaces).toEqual(expected);
+  });
+
+  it("retains configured optional apps when their display metadata request fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-inventory-app-")); roots.push(root);
+    vi.stubEnv("CODEX_HOME", root); fixture.appReadFails = true;
+    const inventory = await loadAgentDefinitionInventory(root, true, process.execPath);
+    expect(inventory.apps).toContainEqual({ id: "optional-app", name: "optional-app", available: false, enabled_by_default: true });
+    expect(fixture.calls.filter(call => call.method === "app/read")).toHaveLength(1);
+    expect(fixture.calls.some(call => call.method === "mcpServer/oauth/login")).toBe(false);
+  });
+
   it("resolves remote plugin details using the catalog identifier, including disabled installs", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-inventory-remote-")); roots.push(root);
     vi.stubEnv("CODEX_HOME", root); fixture.remotePlugin = true;

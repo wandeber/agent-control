@@ -39,6 +39,8 @@ export interface FlowVisualNode {
   inputCount: number;
   outputCount: number;
   waitingLabel?: string | null;
+  questionOriginNodeId?: string;
+  routingOriginStepId?: string;
 }
 
 export interface FlowVisualEdge {
@@ -88,9 +90,9 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
     const isCurrent = instance.status !== "completed" && instance.status !== "cancelled" && instance.current_step_id === stepId;
     nodes.set(stepNodeId(stepId), {
       id: stepNodeId(stepId),
-      kind: "step",
+      kind: step.decision?.authority === "user" ? "decision" : "step",
       title: humanizeStepId(stepId),
-      subtitle: step.role ? `${step.role} phase` : "Flow phase",
+      subtitle: step.decision?.authority === "user" ? "User question" : step.role ? `${step.role} phase` : "Flow phase",
       description: step.description ?? null,
       isCurrent,
       position: stepPosition(index),
@@ -154,7 +156,57 @@ export function buildFlowVisualModel(snapshot: DashboardSnapshot): FlowVisualMod
     }
   }
 
-  return { flow, instance, nodes: [...nodes.values()], edges };
+  const graph = addAutomaticBranches([...nodes.values()], edges);
+  for (const question of snapshot.user_questions ?? []) {
+    const origin = question.flow_context;
+    if (question.state !== "pending" || origin?.flow_instance_id !== instance.flow_instance_id) continue;
+    const attempt = snapshot.flow_steps.find(step => step.step_instance_id === origin.step_instance_id && step.flow_instance_id === instance.flow_instance_id && step.agent_id === question.agent_id && step.step_id === origin.step_id);
+    const parent = nodes.get(stepNodeId(origin.step_id));
+    if (!attempt || !parent || parent.kind === "decision") continue;
+    const id = `question:${question.question_id}`;
+    nodes.set(id, { id, kind: "decision", title: question.title, subtitle: "User question",
+      description: question.questions.map(item => [item.prompt, ...(item.options ?? []).map(option => option.label)].join("\n")).join("\n\n"),
+      isCurrent: true, position: parent.position, role: null, stepId: null, latestStep: attempt, instanceCount: 1,
+      status: "active", reportValues: question.questions.flatMap(item => (item.options ?? []).map(option => option.label)),
+      inputCount: 0, outputCount: 0, waitingLabel: "Waiting for your answer", questionOriginNodeId: parent.id });
+    graph.nodes.push(nodes.get(id)!);
+    // Answer options are not declared transitions. Show the verified origin
+    // without inventing destinations for free text or dynamically raised choices.
+    graph.edges.push({ id: `${parent.id}->${id}`, source: parent.id, target: id, label: "Question", tone: "default", transitionId: null, sourceStepId: origin.step_id });
+  }
+  return { flow, instance, ...graph };
+}
+
+/** Routing diamonds are a projection of declared exits, never runtime phases. */
+function addAutomaticBranches(nodes: FlowVisualNode[], edges: FlowVisualEdge[]) {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const branches = new Map<string, FlowVisualNode>();
+  const routedEdges = new Set<string>();
+  for (const node of nodes) {
+    if (node.kind !== "step" || !node.stepId) continue;
+    const exits = edges.filter(edge => edge.source === node.id && !edge.id.startsWith("manual:") &&
+      // Attention handoffs (including generic blockers) remain lateral exits.
+      !(byId.get(edge.target)?.kind === "notify" && byId.get(edge.target)?.role === "orchestrator"));
+    if (new Set(exits.map(edge => edge.target)).size < 2) continue;
+    const taken = exits.some(edge => edge.tone === "taken");
+    const title = `${node.title} outcome`;
+    branches.set(node.id, { ...node, id: `routing:${node.stepId}`, kind: "decision", title,
+      subtitle: "Automatic decision", description: exits.map(edge => `${edge.label.replaceAll("_", " ")} → ${byId.get(edge.target)?.title ?? edge.target}`).join("\n"),
+      routingOriginStepId: node.stepId, stepId: null, role: null, isCurrent: false,
+      status: taken ? "completed" : "planned", reportValues: exits.map(edge => edge.label),
+      waitingLabel: null, inputCount: 0, outputCount: 0 });
+    exits.forEach(edge => routedEdges.add(edge.id));
+  }
+  return {
+    nodes: nodes.flatMap(node => branches.has(node.id) ? [node, branches.get(node.id)!] : [node]),
+    edges: [
+      ...edges.map(edge => routedEdges.has(edge.id) ? { ...edge, source: branches.get(edge.source)!.id } : edge),
+      ...[...branches].map(([source, branch]): FlowVisualEdge => ({
+        id: `${source}->${branch.id}`, source, target: branch.id, label: "",
+        tone: branch.status === "completed" ? "taken" : "default", transitionId: null, sourceStepId: branch.routingOriginStepId!
+      }))
+    ]
+  };
 }
 
 function selectFlowInstance(snapshot: DashboardSnapshot): FlowInstanceRecord | null {
@@ -353,7 +405,7 @@ function targetForAction(
       input.nodes.set(id, {
         id,
         kind: "notify",
-        title: humanizeStepId(action.notify),
+        title: action.notify === "orchestrator" ? "Needs attention" : humanizeStepId(action.notify),
         subtitle: "Notification target",
         description: "Agent Control notifies this role instead of auto-routing to another phase.",
         isCurrent: false,
@@ -402,7 +454,7 @@ function virtualNodeId(kind: VirtualTargetKind, id: string): string {
 }
 
 function reportEnumValues(step: FlowStepConfigRecord): string[] {
-  const conclusion = step.report?.schema?.properties?.conclusion?.enum ?? [];
+  const conclusion = step.report?.schema?.properties?.[step.decision?.authority === "user" ? "decision" : "conclusion"]?.enum ?? [];
   return conclusion.map((value) => String(value));
 }
 
@@ -435,7 +487,7 @@ function fallbackTransitionId(sourceStepId: string | null, action: FlowStepActio
 
 function conditionLabel(condition: FlowConditionConfigRecord): string {
   if ("equals" in condition) {
-    if (condition.equals.var === "result.conclusion") {
+    if (condition.equals.var === "result.conclusion" || condition.equals.var === "result.decision") {
       return String(condition.equals.value);
     }
     if (condition.equals.var === "result.target_phase") {
@@ -461,7 +513,8 @@ function humanizeStepId(value: string): string {
     .replace(/[-_]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .replace(/\b\w/g, (match) => match.toUpperCase());
+    .replace(/\b\w/g, (match) => match.toUpperCase())
+    .replace(/\bUat\b/g, "UAT");
 }
 
 /** Build an authored graph directly; source inspection never needs a fake run. */
@@ -472,8 +525,8 @@ export function buildFlowDefinitionGraph(config: FlowConfigRecord): { nodes: Flo
   const virtualIndexes = new Map<VirtualTargetKind, number>();
   stepOrder.forEach((stepId, index) => {
     const step = config.steps[stepId]!;
-    nodes.set(stepNodeId(stepId), { id: stepNodeId(stepId), kind: "step", title: humanizeStepId(stepId),
-      subtitle: step.role ?? "Coordinator", description: step.description ?? null, isCurrent: false,
+    nodes.set(stepNodeId(stepId), { id: stepNodeId(stepId), kind: step.decision?.authority === "user" ? "decision" : "step", title: humanizeStepId(stepId),
+      subtitle: step.decision?.authority === "user" ? "User question" : step.role ?? "Coordinator", description: step.description ?? null, isCurrent: false,
       position: stepPosition(index), role: step.role ?? null, stepId, latestStep: null, instanceCount: 0,
       status: "planned", reportValues: reportEnumValues(step), inputCount: Object.keys(step.inputs ?? {}).length,
       outputCount: Object.keys(step.outputs ?? {}).length });
@@ -482,5 +535,5 @@ export function buildFlowDefinitionGraph(config: FlowConfigRecord): { nodes: Flo
     addActionEdges({ action, edges, eventName, nodes, sourceNodeId: stepNodeId(stepId), sourceStepId: stepId,
       stepIndex: stepOrder.indexOf(stepId), stepOrder, takenTransitions: new Set(), virtualIndexes });
   }
-  return { nodes: [...nodes.values()], edges };
+  return addAutomaticBranches([...nodes.values()], edges);
 }

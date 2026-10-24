@@ -31,4 +31,5 @@ write the detailed execution plan.
 Write the assigned Analysis document. A correction amends the current decision
 set and explains the changed intent; runtime snapshots preserve prior revisions.
 Return all discovered in-scope problems together. Report `ready` only when the
-solution can proceed to the clarification owner's narrow intent check.
+solution can proceed directly to Planning with no unresolved material user choice.
+The analyst owns these solution decisions; no coordinator approval is required.

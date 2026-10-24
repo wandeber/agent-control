@@ -31,6 +31,11 @@ backend. Configure provider endpoints and credentials through the Codex profile
 setup in Agent Settings. A sleeping/unreachable supervisor reports unavailable
 rather than falsely completing the task; reads never replay a task.
 
+For external-model diagnostics, distinguish the recorded selection from the
+actual request and the model's generated self-description. See
+[provider routing verification](docs/provider-routing.md) for evidence boundaries
+and the opt-in local HTTP regression test.
+
 The plugin also ships Agent Control skills:
 
 - `development-flow` for clarifying and running the bundled development workflow
@@ -255,18 +260,21 @@ require installing Agent Settings.
 
 ## Development Flow Evidence
 
-The bundled `development-flow-v1` version 1.3.0 records the current accepted
+The bundled `development-flow-v1` version 1.3.3 records the current accepted
 contract before dispatch, gathers context with a dedicated researcher and hands
-it to the analyst, checks intent with the clarification owner, and requires approval of the exact
-plan after the analyst's review. Integration is conditional; mechanical
+it to the analyst. A ready Analysis proceeds directly to Planning without
+coordinator approval; the exact plan still requires user approval after the
+analyst's review. Integration is conditional; mechanical
 validation, the planner's first result approval, optional user testing, expert
-review, and verified closure have separate transition requirements.
+review, and verified closure have separate transition requirements. Initial work
+and corrections use the same Validation phase, which reuses eligible checks
+and requires complete current coverage before success.
 
 The flow defaults to clean pre-production development, with compatibility or
 old-format data conversion only for explicit preservation requirements or confirmed
 obligations. It may plan to recreate old development data when simpler, while
 keeping normal ORM/schema migrations.
-Context and Planning surface material user choices before dependent work; the
+Context, Analysis, and Planning surface material user choices before dependent work; the
 original conversation uses the available native question interface, with text
 fallback. That design default does not authorize executing destructive database
 operations or discarding migration history or actual external contracts. See the
@@ -1181,6 +1189,26 @@ persistent and appear together in Full Console, independently of the selected
 room or chat. Pending questions also mark agent avatars, the Subagents list,
 and rooms. Users can choose an option, multiple options when requested, or
 write a free-text answer. The inbox can be collapsed without dismissing requests.
+
+Flow diagrams show declared user decisions as question diamonds with labeled
+outgoing choices, separate from work phases. Pending questions raised during
+execution attach to their recorded originating phase and attempt; reused agents
+do not move earlier questions. Requests without an unambiguous origin remain in
+the inbox. Answer options alone never invent flow transitions.
+
+Automatic routing also uses diamonds when a phase has at least two distinct
+destinations. Attention notifications to the orchestrator stay on the phase as
+lateral exits and do not create a diamond by themselves. These routing nodes
+only visualize existing transitions, preserving conditions and the route taken
+by the latest attempt; they do not add execution phases or user questions.
+
+A preference declaration can include `step_id` for an answer collected inside a
+worker phase. Only its configured conversation owner can record it while that
+phase is active. The runtime binds it to the exact step instance and acceptance
+revision; it cannot authorize another attempt. Recording it does not finish or
+restart the worker: the requester resumes that same worker to report after the
+answer is recorded. UAT uses this contract to prepare and collect user feedback
+in one phase, with transition conditions requiring the recorded answer.
 
 `question_ask` defaults to a one-hour wait returning the user's saved answers.
 Use `wait=false` for independent work and then `question_wait`; recover an

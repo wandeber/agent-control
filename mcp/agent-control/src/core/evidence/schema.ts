@@ -72,6 +72,12 @@ export const evidenceRequestSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('validation_run'), ...checkpoint, checks: z.array(validationCheckSchema),
     coverage: validationCoverageSchema, source_receipt_ids: z.array(id).default([]),
   }).strict(),
+  z.object({ operation: z.literal('validation_resolve_isolated_tests'), validation_receipt_id: id,
+    isolated_receipt_ids: z.array(id).min(1),
+    // The pinned provider validates the canonical resolution contract. This
+    // adapter binds its declarations to actual, unchanged process receipts.
+    isolated_test_resolutions: z.array(jsonObject).min(1),
+  }).strict(),
   z.object({ operation: z.literal('verify_closure'), expert_receipt_id: id, validation_receipt_id: id }).strict(),
 ]);
 export type EvidenceRequest = z.input<typeof evidenceRequestSchema>;
@@ -101,7 +107,7 @@ export const evidenceReceiptKindSchema = z.enum(['artifact', 'plan_checkpoint', 
 export type EvidenceReceiptKind = z.infer<typeof evidenceReceiptKindSchema>;
 export const evidenceReceiptSchema = z.object({
   schema_version: z.literal(1), receipt_id: id, kind: evidenceReceiptKindSchema,
-  status: z.enum(['prepared', 'approved', 'rejected', 'passed', 'failed', 'verified']),
+  status: z.enum(['prepared', 'approved', 'rejected', 'passed', 'accepted_with_isolated_test_passes', 'failed', 'verified']),
   provider: z.literal('hdt-review-checkpoint'), provider_version: z.string(), provider_sha256: digest,
   run_id: id, flow_instance_id: id, actor_id: z.string(), actor_role: z.string(), repo_path: z.string(),
   acceptance_revision: z.string(), plan_revision: z.string(),

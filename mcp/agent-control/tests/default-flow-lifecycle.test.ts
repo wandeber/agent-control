@@ -124,7 +124,7 @@ async function reviewPlan(checkpoint = "plan-1", previous?: string, approved = t
 async function toImplementation(planCorrection = false, packages: PackageSpec[] = [], planDocument = planText()) {
   await enter("context"); writeFileSync(output("context"), `# Context\nAffected files: ${Object.keys(taskPackages).join(", ")}.\n`); report({ conclusion: "ready" });
   await enter("analysis"); writeFileSync(output("analysis"), "# Analysis\nUpdate the accepted files while preserving unrelated content.\n"); report({ conclusion: "ready" });
-  expect(current().step_id).toBe("analysis_intent"); decision("analysis_intent", "approved", "analysis");
+  expect(current().step_id).toBe("planning");
   await enter("planning"); writeFileSync(output("plan"), planDocument); report({ conclusion: "ready" });
   const originalPath = artifact("plan");
   if (planCorrection) {
@@ -140,21 +140,24 @@ async function toImplementation(planCorrection = false, packages: PackageSpec[] 
 async function prepareResult(checkpoint: string, previous?: string) {
   return evidence(`checkpoint-${checkpoint}`, { operation: "prepare_result", checkpoint_id: checkpoint, plan_path: artifact("plan"), base: snapshot().runtime!.packages!.base_commit, paths: Object.keys(taskPackages), ...(previous ? { previous } : {}) });
 }
-async function validate(checkpoint = "result-1", mode: "focused" | "complete_gate" = "complete_gate", previous?: string, reuse: string[] = [], options: { requestClosure?: boolean; deferReport?: boolean } = {}) {
-  await enter(mode === "focused" ? "focused_validation" : "validation");
+async function validate(checkpoint = "result-1", mode: "focused" | "complete_gate" = "complete_gate", previous?: string, reuse: string[] = [], options: { requestClosure?: boolean; deferReport?: boolean; expectFailure?: boolean } = {}) {
+  const active = current();
+  expect(active.step_id).toBe("validation");
+  if (active.agent_id) asAgent(active.agent_id);
+  else await enter("validation");
   const existing = snapshot().runtime!.evidence[`checkpoint-${checkpoint}`];
   if (existing) {
     const source = await evidence("read-checkpoint", { operation: "read_receipt", receipt_id: existing });
     expect(source.checkpoint_id).toBe(checkpoint);
   } else await prepareResult(checkpoint, previous);
-  const receipt = await evidence(mode === "focused" ? "focused_validation" : "validation", {
+  const receipt = await evidence(mode === "focused" ? "diagnostic-validation" : "validation", {
     operation: "validation_run", checkpoint_id: checkpoint,
     checks: [{ check_id: "value-check", argv: [process.execPath, "-e", `const fs=require("node:fs"); for(const path of ${JSON.stringify(Object.keys(taskPackages))}) if(!fs.readFileSync(path,"utf8").startsWith("after")) process.exit(1)`], sandbox: "workspace", volatile: false, context_complete: true, environment_names: ["AC_FIXTURE_VALIDATION_EPOCH"] }],
     coverage: { validation_mode: mode, path_packages: taskPackages, surfaces: [...new Set(Object.values(taskPackages))].map(surface_id => ({ surface_id, kind: "package" as const, check_ids: ["value-check"], no_applicable_checks_reason: null })) }, source_receipt_ids: reuse
   });
-  expect(receipt.status).toBe("passed");
+  expect(receipt.status).toBe(options.expectFailure ? "failed" : "passed");
   if (mode === "complete_gate") lastValidation = receipt;
-  if (!options.deferReport) report({ conclusion: "passed", evidence_receipt_id: receipt.receipt_id, ...(options.requestClosure === undefined ? {} : { request_closure: options.requestClosure }) });
+  if (!options.deferReport) report({ conclusion: options.expectFailure ? "failed" : "passed", evidence_receipt_id: receipt.receipt_id, ...(options.requestClosure === undefined ? {} : { request_closure: options.requestClosure }) });
   return receipt;
 }
 function resultDraft(gate: "planner" | "expert", rework = false, successor = false) {
@@ -264,6 +267,42 @@ async function toPackageIntegration() {
 
 describe("bundled default flow with actual evidence and closure", () => {
 
+  it("closes after isolated test recovery without another complete run or user waiver", async () => {
+    writeFileSync(join(repo, "order.test.cjs"), `const { test } = require('node:test');
+const assert = require('node:assert/strict');
+let state = 0;
+test('sets shared state', () => { state = 1; });
+test('expects fresh state', () => { assert.equal(state, 0); });
+`);
+    execFileSync("git", ["-C", repo, "add", "order.test.cjs"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "fixture tests"]);
+    await toImplementation();
+    await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await enter("validation"); await prepareResult("result-1");
+    const run: Extract<EvidenceRequest, { operation: "validation_run" }> = {
+      operation: "validation_run", checkpoint_id: "result-1",
+      checks: [{ check_id: "suite", argv: [process.execPath, "--test", "order.test.cjs"], sandbox: "workspace",
+        context_complete: true, volatile: false, configuration_paths: ["order.test.cjs"] }],
+      coverage: { validation_mode: "complete_gate", path_packages: taskPackages,
+        surfaces: [{ surface_id: "work", kind: "package", check_ids: ["suite"], no_applicable_checks_reason: null }] },
+    };
+    const failed = await evidence("failed-complete", run);
+    expect(failed.status).toBe("failed");
+    run.coverage.validation_mode = "focused"; run.coverage.surfaces[0].check_ids = ["isolated"];
+    run.checks[0].check_id = "isolated";
+    run.checks[0].argv = [process.execPath, "--test", "--test-name-pattern=expects fresh state", "order.test.cjs"];
+    const isolated = await evidence("isolated", run);
+    lastValidation = await evidence("validation", { operation: "validation_resolve_isolated_tests",
+      validation_receipt_id: failed.receipt_id, isolated_receipt_ids: [isolated.receipt_id],
+      isolated_test_resolutions: [{ failed_check_id: "suite", failure_kind: "tests_only", failed_test_ids: ["expects fresh state"],
+        isolated_rechecks: [{ check_id: "isolated", test_ids: ["expects fresh state"] }] }],
+    });
+    report({ conclusion: "accepted_with_isolated_test_passes", evidence_receipt_id: lastValidation.receipt_id });
+    expect(lastValidation.summary.executed_check_count).toBe(0);
+    await planner(); await close(await expert());
+    expect(snapshot().steps.filter(step => step.step_id === "validation")).toHaveLength(1);
+  }, 30_000);
+
   it("joins two approved packages and verifies exact consolidation through closure", async () => {
     const { accepted, deliveries, approvedManifest } = await toPackageIntegration();
     const checkpoint = await prepareResult("result-1");
@@ -335,15 +374,14 @@ describe("bundled default flow with actual evidence and closure", () => {
     expect(current().step_id).toBe("planning");
   }, 60_000);
 
-  it("keeps the original requester’s analysis decision separate from its executing coordinator", async () => {
+  it("dispatches Planning with the completed Analysis and acceptance without coordinator approval", async () => {
     await enter("context"); writeFileSync(output("context"), "# Context\nFixture facts.\n"); report({ conclusion: "ready" });
     await enter("analysis"); writeFileSync(output("analysis"), "# Analysis\nPreserve accepted intent.\n"); report({ conclusion: "ready" });
-    const owners = snapshot().runtime!.decision_owners!;
-    expect(owners.requester).not.toBe(owners.orchestrator);
-    expect(() => controller.recordFlowDecision({ flowInstanceId: id, key: "analysis_intent", value: "approved", reason: "Executor claims approval", expectedRevision: snapshot().runtime!.revision, artifactDigest: artifactDigest(artifact("analysis")), agentToken: coordinator.agent_token })).toThrow(/different conversation/);
-    decision("analysis_intent", "approved", "analysis");
-    expect(snapshot().runtime!.decisions.analysis_intent).toMatchObject({ actor_id: owners.requester, authority: "coordinator", source: "coordinator_review" });
     expect(current().step_id).toBe("planning");
+    expect(snapshot().runtime!.decisions.analysis_intent).toBeUndefined();
+    await enter("planning");
+    expect(current().input_json.analysis).toBe(artifact("analysis"));
+    expect(current().input_json.runtime_contract).toMatchObject({ objective: acceptance });
   });
 
   it("executes Context through verified closure without dispatching decision workers", async () => {
@@ -363,14 +401,31 @@ describe("bundled default flow with actual evidence and closure", () => {
     expect(snapshot().steps.filter(item => item.step_id === "plan_approval")).toHaveLength(1);
   }, 60_000);
 
-  it("rechecks expert corrections with focused then complete evidence and skips the approved planner", async () => {
+  it("returns a failed diagnostic to Implementation and revalidates the corrected result", async () => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "broken\n"); report({ conclusion: "ready" });
+    await validate("result-1", "focused", undefined, [], { expectFailure: true });
+    expect(current().step_id).toBe("implementation");
+    await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    expect(current().step_id).toBe("validation");
+    await validate("result-2", "complete_gate", "result-1");
+    expect(current().step_id).toBe("implementation_review");
+  }, 60_000);
+
+  it("tracks corrections and reuses diagnostic checks within one Validation phase", async () => {
     await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
     await validate(); await planner(); const first = await expert("result-1", true);
     const originalExpert = snapshot().runtime!.owners.final_reviewer;
     await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after-corrected\n"); report({ conclusion: "ready" });
-    const focused = await validate("result-2", "focused", "result-1");
+    const correctionStep = await enter("validation");
+    expect(correctionStep.input_json.correction).toMatchObject({ from_step_id: "implementation" });
+    expect(() => report({ conclusion: "passed", evidence_receipt_id: lastValidation.receipt_id })).toThrow(/matches verification failed/i);
+    const focused = await validate("result-2", "focused", "result-1", [], { deferReport: true });
+    expect(() => report({ conclusion: "passed", evidence_receipt_id: focused.receipt_id })).toThrow(/focused/i);
+    expect(current().step_instance_id).toBe(correctionStep.step_instance_id);
     const complete = await validate("result-2", "complete_gate", "result-1", [focused.receipt_id]);
     expect(complete.summary.reused_check_count).toBe(1);
+    expect(snapshot().steps.filter(item => item.step_id === "validation")).toHaveLength(2);
+    expect(snapshot().steps.some(item => item.step_id === "focused_validation")).toBe(false);
     expect(current().step_id).toBe("final_review");
     expect(snapshot().steps.filter(item => item.step_id === "implementation_review")).toHaveLength(1);
     const approved = await expert("result-2", false, true);
@@ -416,24 +471,56 @@ describe("bundled default flow with actual evidence and closure", () => {
     if (expertOwner) expect(snapshot().runtime!.owners.final_reviewer).toBe(expertOwner);
   }, 60_000);
 
-  it.each([false, true])("prepares selected UAT with optional guide=%s and retains the real user gate", async withGuide => {
+  it.each([false, true])("keeps selected UAT in one phase with optional guide=%s and a trusted user answer", async withGuide => {
     await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
-    await validate(); await planner("prepare"); await enter("uat_preparation");
+    await validate(); await planner("prepare"); await enter("uat");
     const guide = output("uat-guide");
     if (withGuide) writeFileSync(guide, "# UAT\nOpen the preview and check the changed value.\n");
-    report({ conclusion: "ready", access_details: "Open http://localhost:3000 and check the changed value." }, withGuide ? { uat_guide: guide } : undefined);
-    expect(current().step_id).toBe("uat_review");
+    const attempt = current();
+    const uatReport = { conclusion: "ready", access_details: "Open http://localhost:3000 and check the changed value." };
+    expect(() => report(uatReport)).toThrow(/No declared transition/);
+    expect(current().step_instance_id).toBe(attempt.step_instance_id);
+    expect(() => controller.recordFlowDecision({ flowInstanceId: id, key: "uat_result", value: "approved", reason: "Worker claim", expectedRevision: snapshot().runtime!.revision })).toThrow(/conversation/);
+    decision("uat_result", "approved");
+    expect(current().step_instance_id).toBe(attempt.step_instance_id);
+    expect(snapshot().runtime!.decisions.uat_result.step_instance_id).toBe(attempt.step_instance_id);
+    expect(snapshot().runtime!.state.uat_completed).toBe(false);
+    asAgent(attempt.agent_id!);
+    report(uatReport, withGuide ? { uat_guide: guide } : undefined);
     const binding = snapshot().artifact_bindings.find(item => item.artifact_key === "uat_guide");
     expect(Boolean(binding)).toBe(withGuide);
     if (binding) expect(snapshot().runtime!.artifacts!.uat_guide.snapshot_path).not.toBe(binding.path);
-    expect(snapshot().runtime!.state.uat_completed).toBe(false);
-    decision("uat_result", "approved");
+    expect(snapshot().runtime!.state.uat_completed).toBe(true);
     expect(current().step_id).toBe("final_review");
+  }, 60_000);
+
+  it("requires a fresh user answer for a new UAT attempt and routes corrections and skips", async () => {
+    await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
+    await validate(); await planner("prepare"); await enter("uat");
+    const first = current();
+    const uatReport = { conclusion: "ready", access_details: "Open http://localhost:3000 and check the changed value." };
+    decision("uat_result", "changes_required");
+    asAgent(first.agent_id!); report(uatReport);
+    expect(current().step_id).toBe("implementation");
+    expect(snapshot().runtime!.state.uat_completed).toBe(false);
+    expect(() => decision("uat_result", "approved")).toThrow(/phase to be active/);
+    // Revisit the unchanged result to isolate attempt freshness from evidence freshness.
+    vi.stubEnv("CODEX_THREAD_ID", "executor-thread");
+    await controller.startFlowStep({ flowInstanceId: id, stepId: "uat", reason: "Repeat the same selected test with a new answer.", agentToken: coordinator.agent_token });
+    await enter("uat");
+    const second = current();
+    expect(second.step_instance_id).not.toBe(first.step_instance_id);
+    expect(() => report(uatReport)).toThrow(/No declared transition/);
+    expect(current().step_instance_id).toBe(second.step_instance_id);
+    decision("uat_result", "skip");
+    asAgent(second.agent_id!); report(uatReport);
+    expect(current().step_id).toBe("final_review");
+    expect(snapshot().runtime!.state.uat_completed).toBe(true);
   }, 60_000);
 
   it("returns a UAT preparation plan defect through analyst and human plan gates", async () => {
     await toImplementation(); await enter("implementation"); writeFileSync(join(repo, "value.txt"), "after\n"); report({ conclusion: "ready" });
-    await validate(); await planner("prepare"); await enter("uat_preparation");
+    await validate(); await planner("prepare"); await enter("uat");
     report({ conclusion: "plan_changes_needed", access_details: "The approved plan omitted the required user access route." });
     expect(current().step_id).toBe("planning");
     expect(snapshot().runtime!.state.planner_approved).toBe(true);

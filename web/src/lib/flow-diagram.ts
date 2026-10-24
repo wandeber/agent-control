@@ -2,7 +2,11 @@ import type { FlowVisualEdge, FlowVisualNode } from "./flow-graph";
 
 export const PHASE_WIDTH = 264;
 export const PHASE_HEIGHT = 80;
-export const PHASE_GAP = 60;
+export const PHASE_GAP = 76;
+export const QUESTION_HEIGHT = 156;
+export function flowNodeSize(kind: FlowVisualNode["kind"]): { width: number; height: number } {
+  return { width: PHASE_WIDTH, height: kind === "decision" ? QUESTION_HEIGHT : PHASE_HEIGHT };
+}
 export type Point = { x: number; y: number };
 export interface DiagramNode {
   id: string;
@@ -23,7 +27,7 @@ export interface DiagramRoute {
 
 export function flowDiagramEdges(nodes: FlowVisualNode[], edges: FlowVisualEdge[]): DiagramEdge[] {
   const kinds = new Map(nodes.map((node) => [node.id, node.kind]));
-  const ranks = new Map(nodes.filter((node) => node.kind === "step").map((node, index) => [node.id, index]));
+  const ranks = new Map(nodes.filter((node) => node.kind === "step" || (node.kind === "decision" && !node.questionOriginNodeId)).map((node, index) => [node.id, index]));
   const groups = new Map<string, FlowVisualEdge[]>();
   for (const edge of edges) {
     const key = `${edge.source}->${edge.target}`;
@@ -44,17 +48,20 @@ export function flowDiagramEdges(nodes: FlowVisualNode[], edges: FlowVisualEdge[
       // conditions available in the tooltip without repeating the target name.
       label: labels.map((label) => label.replace(/ \+ target .+$/, "")).filter((label, index, all) => all.indexOf(label) === index).join(" / "),
       tone: group.some((item) => item.tone === "taken") ? "taken" : edge.tone,
-      alternative: backward || (kinds.get(edge.target) === "notify" && hasPhaseExit)
+      alternative: kinds.get(edge.source) !== "decision" && (backward || (kinds.get(edge.target) === "notify" && hasPhaseExit))
     };
   });
 }
 
 export function flowDiagramPositions(nodes: FlowVisualNode[], columns = 1): Map<string, Point> {
-  const steps = nodes.filter((node) => node.kind === "step");
+  const steps = nodes.filter((node) => node.kind === "step" || (node.kind === "decision" && !node.questionOriginNodeId));
+  let nextY = 0;
   const positions = new Map(steps.map((node, index) => {
     const row = Math.floor(index / columns);
     const column = row % 2 === 0 ? index % columns : columns - 1 - index % columns;
-    return [node.id, { x: column * (PHASE_WIDTH + 116), y: row * (columns === 1 ? PHASE_HEIGHT + PHASE_GAP : 260) }] as const;
+    const y = columns === 1 ? nextY : row * (QUESTION_HEIGHT + PHASE_GAP);
+    nextY += flowNodeSize(node.kind).height + PHASE_GAP;
+    return [node.id, { x: column * (PHASE_WIDTH + 116), y }] as const;
   }));
   nodes.filter((node) => node.kind === "notify").forEach((node, index) => {
     positions.set(node.id, columns === 1
@@ -63,7 +70,11 @@ export function flowDiagramPositions(nodes: FlowVisualNode[], columns = 1): Map<
   });
   const last = positions.get(steps.at(-1)?.id ?? "") ?? { x: 0, y: 0 };
   nodes.filter((node) => node.kind === "finish").forEach((node, index) => {
-    positions.set(node.id, { x: last.x, y: last.y + (index + 1) * (PHASE_HEIGHT + PHASE_GAP) });
+    positions.set(node.id, { x: last.x, y: last.y + flowNodeSize(steps.at(-1)?.kind ?? "step").height + PHASE_GAP + index * (PHASE_HEIGHT + PHASE_GAP) });
+  });
+  nodes.filter(node => node.questionOriginNodeId).forEach((node, index) => {
+    const origin = positions.get(node.questionOriginNodeId!) ?? { x: 0, y: 0 };
+    positions.set(node.id, { x: columns * (PHASE_WIDTH + 116) + 200 + index * (PHASE_WIDTH + 80), y: origin.y });
   });
   return positions;
 }
@@ -82,13 +93,13 @@ export function routeFlowDiagram(edges: DiagramEdge[], nodes: DiagramNode[]): Di
   const returnLanes: Array<Array<{ top: number; bottom: number }>> = [];
   let rightLane = 0;
   let overheadLane = 0;
-  const wrapped = new Set(nodes.filter((node) => node.kind === "step").map((node) => node.position.x)).size > 1;
-  return edges.flatMap((edge) => {
+  const wrapped = new Set(nodes.filter((node) => node.kind === "step" || node.kind === "decision").map((node) => node.position.x)).size > 1;
+  const routes: DiagramRoute[] = edges.flatMap((edge) => {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
     if (!source || !target) return [];
     const arrivals = incoming.get(edge.target) ?? [];
-    const arrivalShift = Math.max(-target.height / 2 + 12, Math.min(target.height / 2 - 12, (arrivals.indexOf(edge) - (arrivals.length - 1) / 2) * 12));
+    const arrivalShift = target.kind === "decision" ? 0 : Math.max(-target.height / 2 + 12, Math.min(target.height / 2 - 12, (arrivals.indexOf(edge) - (arrivals.length - 1) / 2) * 12));
     const sourceCenter = { x: source.position.x + source.width / 2, y: source.position.y + source.height / 2 };
     const targetCenter = { x: target.position.x + target.width / 2, y: target.position.y + target.height / 2 };
     let points: Point[];
@@ -111,9 +122,9 @@ export function routeFlowDiagram(edges: DiagramEdge[], nodes: DiagramNode[]): Di
       returnLanes[lane]!.push(interval);
       const laneX = left - 112 - lane * 168;
       const siblings = groups.get(edge.source) ?? [];
-      const shift = (siblings.indexOf(edge) - (siblings.length - 1) / 2) * 10;
+      const shift = source.kind === "decision" ? 0 : (siblings.indexOf(edge) - (siblings.length - 1) / 2) * 10;
       const start = { x: source.position.x, y: sourceCenter.y + shift };
-      const end = { x: target.position.x, y: targetCenter.y + (source.id === target.id ? 24 : arrivalShift) };
+      const end = { x: target.position.x, y: targetCenter.y + (target.kind === "decision" ? 0 : source.id === target.id ? 24 : arrivalShift) };
       points = [start, { x: laneX, y: start.y }, { x: laneX, y: end.y }, end];
       labelPoint = { x: laneX, y: (start.y + end.y) / 2 };
     } else {
@@ -139,13 +150,29 @@ export function routeFlowDiagram(edges: DiagramEdge[], nodes: DiagramNode[]): Di
       const laneY = Math.min(...nodes.map((node) => node.position.y)) - 64 - overheadLane++ * 64;
       const sourceX = source.position.x - 32;
       const targetX = target.position.x - (source.id === target.id ? 64 : 48);
-      const start = { x: source.position.x, y: sourceCenter.y - (source.id === target.id ? 16 : 0) };
-      const end = { x: target.position.x, y: targetCenter.y + (source.id === target.id ? 16 : arrivalShift) };
+      const start = { x: source.position.x, y: sourceCenter.y - (source.kind === "decision" ? 0 : source.id === target.id ? 16 : 0) };
+      const end = { x: target.position.x, y: targetCenter.y + (target.kind === "decision" ? 0 : source.id === target.id ? 16 : arrivalShift) };
       points = [start, { x: sourceX, y: start.y }, { x: sourceX, y: laneY }, { x: targetX, y: laneY }, { x: targetX, y: end.y }, end];
       labelPoint = { x: (sourceX + targetX) / 2, y: laneY };
     }
     return [{ edge, points: points.filter((point, index) => index === 0 || point.x !== points[index - 1]!.x || point.y !== points[index - 1]!.y), labelPoint }];
   });
+  const exitSide = (route: DiagramRoute) => {
+    const [start, next] = route.points;
+    return !start || !next ? "none" : next.x < start.x ? "left" : next.x > start.x ? "right" : next.y < start.y ? "top" : "bottom";
+  };
+  for (const route of routes) {
+    if (byId.get(route.edge.source)?.kind !== "decision") continue;
+    const side = exitSide(route);
+    const siblings = routes.filter(other => other.edge.source === route.edge.source && exitSide(other) === side);
+    // Keep a single choice close to its diamond. Shared-side choices retain
+    // their separate lane labels so several returns never cover each other.
+    if (siblings.length === 1 && (side === "left" || side === "right")) {
+      const start = route.points[0]!;
+      route.labelPoint = { x: start.x + (side === "right" ? 78 : -78), y: start.y - 22 };
+    }
+  }
+  return routes;
 }
 
 export function diagramPath(points: Point[]): string {

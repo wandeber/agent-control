@@ -862,6 +862,9 @@ export class AgentController {
       const step = this.store.listFlowStepInstances(instance.flow_instance_id).find(item => item.status === "active" && flow.config.steps[item.step_id].decision?.key === input.key);
       const declaration = step ? flow.config.steps[step.step_id].decision : flow.config.preferences?.[input.key];
       if (!declaration || !input.reason.trim()) throw new ControllerError("This decision is not a configured active gate or preference, or has no human decision record.", "tool_error");
+      const scopedStepId = "step_id" in declaration ? declaration.step_id : undefined;
+      const scopedStep = scopedStepId ? this.store.listFlowStepInstances(instance.flow_instance_id).find(item => item.status === "active" && item.step_id === scopedStepId && item.step_id === instance.current_step_id) : undefined;
+      if (scopedStepId && !scopedStep) throw new ControllerError("This decision requires its configured phase to be active.", "tool_error");
       if ("values" in declaration && declaration.values && !declaration.values.includes(input.value as string)) throw new ControllerError("Decision is outside configured preference values.", "tool_error");
       const actorId = this.requireFlowDecisionActor(instance, declaration, input);
       const authority = "authority" in declaration ? declaration.authority ?? "user" : "user";
@@ -871,7 +874,7 @@ export class AgentController {
       const boundDigest = binding ? this.boundFlowArtifactDigest(instance, artifactKey!) : undefined;
       if (artifactKey && (!binding || !input.artifactDigest || input.artifactDigest !== boundDigest)) throw new ControllerError("The human decision must name the exact current artifact digest.", "tool_error");
       const packageManifestDigest = flow.config.policy?.work_packages?.approval_decision === input.key && input.value === (flow.config.policy.work_packages.approval_value ?? "approved") ? this.packageRuntime(input).approval(this.packageContext(instance.flow_instance_id), input.packageManifestDigest) : undefined;
-      state.decisions[input.key] = { ...(packageManifestDigest ? { package_manifest_digest: packageManifestDigest } : {}), value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
+      state.decisions[input.key] = { ...(scopedStep ? { step_instance_id: scopedStep.step_instance_id } : {}), ...(packageManifestDigest ? { package_manifest_digest: packageManifestDigest } : {}), value: input.value, reason: input.reason, actor_id: actorId, authority, source: authority === "coordinator" ? "coordinator_review" : "user_reply", acceptance_revision: state.acceptance_revision, ...(artifactKey ? { artifact_key: artifactKey, artifact_digest: boundDigest } : {}) };
       state.revision += 1;
       this.flowRuntime.save(instance.flow_instance_id, state);
       this.emit({ runId: instance.run_id, agentId: instance.orchestrator_agent_id, type: "flow.notification", payload: { flow_instance_id: instance.flow_instance_id, reason: "human_decision_recorded", decision_key: input.key, decision: input.value } });
@@ -879,12 +882,18 @@ export class AgentController {
     });
   }
 
-  private flowConditionContext(instance: FlowInstanceRecord): Record<string, unknown> {
+  private flowConditionContext(instance: FlowInstanceRecord, reportingStepInstanceId?: string): Record<string, unknown> {
     const state = this.flowRuntime.get(instance.flow_instance_id);
     if (!state) return {};
     const bindings = this.store.listFlowArtifactBindings(instance.flow_instance_id);
-    const decisions = Object.fromEntries(Object.entries(state.decisions).filter(([, decision]) => {
+    const config = this.getFlowOrThrow(instance.flow_record_id).config;
+    const currentAttemptId = reportingStepInstanceId ?? this.store.listFlowStepInstances(instance.flow_instance_id).find(step => step.status === "active" && step.step_id === instance.current_step_id)?.step_instance_id;
+    const decisions = Object.fromEntries(Object.entries(state.decisions).filter(([key, decision]) => {
       if (decision.acceptance_revision !== state.acceptance_revision) return false;
+      const scope = config.preferences?.[key]?.step_id;
+      // An in-phase answer belongs to this exact attempt, including while its
+      // completed report is selecting a transition in the same transaction.
+      if (scope && (scope !== instance.current_step_id || !currentAttemptId || decision.step_instance_id !== currentAttemptId)) return false;
       if (!decision.artifact_key) return true;
       const binding = bindings.find(item => item.artifact_key === decision.artifact_key);
       try { return Boolean(binding && this.boundFlowArtifactDigest(instance, decision.artifact_key!) === decision.artifact_digest); } catch { return false; }
@@ -8866,7 +8875,7 @@ export class AgentController {
     }
 
     const context = {
-      ...this.flowConditionContext(instance),
+      ...this.flowConditionContext(instance, step.step_instance_id),
       status: step.status,
       result,
       step: {

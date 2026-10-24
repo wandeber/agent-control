@@ -24,6 +24,9 @@ interface CapabilityBase {
 }
 
 export interface PluginInventory extends CapabilityBase {
+  blocked_by_policy?: boolean;
+  /** Declared executable surfaces without a thread-scoped readiness API. */
+  unverified_runtime_surfaces?: string[];
   id: string;
   name: string;
   description?: string;
@@ -160,7 +163,8 @@ export function compileAgentConfiguration(
   const selectedPlugins = new Map((inherit ? inventory.plugins.map(entry => ({ id: entry.id, enabled: entry.enabled_by_default })) : definition.plugins).map((entry) => [entry.id, entry.enabled]));
   selectedPlugins.set(REQUIRED_AGENT_CONTROL_PLUGIN, true);
   for (const [id, enabled] of selectedPlugins) {
-    if (enabled && !inventory.plugins.some((entry) => entry.id === id && entry.available)) {
+    if (enabled && !inventory.plugins.some((entry) => entry.id === id && !entry.blocked_by_policy &&
+      (!(entry.required || id === REQUIRED_AGENT_CONTROL_PLUGIN) || entry.available))) {
       throw capabilityUnavailable("plugin", id);
     }
   }
@@ -251,12 +255,8 @@ export function compileAgentConfiguration(
       ...(bundle ? { plugin_ids: bundle.pluginIds } : {})
     };
   });
-  for (const [id, bundle] of bundledApps) {
-    const enabledOwner = bundle.pluginIds.find((pluginId) => pluginEnabled.get(pluginId) === true);
-    if (!inventoryAppById.get(id)?.available && enabledOwner && apps.some(app => app.id === id && app.enabled)) {
-      throw capabilityUnavailable("plugin", enabledOwner, "Bundled app " + id + " is unavailable.");
-    }
-  }
+  // Installed manifests/configuration establish selection; app metadata and
+  // connector authentication describe readiness, which is checked at use time.
   const inherited = inventory.inherited_developer_instructions;
   const developerInstructions = composeDeveloperInstructions(inherited, definition.instructions);
   const overrides = compileOverrides({
@@ -363,7 +363,8 @@ export function refreshCompiledAgentConfiguration(
     };
   });
   for (const entry of snapshot.plugins) {
-    if (entry.enabled && !inventory.plugins.some((candidate) => candidate.id === entry.id && candidate.available)) {
+    if (entry.enabled && !inventory.plugins.some((candidate) => candidate.id === entry.id && !candidate.blocked_by_policy &&
+      (!entry.required || candidate.available))) {
       throw capabilityUnavailable("plugin", entry.id);
     }
     const current = inventoryPluginById.get(entry.id);
@@ -458,7 +459,7 @@ export function refreshCompiledAgentConfiguration(
     };
   });
   for (const entry of snapshot.apps) {
-    if (entry.enabled && !inventory.apps.some((candidate) => candidate.id === entry.id && candidate.available)) {
+    if (entry.enabled && !currentApps.has(entry.id) && !currentBundledApps.has(entry.id)) {
       throw capabilityUnavailable("app", entry.id);
     }
   }
@@ -495,6 +496,19 @@ function compileOverrides(input: {
   mcpServers: CompiledAgentConfiguration["mcp_servers"];
   apps: CompiledAgentConfiguration["apps"];
 }): string[] {
+  const skills = new Map(input.skills.map((entry) => [entry.path, entry]));
+  for (const plugin of input.plugins) {
+    for (const skill of plugin.bundled_skills) {
+      const previous = skills.get(skill.path);
+      if (previous && previous.enabled !== skill.enabled) {
+        throw new ControllerError("Configured-agent skill selection is inconsistent.", "validation", {
+          capability_kind: "skill",
+          capability_id: skill.path
+        });
+      }
+      skills.set(skill.path, { path: skill.path, enabled: skill.enabled, plugin_id: plugin.id });
+    }
+  }
   const bundledMcpByPlugin = new Map<string, Array<{ name: string; enabled: boolean }>>();
   for (const server of input.mcpServers) {
     if (!server.plugin_id) continue;
@@ -511,7 +525,7 @@ function compileOverrides(input: {
       ]))
     } : {})
   }]));
-  const mcpServers = Object.fromEntries(input.mcpServers.flatMap((entry) => {
+  const mcpServers: Record<string, { enabled: boolean; command?: string; args?: string[] }> = Object.fromEntries(input.mcpServers.flatMap((entry) => {
     if (!entry.plugin_id || entry.root_transport) {
       return [[entry.name, { enabled: entry.enabled }]];
     }
@@ -525,13 +539,22 @@ function compileOverrides(input: {
       args: ["-e", "process.exit(0)"]
     }]];
   }));
+  if (!input.apps.some((entry) => entry.enabled)) {
+    // Codex's built-in app transport may publish every connected app tool even
+    // when every app row is disabled, so shadow it when this agent selects none.
+    mcpServers.codex_apps = {
+      enabled: false,
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"]
+    };
+  }
   const apps = Object.fromEntries([
     ["_default", { enabled: false }],
     ...input.apps.map((entry) => [entry.id, { enabled: entry.enabled }] as const)
   ]);
   const result = [
     "plugins=" + toTomlInline(plugins),
-    "skills.config=" + toTomlInline(input.skills),
+    "skills.config=" + toTomlInline([...skills.values()]),
     "mcp_servers=" + toTomlInline(mcpServers),
     "apps=" + toTomlInline(apps),
     "model=" + toTomlInline(input.model),
@@ -594,11 +617,17 @@ async function readRuntime(executable: string, cwd: string, refresh: boolean): P
     const appMetadata: JsonObject[] = [];
     const ids = [...appIds];
     for (let index = 0; index < ids.length; index += 100) {
-      const response = object(await client.request("app/read", {
-        appIds: ids.slice(index, index + 100),
-        includeTools: false
-      }));
-      appMetadata.push(...array(response.apps).map(object));
+      try {
+        const response = object(await client.request("app/read", {
+          appIds: ids.slice(index, index + 100),
+          includeTools: false
+        }));
+        appMetadata.push(...array(response.apps).map(object));
+      } catch {
+        // Optional display metadata is not an authentication prerequisite.
+        // Manifest/config IDs retain selection; thread app/list still verifies
+        // that unselected apps are not exposed before the first prompt.
+      }
     }
     return {
       config: object(configResponse),
@@ -743,10 +772,28 @@ function pluginInventory(row: JsonObject, skills: JsonObject[], detail?: JsonObj
     bundled_skills: manifest.skills,
     bundled_mcp_servers: manifest.mcpServers.map((serverName) => ({ name: serverName })),
     bundled_apps: manifest.apps,
+    unverified_runtime_surfaces: unverifiedPluginRuntimeSurfaces(detail, roots[0]),
     required,
-    available: row.availability !== "UNAVAILABLE",
+    available: row.availability !== "UNAVAILABLE" && row.availability !== "DISABLED_BY_ADMIN",
+    ...(row.availability === "DISABLED_BY_ADMIN" ? { blocked_by_policy: true } : {}),
     enabled_by_default: required || row.enabled === true
   };
+}
+
+function unverifiedPluginRuntimeSurfaces(detail: JsonObject | undefined, root: string | undefined): string[] {
+  const manifest = root ? readJson(join(root, ".codex-plugin", "plugin.json")) : {};
+  const surfaces: string[] = [];
+  if (!detail || !("hooks" in detail) || !("scheduledTasks" in detail)) surfaces.push("plugin_metadata");
+  for (const [name, values] of [
+    ["hooks", [detail?.hooks, manifest.hooks]],
+    ["scheduled_tasks", [detail?.scheduledTasks, manifest.scheduledTasks]]
+  ] as const) {
+    if (values.some((value) => value !== undefined && value !== null && (
+      Array.isArray(value) ? value.length > 0 :
+        typeof value === "object" ? Object.keys(object(value)).length > 0 : true
+    ))) surfaces.push(name);
+  }
+  return orderedUnique(surfaces);
 }
 
 function manifestInfo(row: JsonObject, skills: JsonObject[], detail?: JsonObject): PluginManifestInfo {

@@ -58,7 +58,12 @@ export class UserQuestions {
                     throw new ControllerError("This request_key already identifies a different question.", "tool_error");
                 return this.get(record.question_id);
             }
+            // Bind once at creation: reused agents and retries must not move a question
+            // to whichever phase happens to be active when the console reads it.
+            const origins = this.store.listFlowInstances({ runId: agent.run_id }).flatMap(flow => this.store.listFlowStepInstances(flow.flow_instance_id).filter(step => step.agent_id === agent.agent_id && step.status === "active"));
+            const origin = origins.length === 1 ? origins[0] : undefined;
             const record = { ...parsed, question_id: newId("question"), run_id: agent.run_id, agent_id: agent.agent_id,
+                ...(origin ? { flow_context: { flow_instance_id: origin.flow_instance_id, step_instance_id: origin.step_instance_id, step_id: origin.step_id } } : {}),
                 agent_title: agent.title, run_title: run.title, state: "pending", answers: null, created_at: nowIso(), answered_at: null };
             this.store.db.prepare("insert into user_questions (question_id,run_id,agent_id,generation,request_key,record_json,state,created_at) values (?,?,?,?,?,?,?,?)")
                 .run(record.question_id, record.run_id, record.agent_id, current.work_generation, record.request_key, JSON.stringify(record), record.state, record.created_at);

@@ -16,6 +16,14 @@ command, copied log, or worker-supplied GREEN flag is not execution evidence.
 Behavioral no-edit instructions are distinct from backend-enforced capability;
 report the actual capability returned by the runtime.
 
+If test cases fail during a complete run but all pass when rerun in isolation,
+continue without blocking progress or requiring another complete run. Keep the
+original failures and isolated passing evidence separate; use the flow's
+`accepted_with_isolated_test_passes` contract when applicable. This standing
+policy needs no new waiver or proof of the root cause. Do not weaken checks;
+unexecuted coverage, persistent isolated failures and non-test failures remain
+unresolved.
+
 Return independent failures together. Missing path ownership, required check
 inputs, unsafe execution, or an incomplete gate is blocked, never GREEN. Keep
 credentials and raw sensitive environment values out of reports.

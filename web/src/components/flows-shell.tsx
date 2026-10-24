@@ -6,11 +6,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { buildFlowDefinitionGraph, type FlowVisualNode } from "@/lib/flow-graph";
-import { flowDiagramEdges, flowDiagramPositions, routeFlowDiagram, visibleFlowDiagramEdges, PHASE_HEIGHT, PHASE_WIDTH } from "@/lib/flow-diagram";
+import { flowDiagramEdges, flowDiagramPositions, routeFlowDiagram, visibleFlowDiagramEdges, flowNodeSize, PHASE_WIDTH } from "@/lib/flow-diagram";
 import { shouldTryMcpApp } from "@/lib/mcp-app";
 import { useFlowPreview, type FlowDefinition, type FlowPromptPreview } from "@/lib/flow-preview";
 import { useConsoleSelection } from "./console-selection";
 import { PhaseEdgeOverlay } from "./flow-phase-graph";
+import { FlowQuestionNode } from "./flow-question-node";
 import { SettingsLayout, type SettingsSection } from "./settings-navigation";
 
 export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSection) => void }) {
@@ -20,6 +21,8 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
   const detailOpen = Boolean(selectedFlowId);
   const [stepId, setStepId] = useState<string | null>(null);
   const [tab, setTab] = useState("instructions");
+  const graph = useMemo(() => definition ? buildFlowDefinitionGraph(definition.config) : null, [definition]);
+  const selectedRouting = graph?.nodes.find(node => node.id === stepId && node.routingOriginStepId);
   useEffect(() => registerRefresh(refresh), [refresh, registerRefresh]);
   useEffect(() => setConnection(connection), [connection, setConnection]);
   const flowKey = `${projectDir}:${definition?.config.id ?? selectedFlowId}`;
@@ -29,7 +32,9 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
   const sourceRole = step?.role ? definition?.config.roles?.[step.role] : null;
   const role = step?.role ? definition?.resolved_roles?.[step.role] ?? sourceRole : null;
   const prompts = selectedStep ? definition?.prompts[selectedStep] ?? [] : [];
-  const phaseCount = Object.keys(definition?.config.steps ?? {}).length;
+  const userQuestion = step?.decision?.authority === "user";
+  const questionCount = Object.values(definition?.config.steps ?? {}).filter(step => step.decision?.authority === "user").length;
+  const phaseCount = Object.keys(definition?.config.steps ?? {}).length - questionCount;
   const agentCount = Object.keys(definition?.config.roles ?? {}).length;
   const chooseFlow = (id: string) => {
     setSelectedFlowId(id);
@@ -71,26 +76,30 @@ export function FlowsShell({ onNavigate }: { onNavigate: (section: SettingsSecti
       <header className="flow-preview-heading"><div><button type="button" className="settings-back" aria-label="Back to flows" onClick={showList}><ArrowLeft size={16} />Flows</button><h1>{definition?.config.id ?? selectedFlowId ?? "Choose a flow"}</h1><p>{definition?.config.description ?? "Explore phases, agent instructions and routes before running a flow."}</p></div><span className="flow-preview-badge">Source preview</span></header>
       {data?.error ? <details className="flow-draft-notice"><summary>{definition ? "Draft in progress · showing the last valid version" : "Draft in progress"}</summary><p>{data.error}</p></details> : null}
       {definition ? <div className="flow-preview-workspace">
-        <DefinitionGraph key={flowKey} definition={definition} selectedStepId={selectedStep} onSelect={setStepId} />
-        <aside className="flow-definition-details agent-scroll" aria-label="Phase details">
-          <div className="flow-phase-heading"><span className="flow-eyebrow">Phase</span><h2>{selectedStep?.replaceAll("_", " ")}</h2><p>{step?.description}</p>
+        <DefinitionGraph key={flowKey} definition={definition} selectedStepId={selectedRouting?.id ?? selectedStep} onSelect={setStepId} />
+        {selectedRouting ? <aside className="flow-definition-details agent-scroll" aria-label="Automatic decision details">
+          <div className="flow-phase-heading"><span className="flow-eyebrow">Automatic decision</span><h2>{selectedRouting.title}</h2><p>The next route follows the phase result and the flow conditions.</p></div>
+          <div className="flow-instructions"><Relations definition={definition} stepId={selectedRouting.id} onSelect={setStepId} outgoingOnly /></div>
+        </aside> : <aside className="flow-definition-details agent-scroll" aria-label="Phase details">
+          <div className="flow-phase-heading"><span className="flow-eyebrow">{userQuestion ? "User question" : "Phase"}</span><h2>{selectedStep?.replaceAll("_", " ").replace(/\buat\b/gi, "UAT")}</h2><p>{step?.description}</p>
             <div className="flow-model-summary"><Bot size={16} /><span>{step?.execution === "coordinator" ? (step.decision?.authority === "user" ? "User decision" : "Coordinator decision") : `${step?.role ?? "Agent"} · ${role?.model ?? "Provider default"}${role?.reasoning_effort ? ` · ${role.reasoning_effort}` : ""}`}</span></div>
           </div>
           <div className="flow-detail-tabs" role="tablist" aria-label="Phase information">
             {[["instructions", "Instructions"], ["routes", "Relations"], ["source", "Definition"]].map(([id,label]) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{label}</button>)}
           </div>
           {tab === "instructions" ? <div className="flow-instructions" role="tabpanel">
+            {userQuestion ? <Relations definition={definition} stepId={selectedStep!} onSelect={setStepId} outgoingOnly /> : <>
             <PromptSection title="Phase instructions" prompts={prompts.filter(prompt => prompt.scope === "step")} />
-            <PromptSection title={`Agent prompt${step?.role ? ` · ${step.role}` : ""}`} prompts={prompts.filter(prompt => prompt.scope === "role")} description={role?.description} />
+            <PromptSection title={`Agent prompt${step?.role ? ` · ${step.role}` : ""}`} prompts={prompts.filter(prompt => prompt.scope === "role")} description={role?.description} /></>}
           </div> : tab === "routes" ? <div className="flow-instructions" role="tabpanel">
-            {step?.decision ? <section><h3>Decision</h3><p>{step.decision.key} · {step.decision.authority ?? "coordinator"} · {step.decision.owner ?? "orchestrator"}</p></section> : null}
+            {step?.decision ? <section><h3>{userQuestion ? "User question" : "Decision"}</h3>{!userQuestion ? <p>{step.decision.key} · {step.decision.authority ?? "coordinator"} · {step.decision.owner ?? "orchestrator"}</p> : null}</section> : null}
             <Relations definition={definition} stepId={selectedStep!} onSelect={setStepId} />
             <section><h3>Inputs</h3>{Object.keys(step?.inputs ?? {}).length ? Object.entries(step!.inputs!).map(([key, value]) => <p key={key}>{key} → {value.artifact}{value.required ? " · required" : ""}</p>) : <p className="flow-muted">No declared inputs.</p>}</section>
             <section><h3>Outputs</h3>{Object.keys(step?.outputs ?? {}).length ? Object.entries(step!.outputs!).map(([key, value]) => <p key={key}>{key} → {value.artifact}{value.required ? " · required" : ""}</p>) : <p className="flow-muted">No declared outputs.</p>}</section>
           </div> : <div className="flow-instructions" role="tabpanel"><section><h3><FileText size={15} /> Flow source</h3><p className="flow-file-path">{definition.config_path}</p><p className="flow-muted">Source configuration includes project model overrides. Editing these sources does not change an existing run.</p><pre>{JSON.stringify({ phase: step, agent: sourceRole }, null, 2)}</pre></section></div>}
-        </aside>
+        </aside>}
       </div> : <div className="flow-preview-empty"><Workflow size={36} /><p>{connection === "connecting" ? "Loading flows…" : connection === "offline" ? "Offline" : "Your flow will appear here as Codex creates it."}</p><span>Project flows live in .agents/flows/&lt;flow-id&gt;/flow.yaml</span></div>}
-      <footer className="flow-preview-footer"><span>{projectDir ?? data?.project_dir ?? "Shared flow catalogs"}</span><span>{definition ? `${phaseCount} ${phaseCount === 1 ? "phase" : "phases"} · ${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : "No run required"}</span></footer>
+      <footer className="flow-preview-footer"><span>{projectDir ?? data?.project_dir ?? "Shared flow catalogs"}</span><span>{definition ? `${phaseCount} ${phaseCount === 1 ? "phase" : "phases"} · ${questionCount} ${questionCount === 1 ? "question" : "questions"} · ${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : "No run required"}</span></footer>
     </section>}
   </SettingsLayout>;
 }
@@ -102,20 +111,21 @@ function PromptSection({ title, prompts, description }: { title: string; prompts
   </div>) : <p className="flow-muted">No separate prompt declared.</p>}</section>;
 }
 
-function Relations({ definition, stepId, onSelect }: { definition: FlowDefinition; stepId: string; onSelect: (id: string) => void }) {
+function Relations({ definition, stepId, onSelect, outgoingOnly = false }: { definition: FlowDefinition; stepId: string; onSelect: (id: string) => void; outgoingOnly?: boolean }) {
   const graph = buildFlowDefinitionGraph(definition.config);
-  const node = graph.nodes.find(value => value.stepId === stepId);
-  const edges = graph.edges.filter(edge => edge.source === node?.id || edge.target === node?.id);
-  return <section><h3>Routes</h3>{edges.length ? edges.map((edge,index) => {
+  const node = graph.nodes.find(value => value.stepId === stepId || value.id === stepId);
+  const edges = graph.edges.filter(edge => edge.source === node?.id || (!outgoingOnly && edge.target === node?.id));
+  return <section><h3>{outgoingOnly ? "Choices" : "Routes"}</h3>{edges.length ? edges.map((edge,index) => {
     const source = graph.nodes.find(value => value.id === edge.source);
     const target = graph.nodes.find(value => value.id === edge.target);
-    return <div className="flow-route-detail" key={`${edge.id}:${index}`}><button onClick={() => { if (source?.stepId) onSelect(source.stepId); }}>{source?.title}</button><span> → </span><button onClick={() => { if (target?.stepId) onSelect(target.stepId); }}>{target?.title}</button><p>{edge.label}</p></div>;
+    return <div className="flow-route-detail" key={`${edge.id}:${index}`}><button onClick={() => { if (source) onSelect(source.stepId ?? source.id); }}>{source?.title}</button><span> → </span><button onClick={() => { if (target) onSelect(target.stepId ?? target.id); }}>{target?.title}</button><p>{edge.label.replaceAll("_", " ")}</p></div>;
   }) : <p className="flow-muted">No declared routes.</p>}</section>;
 }
 
 type DefinitionNode = Node<FlowVisualNode & { modelLabel: string; chosen: boolean; choose: () => void } & Record<string, unknown>, "definition">;
 const definitionNodeTypes = { definition: DefinitionNodeCard };
 function DefinitionNodeCard({ data }: NodeProps<DefinitionNode>) {
+  if (data.kind === "decision") return <FlowQuestionNode title={data.title} description={data.description} automatic={Boolean(data.routingOriginStepId)} selected={data.chosen} onSelect={data.choose} />;
   return <button className="flow-definition-node" data-selected={data.chosen} onClick={data.choose} title={data.description ?? data.title}>
     <div>{data.kind === "finish" ? <Check size={16} /> : <Workflow size={16} />}<strong>{data.title}</strong></div>
     <span>{data.role ?? (data.kind === "finish" ? "End of flow" : data.subtitle)}</span>
@@ -137,7 +147,7 @@ function DefinitionGraph({ definition, selectedStepId, onSelect }: { definition:
       const step = node.stepId ? definition.config.steps[node.stepId] : undefined;
       const role = node.role ? definition.resolved_roles?.[node.role] ?? definition.config.roles?.[node.role] : undefined;
       return { id: node.id, type: "definition", position: previous.find(value => value.id === node.id)?.position ?? positions.get(node.id)!,
-        data: { ...node, chosen: node.stepId === selectedStepId, choose: () => { if (node.stepId) onSelect(node.stepId); },
+        data: { ...node, chosen: (node.stepId ?? node.id) === selectedStepId, choose: () => { onSelect(node.stepId ?? node.id); },
           modelLabel: step?.execution === "coordinator" ? (step.decision?.authority === "user" ? "User decision" : "Coordinator") : `${role?.model ?? "Provider default"}${role?.reasoning_effort ? ` · ${role.reasoning_effort}` : ""}` } };
     }));
   }, [model, definition, selectedStepId, onSelect]);
@@ -152,11 +162,11 @@ function DefinitionGraph({ definition, selectedStepId, onSelect }: { definition:
     return () => clearTimeout(timer);
   }, [ready, nodes.length]);
   const edges = useMemo(() => flowDiagramEdges(model.nodes, model.edges), [model]);
-  const focused = model.nodes.find(node => node.stepId === selectedStepId)?.id ?? null;
-  const routes = useMemo(() => routeFlowDiagram(visibleFlowDiagramEdges(edges, focused, allRoutes), nodes.map(node => ({ id: node.id, position: node.position, width: PHASE_WIDTH, height: PHASE_HEIGHT, kind: node.data.kind }))), [edges, focused, allRoutes, nodes]);
+  const focused = model.nodes.find(node => node.stepId === selectedStepId || node.id === selectedStepId)?.id ?? null;
+  const routes = useMemo(() => routeFlowDiagram(visibleFlowDiagramEdges(edges, focused, allRoutes), nodes.map(node => ({ id: node.id, position: node.position, ...flowNodeSize(node.data.kind), kind: node.data.kind }))), [edges, focused, allRoutes, nodes]);
   const onNodesChange = useCallback((changes: Parameters<typeof applyNodeChanges<DefinitionNode>>[0]) => setNodes(current => applyNodeChanges(changes, current)), []);
   return <div ref={canvas} className="flow-definition-canvas" aria-label="Flow definition diagram">
-    <button className="flow-routes-toggle" aria-pressed={allRoutes} onClick={() => setAllRoutes(value => !value)}><GitBranch size={14} />{allRoutes ? "All routes" : "Selected phase routes"}</button>
+    <button className="flow-routes-toggle" aria-pressed={allRoutes} onClick={() => setAllRoutes(value => !value)}><GitBranch size={14} />{allRoutes ? "All routes" : "Main routes"}</button>
     <ReactFlow<DefinitionNode, Edge> nodes={nodes} edges={[]} nodeTypes={definitionNodeTypes} onNodesChange={onNodesChange} onInit={instance => { flow.current = instance; setReady(true); }} minZoom={0.15} maxZoom={1.6} proOptions={{ hideAttribution: true }}>
       <PhaseEdgeOverlay routes={routes} /><Background gap={22} size={1} /><Controls showInteractive={false} />
     </ReactFlow>

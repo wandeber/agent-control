@@ -26,13 +26,15 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     expect(route("context", { conclusion: "ready" })?.to).toBe("analysis");
   });
 
-  it("keeps the clarification-owner intention decision separate from plan review", () => {
-    expect(route("analysis", { conclusion: "ready" })?.to).toBe("analysis_intent");
-    expect(record.steps.analysis_intent).toMatchObject({
-      execution: "coordinator",
-      decision: { key: "analysis_intent", artifact_key: "analysis", authority: "coordinator", owner: "requester" }
-    });
-    expect(route("analysis_intent", { decision: "changes_required" })?.to).toBe("analysis");
+  it("hands ready Analysis directly to Planning while preserving clarification and plan review", () => {
+    expect(route("analysis", { conclusion: "ready" })?.to).toBe("planning");
+    expect(record.steps.analysis_intent).toBeUndefined();
+    expect(record.steps.planning.requires).toBeUndefined();
+    expect(record.steps.planning.inputs.analysis).toEqual({ artifact: "analysis", required: true });
+    for (const step of ["context", "analysis"]) {
+      expect(route(step, { conclusion: "needs_clarification" })).toMatchObject({ notify: "orchestrator" });
+      expect(route(step, { conclusion: "needs_clarification" })?.to).toBeUndefined();
+    }
     expect(record.steps.plan_review.role).toBe(record.steps.analysis.role);
   });
 
@@ -52,21 +54,24 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     expect(route("implementation", { conclusion: "ready", integration_needed: false }, {}, {}, { integration_required: true })?.to).toBe("integration");
     expect(record.steps.implementation.report.schema.required).toEqual(["conclusion"]);
     expect(record.steps.implementation.report.schema.properties.integration_needed).toBeUndefined();
-    for (const step of ["validation", "focused_validation", "implementation_review", "uat_decision", "uat_preparation", "uat_review", "final_review", "closure"]) {
+    for (const step of ["validation", "implementation_review", "uat_decision", "uat", "final_review", "closure"]) {
       expect(record.steps[step].requires.all).toContainEqual({ equals: { var: "packages.integrated", value: true } });
     }
     expect(record.steps.integration.requires.all).toContainEqual({ equals: { var: "packages.joined", value: true } });
     expect(route("integration", { conclusion: "needs_package_changes" })?.to).toBe("implementation");
-    expect(route("implementation", { conclusion: "ready", integration_needed: false }, { validation_mode: "complete_gate" })?.to).toBe("validation");
-    expect(route("implementation", { conclusion: "ready", integration_needed: false }, { validation_mode: "focused_recheck" })?.to).toBe("focused_validation");
+    expect(route("implementation", { conclusion: "ready" })?.to).toBe("validation");
+    expect(route("integration", { conclusion: "ready" })?.to).toBe("validation");
   });
 
-  it("keeps focused passes distinct from the complete gate", () => {
-    expect(route("focused_validation", { conclusion: "passed" })?.to).toBe("validation");
-    expect(route("validation", { conclusion: "failed" })).toMatchObject({ to: "implementation", set: { validation_mode: "focused_recheck" } });
+  it("returns corrections to one Validation phase without weakening complete coverage", () => {
+    expect(record.steps.focused_validation).toBeUndefined();
+    expect(record.state.validation_mode).toBeUndefined();
+    expect(route("validation", { conclusion: "failed" })?.to).toBe("implementation");
+    expect(route("implementation_review", { conclusion: "implementation_changes_needed" })?.to).toBe("implementation");
+    expect(route("uat", { conclusion: "implementation_changes_needed" })?.to).toBe("implementation");
+    expect(route("uat", { conclusion: "ready" }, {}, { uat_result: { value: "changes_required" } })?.to).toBe("implementation");
     expect(record.steps.validation.role).toBe("validator");
     expect(record.steps.validation.sandbox).toBe("read_only");
-    expect(route("focused_validation", { conclusion: "passed" })).toMatchObject({ requires_evidence: [{ validation_mode: "focused" }] });
     expect(route("validation", { conclusion: "passed" }, { planner_approved: false })).toMatchObject({ requires_evidence: [{ validation_mode: "complete_gate" }] });
   });
 
@@ -78,17 +83,37 @@ describe("development-flow-v1 responsibility and routing parity", () => {
     });
     expect(route("validation", { conclusion: "passed" }, { planner_approved: true, uat_completed: true })?.to).toBe("final_review");
     expect(route("final_review", { conclusion: "changes_required", target_phase: "implementation" })).toMatchObject({
-      to: "implementation", set: { validation_mode: "focused_recheck" }
+      to: "implementation"
     });
+  });
+
+  it("advances accepted isolated test passes through the same guarded validation routes", () => {
+    const conclusion = "accepted_with_isolated_test_passes";
+    for (const [state, decisions, requestClosure] of [
+      [{ planner_approved: false }, {}, false],
+      [{ planner_approved: true, uat_completed: true }, {}, false],
+      [{ planner_approved: true, uat_completed: false }, { uat_preference: { value: "prepare" } }, false],
+      [{ planner_approved: true, uat_completed: false }, {}, false],
+      [{ planner_approved: true, uat_completed: true }, {}, true],
+    ] as const) {
+      expect(route("validation", { conclusion, request_closure: requestClosure }, state, decisions))
+        .toEqual(route("validation", { conclusion: "passed", request_closure: requestClosure }, state, decisions));
+    }
+    expect(record.steps.validation.evidence_operations).toContain("validation_resolve_isolated_tests");
+    expect(record.steps.validation.report.schema.properties.conclusion.enum).toContain(conclusion);
   });
 
   it("asks once for UAT and preserves the user-selected branch through corrections", () => {
     expect(record.preferences.uat_preference.values).toEqual(["prepare", "skip"]);
     expect(route("uat_decision", { decision: "skip" })).toMatchObject({ to: "final_review", set: { uat_completed: true } });
-    expect(route("uat_decision", { decision: "prepare" })?.to).toBe("uat_preparation");
-    expect(route("uat_preparation", { conclusion: "ready" })?.to).toBe("uat_review");
-    expect(route("uat_review", { decision: "changes_required" })).toMatchObject({ to: "implementation", set: { uat_completed: false } });
-    expect(route("validation", { conclusion: "passed" }, { planner_approved: true, uat_completed: false }, { uat_preference: { value: "prepare" } })?.to).toBe("uat_preparation");
+    expect(route("uat_decision", { decision: "prepare" })?.to).toBe("uat");
+    expect(route("uat", { conclusion: "ready" })).toBeNull();
+    expect(() => parseFlowConfig({ ...raw, preferences: { ...raw.preferences, invalid: { values: ["approved"], step_id: "missing-phase" } } })).toThrow(/existing step/);
+    expect(record.steps.uat_review).toBeUndefined();
+    expect(record.preferences.uat_result).toMatchObject({ step_id: "uat", owner: "requester" });
+    expect(route("uat", { conclusion: "ready" }, {}, { uat_result: { value: "approved" } })?.to).toBe("final_review");
+    expect(route("uat", { conclusion: "ready" }, {}, { uat_result: { value: "changes_required" } })).toMatchObject({ to: "implementation", set: { uat_completed: false } });
+    expect(route("validation", { conclusion: "passed" }, { planner_approved: true, uat_completed: false }, { uat_preference: { value: "prepare" } })?.to).toBe("uat");
   });
 
   it("stops automatic expert corrections under an explicit single-review preference", () => {

@@ -1,7 +1,7 @@
 # Shared agent defaults match HDT; personal agents and project model preferences remain configurable.
 # Human decisions and evidence guards are verified by the runtime, not worker conclusions.
 id: development-flow-v1
-version: 1.3.0
+version: 1.3.3
 description: Clean pre-production development by default, proactive user clarification
   through the available question interface, evidence-based compatibility exceptions,
   normal ORM/schema migrations with old development data recreated when simpler,
@@ -32,10 +32,13 @@ preferences:
       - prepare
       - skip
     owner: requester
+  uat_result:
+    values: [approved, changes_required, skip, blocked]
+    owner: requester
+    step_id: uat
 state:
   planner_approved: false
   uat_completed: false
-  validation_mode: complete_gate
 prompts:
   role_analyst:
     path: roles/analyst.md
@@ -55,8 +58,8 @@ prompts:
     path: prompts/validation.md
   step_implementation_review:
     path: prompts/implementation-review.md
-  step_uat_preparation:
-    path: prompts/uat-preparation.md
+  step_uat:
+    path: prompts/uat.md
   step_final_review:
     path: prompts/final-review.md
 roles:
@@ -178,7 +181,7 @@ steps:
               equals:
                 var: result.conclusion
                 value: ready
-            to: analysis_intent
+            to: planning
           - id: analysis-clarification
             when:
               equals:
@@ -194,54 +197,6 @@ steps:
     sandbox: workspace
     evidence_operations:
       - read_receipt
-  analysis_intent:
-    role: orchestrator
-    execution: coordinator
-    decision:
-      key: analysis_intent
-      artifact_key: analysis
-      authority: coordinator
-      owner: requester
-    report:
-      schema:
-        type: object
-        required:
-          - decision
-        properties:
-          decision:
-            enum:
-              - approved
-              - changes_required
-              - blocked
-    on:
-      reported:
-        transitions:
-          - id: intent-approved
-            when:
-              equals:
-                var: result.decision
-                value: approved
-            to: planning
-          - id: intent-correction
-            when:
-              equals:
-                var: result.decision
-                value: changes_required
-            to: analysis
-          - id: intent-blocked
-            when:
-              equals:
-                var: result.decision
-                value: blocked
-            notify: orchestrator
-    inputs:
-      analysis:
-        artifact: analysis
-        required: true
-    description: The original clarification owner checks Analysis only for
-      preservation of user intent.
-    evidence_operations:
-      - read_receipt
   planning:
     role: planner
     prompt_ref: step_planning
@@ -250,10 +205,6 @@ steps:
       obligations into projections; prefer recreating old development data over
       format conversion unless preservation is required, keep ORM/schema migrations,
       and ask material user questions before dependent planning.
-    requires:
-      equals:
-        var: decisions.analysis_intent.value
-        value: approved
     inputs:
       analysis:
         artifact: analysis
@@ -474,7 +425,7 @@ steps:
                     var: packages.integration_required
                     value: true
             to: integration
-          - id: implementation-focused-check
+          - id: implementation-validation
             when:
               all:
                 - equals:
@@ -483,22 +434,6 @@ steps:
                 - equals:
                     var: packages.integration_required
                     value: false
-                - equals:
-                    var: state.validation_mode
-                    value: focused_recheck
-            to: focused_validation
-          - id: implementation-complete-check
-            when:
-              all:
-                - equals:
-                    var: result.conclusion
-                    value: ready
-                - equals:
-                    var: packages.integration_required
-                    value: false
-                - equals:
-                    var: state.validation_mode
-                    value: complete_gate
             to: validation
           - id: implementation-plan-correction
             when:
@@ -548,25 +483,11 @@ steps:
     on:
       reported:
         transitions:
-          - id: integration-focused-check
+          - id: integration-validation
             when:
-              all:
-                - equals:
-                    var: result.conclusion
-                    value: ready
-                - equals:
-                    var: state.validation_mode
-                    value: focused_recheck
-            to: focused_validation
-          - id: integration-complete-check
-            when:
-              all:
-                - equals:
-                    var: result.conclusion
-                    value: ready
-                - equals:
-                    var: state.validation_mode
-                    value: complete_gate
+              equals:
+                var: result.conclusion
+                value: ready
             to: validation
           - id: integration-package-correction
             when:
@@ -591,83 +512,12 @@ steps:
       - project_plan
       - prepare_result
     sandbox: workspace
-  focused_validation:
-    role: validator
-    prompt_ref: step_validation
-    description: No-edit focused recheck of the known correction bundle; never
-      sufficient for closure.
-    requires:
-      all:
-        - equals:
-            var: packages.integrated
-            value: true
-        - equals:
-            var: decisions.plan_approval.value
-            value: approved
-    inputs:
-      plan:
-        artifact: plan
-        required: true
-    report:
-      schema:
-        type: object
-        required:
-          - conclusion
-        properties:
-          conclusion:
-            enum:
-              - passed
-              - failed
-              - blocked
-          evidence_receipt_id:
-            type: string
-    on:
-      reported:
-        transitions:
-          - id: focused-ready-for-complete
-            when:
-              equals:
-                var: result.conclusion
-                value: passed
-            to: validation
-            requires_evidence:
-              - receipt: result.evidence_receipt_id
-                kind: validation
-                require_current: true
-                require_approved: true
-                owner_role: validator
-                validation_mode: focused
-          - id: focused-correction
-            when:
-              equals:
-                var: result.conclusion
-                value: failed
-            to: implementation
-            set:
-              validation_mode: focused_recheck
-            requires_evidence:
-              - receipt: result.evidence_receipt_id
-                kind: validation
-                require_current: true
-                require_approved: false
-                owner_role: validator
-                validation_mode: focused
-          - id: focused-blocked
-            when:
-              equals:
-                var: result.conclusion
-                value: blocked
-            notify: orchestrator
-    evidence_operations:
-      - read_receipt
-      - prepare_result
-      - validation_run
-    sandbox: read_only
   validation:
     role: validator
     prompt_ref: step_validation
-    description: No-edit complete affected gate with controlled execution receipts;
-      request closure when an existing expert approval still covers the same result.
+    description: No-edit validation of the current result and pending corrections,
+      reusing eligible checks and requiring complete affected coverage before
+      success; request closure when existing expert approval covers the same result.
     requires:
       all:
         - equals:
@@ -689,6 +539,7 @@ steps:
           conclusion:
             enum:
               - passed
+              - accepted_with_isolated_test_passes
               - failed
               - blocked
           evidence_receipt_id:
@@ -702,9 +553,13 @@ steps:
           - id: validated-existing-expert-approval
             when:
               all:
-                - equals:
-                    var: result.conclusion
-                    value: passed
+                - any:
+                    - equals:
+                        var: result.conclusion
+                        value: passed
+                    - equals:
+                        var: result.conclusion
+                        value: accepted_with_isolated_test_passes
                 - equals:
                     var: state.planner_approved
                     value: true
@@ -730,9 +585,13 @@ steps:
           - id: validated-first-planner
             when:
               all:
-                - equals:
-                    var: result.conclusion
-                    value: passed
+                - any:
+                    - equals:
+                        var: result.conclusion
+                        value: passed
+                    - equals:
+                        var: result.conclusion
+                        value: accepted_with_isolated_test_passes
                 - equals:
                     var: state.planner_approved
                     value: false
@@ -747,9 +606,13 @@ steps:
           - id: validated-back-to-expert
             when:
               all:
-                - equals:
-                    var: result.conclusion
-                    value: passed
+                - any:
+                    - equals:
+                        var: result.conclusion
+                        value: passed
+                    - equals:
+                        var: result.conclusion
+                        value: accepted_with_isolated_test_passes
                 - equals:
                     var: state.planner_approved
                     value: true
@@ -767,9 +630,13 @@ steps:
           - id: validated-back-to-uat
             when:
               all:
-                - equals:
-                    var: result.conclusion
-                    value: passed
+                - any:
+                    - equals:
+                        var: result.conclusion
+                        value: passed
+                    - equals:
+                        var: result.conclusion
+                        value: accepted_with_isolated_test_passes
                 - equals:
                     var: state.planner_approved
                     value: true
@@ -779,7 +646,7 @@ steps:
                 - equals:
                     var: decisions.uat_preference.value
                     value: prepare
-            to: uat_preparation
+            to: uat
             requires_evidence:
               - receipt: result.evidence_receipt_id
                 kind: validation
@@ -790,9 +657,13 @@ steps:
           - id: validated-uat-decision
             when:
               all:
-                - equals:
-                    var: result.conclusion
-                    value: passed
+                - any:
+                    - equals:
+                        var: result.conclusion
+                        value: passed
+                    - equals:
+                        var: result.conclusion
+                        value: accepted_with_isolated_test_passes
                 - equals:
                     var: state.planner_approved
                     value: true
@@ -813,15 +684,12 @@ steps:
                 var: result.conclusion
                 value: failed
             to: implementation
-            set:
-              validation_mode: focused_recheck
             requires_evidence:
               - receipt: result.evidence_receipt_id
                 kind: validation
                 require_current: true
                 require_approved: false
                 owner_role: validator
-                validation_mode: complete_gate
           - id: validation-blocked
             when:
               equals:
@@ -832,6 +700,7 @@ steps:
       - read_receipt
       - prepare_result
       - validation_run
+      - validation_resolve_isolated_tests
     sandbox: read_only
   implementation_review:
     role: planner
@@ -894,8 +763,6 @@ steps:
                 var: result.conclusion
                 value: implementation_changes_needed
             to: implementation
-            set:
-              validation_mode: focused_recheck
             requires_evidence:
               - receipt: result.evidence_receipt_id
                 kind: planner_review
@@ -955,7 +822,7 @@ steps:
               equals:
                 var: result.decision
                 value: prepare
-            to: uat_preparation
+            to: uat
           - id: uat-skipped
             when:
               equals:
@@ -983,11 +850,12 @@ steps:
       choice from silence or a preselected option.
     evidence_operations:
       - read_receipt
-  uat_preparation:
+  uat:
     role: implementer
-    prompt_ref: step_uat_preparation
-    description: Prepare user-selected access and test steps, with an optional guide;
-      route setup or plan defects without editing product code or claiming approval.
+    prompt_ref: step_uat
+    description: Prepare the selected acceptance test, collect actual user observations,
+      and complete this same phase using the recorded answer for this attempt.
+      Route setup or plan defects without editing product code or claiming approval.
     requires:
       all:
         - equals:
@@ -1029,20 +897,58 @@ steps:
     on:
       reported:
         transitions:
-          - id: uat-ready
+          - id: uat-accepted
             when:
-              equals:
-                var: result.conclusion
-                value: ready
-            to: uat_review
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: decisions.uat_result.value
+                    value: approved
+            to: final_review
+            set:
+              uat_completed: true
+          - id: uat-user-skipped
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: decisions.uat_result.value
+                    value: skip
+            to: final_review
+            set:
+              uat_completed: true
+          - id: uat-user-correction
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: decisions.uat_result.value
+                    value: changes_required
+            to: implementation
+            set:
+              uat_completed: false
+          - id: uat-user-blocked
+            when:
+              all:
+                - equals:
+                    var: result.conclusion
+                    value: ready
+                - equals:
+                    var: decisions.uat_result.value
+                    value: blocked
+            notify: orchestrator
           - id: uat-setup-correction
             when:
               equals:
                 var: result.conclusion
                 value: implementation_changes_needed
             to: implementation
-            set:
-              validation_mode: focused_recheck
           - id: uat-plan-correction
             when:
               equals:
@@ -1051,7 +957,6 @@ steps:
             to: planning
             set:
               uat_completed: false
-              validation_mode: complete_gate
           - id: uat-setup-blocked
             when:
               equals:
@@ -1059,71 +964,6 @@ steps:
                 value: blocked
             notify: orchestrator
     sandbox: workspace
-    evidence_operations:
-      - read_receipt
-  uat_review:
-    role: orchestrator
-    execution: coordinator
-    decision:
-      key: uat_result
-      authority: user
-      owner: requester
-    report:
-      schema:
-        type: object
-        required:
-          - decision
-        properties:
-          decision:
-            enum:
-              - approved
-              - changes_required
-              - skip
-              - blocked
-    on:
-      reported:
-        transitions:
-          - id: uat-accepted
-            when:
-              equals:
-                var: result.decision
-                value: approved
-            to: final_review
-            set:
-              uat_completed: true
-          - id: uat-user-skipped
-            when:
-              equals:
-                var: result.decision
-                value: skip
-            to: final_review
-            set:
-              uat_completed: true
-          - id: uat-user-correction
-            when:
-              equals:
-                var: result.decision
-                value: changes_required
-            to: implementation
-            set:
-              validation_mode: focused_recheck
-              uat_completed: false
-          - id: uat-result-blocked
-            when:
-              equals:
-                var: result.decision
-                value: blocked
-            notify: orchestrator
-    requires:
-      all:
-        - equals:
-            var: packages.integrated
-            value: true
-        - equals:
-            var: decisions.uat_preference.value
-            value: prepare
-    description: Wait for the user’s UAT observations; never infer acceptance from
-      preparation or elapsed time.
     evidence_operations:
       - read_receipt
   final_review:
@@ -1257,8 +1097,6 @@ steps:
                     var: result.target_phase
                     value: implementation
             to: implementation
-            set:
-              validation_mode: focused_recheck
             requires_evidence:
               - receipt: result.evidence_receipt_id
                 kind: expert_review
@@ -1314,7 +1152,7 @@ steps:
   closure:
     role: orchestrator
     execution: coordinator
-    description: Verify strict expert and complete GREEN mechanical evidence against
+    description: Verify strict expert and accepted complete mechanical evidence against
       the unchanged current result, then close.
     requires:
       all:

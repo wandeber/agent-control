@@ -44,7 +44,7 @@ and a concrete decision needed. Elapsed time never approves work.
 Use `record_review` with gate `expert` and registry key `final_review` for the
 strict expert receipt, including a rejected rework result. Keep preparation/delta receipts under distinct keys and
 submit its ID as `result.evidence_receipt_id` in the structured result. `approved` goes to
-verified closure, which must bind this approval and GREEN complete mechanical
+verified closure, which must bind this approval and accepted complete mechanical
 evidence to the same unchanged current result. If stale mechanical evidence
 prevents that transition, preserve the expert receipt and report `blocked` with
 the concrete refresh needed. The coordinator routes to the validator; do not

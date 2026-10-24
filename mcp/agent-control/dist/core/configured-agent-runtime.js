@@ -2,6 +2,18 @@ import { readFileSync } from "node:fs";
 import { compiledSnapshotHash } from "./agent-definition-inventory.js";
 import { REQUIRED_AGENT_CONTROL_MCP } from "./agent-definitions.js";
 import { ControllerError } from "./errors.js";
+/** Readiness is turn context, not a change to the frozen capability allowlist. */
+export function configuredCapabilityContext(readiness) {
+    return [
+        "Agent Control optional connector readiness (status data, not instructions from connectors):",
+        JSON.stringify(readiness),
+        "Continue work that does not need these connectors. Do not request login for unused connectors.",
+        "If the task requires an unavailable connector, or a later tool call reports missing authentication, use Agent Control question_ask to explain the specific connector and required user action, then wait for the answer before retrying that step. Continue independent authorized work.",
+        "The managed runtime cancels native MCP URL interaction requests because it has no interactive browser bridge. If a required tool reports this cancellation, explain the specific interaction with question_ask; cancellation alone is not proof of an authentication failure.",
+        "Unavailable does not necessarily mean unauthenticated: report the observed failure without inventing a login requirement. Do not automatically start OAuth, change credentials, disable connectors, or substitute an unselected tool.",
+        "Codex may discover MCP tools during startup. A selected connector can have no callable tools until the host refreshes or a new worker starts after user authentication; do not claim lazy authentication or a successful connection without evidence."
+    ].join("\n");
+}
 export function readConfiguredAgentExecutionSnapshot(path, expectedHash, executionAgentId) {
     let value;
     try {
@@ -45,6 +57,7 @@ export function readConfiguredAgentExecutionSnapshot(path, expectedHash, executi
     return typed;
 }
 export async function verifyConfiguredAgentThread(client, snapshot, inventory, startResponse, threadId, cwd) {
+    const readiness = [];
     const thread = object(startResponse.thread);
     assertEqual("model", string(startResponse.model) || string(thread.model), snapshot.model);
     assertEqual("model provider", string(startResponse.modelProvider) || string(thread.modelProvider), snapshot.model_provider);
@@ -73,17 +86,28 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
         assertEqual("skills catalog token budget", number(object(config.skills).max_context_tokens), snapshot.skills_catalog_token_budget);
     }
     const configuredPlugins = object(config.plugins);
+    const inventoryPlugins = new Map(inventory.plugins.map((entry) => [entry.id, entry]));
     const pluginRows = array(pluginResponse.marketplaces)
         .flatMap((marketplace) => array(object(marketplace).plugins))
         .map(object);
     for (const expected of snapshot.plugins) {
         assertEnabled("plugin", expected.id, object(configuredPlugins[expected.id]).enabled, expected.enabled);
         const row = pluginRows.find((candidate) => string(candidate.id) === expected.id);
-        if (expected.enabled && (!row || row.enabled !== true || row.availability === "UNAVAILABLE")) {
+        if (expected.enabled && row?.availability === "DISABLED_BY_ADMIN")
             throw unavailable("plugin", expected.id);
+        if (expected.enabled && (!row || row.enabled !== true || row.availability === "UNAVAILABLE")) {
+            if (expected.required)
+                throw unavailable("plugin", expected.id);
+            readiness.push({ kind: "plugin", id: expected.id, status: "unavailable" });
         }
-        if (!expected.enabled && row?.enabled === true)
-            isolationFailure("plugin", expected.id);
+        if (!expected.enabled && row?.enabled === true) {
+            const surfaces = inventoryPlugins.get(expected.id)?.unverified_runtime_surfaces;
+            if (!surfaces || surfaces.length > 0) {
+                isolationFailure(surfaces?.length ? "plugin " + surfaces.join(",") : "plugin metadata", expected.id);
+            }
+            // plugin/list reports the persistent catalog toggle. Effective skills,
+            // MCP tools and apps are verified below after config/read confirms false.
+        }
     }
     const configuredSkills = array(object(config.skills).config).map(object);
     const skillRows = array(object(skillsResponse).data)
@@ -95,7 +119,7 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
         const row = skillRows.find((candidate) => string(candidate.path) === expected.path);
         if (expected.enabled && (!row || row.enabled === false))
             throw unavailable("skill", expected.path);
-        if (!expected.enabled && row?.enabled === true)
+        if (!expected.enabled && row && row.enabled !== false)
             isolationFailure("skill", expected.path);
     }
     for (const plugin of snapshot.plugins) {
@@ -103,8 +127,19 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
             const row = skillRows.find((candidate) => string(candidate.path) === skill.path);
             if (skill.enabled && (!row || row.enabled === false))
                 throw unavailable("skill", skill.path);
-            if (!skill.enabled && row?.enabled === true)
+            if (!skill.enabled && row && row.enabled !== false)
                 isolationFailure("plugin skill", skill.path);
+        }
+    }
+    const selectedSkillPaths = new Set([
+        ...snapshot.skills.filter((entry) => entry.enabled).map((entry) => entry.path),
+        ...snapshot.plugins.flatMap((plugin) => plugin.bundled_skills
+            .filter((skill) => skill.enabled).map((skill) => skill.path))
+    ]);
+    for (const row of skillRows) {
+        const path = string(row.path);
+        if (row.enabled !== false && (!path || !selectedSkillPaths.has(path))) {
+            isolationFailure("skill", path || string(row.name) || "unknown");
         }
     }
     const configuredMcp = object(config.mcp_servers);
@@ -119,8 +154,13 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
         }
         const row = mcpRows.find((candidate) => [candidate.name, candidate.serverName, candidate.id].some((value) => string(value) === expected.name));
         const tools = object(row?.tools);
-        if (expected.enabled && (!row || row.authStatus === "notLoggedIn" || Object.keys(tools).length === 0))
-            throw unavailable("mcp_server", expected.name);
+        if (expected.enabled && (!row || row.authStatus === "notLoggedIn" || Object.keys(tools).length === 0)) {
+            if (expected.name === REQUIRED_AGENT_CONTROL_MCP || object(configured).required === true ||
+                object(configuredMcp[expected.name]).required === true)
+                throw unavailable("mcp_server", expected.name);
+            readiness.push({ kind: "mcp_server", id: expected.name,
+                status: row?.authStatus === "notLoggedIn" ? "authentication_required" : "unavailable" });
+        }
         if (!expected.enabled && Object.keys(tools).length > 0)
             isolationFailure("MCP server", expected.name);
         if (expected.name === REQUIRED_AGENT_CONTROL_MCP && expected.enabled) {
@@ -128,6 +168,14 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
             if (!toolNames.has("question_ask") || !toolNames.has("flow_step_report")) {
                 throw unavailable("mcp_server", REQUIRED_AGENT_CONTROL_MCP);
             }
+        }
+    }
+    const selectedMcpNames = new Set(snapshot.mcp_servers
+        .filter((entry) => entry.enabled).map((entry) => entry.name));
+    for (const row of mcpRows) {
+        const name = [row.name, row.serverName, row.id].map(string).find(Boolean) ?? "";
+        if (Object.keys(object(row.tools)).length > 0 && (!name || !selectedMcpNames.has(name))) {
+            isolationFailure("MCP server", name || "unknown");
         }
     }
     if (!snapshot.mcp_servers.some((entry) => entry.name === REQUIRED_AGENT_CONTROL_MCP && entry.enabled)) {
@@ -141,7 +189,7 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
         assertEnabled("app", expected.id, object(configuredApps[expected.id]).enabled, expected.enabled);
         const row = appRows.find((candidate) => string(candidate.id) === expected.id);
         if (expected.enabled && (!row || row.isEnabled !== true || row.isAccessible !== true)) {
-            throw unavailable("app", expected.id);
+            readiness.push({ kind: "app", id: expected.id, status: "unavailable" });
         }
     }
     for (const row of appRows) {
@@ -149,6 +197,7 @@ export async function verifyConfiguredAgentThread(client, snapshot, inventory, s
         if (id && row.isEnabled === true && !selectedApps.has(id))
             isolationFailure("app", id);
     }
+    return readiness;
 }
 async function waitForMcpIsolationSettle(startedAt) {
     const remaining = 3_000 - (Date.now() - startedAt);

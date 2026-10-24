@@ -1,9 +1,11 @@
 import { replaceAgentCapabilities, skillRows } from "../../../web/src/lib/agent-definitions.js";
 import { agentDefinitionSchema } from "../src/core/agent-definitions.js";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as inventoryModule from "../src/core/agent-definition-inventory.js";
+import { runInteractiveCliTurn } from "../src/adapters/codex-cli-interactive.js";
 import {
   compileAgentConfiguration,
   compiledSnapshotHash,
@@ -11,6 +13,7 @@ import {
   type AgentDefinitionInventory
 } from "../src/core/agent-definition-inventory.js";
 import {
+  configuredCapabilityContext,
   readConfiguredAgentExecutionSnapshot,
   verifyConfiguredAgentThread
 } from "../src/core/configured-agent-runtime.js";
@@ -22,6 +25,8 @@ import {
 
 const roots: string[] = [];
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -79,6 +84,209 @@ function definition(): AgentDefinition {
   };
 }
 
+function verificationFixture(repo = "/project", executable = "/qualified/codex") {
+  const current = inventory(repo);
+  current.runtime.executable = executable;
+  const compiled = compileAgentConfiguration(definition(), "catalog", current, repo);
+  const config = {
+    model: compiled.model, model_provider: compiled.model_provider,
+    model_reasoning_effort: compiled.reasoning_effort, developer_instructions: compiled.developer_instructions,
+    skills: { max_context_tokens: 9000, config: compiled.skills },
+    plugins: Object.fromEntries(compiled.plugins.map(entry => [entry.id, { enabled: entry.enabled,
+      mcp_servers: Object.fromEntries(compiled.mcp_servers.filter(server => server.plugin_id === entry.id)
+        .map(server => [server.name, { enabled: server.enabled }])) }])),
+    mcp_servers: Object.fromEntries(compiled.mcp_servers.map(entry => [entry.name, { enabled: entry.enabled }])),
+    apps: Object.fromEntries([["_default", { enabled: false }], ...compiled.apps.map(entry => [entry.id, { enabled: entry.enabled }])])
+  };
+  const responses: Record<string, any> = {
+    "config/read": { config },
+    "skills/list": { data: [{ skills: [...compiled.skills, ...compiled.plugins.flatMap(plugin => plugin.bundled_skills)] }] },
+    "plugin/list": { marketplaces: [{ plugins: compiled.plugins.map(entry => ({ id: entry.id, enabled: entry.enabled, availability: "AVAILABLE" })) }] },
+    "mcpServerStatus/list": { data: compiled.mcp_servers.map(entry => ({ name: entry.name, authStatus: "unsupported",
+      tools: entry.enabled ? entry.name === REQUIRED_AGENT_CONTROL_MCP
+        ? { question: { name: "question_ask" }, report: { name: "flow_step_report" } }
+        : { one: { name: "selected_tool" } } : {} })) },
+    "app/list": { data: compiled.apps.map(entry => ({ id: entry.id, isEnabled: entry.enabled, isAccessible: true })) }
+  };
+  const client = { request: vi.fn(async (method: string) => {
+    if (!(method in responses)) throw new Error(`Unexpected method ${method}`);
+    return responses[method];
+  }) } as any;
+  const start = { model: compiled.model, modelProvider: compiled.model_provider,
+    reasoningEffort: compiled.reasoning_effort, thread: { id: "thread" } };
+  return { current, compiled, config, responses, client, start,
+    verify: () => verifyConfiguredAgentThread(client, compiled, current, start, "thread", "/project") };
+}
+
+describe("optional connector startup", () => {
+  it("accepts a global plugin toggle only when every effective surface is disabled", async () => {
+    vi.useFakeTimers();
+    const fixture = verificationFixture();
+    fixture.current.plugins.find(plugin => plugin.id === "off@plugins")!.unverified_runtime_surfaces = [];
+    fixture.responses["plugin/list"].marketplaces[0].plugins.find((plugin: any) => plugin.id === "off@plugins").enabled = true;
+    const result = fixture.verify();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await result).toEqual([]);
+  });
+
+  it("fails closed when a globally enabled plugin has an unverified executable surface", async () => {
+    vi.useFakeTimers();
+    const fixture = verificationFixture();
+    fixture.current.plugins.find(plugin => plugin.id === "off@plugins")!.unverified_runtime_surfaces = ["hooks"];
+    fixture.responses["plugin/list"].marketplaces[0].plugins.find((plugin: any) => plugin.id === "off@plugins").enabled = true;
+    const result = expect(fixture.verify()).rejects.toMatchObject({
+      reason: "unsupported_runtime",
+      details: { capability_kind: "plugin hooks", capability_id: "off@plugins" }
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    await result;
+  });
+
+  it.each(["missing", "notLoggedIn", "empty"])("allows optional MCP status %s without authentication requests", async status => {
+    vi.useFakeTimers();
+    const fixture = verificationFixture();
+    const rows = fixture.responses["mcpServerStatus/list"].data;
+    const selected = rows.find((row: any) => row.name === "selected_mcp");
+    if (status === "missing") rows.splice(rows.indexOf(selected), 1);
+    else { selected.tools = {}; selected.authStatus = status === "notLoggedIn" ? status : "unsupported"; }
+    const result = fixture.verify();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await result).toEqual([{ kind: "mcp_server", id: "selected_mcp",
+      status: status === "notLoggedIn" ? "authentication_required" : "unavailable" }]);
+    expect(fixture.client.request.mock.calls.map((call: any[]) => call[0]))
+      .not.toContain("mcpServer/oauth/login");
+    expect(fixture.compiled.mcp_servers.find(server => server.name === "selected_mcp")!.enabled).toBe(true);
+  });
+
+  it("allows unavailable installed plugins and apps while retaining their configuration", async () => {
+    vi.useFakeTimers();
+    const fixture = verificationFixture();
+    fixture.current.plugins.find(plugin => plugin.id === "selected@plugins")!.available = false;
+    fixture.current.apps = fixture.current.apps.filter(app => app.id !== "selected-app");
+    const compiled = compileAgentConfiguration(definition(), "catalog", fixture.current, "/project");
+    expect(refreshCompiledAgentConfiguration(compiled, fixture.current).apps.find(app => app.id === "selected-app")!.enabled).toBe(true);
+    fixture.responses["plugin/list"].marketplaces[0].plugins.find((plugin: any) => plugin.id === "selected@plugins").availability = "UNAVAILABLE";
+    fixture.responses["app/list"].data.find((app: any) => app.id === "selected-app").isAccessible = false;
+    const result = fixture.verify();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await result).toEqual([
+      { kind: "plugin", id: "selected@plugins", status: "unavailable" },
+      { kind: "app", id: "selected-app", status: "unavailable" }
+    ]);
+  });
+
+  it.each(["required-mcp", "required-plugin", "explicit-required-mcp", "admin-disabled", "disabled-plugin-skill", "disabled-mcp", "unexpected-skill", "unexpected-mcp", "unfiltered-app-transport", "unselected-app", "config-mismatch", "missing-skill"])
+    ("still blocks %s before a prompt", async failure => {
+      vi.useFakeTimers();
+      const fixture = verificationFixture();
+      if (failure === "required-mcp") fixture.responses["mcpServerStatus/list"].data.find((row: any) => row.name === REQUIRED_AGENT_CONTROL_MCP).authStatus = "notLoggedIn";
+      if (failure === "explicit-required-mcp") {
+        (fixture.config.mcp_servers.selected_mcp as any).required = true;
+        fixture.responses["mcpServerStatus/list"].data.find((row: any) => row.name === "selected_mcp").tools = {};
+      }
+      if (failure === "required-plugin") fixture.responses["plugin/list"].marketplaces[0].plugins.find((row: any) => row.id === REQUIRED_AGENT_CONTROL_PLUGIN).availability = "UNAVAILABLE";
+      if (failure === "admin-disabled") fixture.responses["plugin/list"].marketplaces[0].plugins.find((row: any) => row.id === "selected@plugins").availability = "DISABLED_BY_ADMIN";
+      if (failure === "disabled-plugin-skill") fixture.responses["skills/list"].data[0].skills =
+        fixture.responses["skills/list"].data[0].skills.map((row: any) =>
+          row.path === "/off/SKILL.md" ? { ...row, enabled: true } : row);
+      if (failure === "disabled-mcp") fixture.responses["mcpServerStatus/list"].data.find((row: any) => row.name === "off_mcp").tools = { leaked: { name: "leaked" } };
+      if (failure === "unexpected-skill") fixture.responses["skills/list"].data[0].skills.push({
+        name: "Unexpected", path: "/unexpected/SKILL.md", enabled: true
+      });
+      if (failure === "unexpected-mcp") fixture.responses["mcpServerStatus/list"].data.push({
+        name: "unexpected_mcp", authStatus: "unsupported", tools: { leaked: { name: "leaked" } }
+      });
+      if (failure === "unfiltered-app-transport") fixture.responses["mcpServerStatus/list"].data.push({
+        name: "codex_apps", authStatus: "unsupported", tools: {
+          selected: { name: "selected.tool" }, leaked: { name: "unselected.tool" }
+        }
+      });
+      if (failure === "unselected-app") fixture.responses["app/list"].data.push({ id: "unselected", isEnabled: true });
+      if (failure === "config-mismatch") fixture.config.mcp_servers.selected_mcp!.enabled = false;
+      if (failure === "missing-skill") fixture.responses["skills/list"].data[0].skills = [];
+      const result = expect(fixture.verify()).rejects.toMatchObject({ reason:
+        ["required-mcp", "required-plugin", "explicit-required-mcp", "admin-disabled", "missing-skill"].includes(failure) ? "capability_unavailable" : "unsupported_runtime" });
+      await vi.advanceTimersByTimeAsync(3000);
+      await result;
+    });
+
+  it("provides use-time guidance even when authentication expires after a ready startup", () => {
+    const context = configuredCapabilityContext([]);
+    expect(context).toContain("a later tool call reports missing authentication");
+    expect(context).toContain("question_ask");
+    expect(context).toContain("wait for the answer before retrying");
+    expect(context).toContain("Do not automatically start OAuth");
+  });
+
+  it("retains administrative plugin restrictions during compile and continuation", () => {
+    const fixture = verificationFixture();
+    fixture.current.plugins.find(plugin => plugin.id === "selected@plugins")!.blocked_by_policy = true;
+    expect(() => compileAgentConfiguration(definition(), "catalog", fixture.current, "/project")).toThrow(/unavailable/);
+    expect(() => refreshCompiledAgentConfiguration(fixture.compiled, fixture.current)).toThrow(/unavailable/);
+  });
+
+  it("dispatches a first turn with optional auth missing and cancels only owned URL interaction requests", async () => {
+    const root = mkdtempSync(join(tmpdir(), "configured-optional-auth-")); roots.push(root);
+    const executable = join(root, "fixture-codex"), callsPath = join(root, "calls.jsonl");
+    const fixture = verificationFixture(root, executable);
+    fixture.responses["mcpServerStatus/list"].data.find((row: any) => row.name === "selected_mcp").authStatus = "notLoggedIn";
+    const snapshot = { ...fixture.compiled, execution_agent_id: "worker" };
+    const snapshotPath = join(root, "snapshot.json");
+    writeFileSync(snapshotPath, JSON.stringify(snapshot));
+    vi.spyOn(inventoryModule, "loadAgentDefinitionInventory").mockResolvedValue(fixture.current);
+    // A local JSON-RPC peer proves dispatch and cancellation without a model,
+    // browser, OAuth endpoint, credential helper, or installed plugin runtime.
+    writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const responses = ${JSON.stringify(fixture.responses)};
+const start = ${JSON.stringify({ ...fixture.start, approvalPolicy: "never", sandbox: { type: "readOnly" } })};
+let pendingTurn, pendingThread;
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(request) + '\\n');
+  if (!request.method) {
+    if (request.id === 'startup-url') send({id:pendingThread,result:start});
+    if (request.id === 'owned-url') send({id:pendingTurn,result:{turn:{id:'turn',status:'completed'}}});
+    return;
+  }
+  if (request.id === undefined) return;
+  if (request.method === 'thread/start') {
+    pendingThread = request.id;
+    send({id:'startup-url',method:'mcpServer/elicitation/request',params:{threadId:'thread',turnId:null,serverName:'selected_mcp',mode:'url',url:'https://example.invalid/interaction',message:'User interaction required',elicitationId:'startup'}});
+    return;
+  }
+  if (request.method === 'turn/start') {
+    pendingTurn = request.id;
+    for (const [id, threadId] of [['other-url','other-thread'],['owned-url','thread']]) {
+      send({id,method:'mcpServer/elicitation/request',params:{threadId,turnId:null,serverName:'selected_mcp',mode:'url',url:'https://example.invalid/interaction',message:'User interaction required',elicitationId:id}});
+    }
+    return;
+  }
+  send({id:request.id,result:request.method.startsWith('thread/') ? start : responses[request.method] || {}});
+});`, { mode: 0o700 });
+    const result = await runInteractiveCliTurn({ executable, cwd: root, prompt: "Write a short poem.",
+      model: snapshot.model, model_provider: snapshot.model_provider, reasoning_effort: snapshot.reasoning_effort,
+      sandbox: "read_only", agent_id: "worker", db_path: join(root, "state.sqlite"),
+      snapshot_path: snapshotPath, snapshot_hash: compiledSnapshotHash(snapshot) }, {
+      event: () => {}, thread: () => {}, turn: () => {}, heartbeat: () => {}, stop: () => undefined,
+      dispatch: send => send()
+    });
+    expect(result).toEqual({ thread_id: "thread", status: "completed" });
+    const calls = readFileSync(callsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const turns = calls.filter(call => call.method === "turn/start");
+    expect(turns).toHaveLength(1);
+    expect(turns[0].params.input[0].text).toBe("Write a short poem.");
+    expect(turns[0].params.input[1].text).toContain('"id":"selected_mcp","status":"authentication_required"');
+    expect(turns[0].params.input[1].text).toContain("question_ask");
+    expect(calls.filter(call => !call.method)).toEqual([
+      { id: "startup-url", result: { action: "cancel", content: null, _meta: null } },
+      { id: "owned-url", result: { action: "cancel", content: null, _meta: null } }
+    ]);
+    expect(calls.some(call => call.method === "mcpServer/oauth/login")).toBe(false);
+  }, 10_000);
+});
+
 describe("configured-agent runtime", () => {
   it("inherits effective skills but preserves explicit configuration across global changes", () => {
     const current = inventory("/project");
@@ -126,13 +334,15 @@ describe("configured-agent runtime", () => {
     expect(compileAgentConfiguration({ ...inherited, capabilities_mode: "custom" }, "revision", current, "/project").plugins.find(plugin => plugin.id === "selected@plugins")!.enabled).toBe(true);
   });
 
-  it("ignores unavailable inherited apps that the user has disabled", () => {
+  it("preserves optional app selection regardless of metadata readiness", () => {
     const current = inventory("/project");
     current.plugins.find(plugin => plugin.id === "selected@plugins")!.enabled_by_default = true;
     current.apps.find(app => app.id === "selected-app")!.available = false;
     const inherited = compileAgentConfiguration({ ...definition(), capabilities_mode: "inherit" }, "revision", current, "/project");
     expect(inherited.apps.find(app => app.id === "selected-app")!.enabled).toBe(false);
-    expect(() => compileAgentConfiguration(definition(), "revision", current, "/project")).toThrow(/unavailable/);
+    const custom = compileAgentConfiguration(definition(), "revision", current, "/project");
+    expect(custom.apps.find(app => app.id === "selected-app")!.enabled).toBe(true);
+    expect(refreshCompiledAgentConfiguration(custom, current).apps).toEqual(custom.apps);
     expect(() => refreshCompiledAgentConfiguration(inherited, current)).not.toThrow();
   });
 
@@ -197,12 +407,25 @@ describe("configured-agent runtime", () => {
     });
     expect(compiled.app_server_overrides[0]).toContain('"off@plugins"={"enabled"=false');
     expect(compiled.app_server_overrides[0]).toContain('"agent_control"={"enabled"=true}');
+    expect(compiled.app_server_overrides.join("\n")).toContain(
+      '"path"="/agent-control/SKILL.md","enabled"=true,"plugin_id"="agent-control@agent-control"'
+    );
     expect(compiled.app_server_overrides.join("\n")).toContain('"_default"={"enabled"=false}');
     expect(compiled.app_server_overrides.join("\n")).toContain("skills.max_context_tokens=9000");
     const rootMcpOverride = compiled.app_server_overrides.find((entry) => entry.startsWith("mcp_servers="))!;
     expect(rootMcpOverride).not.toContain("agent_control");
     expect(rootMcpOverride).toContain('"selected_mcp"={"enabled"=true}');
     expect(rootMcpOverride).toContain('"off_mcp"={"enabled"=false');
+    expect(rootMcpOverride).toContain(JSON.stringify(process.execPath));
+  });
+
+  it("shadows the built-in app transport when no app is selected", () => {
+    const configured = definition();
+    configured.plugins = [{ id: REQUIRED_AGENT_CONTROL_PLUGIN, enabled: true }];
+    const compiled = compileAgentConfiguration(configured, "catalog", inventory("/project"), "/project");
+    const rootMcpOverride = compiled.app_server_overrides.find((entry) => entry.startsWith("mcp_servers="))!;
+    expect(compiled.apps.every((entry) => !entry.enabled)).toBe(true);
+    expect(rootMcpOverride).toContain('"codex_apps"={"enabled"=false');
     expect(rootMcpOverride).toContain(JSON.stringify(process.execPath));
   });
 
@@ -290,7 +513,7 @@ describe("configured-agent runtime", () => {
     } } as any;
     await expect(verifyConfiguredAgentThread(client, compiled, currentInventory, {
       model: "model", modelProvider: "provider", reasoningEffort: "high", thread: { id: "thread" }
-    }, "thread", root)).resolves.toBeUndefined();
+    }, "thread", root)).resolves.toEqual([]);
     expect(calls.some((entry) => entry.method === "app/list")).toBe(true);
     expect(calls.some((entry) => entry.method === "apps/list")).toBe(false);
     expect(calls.find((entry) => entry.method === "plugin/list")?.params)

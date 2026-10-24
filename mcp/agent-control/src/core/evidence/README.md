@@ -98,9 +98,20 @@ Coverage is structural evidence over model-declared semantic scope. The helper
 checks every manifest path, package/consumer/mandatory/material-risk surface and
 check reference. It cannot discover undeclared semantic dependencies. Focused
 or failing coverage is shape-checked through the same canonical validator, but
-the actual mode/verdict is preserved and cannot close a run. Closure requires
-an authenticated strict-approved expert result and a GREEN complete gate for
-the same current snapshot; every reused source is dereferenced.
+the actual mode/verdict is preserved. A failed or focused receipt alone cannot
+close a run. Closure requires authenticated strict-approved expert evidence and
+accepted complete validation for the same snapshot; every source is dereferenced.
+
+`validation_resolve_isolated_tests` takes an original failed complete
+`validation_receipt_id`, passing focused `isolated_receipt_ids`, and the
+canonical `isolated_test_resolutions` declaration. It executes no commands and
+preserves the original raw records. Every rerun must be executed, have a unique
+check ID, and cover the same current result. The provider verifies resolution
+coverage and the adapter verifies immutable execution provenance. The resulting
+status is `accepted_with_isolated_test_passes`, not `passed`: the failed commands
+remain failed, while the complete gate may advance without another full run.
+Uncovered failures, non-test failures and still-failing isolated reruns are not
+accepted. This policy requires no new approval or root-cause proof.
 
 ## Packaging and regression checks
 

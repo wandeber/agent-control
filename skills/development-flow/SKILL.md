@@ -118,16 +118,15 @@ not a replacement for the pending call.
 
 Use `flow_decision` for configured decision steps. Their `owner: requester`
 binds the original conversational thread, even when another coordinator executes
-the run. `authority: coordinator` marks its narrow analysis-intent judgment;
-`authority: user` records actual user choices. Neither permits an executing
-coordinator to impersonate the original conversation. Consume the generated gate
+the run. `authority: user` records actual user choices and does not permit an
+executing coordinator to impersonate the original conversation. Consume the generated gate
 contract and current revision; never infer approval from a timeout, a worker's
 `approved` label, or the absence of an objection.
 
-- **Analysis intent:** the exact clarification owner compares current Analysis
-  with accepted user intent. Record approval or a concrete correction. Keep
-  this check narrow: it is not another technical expert review. If execution
-  is elsewhere, its coordinator waits for this owner's decision.
+- **Analysis handoff:** the analyst owns the solution and a `ready` result
+  proceeds directly to Planning. Do not add a coordinator review or approval
+  of Analysis. Context surfaces material user questions early; the analyst
+  can ask further questions through the clarification route before proceeding.
 - **Exact plan approval:** after strict approval by the same Analysis owner,
   ensure its package manifest is registered. Use an empty manifest for inline
   work. When parallel work helps, provision the declared disjoint worktrees
@@ -142,7 +141,11 @@ contract and current revision; never infer approval from a timeout, a worker's
   once after the first planner approval whether to prepare UAT or continue to
   final review through the available question interface. Record `prepare` or
   `skip`. Prepare the environment only when
-  selected, wait for actual user observations, and record the result. Do not
+  selected. The single `uat` phase prepares and waits for actual user observations.
+  Record `uat_result` with `flow_decision` while that attempt is active, then
+  explicitly resume the same UAT worker to submit its final report and optional
+  guide. The answer is bound to that exact step instance; a new attempt needs a
+  new answer. Do not
   repeatedly ask on expert corrections or pretend preparation means approval.
 - **No progress:** on the second recurrence of the same underlying issue without
   material progress, or incompatible correction approaches, preserve the
@@ -151,8 +154,12 @@ contract and current revision; never infer approval from a timeout, a worker's
 - **Closure:** run `flow_evidence` operation `verify_closure` under key `closure`
   with current expert and complete validation receipt IDs, then submit the
   coordinator closure report with `conclusion: verified`. Finish only when strict
-  expert approval and GREEN complete mechanical evidence cover the unchanged
+  expert approval and accepted complete mechanical evidence cover the unchanged
   current result and all earlier user/workflow gates remain satisfied.
+  Acceptance includes `accepted_with_isolated_test_passes`: preserve the failed
+  complete run and executed passing isolated reruns, then continue without
+  another full run or a new user waiver. Use the Validation phase's resolution
+  operation and canonical contract; do not relabel failed commands GREEN.
   If only the complete mechanical evidence is stale, preserve the expert receipt
   and use `flow_step_start` to return to `validation` with the observed refresh
   reason. The validator can request closure against both verified current
@@ -181,8 +188,11 @@ closure. Do not rewrite full ledgers, copy the helper into a prompt, or create
 Markdown solely to transport structured reports. Reuse immutable references and
 send continued owners only new directives, relevant changes, and pending scope.
 
-Keep testing proportionate. Reuse adequate coverage, execute focused correction
-checks, and run the relevant complete affected gate once when needed. Do not
+Use one Validation phase for both initial work and corrections. Keep testing
+proportionate: reuse adequate coverage, use focused correction checks only when
+useful within that phase, and require complete affected evidence before success.
+Preserve pending findings and checkpoint lineage; a partial check cannot mark
+the whole result validated. Do not add a separate focused-validation phase. Do not
 impose TDD, duplicate suites, one test per requirement, or additional tests merely
 to create cache entries. Real context loss, missing evidence, or unbounded impact
 requires full review by the same owner; owner loss blocks rather than silently

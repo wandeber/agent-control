@@ -333,7 +333,8 @@ def sensitive_path(path: str) -> bool:
     name = PurePosixPath(path).name.lower()
     return (
         name in SENSITIVE_NAMES
-        or name.startswith(".env.")
+        # Public sample files belong in the reviewed configuration surface.
+        or (name.startswith(".env.") and name != ".env.sample")
         or name.endswith(SENSITIVE_UNTRACKED_SUFFIXES)
     )
 
@@ -4113,16 +4114,70 @@ def record_review(args: argparse.Namespace) -> dict[str, Any]:
     return composed_review_receipt(envelope, "surfaces") if args.compose else envelope
 
 
+def validate_isolated_test_resolutions(
+    value: Any,
+    checks: dict[str, dict[str, Any]],
+) -> None:
+    if not isinstance(value, list) or not value:
+        raise CheckpointError("Accepted isolated test evidence requires non-empty isolated_test_resolutions.")
+    failed_ids = {check_id for check_id, check in checks.items() if check["verdict"] == "failed"}
+    if not failed_ids:
+        raise CheckpointError("Isolated test resolutions require a failed complete-run check.")
+    resolved_ids: set[str] = set()
+    for resolution in value:
+        if not isinstance(resolution, dict):
+            raise CheckpointError("An isolated test resolution must be an object.")
+        require_exact_keys(resolution, {
+            "failed_check_id", "failure_kind", "failed_test_ids", "isolated_rechecks",
+        }, "Isolated test resolution")
+        failed_id = safe_id(
+            validate_non_empty_string(resolution["failed_check_id"], "Failed check ID"), "check ID"
+        )
+        if failed_id not in failed_ids or failed_id in resolved_ids:
+            raise CheckpointError("Every isolated resolution must identify one unique failed complete-run check.")
+        if resolution["failure_kind"] != "tests_only":
+            raise CheckpointError("Isolated test acceptance cannot resolve non-test failures.")
+        failed_tests = set(validate_required_string_list(
+            resolution["failed_test_ids"], f"Check {failed_id} failed_test_ids"
+        ))
+        rechecks = resolution["isolated_rechecks"]
+        if not isinstance(rechecks, list) or not rechecks:
+            raise CheckpointError(f"Check {failed_id} requires executed isolated rechecks.")
+        recheck_ids: set[str] = set()
+        covered_tests: set[str] = set()
+        for recheck in rechecks:
+            if not isinstance(recheck, dict):
+                raise CheckpointError("An isolated recheck must be an object.")
+            require_exact_keys(recheck, {"check_id", "test_ids"}, "Isolated recheck")
+            check_id = safe_id(validate_non_empty_string(recheck["check_id"], "Isolated check ID"), "check ID")
+            if check_id not in checks or check_id in recheck_ids:
+                raise CheckpointError("Isolated recheck IDs must reference unique existing checks.")
+            check = checks[check_id]
+            if check["disposition"] != "executed" or check["verdict"] != "passed":
+                raise CheckpointError(f"Isolated recheck {check_id} must actually execute and pass.")
+            recheck_ids.add(check_id)
+            covered_tests.update(validate_required_string_list(recheck["test_ids"], "Isolated test_ids"))
+        if covered_tests != failed_tests:
+            raise CheckpointError(f"Isolated rechecks must cover every failed test for check {failed_id} exactly.")
+        resolved_ids.add(failed_id)
+    if resolved_ids != failed_ids:
+        raise CheckpointError("Isolated test resolutions must cover every failed complete-run check.")
+
+
 def validate_closure_mechanical_report(
     report: dict[str, Any],
     repo: Path,
     manifest: dict[str, Any],
 ) -> None:
-    require_exact_keys(report, {
+    accepted_isolated = report.get("verdict") == "accepted_with_isolated_test_passes"
+    report_fields = {
         "report_schema_version", "checkpoint_id", "task_result_snapshot_sha256",
         "validation_mode", "verdict", "summary", "path_packages", "surfaces",
         "checks", "required_corrections",
-    }, "Closure mechanical report")
+    }
+    if accepted_isolated:
+        report_fields.add("isolated_test_resolutions")
+    require_exact_keys(report, report_fields, "Closure mechanical report")
     if (
         not isinstance(report["report_schema_version"], int)
         or isinstance(report["report_schema_version"], bool)
@@ -4134,8 +4189,10 @@ def validate_closure_mechanical_report(
         or report["task_result_snapshot_sha256"] != manifest["snapshot_sha256"]
     ):
         raise CheckpointError("Closure mechanical report does not bind its checkpoint snapshot.")
-    if report["validation_mode"] != "complete_gate" or report["verdict"] != "passed":
-        raise CheckpointError("Closure requires a passed complete_gate mechanical report.")
+    if report["validation_mode"] != "complete_gate" or report["verdict"] not in (
+        "passed", "accepted_with_isolated_test_passes",
+    ):
+        raise CheckpointError("Closure requires a passed or accepted_with_isolated_test_passes complete_gate report.")
     validate_non_empty_string(report["summary"], "Mechanical summary")
     if validate_string_list(report["required_corrections"], "Mechanical required_corrections"):
         raise CheckpointError("Closure mechanical report must have no required corrections.")
@@ -4148,7 +4205,7 @@ def validate_closure_mechanical_report(
     checks_value = report["checks"]
     if not isinstance(checks_value, list):
         raise CheckpointError("Closure mechanical checks must be an array.")
-    check_ids: set[str] = set()
+    checks: dict[str, dict[str, Any]] = {}
     for check in checks_value:
         if not isinstance(check, dict):
             raise CheckpointError("Closure mechanical check must be an object.")
@@ -4157,21 +4214,25 @@ def validate_closure_mechanical_report(
             "evidence", "skip_reason", "source_identity",
         }, "Closure mechanical check")
         check_id = safe_id(validate_non_empty_string(check["check_id"], "Check ID"), "check ID")
-        if check_id in check_ids:
+        if check_id in checks:
             raise CheckpointError("Closure mechanical check IDs must be unique.")
-        check_ids.add(check_id)
+        checks[check_id] = check
         validate_non_empty_string(check["command"], f"Check {check_id} command")
         normalized_check_cwd(repo, check["cwd"])
         validate_required_string_list(check["evidence"], f"Check {check_id} evidence")
+        valid_exit_status = isinstance(check["exit_status"], int) and not isinstance(check["exit_status"], bool)
+        passed = check["verdict"] == "passed" and valid_exit_status and check["exit_status"] == 0
+        # Preserve a failed full-run receipt; separate isolated execution evidence resolves it.
+        resolved_failure = (
+            accepted_isolated and check["disposition"] == "executed"
+            and check["verdict"] == "failed" and valid_exit_status and check["exit_status"] != 0
+        )
         if (
             check["disposition"] not in ("executed", "reused")
-            or check["verdict"] != "passed"
-            or not isinstance(check["exit_status"], int)
-            or isinstance(check["exit_status"], bool)
-            or check["exit_status"] != 0
+            or not (passed or resolved_failure)
             or check["skip_reason"] is not None
         ):
-            raise CheckpointError(f"Closure check {check_id} must be executed or reused GREEN evidence, without skips.")
+            raise CheckpointError(f"Closure check {check_id} requires passing evidence or a resolved test failure, without skips.")
         source = check["source_identity"]
         if check["disposition"] == "executed":
             if source is not None:
@@ -4188,6 +4249,9 @@ def validate_closure_mechanical_report(
             if source["task_result_snapshot_sha256"] != manifest["snapshot_sha256"]:
                 raise CheckpointError(f"Reused check {check_id} belongs to a different task result.")
 
+    if accepted_isolated:
+        validate_isolated_test_resolutions(report["isolated_test_resolutions"], checks)
+    check_ids = set(checks)
     surfaces_value = report["surfaces"]
     if not isinstance(surfaces_value, list) or not surfaces_value:
         raise CheckpointError("Closure mechanical surfaces must be a non-empty array.")

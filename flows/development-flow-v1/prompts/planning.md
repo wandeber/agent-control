@@ -1,6 +1,6 @@
 # Planning
 
-Build an executable plan from the intent-approved Analysis and current acceptance
+Build an executable plan from the completed Analysis and current acceptance
 revision. Inspect the current correction capsule when reworking. Return an
 incorrect or materially incomplete analysis to its owner; do not silently
 replace its decisions.

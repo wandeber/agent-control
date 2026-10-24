@@ -349,6 +349,28 @@ class ReviewCheckpointTests(unittest.TestCase):
             "--expert-checkpoint-id", expert_id, "--mechanical-report", str(path), expected=expected,
         )
 
+    def isolated_closure_report(self, checkpoint: dict[str, object]) -> dict[str, object]:
+        report = self.closure_report(checkpoint)
+        report["verdict"] = "accepted_with_isolated_test_passes"
+        report["summary"] = "The complete run failed two tests; both passed in isolation on the unchanged result."
+        report["checks"][0].update({
+            "verdict": "failed", "exit_status": 1,
+            "evidence": ["Complete run: 8 passed, 2 failed (first case and second case)."],
+        })
+        report["checks"].append({
+            "check_id": "isolated", "command": "pnpm test tests/affected.test.ts", "cwd": ".",
+            "disposition": "executed", "verdict": "passed", "exit_status": 0,
+            "evidence": ["Isolated run: both failed cases executed and passed; assertions and configuration unchanged."],
+            "skip_reason": None, "source_identity": None,
+        })
+        report["surfaces"][0]["check_ids"].append("isolated")
+        report["isolated_test_resolutions"] = [{
+            "failed_check_id": "unit", "failure_kind": "tests_only",
+            "failed_test_ids": ["first case", "second case"],
+            "isolated_rechecks": [{"check_id": "isolated", "test_ids": ["first case", "second case"]}],
+        }]
+        return report
+
     def test_compose_strict_reviews_binds_identity_and_requires_pending_coverage(self) -> None:
         _, first = self.create("compose-1", "--path", "src/value.txt", "--path", "docs/note.md")
         assert first is not None
@@ -627,6 +649,93 @@ class ReviewCheckpointTests(unittest.TestCase):
         self.close("closure-shapes", no_checks, expected=2)
         no_checks["surfaces"][0]["no_applicable_checks_reason"] = "This package changes only prose; the declared affected surface has no configured checks."
         self.close("closure-shapes", no_checks)
+
+    def test_closure_accepts_isolated_test_passes_and_preserves_the_complete_run_failure(self) -> None:
+        _, checkpoint = self.create("closure-isolated", "--path", "src/value.txt")
+        assert checkpoint is not None
+        self.record_review(checkpoint, "expert", self.strict_report(checkpoint, "expert"))
+        report = self.isolated_closure_report(checkpoint)
+        _, receipt = self.close("closure-isolated", report)
+        assert receipt is not None
+        self.assertTrue(receipt["closure_verified"])
+        stored = json.loads(Path(receipt["record_path"]).read_text())["mechanical_report"]
+        self.assertEqual(stored, report)
+        self.assertEqual(stored["checks"][0]["verdict"], "failed")
+        self.assertEqual(stored["checks"][0]["exit_status"], 1)
+        self.assertEqual(stored["verdict"], "accepted_with_isolated_test_passes")
+        self.assertEqual(receipt["mechanical_report_sha256"], self.canonical_digest(report))
+        self.write("src/value.txt", "changed after isolated evidence\n")
+        self.close("closure-isolated", report, expected=2)
+
+    def test_closure_rejects_unresolved_or_unexecuted_isolated_test_evidence(self) -> None:
+        _, checkpoint = self.create("closure-isolated-invalid", "--path", "src/value.txt")
+        assert checkpoint is not None
+        self.record_review(checkpoint, "expert", self.strict_report(checkpoint, "expert"))
+        report = self.isolated_closure_report(checkpoint)
+        cases = (
+            "missing-resolution", "empty-resolutions", "duplicate-resolution", "unknown-failure",
+            "non-test-failure", "missing-test", "unrelated-test", "empty-failures",
+            "missing-recheck", "unknown-recheck", "duplicate-recheck", "original-as-recheck",
+            "isolated-failed", "isolated-skipped", "isolated-reused", "isolated-nonzero",
+            "isolated-no-evidence", "unresolved-build", "failed-with-zero-exit",
+            "false-green", "no-original-failure", "stale-snapshot",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                malformed = json.loads(json.dumps(report))
+                resolution = malformed["isolated_test_resolutions"][0]
+                rerun = malformed["checks"][1]
+                if case == "missing-resolution":
+                    del malformed["isolated_test_resolutions"]
+                elif case == "empty-resolutions":
+                    malformed["isolated_test_resolutions"] = []
+                elif case == "duplicate-resolution":
+                    malformed["isolated_test_resolutions"].append(resolution)
+                elif case == "unknown-failure":
+                    resolution["failed_check_id"] = "missing"
+                elif case == "non-test-failure":
+                    resolution["failure_kind"] = "lint"
+                elif case == "missing-test":
+                    resolution["isolated_rechecks"][0]["test_ids"] = ["first case"]
+                elif case == "unrelated-test":
+                    resolution["isolated_rechecks"][0]["test_ids"].append("third case")
+                elif case == "empty-failures":
+                    resolution["failed_test_ids"] = []
+                elif case == "missing-recheck":
+                    resolution["isolated_rechecks"] = []
+                elif case == "unknown-recheck":
+                    resolution["isolated_rechecks"][0]["check_id"] = "missing"
+                elif case == "duplicate-recheck":
+                    resolution["isolated_rechecks"].append(resolution["isolated_rechecks"][0])
+                elif case == "original-as-recheck":
+                    resolution["isolated_rechecks"][0]["check_id"] = "unit"
+                elif case == "isolated-failed":
+                    rerun.update({"verdict": "failed", "exit_status": 1})
+                elif case == "isolated-skipped":
+                    rerun.update({"disposition": "skipped", "skip_reason": "Not run."})
+                elif case == "isolated-reused":
+                    rerun.update({"disposition": "reused", "source_identity": {
+                        "report_reference": "Earlier report", "check_id": "isolated",
+                        "task_result_snapshot_sha256": checkpoint["snapshot_sha256"],
+                        "invocation_context": "Earlier isolated execution on matching inputs.",
+                    }})
+                elif case == "isolated-nonzero":
+                    rerun["exit_status"] = 1
+                elif case == "isolated-no-evidence":
+                    rerun["evidence"] = []
+                elif case == "unresolved-build":
+                    malformed["checks"].append({**malformed["checks"][0], "check_id": "build", "command": "pnpm build"})
+                    malformed["surfaces"][0]["check_ids"].append("build")
+                elif case == "failed-with-zero-exit":
+                    malformed["checks"][0]["exit_status"] = 0
+                elif case == "false-green":
+                    malformed["verdict"] = "passed"
+                    del malformed["isolated_test_resolutions"]
+                elif case == "no-original-failure":
+                    malformed["checks"][0].update({"verdict": "passed", "exit_status": 0})
+                else:
+                    malformed["task_result_snapshot_sha256"] = "0" * 64
+                self.close("closure-isolated-invalid", malformed, expected=2)
 
     def test_closure_rejects_unapproved_stale_corrupt_and_current_drift(self) -> None:
         _, old = self.create("closure-old", "--path", "src/value.txt")
@@ -1744,6 +1853,25 @@ Content.
             mode="incremental",
         )
         self.record_review(second, "planner", report)
+
+    def test_public_env_sample_is_checkpointed_but_private_variants_are_rejected(self) -> None:
+        self.write("apps/web/.env.sample", "CUSTOM_PROVIDER_SECRET=\n")
+        self.git("add", "apps/web/.env.sample")
+        self.git("commit", "-qm", "public configuration sample")
+        self.write("apps/web/.env.sample", "CUSTOM_PROVIDER_SECRET=\nMODEL_PROVIDER=custom\n")
+        _, checkpoint = self.create("sample", "--path", "apps/web/.env.sample")
+        self.assertIn("apps/web/.env.sample", checkpoint["files"])
+        for operation in ("verify", "matches"):
+            _, result = self.run_helper(
+                operation, "--workflow-id", "test-workflow", "--checkpoint-id", "sample",
+                "--repo", str(self.repo),
+            )
+            self.assertTrue(result["valid" if operation == "verify" else "matches"])
+        for index, name in enumerate((".env", ".env.local", ".env.production", ".env.sample.local", ".env.local.sample")):
+            with self.subTest(name=name):
+                self.write(f"apps/web/{name}", "TOKEN=private\n")
+                rejected, _ = self.create(f"private-{index}", "--path", f"apps/web/{name}", expected=2)
+                self.assertIn("sensitive-looking", rejected.stderr)
 
     def test_sensitive_paths_and_symlink_traversal_are_rejected(self) -> None:
         self.write(".env.local", "TOKEN=secret\n")

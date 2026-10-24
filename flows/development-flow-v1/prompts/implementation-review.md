@@ -1,7 +1,9 @@
 # Implementation Intent Review
 
 As the exact Plan owner, review the frozen current result against the exact
-approved plan after a verified GREEN complete mechanical gate. Consume those
+approved plan after a verified accepted complete mechanical gate (`passed` or
+`accepted_with_isolated_test_passes`). Do not require another full run for
+resolved isolated test failures. Consume those
 receipts; do not rerun checks or perform a second independent expert review.
 
 Check that the result retains the approved clean pre-production design and its
@@ -22,7 +24,7 @@ coverage without removing dependencies or changing closed surface meaning to
 justify reuse. Return direct decisions to the evidence composer and reference
 the strict receipt as `result.evidence_receipt_id`. Register the
 `record_review` result with gate `planner` under key `implementation_review`;
-keep checkpoint/delta receipts under distinct keys. Supply the current passed
+keep checkpoint/delta receipts under distinct keys. Supply the current accepted
 complete validation receipt in `source_receipt_ids`; it must identify this same
 result snapshot. Omit `mechanical_validation_report_sha256` from the semantic
 draft: the service derives it from that verified source and rejects a conflicting

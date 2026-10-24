@@ -50,8 +50,14 @@ try:
     report = provider.read_review_report(args.report, repo)
     if report.get("validation_mode") not in ("focused", "complete_gate"):
         raise provider.CheckpointError("Invalid mechanical validation mode.")
-    if report.get("verdict") not in ("passed", "failed"):
+    if report.get("verdict") not in ("passed", "failed", "accepted_with_isolated_test_passes"):
         raise provider.CheckpointError("Invalid mechanical validation verdict.")
+    if report["verdict"] == "accepted_with_isolated_test_passes":
+        # This is a complete combined result, not a GREEN shape projection.
+        # Keep failed commands intact so the provider can verify their reruns.
+        provider.validate_closure_mechanical_report(report, repo, manifest)
+        print(json.dumps({"valid": True, "validation_mode": report["validation_mode"]}))
+        raise SystemExit(0)
     shape = copy.deepcopy(report)
     if report["validation_mode"] == "focused":
         packages = report.get("path_packages")

@@ -109,10 +109,28 @@ the worker. It performs fresh inventory checks; do not manually preflight,
 register, log in, subscribe again, or reconstruct a saved agent as a role prompt.
 
 The definition selects the managed Codex CLI route. Do not override it with a
-native default model/profile or another backend. A missing selected capability,
-unsupported runtime, or isolation failure is a concrete launch blocker; report
-it without silently weakening the saved configuration. Installing capabilities
-or changing the definition requires the corresponding user authorization.
+native default model/profile or another backend. Missing selected installed
+content, administrative restrictions, unsupported runtime, required Agent
+Control infrastructure, or isolation failures remain launch blockers. Preserve
+the saved configuration. Installing capabilities or changing the definition
+requires the corresponding user authorization.
+
+Optional connector readiness is separate from capability selection. An enabled
+MCP without authentication/tools, an inaccessible app, or temporarily unavailable
+installed plugin must not require a global login sweep before unrelated work.
+Ask through `question_ask` for the specific user action only when the task needs
+that connector, then wait before retrying the dependent step. Continue independent
+authorized work; do not automatically start OAuth or change credentials.
+
+The managed worker receives per-turn readiness context, including guidance for
+authentication failures after startup. Native MCP URL interaction requests are
+cancelled because this runtime has no interactive browser bridge; report that
+cancellation only when the task needs the interaction. A URL request is not
+necessarily OAuth. Codex can still discover tools eagerly and omit unavailable
+ones. Later authentication can require a host refresh or new worker. This is
+startup tolerance, not host-level lazy authentication. Failures of discovery RPCs
+that prevent isolation verification remain blockers. Model-provider credential
+failures are separate and can prevent the first model request.
 
 Preserve the launch receipt's worker, run, snapshot identity, requester and
 coordinator observations. A separate executor carries the original

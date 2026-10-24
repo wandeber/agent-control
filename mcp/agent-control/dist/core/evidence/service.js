@@ -6,6 +6,7 @@ import { evidenceContextSchema, evidenceRequestSchema, evidenceReceiptSchema, } 
 import { HdtProvider, fingerprint, immutableJson, privateDirectory, readRegular, sha256 } from './provider.js';
 import { executeCheck, executeCheckGraph, prepareCheck, verifyCurrentCommand } from './commands.js';
 export * from './schema.js';
+const acceptedValidationStatuses = ['passed', 'accepted_with_isolated_test_passes'];
 const executionSchema = z.object({
     check_id: z.string(), identity_sha256: z.string().length(64), input_sha256: z.string().length(64),
     mode: z.enum(['exact_result', 'declared_inputs']), volatile: z.boolean(), context_complete: z.boolean(),
@@ -244,6 +245,8 @@ export class EvidenceService {
         }
         if (request.operation === 'validation_run')
             return this.runValidation(context, provider, request);
+        if (request.operation === 'validation_resolve_isolated_tests')
+            return this.resolveIsolatedTests(context, provider, request);
         const expert = this.verifyReceiptSync(context, request.expert_receipt_id, { kind: 'expert_review', requireApproved: true, requireCurrent: true });
         const validation = this.verifyReceiptSync(context, request.validation_receipt_id, { kind: 'validation', requireApproved: true, requireCurrent: true });
         if (expert.snapshot_sha256 !== validation.snapshot_sha256)
@@ -305,7 +308,7 @@ export class EvidenceService {
                 throw new Error('Evidence receipt checkpoint does not satisfy this gate.');
             if (expected.actorId && receipt.actor_id !== expected.actorId)
                 throw new Error('Evidence receipt author does not own this review.');
-            if (expected.requireApproved && !['approved', 'passed', 'verified'].includes(receipt.status))
+            if (expected.requireApproved && !['approved', 'verified', ...acceptedValidationStatuses].includes(receipt.status))
                 throw new Error('Evidence receipt has not passed its gate.');
             if (receipt.kind === 'validation') {
                 const requiredMode = expected.validationMode ?? (expected.requireApproved ? 'complete_gate' : undefined);
@@ -355,7 +358,7 @@ export class EvidenceService {
                     throw new Error('Review receipt no longer matches its exact provider record.');
                 if (receipt.kind === 'planner_review') {
                     const validation = sources.find(source => source.kind === 'validation' && source.snapshot_sha256 === receipt.snapshot_sha256
-                        && source.status === 'passed' && source.payload.mechanical_report.validation_mode === 'complete_gate'
+                        && acceptedValidationStatuses.includes(source.status) && source.payload.mechanical_report.validation_mode === 'complete_gate'
                         && fingerprint(source.payload.mechanical_report) === envelope.report.mechanical_validation_report_sha256);
                     if (!validation)
                         throw new Error('Planner review does not bind a verified complete mechanical source for its exact result.');
@@ -370,8 +373,8 @@ export class EvidenceService {
             if (receipt.kind === 'closure') {
                 const expert = sources.find(source => source.kind === 'expert_review');
                 const validation = sources.find(source => source.kind === 'validation');
-                if (!expert || expert.status !== 'approved' || !validation || validation.status !== 'passed' || expert.snapshot_sha256 !== validation.snapshot_sha256)
-                    throw new Error('Closure sources are missing, stale or not GREEN.');
+                if (!expert || expert.status !== 'approved' || !validation || !acceptedValidationStatuses.includes(validation.status) || expert.snapshot_sha256 !== validation.snapshot_sha256)
+                    throw new Error('Closure sources are missing, stale or not accepted.');
                 if (expected.requireCurrent)
                     for (const record of z.array(executionSchema).parse(validation.payload.executions))
                         verifyCurrentCommand(context, record, validation.snapshot_sha256);
@@ -408,19 +411,29 @@ export class EvidenceService {
             const file = resolve(this.namespace(context), 'executions', `${record.execution_id}.json`);
             if (fingerprint(JSON.parse(readRegular(file).toString())) !== fingerprint(record))
                 throw new Error('Native command execution record is missing or corrupt.');
-            if (record.disposition === 'reused') {
+            if (record.disposition === 'reused' && receipt.status !== 'accepted_with_isolated_test_passes') {
                 const origin = sources.find(source => source.receipt_id === record.source_receipt_id && source.kind === 'validation');
                 const original = origin?.payload.executions?.find((item) => item.execution_id === record.source_execution_id);
                 if (!original || original.verdict !== 'passed' || original.exit_status !== 0 || original.volatile || !original.context_complete
                     || original.identity_sha256 !== record.identity_sha256 || original.input_sha256 !== record.input_sha256)
                     throw new Error('Reused command origin does not prove this execution identity.');
             }
-            else if (record.source_receipt_id !== null || record.source_execution_id !== null)
+            else if (record.disposition === 'executed' && (record.source_receipt_id !== null || record.source_execution_id !== null))
                 throw new Error('Executed command must not claim a reuse origin.');
         }
         if (receipt.status === 'passed' && records.some(record => record.verdict !== 'passed' || record.exit_status !== 0))
             throw new Error('Passed validation includes a failed command.');
-        if (records.length) {
+        if (receipt.status !== payload.mechanical_report.verdict)
+            throw new Error('Validation receipt status contradicts its mechanical report.');
+        if (receipt.status === 'accepted_with_isolated_test_passes') {
+            const original = sources.find(source => source.receipt_id === payload.original_validation_receipt_id);
+            const isolated = sources.filter(source => source.receipt_id !== payload.original_validation_receipt_id);
+            const composed = this.composeIsolatedTests(original, isolated, payload.mechanical_report.isolated_test_resolutions);
+            if (fingerprint(composed.executions) !== fingerprint(records) || fingerprint(composed.mechanical) !== fingerprint(payload.mechanical_report)) {
+                throw new Error('Isolated resolution no longer matches its original and isolated execution receipts.');
+            }
+        }
+        else if (records.length) {
             const stored = provider.verifyMechanical(context, receipt.checkpoint_id, payload.provider_mechanical.evidence_id);
             if (stored.report_sha256 !== payload.provider_mechanical.report_sha256)
                 throw new Error('Validation no longer binds its canonical mechanical batch.');
@@ -442,6 +455,49 @@ export class EvidenceService {
         // or surface semantics are reimplemented in TypeScript.
         provider.verifyStored(context, checkpointId);
         provider.validateMechanical(context, checkpointId, mechanical);
+    }
+    composeIsolatedTests(original, isolated, resolutions) {
+        const originalReport = original?.payload.mechanical_report;
+        if (!original || original.kind !== 'validation' || original.status !== 'failed' || originalReport?.validation_mode !== 'complete_gate') {
+            throw new Error('Isolated resolution requires the original failed complete validation receipt.');
+        }
+        if (!isolated.length || isolated.some(source => source.kind !== 'validation' || source.status !== 'passed'
+            || source.snapshot_sha256 !== original.snapshot_sha256
+            || source.payload.mechanical_report.validation_mode !== 'focused')) {
+            throw new Error('Isolated reruns must be passing focused receipts for the same result.');
+        }
+        const originalRecords = z.array(executionSchema).parse(original.payload.executions);
+        const rechecks = isolated.flatMap(source => z.array(executionSchema).parse(source.payload.executions));
+        const executions = [...originalRecords, ...rechecks];
+        if (new Set(executions.map(record => record.check_id)).size !== executions.length || rechecks.some(record => record.disposition !== 'executed')) {
+            throw new Error('Isolated reruns require new, unique executed checks, not reused evidence.');
+        }
+        // Preserve the complete coverage and raw failures. Only add the reruns to
+        // the surfaces they resolve; the canonical provider checks every link.
+        const mechanical = { ...originalReport, verdict: 'accepted_with_isolated_test_passes',
+            summary: 'Complete-run test failures passed in isolation; original failures are retained and no complete rerun is required.',
+            checks: [...originalReport.checks, ...isolated.flatMap(source => source.payload.mechanical_report.checks)],
+            surfaces: originalReport.surfaces.map((surface) => ({ ...surface,
+                check_ids: [...new Set([...surface.check_ids, ...resolutions.filter(resolution => surface.check_ids.includes(resolution.failed_check_id))
+                            .flatMap(resolution => Array.isArray(resolution.isolated_rechecks) ? resolution.isolated_rechecks.map((check) => check.check_id) : [])])],
+            })), required_corrections: [], isolated_test_resolutions: resolutions, };
+        return { executions, mechanical };
+    }
+    resolveIsolatedTests(context, provider, request) {
+        const original = this.verifyReceiptSync(context, request.validation_receipt_id, {
+            kind: 'validation', requireCurrent: true, validationMode: 'complete_gate', actorId: context.actorId,
+        });
+        const isolated = request.isolated_receipt_ids.map(id => this.verifyReceiptSync(context, id, {
+            kind: 'validation', requireCurrent: true, requireApproved: true, validationMode: 'focused', actorId: context.actorId,
+        }));
+        const { executions, mechanical } = this.composeIsolatedTests(original, isolated, request.isolated_test_resolutions);
+        this.validateCoverage(provider, context, original.checkpoint_id, mechanical);
+        return this.makeReceipt(context, provider, 'validation', 'accepted_with_isolated_test_passes', {
+            executions, mechanical_report: mechanical, original_validation_receipt_id: original.receipt_id,
+        }, { checkpointId: original.checkpoint_id, snapshot: original.snapshot_sha256,
+            sources: [original.receipt_id, ...isolated.map(source => source.receipt_id)],
+            summary: { executed_check_count: 0, reused_check_count: 0,
+                reason: 'Accepted with isolated test passes; no commands were rerun while composing this receipt.' }, });
     }
     async runValidation(context, provider, request) {
         this.checkpointBinding(context, request.checkpoint_id, false);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildFlowDefinitionGraph, buildFlowVisualModel } from "./flow-graph";
-import { diagramPath, flowDiagramEdges, flowDiagramPositions, PHASE_HEIGHT, PHASE_WIDTH, routeFlowDiagram, visibleFlowDiagramEdges } from "./flow-diagram";
+import { diagramPath, flowDiagramEdges, flowDiagramPositions, flowNodeSize, PHASE_HEIGHT, PHASE_WIDTH, routeFlowDiagram, visibleFlowDiagramEdges } from "./flow-diagram";
 import type { DashboardSnapshot, FlowStepInstanceRecord, FlowTransitionRecord } from "./types";
 
 function snapshot(): DashboardSnapshot {
@@ -54,7 +54,8 @@ describe("flow diagram semantics", () => {
     data.flow_steps = [step("review", "old"), step("review", "new", 2)];
     data.flow_transitions = [transition("old", "changes", 1), transition("new", "approved", 3)];
     const model = buildFlowVisualModel(data)!;
-    expect(model.edges.filter((edge) => edge.tone === "taken").map((edge) => edge.transitionId)).toEqual(["approved"]);
+    expect(model.edges.filter((edge) => edge.tone === "taken" && edge.transitionId).map((edge) => edge.transitionId)).toEqual(["approved"]);
+    expect(model.edges.find(edge => edge.target === "routing:review")?.tone).toBe("taken");
     expect(model.nodes.find((node) => node.stepId === "review")?.instanceCount).toBe(2);
   });
 
@@ -97,12 +98,13 @@ describe("readable flow routes", () => {
     const model = buildFlowVisualModel(snapshot())!;
     const edges = flowDiagramEdges(model.nodes, model.edges);
     const overview = visibleFlowDiagramEdges(edges, "step:analysis", false);
-    expect(overview.map((edge) => edge.id)).toContain("step:planning->step:review");
-    expect(overview.map((edge) => edge.id)).not.toContain("step:planning->step:analysis");
-    expect(visibleFlowDiagramEdges(edges, "step:planning", false).map((edge) => edge.id)).toContain("step:planning->step:analysis");
+    expect(overview.map((edge) => edge.id)).toContain("routing:planning->step:review");
+    expect(overview.map((edge) => edge.id)).toContain("routing:planning->step:analysis");
+    expect(overview.map((edge) => edge.id)).not.toContain("step:planning->notify:orchestrator");
+    expect(visibleFlowDiagramEdges(edges, "step:planning", false).map((edge) => edge.id)).toContain("step:planning->notify:orchestrator");
     expect(visibleFlowDiagramEdges(edges, null, true)).toHaveLength(edges.length);
     const taken = edges.map((edge) => edge.target === "step:analysis" ? { ...edge, tone: "taken" as const } : edge);
-    expect(visibleFlowDiagramEdges(taken, null, false).map((edge) => edge.id)).toContain("step:planning->step:analysis");
+    expect(visibleFlowDiagramEdges(taken, null, false).map((edge) => edge.id)).toContain("routing:planning->step:analysis");
   });
 
   it("keeps different notification origins distinct and preserves their conditions", () => {
@@ -118,7 +120,7 @@ describe("readable flow routes", () => {
     const model = buildFlowVisualModel(snapshot())!;
     const edges = flowDiagramEdges(model.nodes, [...model.edges, { id: "self", source: "step:review", target: "step:review", label: "retry", tone: "default", transitionId: "retry", sourceStepId: "review" }]);
     const positions = flowDiagramPositions(model.nodes, columns);
-    const nodes = model.nodes.map((node) => ({ id: node.id, kind: node.kind, position: positions.get(node.id)!, width: PHASE_WIDTH, height: PHASE_HEIGHT }));
+    const nodes = model.nodes.map((node) => ({ id: node.id, kind: node.kind, position: positions.get(node.id)!, ...flowNodeSize(node.kind) }));
     const routes = routeFlowDiagram(edges, nodes);
     expect(routes).toHaveLength(edges.length);
     for (const { edge, points } of routes) {
@@ -143,6 +145,57 @@ describe("readable flow routes", () => {
 
 
 describe("unstarted source graph", () => {
+  it("keeps labels distinct when several choices leave the same side of a question", () => {
+    const graph = buildFlowDefinitionGraph({ id: "returns", initial_step: "context", steps: {
+      context: { on: { reported: { to: "analysis" } } }, analysis: { on: { reported: { to: "question" } } },
+      question: { decision: { key: "next", authority: "user" }, on: { reported: { transitions: [
+        { id: "reconsider-context", to: "context" }, { id: "reconsider-analysis", to: "analysis" }, { id: "continue", to: "done" }
+      ] } } }, done: {}
+    } });
+    const positions = flowDiagramPositions(graph.nodes);
+    const routes = routeFlowDiagram(flowDiagramEdges(graph.nodes, graph.edges), graph.nodes.map(node => ({ id: node.id, kind: node.kind, position: positions.get(node.id)!, ...flowNodeSize(node.kind) })));
+    const returns = routes.filter(route => route.edge.source === "step:question" && route.edge.target !== "step:done");
+    expect(returns).toHaveLength(2);
+    expect(Math.abs(returns[0]!.labelPoint.x - returns[1]!.labelPoint.x)).toBeGreaterThan(156);
+  });
+
+  it.each([1, 3])("shows generic user questions and every declared choice in a %i-column layout", columns => {
+    const config = { id: "choices", initial_step: "work", steps: {
+      work: { on: { reported: { to: "choose_direction" } } },
+      choose_direction: { execution: "coordinator" as const, decision: { key: "direction", authority: "user" as const }, on: { reported: { transitions: [
+        { id: "retry", when: { equals: { var: "result.decision", value: "retry" } }, to: "work" },
+        { id: "continue", when: { equals: { var: "result.decision", value: "continue" } }, to: "done" }
+      ] } } }, done: { decision: { key: "internal", authority: "coordinator" as const } }
+    } };
+    const graph = buildFlowDefinitionGraph(config);
+    expect(graph.nodes.find(node => node.stepId === "choose_direction")).toMatchObject({ kind: "decision", subtitle: "User question" });
+    expect(graph.nodes.find(node => node.stepId === "done")?.kind).toBe("step");
+    const positions = flowDiagramPositions(graph.nodes, columns);
+    const edges = visibleFlowDiagramEdges(flowDiagramEdges(graph.nodes, graph.edges), null, false);
+    expect(edges.filter(edge => edge.source === "step:choose_direction").map(edge => edge.label)).toEqual(["retry", "continue"]);
+    const geometry = graph.nodes.map(node => ({ id: node.id, kind: node.kind, position: positions.get(node.id)!, ...flowNodeSize(node.kind) }));
+    for (const route of routeFlowDiagram(edges, geometry)) {
+      expect(diagramPath(route.points)).not.toContain("NaN");
+      for (const [nodeId, point] of [[route.edge.source, route.points[0]!], [route.edge.target, route.points.at(-1)!]] as const) {
+        const node = geometry.find(node => node.id === nodeId)!;
+        if (node.kind === "decision") expect(Math.abs((point.x - node.position.x - node.width / 2) / (node.width / 2)) + Math.abs((point.y - node.position.y - node.height / 2) / (node.height / 2))).toBeCloseTo(1);
+      }
+    }
+  });
+
+  it("attaches pending questions only to their recorded originating attempt without inventing choice routes", () => {
+    const data = snapshot();
+    data.flow_steps = [{ ...step("analysis", "original"), agent_id: "analyst" }, { ...step("review", "later", 3, "active"), agent_id: "analyst" }];
+    data.user_questions = [{ question_id: "question-1", run_id: "run", agent_id: "analyst", agent_title: "Analyst", run_title: "Task", title: "Choose behavior", request_key: "behavior", state: "pending", answers: null, answered_at: null, created_at: "2026-09-05T10:00:01Z", questions: [{ id: "behavior", prompt: "Which behavior?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }], flow_context: { flow_instance_id: "instance", step_instance_id: "original", step_id: "analysis" } }];
+    let graph = buildFlowVisualModel(data)!;
+    expect(graph.nodes.find(node => node.id === "question:question-1")).toMatchObject({ kind: "decision", questionOriginNodeId: "step:analysis", reportValues: ["A", "B"] });
+    expect(graph.edges.filter(edge => edge.target === "question:question-1").map(edge => edge.source)).toEqual(["step:analysis"]);
+    expect(graph.edges.some(edge => edge.source === "question:question-1")).toBe(false);
+    delete data.user_questions[0]!.flow_context;
+    graph = buildFlowVisualModel(data)!;
+    expect(graph.nodes.some(node => node.id === "question:question-1")).toBe(false);
+  });
+
   it("includes declared transitions and prompts without synthesizing executed steps", () => {
     const graph = buildFlowDefinitionGraph({ id: "draft", initial_step: "first", steps: {
       first: { role: "writer", prompt: "Write", on: { reported: { to: "review" } } },
@@ -150,6 +203,57 @@ describe("unstarted source graph", () => {
     } });
     expect(graph.nodes.filter(node => node.stepId).map(node => node.stepId)).toEqual(["first", "review"]);
     expect(graph.nodes.every(node => !node.isCurrent && !node.latestStep && !node.instanceCount)).toBe(true);
-    expect(graph.edges.map(edge => [edge.source, edge.target])).toEqual([["step:first", "step:review"], ["step:review", "step:first"], ["step:review", "finish:done"]]);
+    expect(graph.edges.map(edge => [edge.source, edge.target])).toEqual([["step:first", "step:review"], ["routing:review", "step:first"], ["routing:review", "finish:done"], ["step:review", "routing:review"]]);
+  });
+});
+
+describe("automatic routing diamonds", () => {
+  it("leaves one normal destination and generic attention exits directly on the phase", () => {
+    const data = snapshot();
+    data.flows[0]!.config.steps.planning!.on = { reported: { transitions: [
+      { id: "ready", to: "review" },
+      { id: "blocked", when: { equals: { var: "result.conclusion", value: "blocked" } }, notify: "orchestrator" },
+      { id: "clarification", when: { equals: { var: "result.conclusion", value: "needs_clarification" } }, notify: "orchestrator" }
+    ] } };
+    for (const graph of [buildFlowDefinitionGraph(data.flows[0]!.config), buildFlowVisualModel(data)!]) {
+      expect(graph.nodes.some(node => node.id === "routing:planning")).toBe(false);
+      expect(graph.edges.filter(edge => edge.sourceStepId === "planning").every(edge => edge.source === "step:planning")).toBe(true);
+    }
+  });
+
+  it("does not add a diamond for several conditions with the same destination", () => {
+    const config = snapshot().flows[0]!.config;
+    config.steps.planning!.on = { reported: { transitions: [{ id: "ready", to: "review" }, { id: "retry", to: "review" }] } };
+    expect(buildFlowDefinitionGraph(config).nodes.some(node => node.id === "routing:planning")).toBe(false);
+  });
+
+  it("preserves automatic conditions and connects a single diamond before distinct routes", () => {
+    const config = snapshot().flows[0]!.config;
+    config.steps.planning!.on = { reported: { transitions: [
+      { id: "integrate", when: { equals: { var: "packages.integration_required", value: true } }, to: "analysis" },
+      { id: "validate", when: { equals: { var: "packages.integration_required", value: false } }, to: "review" },
+      { id: "blocked", notify: "orchestrator" }
+    ] } };
+    const before = JSON.stringify(config);
+    const graph = buildFlowDefinitionGraph(config);
+    expect(JSON.stringify(config)).toBe(before);
+    const branch = graph.nodes.find(node => node.id === "routing:planning")!;
+    expect(branch).toMatchObject({ kind: "decision", routingOriginStepId: "planning", stepId: null, subtitle: "Automatic decision" });
+    expect(graph.nodes[graph.nodes.indexOf(branch) - 1]?.id).toBe("step:planning");
+    expect(graph.edges.filter(edge => edge.source === branch.id).map(edge => [edge.transitionId, edge.label, edge.target])).toEqual([
+      ["integrate", "integration_required = true", "step:analysis"], ["validate", "integration_required = false", "step:review"]
+    ]);
+    expect(graph.edges.filter(edge => edge.target === branch.id)).toHaveLength(1);
+    expect(graph.edges.find(edge => edge.transitionId === "blocked" && edge.sourceStepId === "planning")?.source).toBe("step:planning");
+  });
+
+  it("does not highlight the routing diamond when only the blocker was taken", () => {
+    const data = snapshot();
+    data.flow_steps = [step("planning", "p")];
+    data.flow_transitions = [transition("p", "blocked", 1, { notify: "orchestrator" })];
+    const graph = buildFlowVisualModel(data)!;
+    expect(graph.nodes.find(node => node.id === "routing:planning")?.status).toBe("planned");
+    expect(graph.edges.find(edge => edge.target === "routing:planning")?.tone).toBe("default");
+    expect(graph.edges.filter(edge => edge.tone === "taken").map(edge => edge.target)).toEqual(["notify:orchestrator"]);
   });
 });

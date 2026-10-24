@@ -11,6 +11,7 @@ import {
   type CompiledAgentConfiguration
 } from "../core/agent-definition-inventory.js";
 import {
+  configuredCapabilityContext,
   readConfiguredAgentExecutionSnapshot,
   verifyConfiguredAgentThread
 } from "../core/configured-agent-runtime.js";
@@ -55,6 +56,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     throw new Error("Configured-agent snapshot binding is incomplete.");
   }
   let configured: CompiledAgentConfiguration | undefined;
+  let capabilityContext: string | undefined;
   if (job.snapshot_path && job.snapshot_hash) {
     const snapshot = readConfiguredAgentExecutionSnapshot(job.snapshot_path, job.snapshot_hash, job.agent_id);
     if (
@@ -83,6 +85,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
   db.pragma("busy_timeout = 5000");
   const access = new AgentAccessStore(db);
   let threadId = control.session, turnId: string | undefined;
+  let creatingThread = false;
   let expectedPolicy: ReturnType<typeof accessTurnOverrides>;
   let requestRevision = 0;
   let requestedPolicy: ReturnType<typeof accessTurnOverrides> | undefined;
@@ -131,6 +134,19 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
   };
   const removeNotification = client.onNotification(notification);
   const removeClose = client.onClose(() => { if (!closing) finish("failed"); });
+  const removeElicitation = client.onServerRequest(request => {
+    const params = record(request.params);
+    if (!configured || request.method !== "mcpServer/elicitation/request" || params.mode !== "url") return;
+    const owned = threadId ? params.threadId === threadId : creatingThread &&
+      typeof params.threadId === "string" && configured.mcp_servers.some(server => server.enabled && server.name === params.serverName);
+    if (!owned) return;
+    // URL interactions can include OAuth. Never open them automatically or
+    // leave an unsupported request hanging; the model receives cancellation
+    // and can ask through the required Agent Control question channel.
+    // During thread/start this dedicated process owns exactly one new thread;
+    // cancellation must not depend on the response it may itself be blocking.
+    client.respond(request.id, { action: "cancel", content: null, _meta: null });
+  });
   try {
     await startup(client.initialize());
     const profile = configured ? {} : readInteractiveProfile(job.profile_path, job.profile_hash);
@@ -152,7 +168,9 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
       ...(job.model ? { model: job.model } : {}), approvalPolicy: expectedPolicy.approvalPolicy,
       ...(!control.session && configured ? { developerInstructions: configured.developer_instructions } : {}),
       approvalsReviewer: "user", sandbox: policy.sandbox === "read_only" ? "read-only" : policy.sandbox === "full_access" ? "danger-full-access" : "workspace-write" };
+    creatingThread = !control.session;
     const response = record(await startup(control.dispatch(() => client.requestConnected(control.session ? "thread/resume" : "thread/start", params))));
+    creatingThread = false;
     const actualId = record(response.thread).id;
     if (typeof actualId !== "string" || (control.session && actualId !== control.session)) throw new Error("Codex interactive continuation returned a different session.");
     threadId = actualId;
@@ -162,7 +180,8 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     if (expectedProvider && response.modelProvider !== expectedProvider) throw new Error("Codex did not retain the selected model provider; no prompt was sent.");
     if (configured) {
       const inventory = await loadAgentDefinitionInventory(job.cwd, false, configured.executable);
-      await verifyConfiguredAgentThread(client, configured, inventory, response, actualId, job.cwd);
+      const readiness = await verifyConfiguredAgentThread(client, configured, inventory, response, actualId, job.cwd);
+      capabilityContext = configuredCapabilityContext(readiness);
     }
     if (job.flow_instance_id) {
       if (policy.sandbox === "workspace") {
@@ -191,6 +210,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
     const started = record(await startup(control.dispatch(() => client.requestConnected("turn/start", { threadId: actualId,
       input: [
         { type: "text", text: job.prompt },
+        ...(capabilityContext ? [{ type: "text", text: capabilityContext }] : []),
         ...(job.attachments ?? []).map((path) => ({ type: "localImage", path }))
       ], ...expectedPolicy,
       ...(job.reasoning_effort ? { effort: job.reasoning_effort } : {}) }))));
@@ -230,7 +250,7 @@ export async function runInteractiveCliTurn(job: InteractiveCliJob, control: Int
   } finally {
     closing = true;
     if (timer) clearInterval(timer);
-    removeNotification(); removeClose();
+    removeNotification(); removeClose(); removeElicitation();
     try { await client.closeAndWait(); } finally { db.close(); }
   }
 }

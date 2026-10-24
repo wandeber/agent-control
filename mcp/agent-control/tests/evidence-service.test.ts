@@ -46,6 +46,58 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('run-owned canonical evidence', () => {
+  it('continues from a failed complete test run with actual isolated passes and no aggregate rerun', async () => {
+    write('order.test.cjs', `const { test } = require('node:test');
+const assert = require('node:assert/strict');
+let state = 0;
+test('sets shared state', () => { state = 1; });
+test('expects fresh state', () => { assert.equal(state, 0); });
+`);
+    await result();
+    const input = validation() as Extract<EvidenceRequest, { operation: 'validation_run' }>;
+    input.checks[0].argv = [process.execPath, '--test', 'order.test.cjs'];
+    input.checks[0].configuration_paths = ['order.test.cjs'];
+    const failed = await service.execute(context, input);
+    expect(failed.status).toBe('failed');
+    expect(payload(failed).executions[0].exit_status).not.toBe(0);
+
+    const focused = structuredClone(input);
+    await result('result-isolated', 'result-1');
+    focused.checkpoint_id = 'result-isolated';
+    focused.coverage.validation_mode = 'focused';
+    focused.checks[0].check_id = 'isolated-case';
+    focused.checks[0].argv = [process.execPath, '--test', '--test-name-pattern=expects fresh state', 'order.test.cjs'];
+    focused.coverage.surfaces[0].check_ids = ['isolated-case'];
+    const isolated = await service.execute(context, focused);
+    expect(isolated.status).toBe('passed');
+    expect(isolated.snapshot_sha256).toBe(failed.snapshot_sha256);
+
+    const resolution: EvidenceRequest = { operation: 'validation_resolve_isolated_tests', validation_receipt_id: failed.receipt_id,
+      isolated_receipt_ids: [isolated.receipt_id], isolated_test_resolutions: [{ failed_check_id: 'unit', failure_kind: 'tests_only',
+        failed_test_ids: ['expects fresh state'], isolated_rechecks: [{ check_id: 'isolated-case', test_ids: ['expects fresh state'] }] }],
+    };
+    const accepted = await service.execute(context, resolution);
+    expect(accepted.status).toBe('accepted_with_isolated_test_passes');
+    expect(accepted.summary.executed_check_count).toBe(0);
+    expect(payload(accepted).executions).toEqual([...payload(failed).executions, ...payload(isolated).executions]);
+    expect(service.verifyReceiptSync(context, failed.receipt_id).status).toBe('failed');
+    expect(service.verifyReceiptSync(context, accepted.receipt_id, { requireCurrent: true, requireApproved: true }).status).toBe('accepted_with_isolated_test_passes');
+    const expert = await service.execute(context, { operation: 'record_review', checkpoint_id: 'result-1', gate: 'expert', draft: draft() });
+    const closure = await service.execute(context, { operation: 'verify_closure', expert_receipt_id: expert.receipt_id, validation_receipt_id: accepted.receipt_id });
+    expect(service.verifyReceiptSync(context, closure.receipt_id, { requireCurrent: true }).status).toBe('verified');
+
+    const incomplete = structuredClone(resolution);
+    incomplete.isolated_test_resolutions[0].failed_test_ids = ['expects fresh state', 'uncovered test'];
+    await expect(service.execute(context, incomplete)).rejects.toThrow(/every failed test/);
+    const nonTest = structuredClone(resolution);
+    nonTest.isolated_test_resolutions[0].failure_kind = 'build';
+    await expect(service.execute(context, nonTest)).rejects.toThrow(/non-test/);
+    const stillFailing = { ...resolution, isolated_receipt_ids: [failed.receipt_id] };
+    await expect(service.execute(context, stillFailing)).rejects.toThrow(/not passed/);
+    write('order.test.cjs', '// changed test assertions');
+    await expect(service.execute(context, resolution)).rejects.toThrow(/matches verification failed|Command input.*changed/);
+  }, 30_000);
+
   it('composes strict review, executes once, reuses once and closes against actual GREEN evidence', async () => {
     await result();
     const first = await service.execute(context, validation());

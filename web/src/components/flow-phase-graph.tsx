@@ -10,11 +10,12 @@ import { buildFlowVisualModel, type FlowVisualNode } from "@/lib/flow-graph";
 import { buildFlowEvidenceView } from "@/lib/flow-evidence";
 import {
   diagramPath, flowDiagramEdges, flowDiagramPositions, routeFlowDiagram, visibleFlowDiagramEdges,
-  PHASE_HEIGHT, PHASE_WIDTH, type DiagramRoute, type Point
+  flowNodeSize, PHASE_WIDTH, type DiagramRoute, type Point
 } from "@/lib/flow-diagram";
 import { cx } from "@/lib/format";
 import type { DashboardSnapshot } from "@/lib/types";
 import { FlowEvidenceDetails } from "./flow-evidence";
+import { FlowQuestionNode } from "./flow-question-node";
 
 const nodeTypes = { phase: FlowPhaseNode };
 type PhaseNodeData = FlowVisualNode & Record<string, unknown> & {
@@ -54,7 +55,7 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
   const graphKeyRef = useRef<string | null>(null);
   const fittedKeyRef = useRef<string | null>(null);
   const programmaticViewportRef = useRef(false);
-  const storageKey = `agent-control:phase-graph:v8:${columns}:${snapshot.selected_run_id ?? "none"}:${model?.instance.flow_instance_id ?? "none"}`;
+  const storageKey = `agent-control:phase-graph:v10:${columns}:${snapshot.selected_run_id ?? "none"}:${model?.instance.flow_instance_id ?? "none"}`;
   const focusedPhase = focusedStepId ?? selectedStepId ?? model?.instance.current_step_id;
   const evidence = useMemo(() => model ? buildFlowEvidenceView(snapshot, {
     flowInstanceId: model.instance.flow_instance_id,
@@ -90,10 +91,10 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
           ordinal: ordinals.get(node.id) ?? null,
           graphKey: storageKey,
           alternativeCount: diagramEdges.filter((edge) => edge.source === node.id && edge.alternative).length,
-          onSelectStep: node.stepId ? () => { fittedKeyRef.current = null; setFocusedStepId(node.stepId); onSelectStep({
+          onSelectStep: (node.stepId || node.latestStep) ? () => { fittedKeyRef.current = null; setFocusedStepId(node.stepId); onSelectStep({
             agentId: node.latestStep?.agent_id ?? null,
             role: node.role,
-            stepId: node.stepId!,
+            stepId: node.stepId ?? node.latestStep!.step_id,
             stepInstanceId: node.latestStep?.step_instance_id ?? null
           }); } : undefined,
           selected: focusedStepId ? node.stepId === focusedStepId : Boolean((node.latestStep && node.latestStep.step_instance_id === selectedStepInstanceId) ||
@@ -108,7 +109,7 @@ export function FlowPhaseGraph({ onSelectStep, selectedStepId, selectedStepInsta
   const focusedNodeId = nodes.find((node) => node.data.selected)?.id ?? activeNodeId;
   const visibleEdges = useMemo(() => visibleFlowDiagramEdges(diagramEdges, focusedNodeId, allRoutes), [diagramEdges, focusedNodeId, allRoutes]);
   const routes = useMemo(() => routeFlowDiagram(visibleEdges, nodes.map((node) => ({
-    id: node.id, kind: node.data.kind, position: node.position, width: node.measured?.width ?? PHASE_WIDTH, height: node.measured?.height ?? PHASE_HEIGHT
+    id: node.id, kind: node.data.kind, position: node.position, width: node.measured?.width ?? flowNodeSize(node.data.kind).width, height: node.measured?.height ?? flowNodeSize(node.data.kind).height
   }))), [nodes, visibleEdges]);
   const hiddenCount = diagramEdges.length - visibleEdges.length;
 
@@ -223,6 +224,7 @@ function FlowPhaseNode({ data }: NodeProps<PhaseFlowNode>) {
   const status = data.kind === "notify" ? (data.isCurrent ? "Waiting here" : "Chooses next phase")
     : data.kind === "finish" ? (completed ? "Completed" : "Not reached")
     : data.waitingLabel ?? (data.isCurrent ? `Current${failed ? ` · ${data.status}` : ""}` : data.status === "planned" ? "Not started" : completed ? `Reported${result ? `: ${result}` : ""}` : data.status);
+  if (data.kind === "decision") return <FlowQuestionNode title={data.title} description={data.description} automatic={Boolean(data.routingOriginStepId)} status={data.routingOriginStepId ? completed ? "Route taken" : "Not reached" : status} current={data.isCurrent} selected={data.selected} onSelect={data.onSelectStep} />;
   return (
     <div className={cx("relative flex h-[80px] w-[264px] flex-col justify-center rounded-xl border bg-white px-3 shadow-sm", failed ? "border-red-500 ring-2 ring-red-100" : data.isCurrent ? "border-teal-600 ring-2 ring-teal-100" : data.selected ? "border-slate-500 ring-2 ring-slate-200" : "border-slate-300")}
       role={data.onSelectStep ? "button" : undefined} tabIndex={data.onSelectStep ? 0 : undefined}
@@ -266,7 +268,7 @@ export function PhaseEdgeOverlay({ routes }: { routes: DiagramRoute[] }) {
         </g>;
       })}
     </svg>
-    {routes.map(({ edge, labelPoint }) => <div key={edge.id} title={edge.conditions} tabIndex={0} onMouseEnter={() => setFocusedEdge(edge.id)} onMouseLeave={() => setFocusedEdge(null)} onFocus={() => setFocusedEdge(edge.id)} onBlur={() => setFocusedEdge(null)}
+    {routes.filter(route => route.edge.label).map(({ edge, labelPoint }) => <div key={edge.id} title={edge.conditions} tabIndex={0} onMouseEnter={() => setFocusedEdge(edge.id)} onMouseLeave={() => setFocusedEdge(null)} onFocus={() => setFocusedEdge(edge.id)} onBlur={() => setFocusedEdge(null)}
       className={cx("pointer-events-auto absolute w-max max-w-[156px] whitespace-normal rounded-md border bg-white px-2 py-1 text-center text-[11px] font-medium leading-4 shadow-sm", edge.tone === "taken" ? "border-teal-200 text-teal-800" : "border-slate-200 text-slate-600")}
       data-flow-edge-label={edge.id} style={{ transform: `translate(-50%, -50%) translate(${labelPoint.x}px, ${labelPoint.y}px)` }}>
       {edge.label}
