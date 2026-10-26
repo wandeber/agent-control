@@ -1,16 +1,12 @@
 {
   "mcpServers": {
     "agent_control": {
-      "command": "sh",
-      "args": [
-        "-lc",
-        "runner=\"${CODEX_AGENT_CONTROL_MCP_RUNNER:-./mcp/agent-control/run-agent-control-mcp.sh}\"; if [ ! -x \"$runner\" ]; then echo \"agent_control runner not found: $runner\" >&2; exit 127; fi; exec \"$runner\""
-      ],
-      "cwd": ".",
+      "type": "http",
+      "url": "http://localhost:17662/mcp",
+      "http_headers_helper": "cat \"${AGENT_CONTROL_HOME:-$HOME/.agent-control}/mcp-headers.json\"",
       "tool_timeout_sec": 3700,
-      "env": {},
-      "note": "Local agent controller MCP. State defaults to $HOME/.agent-control/state.sqlite and artifacts/logs stay outside target repositories.",
-      "startup_timeout_sec": 180
+      "startup_timeout_sec": 30,
+      "note": "One local service shared by all chats. Run the packaged scripts/install-agentctl-link.sh after installing or updating."
     }
   }
 }

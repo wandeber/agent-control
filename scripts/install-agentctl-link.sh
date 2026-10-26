@@ -54,4 +54,7 @@ ln -s "$SOURCE" "$temporary_link"
 # wrapper or previous cache link is atomic from the caller's perspective.
 mv -f "$temporary_link" "$DESTINATION"
 trap - 0 1 2 15
+if [ "$(uname -s)" = "Darwin" ]; then
+  node "$PLUGIN_ROOT/mcp/agent-control/service.mjs" install >/dev/null
+fi
 echo "$DESTINATION"

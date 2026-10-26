@@ -498,28 +498,43 @@ agentctl server start --port 3766
 The default host is `localhost`. Both the console and the API server are
 local-only in v0.
 
-The MCP server has no global polling loop by default. Backends that can observe
-their own workers arm a watcher after start. Imported Codex sessions share one
-background supervisor per controller database, even when the host starts one
-MCP server per conversation. A separate SQLite lock elects the supervisor and
-releases automatically on process exit or crash; another instance takes over
-within five seconds. This lock never reserves the controller database writer.
-The lock file is `<state-database>.session-supervision.sqlite`; do not delete it
-while servers are running, since SQLite owns the live exclusion.
+Agent Control uses one local Streamable HTTP service for all chats at
+`http://localhost:17662/mcp`. Opening another chat creates only a protocol
+session in that process: it does not launch another Node server or stdio bridge.
+The controller, SQLite connection, session watchers and inlined console HTML
+are shared. Tool identity, panel ownership, request IDs and cancellation remain
+separate for each client.
 
-Local rollout notifications trigger refreshes at most once per second.
-Unchanged or unavailable sessions use exponential polling backoff up to 30
-seconds as a fallback, so missing filesystem notifications or rollout rotation
-still recover. Events remain replayable across backoff and supervisor handoff.
-Missing-session discovery is cached for at most five seconds. Terminal imported
-sessions remain observable because they can start new turns outside Agent Control.
-Set `AGENT_CONTROL_POLL_INTERVAL_MS` only for an additional opt-in watchdog; its
-effective minimum is one second and a slow poll never overlaps its successor.
+On macOS, the packaged `scripts/install-agentctl-link.sh` installs/updates the
+user LaunchAgent `dev.agent-control.mcp`, which starts the service at login and
+restarts it after a crash. It uses the packaged runtime and a fixed Node binary,
+without installing a system-wide service. The endpoint binds only to localhost,
+rejects browser origins and requires a random bearer stored in private files
+under `~/.agent-control/`. The HTTP header helper reads that credential locally;
+it is never included in the plugin archive or command line.
 
-MCP stdin EOF, transport closure, SIGINT and SIGTERM cancel pending waits and
-dispose local watchers before closing storage, without stopping durable workers.
-Shutdown has a five-second deadline for unresponsive backend operations.
-Normal shutdown exits with code zero; exceeding the deadline exits with code one.
+Run the linker after every marketplace update so the service points at the new
+package. Service installation is idempotent and retains the same credential.
+Inspect it with:
+
+```bash
+node "$plugin_root/mcp/agent-control/service.mjs" status
+```
+
+Local rollout notifications trigger at most one status refresh per second.
+Unchanged/unavailable sessions back off to 30 seconds, with polling retained as
+recovery for missed filesystem notifications. Missing-session discovery is cached
+for at most five seconds. A cheap SQLite data-version check discovers CLI changes
+without repeatedly scanning all agents. There is no distributed supervisor
+election, per-chat backend, cluster coordinator or general-purpose queue.
+
+Disconnecting a tool POST cancels only that request. Closing a session preserves
+the other chats and the shared controller; durable events remain replayable.
+Idle protocol sessions expire after 30 minutes and the service has a small
+16-session ceiling. Service shutdown drains local work with a five-second
+process deadline and does not stop durable workers. Explicit stdio debugging
+remains available through the runner without `--http`; it is not the plugin's
+normal transport.
 
 Blocking waits are available but must be explicitly acknowledged. They are
 useful for command-line debugging and short opt-in foreground waits:

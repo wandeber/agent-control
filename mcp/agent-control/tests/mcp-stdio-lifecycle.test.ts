@@ -44,6 +44,7 @@ it.each(["EOF", "SIGTERM"])("cancels a pending one-hour MCP wait and exits clean
   expect(waitCompleted).toBe(false);
   if (ending === "EOF") child.stdin!.end(); else child.kill("SIGTERM");
   expect(await exited).toEqual([0, null]);
+  expect(waitCompleted).toBe(true);
   expect((await waiting).result.isError).toBe(true);
   expect(stderr).toBe(""); lines.close();
   const reopened = new SqliteStore(database);

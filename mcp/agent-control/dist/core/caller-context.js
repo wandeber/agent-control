@@ -2,7 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { ControllerError } from "./errors.js";
 const callers = new AsyncLocalStorage();
 /** Codex supplies _meta.threadId outside the model-controlled tool arguments.
- * The local stdio host is the trust boundary; this is not remote authentication.
+ * The local Codex host is the identity boundary. The shared loopback service
+ * separately authenticates the client with its private per-user bearer.
  * A shared MCP process must never use its launching thread as another caller.
  */
 export function withMcpCaller(meta, callback) {

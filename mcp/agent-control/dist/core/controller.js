@@ -7,7 +7,6 @@ import { agentConversationThreadId } from "./agent-conversation-identity.js";
 import { AgentAccessStore } from "./agent-access.js";
 import { PermissionRequests, permissionOwnerMatches } from "./permission-requests.js";
 import { sessionObservationKey } from "./run-wake-policy.js";
-import { SessionSupervision } from "./session-supervision.js";
 import { applyProjectModels } from "./project-models.js";
 import { compileFlowAgent, flowAgentRepoDir, flowSourceConfig, resolveFlowAgentDefinitions } from "./flow-agent-definitions.js";
 import { buildRunCosts } from "./pricing.js";
@@ -62,7 +61,7 @@ export class AgentController {
     backgroundAbort = new AbortController();
     statusWatchers = new Map();
     sessionWatcherKeys = new Map();
-    sessionSupervision;
+    sessionDiscoveryTimer;
     pendingDeliveries = new Set();
     inFlightSubscriberDeliveries = new Set();
     nativeActionDeliveryRetryTasks = new Map();
@@ -134,8 +133,20 @@ export class AgentController {
                 // The durable unknown state remains visible for an explicit refresh.
             }
         }
-        this.sessionSupervision = new SessionSupervision(store.db.name, () => this.reconcileSessionWatchers());
-        this.sessionSupervision.start();
+        let dataVersion = this.store.db.pragma("data_version", { simple: true });
+        this.reconcileSessionWatchers();
+        // CLI writes use another connection. A cheap version check avoids rescanning
+        // all persisted agents while the single shared service is idle.
+        this.sessionDiscoveryTimer = setInterval(() => {
+            this.runBackground(async () => {
+                const next = this.store.db.pragma("data_version", { simple: true });
+                if (next !== dataVersion) {
+                    dataVersion = next;
+                    this.reconcileSessionWatchers();
+                }
+            });
+        }, 5_000);
+        this.sessionDiscoveryTimer.unref();
         this.redrivePendingNativeActionOwnerWakeups();
     }
     /**
@@ -325,14 +336,13 @@ export class AgentController {
             return this.disposeTask;
         this.disposing = true;
         this.backgroundAbort.abort();
-        this.sessionSupervision.stop();
+        clearInterval(this.sessionDiscoveryTimer);
         for (const agentId of this.statusWatchers.keys())
             this.disarmStatusWatcher(agentId);
         this.disposeTask = (async () => {
             while (this.backgroundTasks.size || this.pendingDeliveries.size) {
                 await Promise.allSettled([...this.backgroundTasks, ...this.pendingDeliveries]);
             }
-            this.sessionSupervision.close();
         })();
         return this.disposeTask;
     }
@@ -7945,8 +7955,6 @@ export class AgentController {
         if (this.disposing)
             return;
         if (agent.backend === "codex-session") {
-            if (!this.sessionSupervision?.isOwner)
-                return;
             // Advancing the replay cursor does not change the watched session. Keep
             // its watcher and idle backoff instead of resetting them every refresh.
             const key = JSON.stringify({ ...agent.backend_handle, observed_event_index: undefined });
