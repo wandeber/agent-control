@@ -26,7 +26,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   for (const { client, transport } of clients.splice(0)) { await transport.terminateSession().catch(() => {}); await client.close(); }
-  await runtime.close(); vi.unstubAllEnvs(); rmSync(directory, { recursive: true, force: true });
+  await runtime.close(); vi.useRealTimers(); vi.unstubAllEnvs(); rmSync(directory, { recursive: true, force: true });
 });
 async function connect() {
   const transport = new StreamableHTTPClientTransport(url, { requestInit: { headers } });
@@ -95,6 +95,22 @@ it("keeps serving foreground chats when Codex retains background connections", a
   const foreground = await connect();
   expect(runtime.sessionCount).toBe(18);
   expect((await foreground.client.callTool({ name: "backend_list", arguments: {} })).isError).not.toBe(true);
+});
+it("preserves connected idle chats and reaps only abandoned sessions", async () => {
+  await runtime.close();
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  runtime = await startSharedMcpService({ port: 0, token, createRuntime: () => {
+    const store = new SqliteStore(join(directory, "idle.sqlite"));
+    controller = new AgentController(store, createDefaultAdapterRegistry()); return { controller, store };
+  } });
+  url = new URL(`http://localhost:${(runtime.server.address() as { port: number }).port}/mcp`);
+  const active = await connect(); await until(() => runtime.streamCount === 1);
+  await vi.advanceTimersByTimeAsync(31 * 60_000);
+  expect(runtime.sessionCount).toBe(1);
+  expect((await active.client.callTool({ name: "backend_list", arguments: {} })).isError).not.toBe(true);
+  await active.client.close(); await until(() => runtime.streamCount === 0);
+  await vi.advanceTimersByTimeAsync(31 * 60_000);
+  expect(runtime.sessionCount).toBe(0);
 });
 it("drains a retiring session before closing the shared store", async () => {
   const { client, transport } = await connect();

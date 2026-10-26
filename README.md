@@ -530,8 +530,8 @@ election, per-chat backend, cluster coordinator or general-purpose queue.
 
 Disconnecting a tool POST cancels only that request. Closing a session preserves
 the other chats and the shared controller; durable events remain replayable.
-Idle protocol sessions expire after 30 minutes, including connections retained
-by background chats. Service shutdown drains local work with a five-second
+Disconnected idle protocol sessions expire after 30 minutes. Connected chats
+retain their session even when idle. Service shutdown drains local work with a five-second
 process deadline and does not stop durable workers. Explicit stdio debugging
 remains available through the runner without `--http`; it is not the plugin's
 normal transport.

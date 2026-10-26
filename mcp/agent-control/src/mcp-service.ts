@@ -8,7 +8,7 @@ import type { SqliteStore } from "./storage/sqlite-store.js";
 import { createMcpSession } from "./mcp-server.js";
 import { AGENT_CONTROL_VERSION } from "./core/version.js";
 
-type Session = ReturnType<typeof createMcpSession> & { transport: StreamableHTTPServerTransport; touched: number };
+type Session = ReturnType<typeof createMcpSession> & { transport: StreamableHTTPServerTransport; touched: number; streams: number };
 
 /** One local controller, with small isolated protocol sessions for a few chats. */
 export async function startSharedMcpService(options: { port: number; token: string; createRuntime: () => { controller: AgentController; store: SqliteStore } }) {
@@ -55,7 +55,7 @@ export async function startSharedMcpService(options: { port: number; token: stri
         const client = createMcpSession(runtime.controller, runtime.store);
         const id = randomUUID();
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => id });
-        session = Object.assign(client, { transport, touched: Date.now() });
+        session = Object.assign(client, { transport, touched: Date.now(), streams: 0 });
         const current = session;
         client.server.onclose = () => {
           sessions.delete(id);
@@ -66,6 +66,10 @@ export async function startSharedMcpService(options: { port: number; token: stri
       }
       const current = session;
       current.touched = Date.now();
+      if (request.method === "GET") {
+        current.streams++;
+        response.once("close", () => { current.streams--; current.touched = Date.now(); });
+      }
       const ids = (Array.isArray(body) ? body : [body]).flatMap(value =>
         value && typeof value === "object" && (typeof value.id === "string" || typeof value.id === "number") ? [value.id as RequestId] : []);
       if (ids.length) {
@@ -94,7 +98,7 @@ export async function startSharedMcpService(options: { port: number; token: stri
   catch (error) { server.close(); throw error; }
   const timer = setInterval(() => {
     const cutoff = Date.now() - 30 * 60_000;
-    for (const [id, session] of sessions) if (!session.activeCalls && session.touched < cutoff) {
+    for (const [id, session] of sessions) if (!session.activeCalls && !session.streams && session.touched < cutoff) {
       sessions.delete(id); void retire(session);
     }
   }, 60_000);
@@ -102,6 +106,7 @@ export async function startSharedMcpService(options: { port: number; token: stri
   return {
     server,
     get sessionCount() { return sessions.size; },
+    get streamCount() { return [...sessions.values()].reduce((count, session) => count + session.streams, 0); },
     get activeCalls() { return [...sessions.values()].reduce((count, session) => count + session.activeCalls, 0); },
     close(): Promise<void> {
       return closeTask ??= (async () => {

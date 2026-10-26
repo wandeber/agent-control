@@ -64,7 +64,7 @@ export async function startSharedMcpService(options) {
                 const client = createMcpSession(runtime.controller, runtime.store);
                 const id = randomUUID();
                 const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => id });
-                session = Object.assign(client, { transport, touched: Date.now() });
+                session = Object.assign(client, { transport, touched: Date.now(), streams: 0 });
                 const current = session;
                 client.server.onclose = () => {
                     sessions.delete(id);
@@ -75,6 +75,10 @@ export async function startSharedMcpService(options) {
             }
             const current = session;
             current.touched = Date.now();
+            if (request.method === "GET") {
+                current.streams++;
+                response.once("close", () => { current.streams--; current.touched = Date.now(); });
+            }
             const ids = (Array.isArray(body) ? body : [body]).flatMap(value => value && typeof value === "object" && (typeof value.id === "string" || typeof value.id === "number") ? [value.id] : []);
             if (ids.length) {
                 const cancellation = new AbortController();
@@ -117,7 +121,7 @@ export async function startSharedMcpService(options) {
     const timer = setInterval(() => {
         const cutoff = Date.now() - 30 * 60_000;
         for (const [id, session] of sessions)
-            if (!session.activeCalls && session.touched < cutoff) {
+            if (!session.activeCalls && !session.streams && session.touched < cutoff) {
                 sessions.delete(id);
                 void retire(session);
             }
@@ -126,6 +130,7 @@ export async function startSharedMcpService(options) {
     return {
         server,
         get sessionCount() { return sessions.size; },
+        get streamCount() { return [...sessions.values()].reduce((count, session) => count + session.streams, 0); },
         get activeCalls() { return [...sessions.values()].reduce((count, session) => count + session.activeCalls, 0); },
         close() {
             return closeTask ??= (async () => {
