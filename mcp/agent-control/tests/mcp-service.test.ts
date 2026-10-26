@@ -90,6 +90,12 @@ it("fails a duplicate start before initializing a second controller", async () =
   await expect(startSharedMcpService({ port: Number(url.port), token, createRuntime })).rejects.toMatchObject({ code: "EADDRINUSE" });
   expect(createRuntime).not.toHaveBeenCalled();
 });
+it("keeps serving foreground chats when Codex retains background connections", async () => {
+  await Promise.all(Array.from({ length: 17 }, () => connect()));
+  const foreground = await connect();
+  expect(runtime.sessionCount).toBe(18);
+  expect((await foreground.client.callTool({ name: "backend_list", arguments: {} })).isError).not.toBe(true);
+});
 it("drains a retiring session before closing the shared store", async () => {
   const { client, transport } = await connect();
   let release!: (messages: []) => void;

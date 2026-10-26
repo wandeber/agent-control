@@ -61,8 +61,6 @@ export async function startSharedMcpService(options) {
                     return reply(response, 404);
                 if (request.method !== "POST" || !isInitializeRequest(body))
                     return reply(response, 400);
-                if (sessions.size >= 16)
-                    return reply(response, 503);
                 const client = createMcpSession(runtime.controller, runtime.store);
                 const id = randomUUID();
                 const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => id });
