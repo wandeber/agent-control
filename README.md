@@ -498,11 +498,28 @@ agentctl server start --port 3766
 The default host is `localhost`. Both the console and the API server are
 local-only in v0.
 
-The MCP server does not poll by default. Backends that can observe their own
-workers, such as the OpenCode detached-process adapter, arm a process watcher
-after start. Set `AGENT_CONTROL_POLL_INTERVAL_MS` only when you want an
-additional watchdog for agents that were attached after a restart or whose
-backend cannot push lifecycle changes.
+The MCP server has no global polling loop by default. Backends that can observe
+their own workers arm a watcher after start. Imported Codex sessions share one
+background supervisor per controller database, even when the host starts one
+MCP server per conversation. A separate SQLite lock elects the supervisor and
+releases automatically on process exit or crash; another instance takes over
+within five seconds. This lock never reserves the controller database writer.
+The lock file is `<state-database>.session-supervision.sqlite`; do not delete it
+while servers are running, since SQLite owns the live exclusion.
+
+Local rollout notifications trigger refreshes at most once per second.
+Unchanged or unavailable sessions use exponential polling backoff up to 30
+seconds as a fallback, so missing filesystem notifications or rollout rotation
+still recover. Events remain replayable across backoff and supervisor handoff.
+Missing-session discovery is cached for at most five seconds. Terminal imported
+sessions remain observable because they can start new turns outside Agent Control.
+Set `AGENT_CONTROL_POLL_INTERVAL_MS` only for an additional opt-in watchdog; its
+effective minimum is one second and a slow poll never overlaps its successor.
+
+MCP stdin EOF, transport closure, SIGINT and SIGTERM cancel pending waits and
+dispose local watchers before closing storage, without stopping durable workers.
+Shutdown has a five-second deadline for unresponsive backend operations.
+Normal shutdown exits with code zero; exceeding the deadline exits with code one.
 
 Blocking waits are available but must be explicitly acknowledged. They are
 useful for command-line debugging and short opt-in foreground waits:

@@ -7,6 +7,7 @@ import { agentConversationThreadId } from "./agent-conversation-identity.js";
 import { AgentAccessStore, type AccessPolicy, type AgentAccessSnapshot } from "./agent-access.js";
 import { PermissionRequests, permissionOwnerMatches, type PermissionDecision } from "./permission-requests.js";
 import { sessionObservationKey } from "./run-wake-policy.js";
+import { SessionSupervision } from "./session-supervision.js";
 import { applyProjectModels } from "./project-models.js";
 import { compileFlowAgent, flowAgentRepoDir, flowSourceConfig, resolveFlowAgentDefinitions } from "./flow-agent-definitions.js";
 import { buildRunCosts } from "./pricing.js";
@@ -154,6 +155,8 @@ export class AgentController {
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly backgroundAbort = new AbortController();
   private readonly statusWatchers = new Map<string, () => void>();
+  private readonly sessionWatcherKeys = new Map<string, string>();
+  private readonly sessionSupervision: SessionSupervision;
   private readonly pendingDeliveries = new Set<Promise<void>>();
   private readonly inFlightSubscriberDeliveries = new Set<string>();
   private readonly nativeActionDeliveryRetryTasks = new Map<string, Promise<void>>();
@@ -231,9 +234,8 @@ export class AgentController {
         // The durable unknown state remains visible for an explicit refresh.
       }
     }
-    for (const agent of this.store.listAgents()) {
-      if (agent.backend === "codex-session" && !agent.unregistered_at && agent.backend_handle) this.armStatusWatcher(agent);
-    }
+    this.sessionSupervision = new SessionSupervision(store.db.name, () => this.reconcileSessionWatchers());
+    this.sessionSupervision.start();
     this.redrivePendingNativeActionOwnerWakeups();
   }
 
@@ -438,21 +440,24 @@ export class AgentController {
     if (this.disposeTask) return this.disposeTask;
     this.disposing = true;
     this.backgroundAbort.abort();
+    this.sessionSupervision.stop();
     for (const agentId of this.statusWatchers.keys()) this.disarmStatusWatcher(agentId);
     this.disposeTask = (async () => {
       while (this.backgroundTasks.size || this.pendingDeliveries.size) {
         await Promise.allSettled([...this.backgroundTasks, ...this.pendingDeliveries]);
       }
+      this.sessionSupervision.close();
     })();
     return this.disposeTask;
   }
 
-  runBackground(task: () => Promise<unknown>): void {
-    if (this.disposing) return;
+  runBackground(task: () => Promise<unknown>): Promise<void> {
+    if (this.disposing) return Promise.resolve();
     const pending = Promise.resolve().then(task).then(() => undefined).catch(() => {
       // Background refresh is best-effort; explicit operations report errors.
     }).finally(() => this.backgroundTasks.delete(pending));
     this.backgroundTasks.add(pending);
+    return pending;
   }
 
   private async backgroundDelay(ms: number): Promise<boolean> {
@@ -9834,9 +9839,26 @@ export class AgentController {
     return stopped;
   }
 
+  private reconcileSessionWatchers(): void {
+    if (this.disposing) return;
+    const agents = this.store.listAgents().filter(agent => agent.backend === "codex-session" && !agent.unregistered_at && agent.backend_handle);
+    const current = new Set(agents.map(agent => agent.agent_id));
+    for (const id of this.sessionWatcherKeys.keys()) if (!current.has(id)) this.disarmStatusWatcher(id);
+    for (const agent of agents) this.armStatusWatcher(agent);
+  }
+
   private armStatusWatcher(agent: AgentRecord): void {
     if (this.disposing) return;
-    this.disarmStatusWatcher(agent.agent_id);
+    if (agent.backend === "codex-session") {
+      if (!this.sessionSupervision?.isOwner) return;
+      // Advancing the replay cursor does not change the watched session. Keep
+      // its watcher and idle backoff instead of resetting them every refresh.
+      const key = JSON.stringify({ ...agent.backend_handle, observed_event_index: undefined });
+      if (this.sessionWatcherKeys.get(agent.agent_id) === key && this.statusWatchers.has(agent.agent_id)) return;
+      this.disarmStatusWatcher(agent.agent_id);
+      this.sessionWatcherKeys.set(agent.agent_id, key);
+    }
+    else this.disarmStatusWatcher(agent.agent_id);
     const adapter = this.adapters.get(agent.backend);
     if (!adapter.watchStatus || !agent.backend_handle) {
       if (
@@ -9857,12 +9879,13 @@ export class AgentController {
       return;
     }
     const unwatch = adapter.watchStatus(this.requireHandle(agent), () => {
-      this.runBackground(() => this.refreshAgentStatus(agent.agent_id));
+      return this.runBackground(() => this.refreshAgentStatus(agent.agent_id));
     });
     this.statusWatchers.set(agent.agent_id, unwatch);
   }
 
   private disarmStatusWatcher(agentId: string): void {
+    this.sessionWatcherKeys.delete(agentId);
     const unwatch = this.statusWatchers.get(agentId);
     if (unwatch) {
       unwatch();

@@ -4,7 +4,7 @@ import { discoverCliWriter, hasRolloutWriter, interruptCliWriter } from "./cli-w
 import { CodexThreadAdapter } from "./codex-thread-adapter.js";
 import { controlExistingSession } from "./session-control.js";
 import Database from "../storage/database.js";
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ControllerError } from "../core/errors.js";
@@ -33,29 +33,52 @@ function belongsToThread(path: string, home: string, threadId: string): boolean 
     fd = openSync(actual, "r");
     // Metadata is the first record; never parse another conversation merely
     // because a filename or a stale index mentions the requested UUID.
-    const buffer = Buffer.alloc(1024 * 1024);
-    const length = readSync(fd, buffer, 0, buffer.length, 0);
-    const end = buffer.subarray(0, length).indexOf(10);
-    if (end < 0) return false;
-    const row = JSON.parse(buffer.subarray(0, end).toString("utf8"));
-    return row.type === "session_meta" && row.payload?.id === threadId;
+    const buffer = Buffer.alloc(4096), chunks: Buffer[] = [];
+    for (let offset = 0; offset < 1024 * 1024; offset += buffer.length) {
+      const length = readSync(fd, buffer, 0, buffer.length, offset);
+      if (!length) return false;
+      const end = buffer.subarray(0, length).indexOf(10);
+      chunks.push(Buffer.from(buffer.subarray(0, end < 0 ? length : end)));
+      if (end >= 0) {
+        const row = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        return row.type === "session_meta" && row.payload?.id === threadId;
+      }
+    }
+    return false;
   } catch { return false; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
 
+const resolutions = new Map<string, { signature: string; path?: string; expiresAt: number }>();
+
 function sessionPath(home: string, threadId: string): string | undefined {
   // Codex can resume a conversation into an ID_session-ID filename. Its
   // read-only index identifies the active rollout even when older copies remain.
-  for (const file of readdirSync(home).filter(name => /^state_\d+\.sqlite$/.test(name)).sort((a, b) => Number(b.slice(6, -7)) - Number(a.slice(6, -7)))) {
+  const files = readdirSync(home).filter(name => /^state_\d+\.sqlite$/.test(name)).sort((a, b) => Number(b.slice(6, -7)) - Number(a.slice(6, -7)));
+  const signature = files.flatMap(file => [file, `${file}-wal`]).map(file => {
+    try { const s = statSync(join(home, file)); return `${file}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; }
+    catch { return file; }
+  }).join("|");
+  const key = `${home}:${threadId}`, cached = resolutions.get(key);
+  if (cached?.signature === signature && cached.expiresAt > Date.now() && (!cached.path || existsSync(cached.path))) return cached.path;
+  const remember = (path: string | undefined) => {
+    if (resolutions.size >= 100 && !resolutions.has(key)) resolutions.delete(resolutions.keys().next().value!);
+    // A missing/unindexed session must not trigger a full recursive walk per
+    // second. Indexed rotation invalidates immediately; fallback discovery is
+    // bounded to five seconds, including files restored from an archive.
+    resolutions.set(key, { signature, path, expiresAt: Date.now() + 5_000 });
+    return path;
+  };
+  for (const file of files) {
     let db: Database.Database | undefined;
     try {
       db = new Database(join(home, file), { readonly: true, fileMustExist: true });
       const row = db.prepare("select rollout_path from threads where id = ?").get(threadId) as { rollout_path?: string } | undefined;
-      if (row?.rollout_path && belongsToThread(row.rollout_path, home, threadId)) return row.rollout_path;
+      if (row?.rollout_path && belongsToThread(row.rollout_path, home, threadId)) return remember(row.rollout_path);
     } catch { /* Older hosts may have no compatible thread index. */ }
     finally { db?.close(); }
   }
-  return sessionCandidates(home, threadId).find(path => belongsToThread(path, home, threadId));
+  return remember(sessionCandidates(home, threadId).find(path => belongsToThread(path, home, threadId)));
 }
 
 function sessionCandidates(home: string, threadId: string): string[] {
@@ -269,12 +292,53 @@ export class CodexSessionAdapter implements AgentAdapter {
   async readLatest(handle: AgentHandle, options: { limit: number }) { if (handle.data.remote_session) return new CodexThreadAdapter().readLatest(handle, options); return readCodexSession(String(handle.data.thread_id))?.messages.slice(-options.limit) ?? []; }
   readUsage(handle: AgentHandle) { return handle.data.remote_session ? null : sessionUsage(handle); }
   watchStatus(handle: AgentHandle, onChange: Parameters<NonNullable<AgentAdapter["watchStatus"]>>[1]) {
-    let previous = "", busy = false;
-    const timer = setInterval(async () => { if (busy) return; busy = true;
-      try { const state = await this.getStatus(handle); const signature = JSON.stringify(state);
-        if (signature !== previous) { await onChange(state); previous = signature; }
-      } catch { /* Keep the last successful observation and retry without inventing failure. */ } finally { busy = false; }
-    }, 1000);
-    timer.unref(); return () => clearInterval(timer);
+    let previous = "", busy = false, closed = false, dirty = false, wakeScheduled = false, delay = 1000, lastPollAt = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined, fileWatcher: FSWatcher | undefined, watchedPath: string | undefined;
+    const schedule = (ms: number) => {
+      if (closed) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => { void poll(); }, ms);
+      timer.unref();
+    };
+    const changed = (event?: string) => {
+      if (event === "rename") { fileWatcher?.close(); fileWatcher = undefined; watchedPath = undefined; }
+      dirty = true;
+      // Keep the earliest wakeup: continuous writes must not postpone it
+      // indefinitely, or cause a full rollout parse on every streamed token.
+      if (!busy && !wakeScheduled) {
+        wakeScheduled = true;
+        schedule(Math.max(50, 1000 - (Date.now() - lastPollAt)));
+      }
+    };
+    const poll = async () => {
+      if (closed || busy) return;
+      busy = true; dirty = false; wakeScheduled = false; lastPollAt = Date.now();
+      try {
+        const state = await this.getStatus(handle);
+        if (closed) return;
+        const signature = JSON.stringify(state);
+        if (signature !== previous) { await onChange(state); previous = signature; delay = 1000; }
+        else delay = Math.min(delay * 2, 30_000);
+        if (!closed && !handle.data.remote_session) {
+          const path = readCodexSession(String(handle.data.thread_id))?.path;
+          if (path !== watchedPath) {
+            fileWatcher?.close(); fileWatcher = undefined; watchedPath = undefined;
+            if (path) {
+              fileWatcher = watch(path, changed); watchedPath = path;
+              fileWatcher.unref();
+              fileWatcher.on("error", () => { fileWatcher?.close(); fileWatcher = undefined; watchedPath = undefined; });
+            }
+          }
+        }
+      } catch {
+        // Preserve the last observation on transient read/control errors.
+        delay = Math.min(delay * 2, 30_000);
+      } finally {
+        busy = false;
+        schedule(dirty ? Math.max(50, 1000 - (Date.now() - lastPollAt)) : delay);
+      }
+    };
+    schedule(1000);
+    return () => { closed = true; clearTimeout(timer); fileWatcher?.close(); };
   }
 }

@@ -264,8 +264,20 @@ server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
 const pollIntervalMs = Number(process.env.AGENT_CONTROL_POLL_INTERVAL_MS ?? "0");
 let pollTimer;
 if (Number.isFinite(pollIntervalMs) && pollIntervalMs > 0) {
-    pollTimer = setInterval(() => controller.runBackground(() => controller.pollActiveAgents()), pollIntervalMs);
-    pollTimer.unref();
+    const schedulePoll = () => {
+        if (shutdownCancellation.signal.aborted)
+            return;
+        pollTimer = setTimeout(() => controller.runBackground(async () => {
+            try {
+                await controller.pollActiveAgents();
+            }
+            finally {
+                schedulePoll();
+            }
+        }), Math.max(1000, pollIntervalMs));
+        pollTimer.unref();
+    };
+    schedulePoll();
 }
 process.once("SIGINT", () => {
     void shutdown(0);
@@ -273,6 +285,11 @@ process.once("SIGINT", () => {
 process.once("SIGTERM", () => {
     void shutdown(0);
 });
+// The SDK's stdio transport does not forward stdin EOF to onclose. Chat/host
+// teardown must cancel waits and release shared supervision just like SIGTERM.
+process.stdin.once("end", () => { void shutdown(0); });
+process.stdin.once("close", () => { void shutdown(0); });
+server.onclose = () => { void shutdown(0); };
 await server.connect(new StdioServerTransport());
 function jsonResult(value, isError = false) {
     return {
@@ -573,7 +590,11 @@ function shutdown(code) {
     return shutdownTask ??= (async () => {
         shutdownCancellation.abort();
         if (pollTimer)
-            clearInterval(pollTimer);
+            clearTimeout(pollTimer);
+        // Broken transports/backends must not retain an orphan forever. Normal
+        // cleanup still drains before SQLite closes and preserves durable workers.
+        const deadline = setTimeout(() => process.exit(code || 1), 5_000);
+        deadline.unref();
         await Promise.allSettled([...activeCalls]);
         await controller.dispose();
         await server.close();
