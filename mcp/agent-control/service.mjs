@@ -43,6 +43,16 @@ if (command === "install") {
       writeFileSync(plist + ".previous", previous, { mode: 0o600 });
     }
     try { launchctl(["bootout", `${domain}/${label}`]); } catch { /* First installation has no running job. */ }
+    // bootout can return while macOS is still retiring the old job. Do not
+    // mistake that transient registration for the new version being loaded.
+    const retiredBy = Date.now() + 10_000;
+    for (;;) {
+      let registered = false;
+      try { launchctl(["print", `${domain}/${label}`]); registered = true; } catch { /* Fully retired. */ }
+      if (!registered) break;
+      if (Date.now() > retiredBy) throw new Error("The previous MCP service did not retire; installation has not replaced it.");
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
     writeFileSync(plist, contents, { mode: 0o600 }); chmodSync(plist, 0o600);
   }
   try { launchctl(["print", `${domain}/${label}`]); }
